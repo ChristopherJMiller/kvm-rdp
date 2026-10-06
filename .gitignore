@@ -33,3 +33,11 @@ rustc-ice-*.txt
 
 # on-demand large fixtures (1080p spike/bench streams; regenerate with scripts/gen-fixtures.sh large)
 /fixtures/large/
+
+# throwaway Milestone-0 spikes (spikes/ — Plan A Part 7)
+spikes/**/target/
+spikes/legb-winapp/certs/
+spikes/legc-rdpgw/state/
+spikes/legc-rdpgw/src/
+spikes/legc-rdpgw/bin/
+spikes/legc-rdpgw/gomod/
