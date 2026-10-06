@@ -364,3 +364,77 @@ async fn a_jsonl_flush_error_is_an_error_not_swallowed() {
         "lines were written before the flush"
     );
 }
+
+/// I4 (final review): the web port and the video port present different
+/// certificates (separate daemons). With `--pin` for the web port and
+/// `--video-pin` for the video port, the CLI's per-port pins log in and
+/// capture; the single web pin on the video port (the old behaviour)
+/// fails closed with the mismatch.
+#[tokio::test]
+async fn distinct_web_and_video_certificates_work_with_per_port_pins() {
+    use clap::Parser;
+    use kvm_probe::cli::{Cli, Cmd, Port};
+
+    let web = support::start_login_stub().await;
+    let video = support::start_flv_stub().await;
+    assert_ne!(web.pin_hex, video.pin_hex, "two distinct certificates");
+
+    let cli = Cli::try_parse_from([
+        "kvm-probe",
+        "capture",
+        "--host",
+        "127.0.0.1",
+        "--pin",
+        &web.pin_hex,
+        "--video-pin",
+        &video.pin_hex,
+        "--password-file",
+        "/tmp/pw",
+        "--name",
+        "d.flv",
+    ])
+    .unwrap();
+    cli.validate().unwrap();
+    let Cmd::Capture { conn, .. } = &cli.cmd else {
+        panic!("parsed {:?}", cli.cmd);
+    };
+    let t = KvmTarget {
+        scheme: Scheme::Https,
+        host: "127.0.0.1".into(),
+        login_port: web.port,
+        video_port: video.port,
+        control_port: 1,
+    };
+
+    let token = kvm_probe::kvm::login(&t, conn.pin_for(Port::Web), "pw", 0, "UTC")
+        .await
+        .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = CaptureDir::create(&tmp.path().join("captures")).unwrap();
+    let mut jsonl = Vec::new();
+    let stats = run(
+        &t,
+        conn.pin_for(Port::Video),
+        &token,
+        &dir,
+        "d.flv",
+        &mut jsonl,
+        StopAt::default(),
+    )
+    .await
+    .unwrap();
+    assert!(stats.tags > 0);
+
+    let err = run(
+        &t,
+        conn.pin_for(Port::Web),
+        &token,
+        &dir,
+        "e.flv",
+        &mut Vec::new(),
+        StopAt::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{err:?}").contains("kvm_cert_mismatch"), "{err:?}");
+}

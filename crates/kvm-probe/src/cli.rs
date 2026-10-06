@@ -35,20 +35,32 @@ impl Cli {
     /// its verbatim attribute (controller ruling). `fingerprint` takes no
     /// pin at all (record mode) and is exempt, as are the two subcommands
     /// with no `Conn` (`sample-range`, `summarize`).
+    ///
+    /// Final review I4: the check is on the *effective* pin
+    /// (`Conn::pin_for`) of every port the subcommand touches — web (login,
+    /// logout) plus video for `capture`/`first-idr`, web plus control for
+    /// `ws-open`.
     pub fn validate(&self) -> Result<(), clap::Error> {
-        let conn = match &self.cmd {
-            Cmd::Capture { conn, .. } | Cmd::FirstIdr { conn, .. } | Cmd::WsOpen { conn } => conn,
+        let (conn, ports): (&Conn, &[Port]) = match &self.cmd {
+            Cmd::Capture { conn, .. } | Cmd::FirstIdr { conn, .. } => {
+                (conn, &[Port::Web, Port::Video])
+            }
+            Cmd::WsOpen { conn } => (conn, &[Port::Web, Port::Control]),
             Cmd::Fingerprint { .. } | Cmd::SampleRange { .. } | Cmd::Summarize { .. } => {
                 return Ok(());
             }
         };
-        if conn.scheme == SchemeArg::Https && conn.pin.is_none() {
-            let mut cmd = Cli::command();
-            return Err(cmd.error(
-                clap::error::ErrorKind::MissingRequiredArgument,
-                "--pin is required for https (the default scheme); run `fingerprint` \
-                 first and pass its output as --pin, or pass --scheme http",
-            ));
+        if conn.scheme != SchemeArg::Https {
+            return Ok(());
+        }
+        for &port in ports {
+            if conn.pin_for(port).is_none() {
+                let mut cmd = Cli::command();
+                return Err(cmd.error(
+                    clap::error::ErrorKind::MissingRequiredArgument,
+                    port.missing_pin_help(),
+                ));
+            }
         }
         Ok(())
     }
@@ -73,12 +85,70 @@ pub struct Conn {
     pub host: String,
     #[arg(long, value_enum, default_value_t = SchemeArg::Https)]
     pub scheme: SchemeArg,
-    /// SPKI SHA-256 hex recorded by `fingerprint` (required for https).
+    /// SPKI SHA-256 hex from `fingerprint --port 443` (required for https):
+    /// pins the web port (login, logout), and the video and control ports
+    /// unless --video-pin / --control-pin override it.
     #[arg(long, required_if_eq("scheme", "https"))]
     pub pin: Option<String>,
+    /// Pin for the video port 8881 (av.flv), from `fingerprint --port 8881`;
+    /// defaults to --pin.
+    #[arg(long)]
+    pub video_pin: Option<String>,
+    /// Pin for the control port 8889 (websocket), from `fingerprint --port
+    /// 8889`; defaults to --pin.
+    #[arg(long)]
+    pub control_pin: Option<String>,
     /// File holding the KVM password (never pass it on the command line).
     #[arg(long)]
     pub password_file: PathBuf,
+}
+
+/// Which of the KVM's three services a connection goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Port {
+    /// Web UI: login and logout (https 443, http 80).
+    Web,
+    /// `av.flv` (https 8881, http 8880).
+    Video,
+    /// Control websocket (https 8889, http 8888).
+    Control,
+}
+
+impl Conn {
+    /// The SPKI pin for connections to `port` (final review I4): the web
+    /// port always uses `--pin`; the video and control ports use their own
+    /// `--video-pin` / `--control-pin` when given, else `--pin`. The ES3's
+    /// web UI, video server and control server may be separate daemons
+    /// with separate keys, and one pin for all three would then fail every
+    /// https subcommand closed.
+    pub fn pin_for(&self, port: Port) -> Option<&str> {
+        match port {
+            Port::Web => self.pin.as_deref(),
+            Port::Video => self.video_pin.as_deref().or(self.pin.as_deref()),
+            Port::Control => self.control_pin.as_deref().or(self.pin.as_deref()),
+        }
+    }
+}
+
+impl Port {
+    /// What to pass when this port has no pin under https.
+    fn missing_pin_help(self) -> &'static str {
+        match self {
+            Port::Web => {
+                "--pin is required for https (the default scheme): it pins the web \
+                 port 443 used for login and logout. Run `fingerprint --port 443` \
+                 and pass its output as --pin, or pass --scheme http"
+            }
+            Port::Video => {
+                "the video port 8881 needs a pin for https: pass --video-pin (from \
+                 `fingerprint --port 8881`) or --pin, or pass --scheme http"
+            }
+            Port::Control => {
+                "the control port 8889 needs a pin for https: pass --control-pin \
+                 (from `fingerprint --port 8889`) or --pin, or pass --scheme http"
+            }
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -245,6 +315,104 @@ mod tests {
     fn fingerprint_is_exempt_from_pin_validation() {
         let c = Cli::try_parse_from(["kvm-probe", "fingerprint", "--host", "h"]).unwrap();
         assert!(c.validate().is_ok());
+    }
+
+    fn conn_of(c: &Cli) -> &Conn {
+        match &c.cmd {
+            Cmd::Capture { conn, .. } | Cmd::FirstIdr { conn, .. } | Cmd::WsOpen { conn } => conn,
+            other => panic!("no Conn in {other:?}"),
+        }
+    }
+
+    /// I4 (final review): with only `--pin`, every port uses it.
+    #[test]
+    fn video_and_control_pins_default_to_pin() {
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "capture",
+            "--host",
+            "h",
+            "--pin",
+            "web",
+            "--password-file",
+            "/tmp/pw",
+            "--name",
+            "c.flv",
+        ])
+        .unwrap();
+        let conn = conn_of(&c);
+        assert_eq!(conn.pin_for(Port::Web), Some("web"));
+        assert_eq!(conn.pin_for(Port::Video), Some("web"));
+        assert_eq!(conn.pin_for(Port::Control), Some("web"));
+        assert!(c.validate().is_ok());
+    }
+
+    /// I4: `--video-pin`/`--control-pin` override `--pin` for their own
+    /// port only (the ES3's web UI, video server and control server may be
+    /// separate daemons with separate keys); login/logout keep `--pin`.
+    #[test]
+    fn video_and_control_pins_override_pin_for_their_port_only() {
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "ws-open",
+            "--host",
+            "h",
+            "--pin",
+            "web",
+            "--video-pin",
+            "video",
+            "--control-pin",
+            "control",
+            "--password-file",
+            "/tmp/pw",
+        ])
+        .unwrap();
+        let conn = conn_of(&c);
+        assert_eq!(conn.pin_for(Port::Web), Some("web"));
+        assert_eq!(conn.pin_for(Port::Video), Some("video"));
+        assert_eq!(conn.pin_for(Port::Control), Some("control"));
+        assert!(c.validate().is_ok());
+
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "first-idr",
+            "--host",
+            "h",
+            "--pin",
+            "web",
+            "--video-pin",
+            "video",
+            "--password-file",
+            "/tmp/pw",
+        ])
+        .unwrap();
+        let conn = conn_of(&c);
+        assert_eq!(conn.pin_for(Port::Video), Some("video"));
+        assert_eq!(conn.pin_for(Port::Control), Some("web"));
+    }
+
+    /// I4: the https-needs-a-pin check applies to the effective pin of
+    /// every port the subcommand touches. Every logged-in subcommand
+    /// touches the web port (login, logout), so a per-port pin alone is
+    /// not enough without `--pin`.
+    #[test]
+    fn https_still_needs_the_web_pin_when_only_port_pins_are_given() {
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "capture",
+            "--host",
+            "h",
+            "--video-pin",
+            "video",
+            "--password-file",
+            "/tmp/pw",
+            "--name",
+            "c.flv",
+        ])
+        .unwrap();
+        let err = c.validate().unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        assert!(err.to_string().contains("--pin"), "{err}");
     }
 
     /// m2 (final review): `sample-range --width/--height` are each clamped

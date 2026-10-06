@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 
 use kvm_probe::captures::{self, CaptureDir};
-use kvm_probe::cli::{Cli, Cmd, Conn, SchemeArg};
+use kvm_probe::cli::{Cli, Cmd, Conn, Port, SchemeArg};
 use kvm_probe::request::{KvmTarget, Scheme};
 use kvm_probe::{capture, fingerprint, kvm, report, sandbox, secret, stats, trial, wsprobe};
 
@@ -49,7 +49,7 @@ async fn token(conn: &Conn) -> Result<String, String> {
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?;
     let now = i64::try_from(now.as_secs()).map_err(|e| e.to_string())?;
-    kvm::login(&target(conn), conn.pin.as_deref(), &pw, now, "UTC")
+    kvm::login(&target(conn), conn.pin_for(Port::Web), &pw, now, "UTC")
         .await
         .map_err(|e| format!("{e:?}"))
 }
@@ -114,7 +114,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             };
             let result = capture::run(
                 &target(&conn),
-                conn.pin.as_deref(),
+                conn.pin_for(Port::Video),
                 &tok,
                 &dir,
                 &name,
@@ -144,7 +144,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             for _ in 0..trials {
                 let d = trial::first_idr_latency(
                     &t,
-                    conn.pin.as_deref(),
+                    conn.pin_for(Port::Video),
                     &tok,
                     Duration::from_secs(10),
                 )
@@ -162,9 +162,10 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Cmd::WsOpen { conn } => {
             let tok = token(&conn).await?;
-            let d = wsprobe::open_control_websocket(&target(&conn), conn.pin.as_deref(), &tok)
-                .await
-                .map_err(|e| format!("{e:?}"))?;
+            let d =
+                wsprobe::open_control_websocket(&target(&conn), conn.pin_for(Port::Control), &tok)
+                    .await
+                    .map_err(|e| format!("{e:?}"))?;
             println!("websocket upgrade: {} ms", d.as_millis());
         }
         Cmd::SampleRange {
