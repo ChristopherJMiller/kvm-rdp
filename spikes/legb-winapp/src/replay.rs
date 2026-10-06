@@ -11,6 +11,13 @@ pub struct AccessUnit {
 /// Split a trusted Annex-B fixture (4-byte start codes) into access units.
 /// An AU boundary is the start of an AUD (NAL type 9) or an SPS (type 7) that
 /// follows at least one VCL NAL. IDR = the AU contains a type-5 NAL.
+///
+/// SPS/PPS are retained across AUs as they're seen and re-prepended on any
+/// IDR AU that doesn't already carry its own copy (immediately after any
+/// leading AUD) — a fixture like `360p30_main_norepeat.h264`
+/// (repeat-headers=0) only has in-band SPS/PPS once, at the very start, so
+/// its later IDRs would otherwise be undecodable on their own (brief
+/// B14-brief.md:198; B14-review.md Important finding).
 pub fn load_fixture(path: &Path) -> anyhow::Result<Vec<AccessUnit>> {
     let raw = std::fs::read(path).with_context(|| format!("read fixture {}", path.display()))?;
     let starts = start_code_offsets(&raw);
@@ -30,10 +37,21 @@ pub fn load_fixture(path: &Path) -> anyhow::Result<Vec<AccessUnit>> {
     let mut cur_start = starts[0].0;
     let mut cur_has_vcl = false;
     let mut cur_is_idr = false;
+    let mut last_sps: Option<Vec<u8>> = None;
+    let mut last_pps: Option<Vec<u8>> = None;
 
-    let push = |units: &mut Vec<AccessUnit>, data: &[u8], idr: bool| {
+    let push = |units: &mut Vec<AccessUnit>,
+                data: &[u8],
+                idr: bool,
+                last_sps: &Option<Vec<u8>>,
+                last_pps: &Option<Vec<u8>>| {
+        let bytes = if idr {
+            ensure_leading_sps_pps(data, last_sps, last_pps)
+        } else {
+            data.to_vec()
+        };
         units.push(AccessUnit {
-            annex_b: Bytes::copy_from_slice(data),
+            annex_b: Bytes::from(bytes),
             is_idr: idr,
         });
     };
@@ -46,7 +64,13 @@ pub fn load_fixture(path: &Path) -> anyhow::Result<Vec<AccessUnit>> {
             (nal_type == 1 || nal_type == 5) && cur_has_vcl
         };
         if boundary && off > cur_start {
-            push(&mut units, &raw[cur_start..off], cur_is_idr);
+            push(
+                &mut units,
+                &raw[cur_start..off],
+                cur_is_idr,
+                &last_sps,
+                &last_pps,
+            );
             cur_start = off;
             cur_has_vcl = false;
             cur_is_idr = false;
@@ -57,13 +81,81 @@ pub fn load_fixture(path: &Path) -> anyhow::Result<Vec<AccessUnit>> {
                 cur_is_idr = true;
             }
         }
+        if nal_type == 7 || nal_type == 8 {
+            // Remember this NAL's own bytes (start code included) so a
+            // later IDR AU that doesn't repeat its own copy can still get
+            // one prepended.
+            let nal_end = starts.get(i + 1).map(|&(o, _)| o).unwrap_or(raw.len());
+            let nal_bytes = raw.get(off..nal_end).unwrap_or(&[]).to_vec();
+            if nal_type == 7 {
+                last_sps = Some(nal_bytes);
+            } else {
+                last_pps = Some(nal_bytes);
+            }
+        }
         if i + 1 == starts.len() {
-            push(&mut units, &raw[cur_start..], cur_is_idr);
+            push(
+                &mut units,
+                &raw[cur_start..],
+                cur_is_idr,
+                &last_sps,
+                &last_pps,
+            );
         }
     }
 
     anyhow::ensure!(!units.is_empty(), "fixture produced no access units");
     Ok(units)
+}
+
+/// True if `data` (one AU's own Annex-B bytes) already begins — after
+/// skipping at most one leading AUD (type 9) — with an SPS (type 7) NAL
+/// immediately followed by a PPS (type 8) NAL.
+fn starts_with_sps_pps(data: &[u8]) -> bool {
+    let starts = start_code_offsets(data);
+    let nal_type_at = |idx: usize| -> Option<u8> {
+        let &(off, sc_len) = starts.get(idx)?;
+        data.get(off + sc_len).map(|b| b & 0x1f)
+    };
+    let idx = if nal_type_at(0) == Some(9) { 1 } else { 0 };
+    nal_type_at(idx) == Some(7) && nal_type_at(idx + 1) == Some(8)
+}
+
+/// If `data` (one IDR AU's own bytes) doesn't already carry a leading
+/// SPS/PPS pair, prepend the most recently-seen ones (right after a leading
+/// AUD, if `data` has one) so the AU is independently decodable.
+fn ensure_leading_sps_pps(
+    data: &[u8],
+    last_sps: &Option<Vec<u8>>,
+    last_pps: &Option<Vec<u8>>,
+) -> Vec<u8> {
+    if starts_with_sps_pps(data) {
+        return data.to_vec();
+    }
+    let (Some(sps), Some(pps)) = (last_sps, last_pps) else {
+        // Nothing seen yet to prepend (e.g. an IDR before any SPS/PPS at
+        // all) — leave as-is rather than fabricate parameter sets.
+        return data.to_vec();
+    };
+
+    let starts = start_code_offsets(data);
+    let has_leading_aud = starts
+        .first()
+        .and_then(|&(off, sc_len)| data.get(off + sc_len))
+        .map(|b| b & 0x1f)
+        == Some(9);
+    let insert_at = if has_leading_aud {
+        starts.get(1).map(|&(off, _)| off).unwrap_or(data.len())
+    } else {
+        0
+    };
+
+    let mut out = Vec::with_capacity(data.len() + sps.len() + pps.len());
+    out.extend_from_slice(data.get(..insert_at).unwrap_or(data));
+    out.extend_from_slice(sps);
+    out.extend_from_slice(pps);
+    out.extend_from_slice(data.get(insert_at..).unwrap_or(&[]));
+    out
 }
 
 /// Returns `(start_code_offset, start_code_len)` pairs. Annex-B legally mixes
@@ -171,5 +263,66 @@ mod real_fixture_regression {
     #[test]
     fn single_frame_slate_fixture() {
         check("slate_1080p.h264", 1, 1);
+    }
+
+    /// NAL types of an AU's own bytes, in order (reuses the production
+    /// scanner — no duplicated start-code logic in the test).
+    fn nal_type_sequence(data: &[u8]) -> Vec<u8> {
+        super::start_code_offsets(data)
+            .into_iter()
+            .map(|(off, sc_len)| data.get(off + sc_len).map(|b| b & 0x1f).unwrap_or(0))
+            .collect()
+    }
+
+    // Fix round 1 (B14-review.md, Important): the brief requires SPS/PPS to
+    // be "retained and re-prepended on IDR AUs" so every IDR is
+    // independently decodable, but the splitter only keeps SPS/PPS attached
+    // to whichever AU they happen to sit next to *in the source bytes*.
+    // `360p30_main_norepeat.h264` (repeat-headers=0) has SPS/PPS spliced in
+    // only once, ahead of frame 0 — its later IDRs (frame 30, frame 60) have
+    // none of their own, so a ship loop resuming/looping at one of them
+    // would hand the client an undecodable IDR.
+    #[test]
+    fn norepeat_idr_aus_carry_leading_sps_pps() {
+        let aus = super::load_fixture(&fixture("360p30_main_norepeat.h264")).unwrap();
+        let idr_aus: Vec<_> = aus.iter().enumerate().filter(|(_, au)| au.is_idr).collect();
+        assert_eq!(
+            idr_aus.len(),
+            3,
+            "sanity: norepeat has 3 IDR AUs (frames 0/30/60)"
+        );
+        for (n, au) in idr_aus {
+            let types = nal_type_sequence(&au.annex_b);
+            // Skip at most one leading AUD (type 9) before checking for SPS, PPS.
+            let rest: &[u8] = if types.first() == Some(&9) {
+                &types[1..]
+            } else {
+                &types[..]
+            };
+            assert_eq!(
+                rest.first_chunk::<2>(),
+                Some(&[7u8, 8u8]),
+                "IDR AU #{n} must start with SPS then PPS (after any leading AUD); got {rest:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn idr_au_with_native_sps_pps_is_not_doubled() {
+        let aus = super::load_fixture(&fixture("360p30_main_norepeat.h264")).unwrap();
+        // AU #0 (frame 0) already carries its own SPS/PPS natively (the
+        // splice is ahead of the whole stream, so they land in this AU) —
+        // the re-prepend fix must not stack a second copy on top of it.
+        let types = nal_type_sequence(&aus[0].annex_b);
+        assert_eq!(
+            types.iter().filter(|&&t| t == 7).count(),
+            1,
+            "exactly one SPS, not doubled"
+        );
+        assert_eq!(
+            types.iter().filter(|&&t| t == 8).count(),
+            1,
+            "exactly one PPS, not doubled"
+        );
     }
 }
