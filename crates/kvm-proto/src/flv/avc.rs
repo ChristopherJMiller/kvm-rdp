@@ -10,13 +10,21 @@ pub struct Nal {
 }
 
 impl Nal {
-    /// `nal_unit_type` (header byte & 0x1F).
+    /// `nal_unit_type`, or `None` if the NAL is empty or has the forbidden
+    /// bit set. Delegates to `crate::h264::NalHeader` so there is exactly
+    /// one NAL-header decoder in the crate.
     pub fn unit_type(&self) -> Option<u8> {
-        self.bytes.first().map(|b| b & 0x1F)
+        crate::h264::NalHeader::from_nal(self.bytes.as_ref())
+            .ok()
+            .map(|h| h.nal_unit_type)
     }
-    /// `nal_ref_idc` ((header byte >> 5) & 0x3).
+    /// `nal_ref_idc`, or `None` if the NAL is empty or has the forbidden bit
+    /// set. Delegates to `crate::h264::NalHeader` so there is exactly one
+    /// NAL-header decoder in the crate.
     pub fn ref_idc(&self) -> Option<u8> {
-        self.bytes.first().map(|b| b.wrapping_shr(5) & 0x3)
+        crate::h264::NalHeader::from_nal(self.bytes.as_ref())
+            .ok()
+            .map(|h| h.nal_ref_idc)
     }
 }
 
@@ -246,6 +254,16 @@ mod tests {
             .unit_type(),
             None
         );
+    }
+
+    #[test]
+    fn forbidden_bit_set_rejected() {
+        // 0xE5 = forbidden bit set, nal_ref_idc 3, type 5.
+        let n = Nal {
+            bytes: Bytes::from_static(&[0xE5, 0x88]),
+        };
+        assert_eq!(n.unit_type(), None);
+        assert_eq!(n.ref_idc(), None);
     }
 
     #[test]
