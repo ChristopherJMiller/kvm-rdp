@@ -395,6 +395,19 @@ mod tests {
     }
 
     #[test]
+    fn exact_ceiling_values_pass() {
+        // Fix round 1: pin the ceilings themselves, not just values beyond
+        // them — width=4096, height=2304, level_idc=51, num_ref_frames=16
+        // are each the exact §6.1 limit and must still be admitted.
+        let mut s = ok_summary();
+        s.width = 4096;
+        s.height = 2304;
+        s.level_idc = 51;
+        s.num_ref_frames = 16;
+        assert_eq!(check_sps_limits(&s, &SpsLimits::default()), Ok(()));
+    }
+
+    #[test]
     fn each_rule_has_its_own_violation() {
         let lim = SpsLimits::default();
         let mut s = ok_summary();
@@ -436,17 +449,17 @@ mod tests {
         );
 
         let mut s = ok_summary();
-        s.width = 4112;
+        s.width = 4098;
         assert_eq!(
             check_sps_limits(&s, &lim),
-            Err(SpsLimitViolation::WidthTooLarge(4112))
+            Err(SpsLimitViolation::WidthTooLarge(4098))
         );
 
         let mut s = ok_summary();
-        s.height = 2320;
+        s.height = 2306;
         assert_eq!(
             check_sps_limits(&s, &lim),
-            Err(SpsLimitViolation::HeightTooLarge(2320))
+            Err(SpsLimitViolation::HeightTooLarge(2306))
         );
 
         let mut s = ok_summary();
@@ -497,6 +510,22 @@ mod classify_tests {
         assert_eq!(
             classify_sps_change(None, &ok_summary(), &lim),
             SpsChange::Initial
+        );
+    }
+
+    #[test]
+    fn no_previous_but_outside_limits_is_incompatible_not_initial() {
+        // Fix round 1 (folded-in minor): the limits check must win over
+        // `previous.is_none()` — a session's very first SPS can still be
+        // rejected, never silently waved through as `Initial`.
+        let lim = SpsLimits::default();
+        let mut new = ok_summary();
+        new.profile_idc = 244;
+        assert_eq!(
+            classify_sps_change(None, &new, &lim),
+            SpsChange::Incompatible(SpsIncompatibleReason::OutsideLimits(
+                SpsLimitViolation::Profile(244)
+            ))
         );
     }
 
