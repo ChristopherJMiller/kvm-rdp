@@ -46,7 +46,10 @@ const MAX_LOGIN_BODY: usize = 64 * 1024;
 /// Bound for the TCP connect plus (for `Https`) the TLS handshake. The
 /// device is hostile by assumption (§9.2): a peer that accepts the TCP
 /// connection and then never speaks must not hang the probe forever.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// `pub(crate)` so `fingerprint::observe` — the one other caller allowed to
+/// open a connection (in no-pin record mode, R9) — is bound by the same
+/// timeout rather than its own copy.
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Bound for the whole login exchange: connect, handshake, request, and
 /// the capped response-body read. Covers a peer that accepts the request

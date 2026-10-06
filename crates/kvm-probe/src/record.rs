@@ -1,7 +1,9 @@
 use serde::Serialize;
 
 /// One census JSONL line (§12 Leg A). Field order below is the emitted order.
-#[derive(Serialize, Clone, Debug)]
+/// `Deserialize` lets `summarize` (`report.rs`) read a capture's `.jsonl`
+/// back in.
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
 pub struct TagRecord {
     pub recv_ms: u64,
     pub tag_type: u8,

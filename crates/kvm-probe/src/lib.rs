@@ -1,9 +1,11 @@
 pub mod capture;
 pub mod captures;
+pub mod cli;
 pub mod fingerprint;
 pub mod kvm;
 pub mod pin;
 pub mod record;
+pub mod report;
 pub mod request;
 pub mod sandbox;
 pub mod stats;

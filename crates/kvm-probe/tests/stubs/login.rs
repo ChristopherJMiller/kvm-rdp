@@ -170,6 +170,17 @@ async fn login_body_over_64kib_is_a_clean_login_error() {
     }
 }
 
+/// `fingerprint::observe` connects with no pin (record mode) and must
+/// report the SPKI the stub actually presents.
+#[tokio::test]
+async fn observe_reports_the_stub_pin() {
+    let stub = support::start_login_stub().await;
+    let seen = kvm_probe::fingerprint::observe(&target(stub.port), stub.port)
+        .await
+        .unwrap();
+    assert_eq!(seen, stub.pin_hex);
+}
+
 #[tokio::test]
 async fn rejected_password_body_is_a_clean_login_error() {
     let stub = support::start_http_stub(support::http_response(
