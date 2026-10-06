@@ -92,6 +92,84 @@ async fn non_200_login_is_a_clean_login_error() {
     }
 }
 
+/// I1: a peer that accepts the TCP connection and the TLS handshake but
+/// never answers the login request must not hang `login` forever. Paused
+/// time lets `LOGIN_TIMEOUT`'s internal sleep auto-advance instantly
+/// instead of a real multi-second wait.
+#[tokio::test(start_paused = true)]
+async fn login_times_out_against_a_silent_peer() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        // Accept and hold the connection open; never speak HTTP.
+        let _held = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    let t = KvmTarget {
+        scheme: Scheme::Http,
+        host: "127.0.0.1".into(),
+        login_port: port,
+        video_port: port,
+        control_port: port,
+    };
+    match kvm_probe::kvm::login(&t, None, "pw", 1_759_680_000, "UTC").await {
+        Err(kvm_probe::kvm::KvmError::Login(msg)) => {
+            assert!(msg.to_ascii_lowercase().contains("time"), "{msg}");
+        }
+        other => panic!("expected a timeout Login error, got {other:?}"),
+    }
+}
+
+/// I1: a peer that accepts the TCP connection but never completes the TLS
+/// handshake must not hang `connect_to` forever.
+#[tokio::test(start_paused = true)]
+async fn connect_to_times_out_against_a_silent_tls_peer() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _held = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    let t = KvmTarget {
+        scheme: Scheme::Https,
+        host: "127.0.0.1".into(),
+        login_port: port,
+        video_port: port,
+        control_port: port,
+    };
+    let wrong = "0".repeat(64);
+    match kvm_probe::kvm::connect_to(&t, port, Some(&wrong)).await {
+        Err(kvm_probe::kvm::KvmError::Tls(msg)) => {
+            assert!(msg.to_ascii_lowercase().contains("time"), "{msg}");
+        }
+        Ok(_) => panic!("expected a timeout Tls error, got Ok"),
+        Err(e) => panic!("expected a timeout Tls error, got {e:?}"),
+    }
+}
+
+/// M1: a login response body over the 64 KiB cap is a clean error, not a
+/// hang or an unbounded buffer.
+#[tokio::test]
+async fn login_body_over_64kib_is_a_clean_login_error() {
+    let body = vec![b'a'; 70 * 1024];
+    let stub =
+        support::start_http_stub(support::http_response("200 OK", "application/json", &body)).await;
+    match kvm_probe::kvm::login(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "pw",
+        1_759_680_000,
+        "UTC",
+    )
+    .await
+    {
+        Err(kvm_probe::kvm::KvmError::Login(msg)) => {
+            assert!(msg.contains("cap"), "{msg}");
+        }
+        other => panic!("expected a clean Login error for an oversize body, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn rejected_password_body_is_a_clean_login_error() {
     let stub = support::start_http_stub(support::http_response(

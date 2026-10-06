@@ -11,9 +11,17 @@ pub struct TagRecord {
     pub codec_id: Option<u8>,
     pub avc_packet_type: Option<u8>,
     pub fourcc: Option<String>,
+    /// One entry per NAL seen in this tag. A NAL whose header failed to
+    /// parse (empty, or the forbidden bit set — a framing violation from a
+    /// hostile device) is recorded as the sentinel `255` (`u8::MAX`, not a
+    /// valid 5-bit `nal_unit_type`) rather than dropped, so the anomaly
+    /// stays visible instead of looking like an empty access unit (I2).
     pub nal_types: Vec<u8>,
+    /// Parallel to `nal_types`; `255` for the same sentinel case.
     pub nal_ref_idc: Vec<u8>,
+    /// Parallel to `nal_types`; `None` for a non-slice NAL or a sentinel entry.
     pub slice_types: Vec<Option<u8>>,
+    /// Parallel to `nal_types`; `None` for a non-slice NAL or a sentinel entry.
     pub first_mb: Vec<Option<u32>>,
     pub size: usize,
 }

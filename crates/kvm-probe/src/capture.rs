@@ -10,6 +10,8 @@ use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use kvm_proto::flv::{FlvDemuxer, FlvLimits, FlvTag, FrameType, TagBody, VideoBody};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Every capture is bounded (§13: captures are 15–60 MB and wiped) so a
@@ -43,13 +45,26 @@ fn frame_type_code(f: FrameType) -> u8 {
     }
 }
 
+/// Sentinel for a NAL whose header could not be parsed (I2): not a valid
+/// 5-bit `nal_unit_type`/`nal_ref_idc`, so it cannot be confused with a
+/// real value. Documented on `TagRecord` in `record.rs`.
+const NAL_HEADER_SENTINEL: u8 = u8::MAX;
+
 /// Record one NAL's header/slice-prefix fields (R19: the shared
 /// `kvm_proto::h264::NalHeader` parser, never a hand-split header byte). A
 /// NAL whose header cannot be parsed (empty, or the forbidden bit set — a
-/// framing violation from a hostile device) contributes no entry, keeping
-/// the four parallel per-NAL vectors in `TagRecord` aligned.
+/// framing violation from a hostile device, §6.2/§6.9) is *not* dropped:
+/// dropping it would make a framing violation indistinguishable from an
+/// empty access unit. Instead it records the `NAL_HEADER_SENTINEL` in
+/// `nal_types`/`nal_ref_idc` and `None` for its slice fields, keeping the
+/// four parallel per-NAL vectors in `TagRecord` aligned and the anomaly
+/// visible to census analysis (I2).
 fn push_nal(r: &mut TagRecord, nal: &[u8]) {
     let Ok(header) = kvm_proto::h264::NalHeader::from_nal(nal) else {
+        r.nal_types.push(NAL_HEADER_SENTINEL);
+        r.nal_ref_idc.push(NAL_HEADER_SENTINEL);
+        r.slice_types.push(None);
+        r.first_mb.push(None);
         return;
     };
     let ty = header.nal_unit_type;
@@ -65,6 +80,28 @@ fn push_nal(r: &mut TagRecord, nal: &[u8]) {
     };
     r.slice_types.push(slice_type);
     r.first_mb.push(first_mb);
+}
+
+/// Render a 4-byte Enhanced-RTMP FourCC for the census JSONL (M4). ASCII
+/// FourCCs (`hvc1`, `av01`, …) are recorded as their natural string; a
+/// non-ASCII-graphic FourCC — which could otherwise carry a raw control
+/// character into the operator's terminal via `from_utf8_lossy` — is
+/// recorded as `0x` plus 8 lowercase hex digits instead, so the exact
+/// bytes the device sent are always visible and never garbled by lossy
+/// UTF-8 substitution.
+fn fourcc_to_string(fourcc: &[u8; 4]) -> String {
+    if fourcc.iter().all(|b| b.is_ascii_graphic())
+        && let Ok(s) = std::str::from_utf8(fourcc)
+    {
+        return s.to_string();
+    }
+    let mut s = String::with_capacity(10);
+    s.push_str("0x");
+    for b in fourcc {
+        // {:02x} cannot overflow; no arithmetic on `b`.
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 /// One census record for one FLV tag (§12 Leg A). Framing fields only.
@@ -124,7 +161,7 @@ pub fn record_for(tag: &FlvTag, recv_ms: u64) -> TagRecord {
             } => {
                 r.avc_packet_type = Some(*packet_type);
                 r.frame_type = Some(frame_type_code(*frame_type));
-                r.fourcc = Some(String::from_utf8_lossy(fourcc).into_owned());
+                r.fourcc = Some(fourcc_to_string(fourcc));
             }
         }
     }
@@ -167,12 +204,36 @@ pub(crate) async fn open_flv(
     Ok(resp.into_body())
 }
 
+/// Open the capture file at `path` for writing, refusing to follow or
+/// replace anything already there (I3). The sandbox mounts the captures
+/// dir read-write for ffmpeg (`sandbox.rs`); a sandboxed decoder
+/// compromised by hostile video could otherwise plant a symlink at a
+/// predictable capture name and have a later capture write KVM-controlled
+/// bytes through it to an arbitrary host path. `create_new` (`O_EXCL`)
+/// refuses to open if *anything* — a regular file or a symlink, dangling
+/// or not — already exists at `path`, without ever following it; mode
+/// `0o600` matches the 0700 captures dir's own access discipline.
+fn open_capture_file(path: &Path) -> Result<std::fs::File, KvmError> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| KvmError::Io(e.to_string()))
+}
+
 /// Capture `av.flv` into `dir/name`, writing one `TagRecord` JSONL line per
 /// parsed FLV tag to `jsonl`, stamped with the real receive time. Bounded
 /// by `stop.max_bytes` and `stop.max_duration` (§13) so a forgotten run
 /// cannot fill the disk. A parse error stops *parsing* but not *saving* —
 /// the raw bytes already on disk stay there for sandboxed analysis — and is
 /// counted in `Stats::parse_errors`, never swallowed.
+///
+/// The duration clock starts before `open_flv` and `open_flv` itself is
+/// bounded by `stop.max_duration` (I1): a peer that accepts the connection
+/// (or the TLS handshake) and then never answers the `GET /av.flv` request
+/// is bounded the same as a peer that stalls mid-stream, not left to hang
+/// the whole census.
 pub async fn run(
     target: &KvmTarget,
     pin: Option<&str>,
@@ -185,11 +246,21 @@ pub async fn run(
     let path = dir
         .resolve(name)
         .map_err(|e| KvmError::Io(format!("{e:?}")))?;
-    let mut file = std::fs::File::create(&path).map_err(|e| KvmError::Io(e.to_string()))?;
-
-    let mut body = open_flv(target, pin, token).await?;
 
     let started = Instant::now();
+    let mut body = match tokio::time::timeout(stop.max_duration, open_flv(target, pin, token)).await
+    {
+        Ok(opened) => opened?,
+        Err(_) => {
+            return Err(KvmError::Http(format!(
+                "av.flv open timed out after {:?}",
+                stop.max_duration
+            )));
+        }
+    };
+
+    let mut file = open_capture_file(&path)?;
+
     let mut demux = FlvDemuxer::new(FlvLimits::default());
     let mut parsing = true;
     let mut stats = Stats::default();
@@ -322,5 +393,54 @@ mod tests {
         let r = super::record_for(&t, 0);
         assert_eq!((r.tag_type, r.codec_id, r.frame_type), (18, None, None));
         assert!(r.nal_types.is_empty());
+    }
+
+    /// I2: a forbidden-bit NAL is a framing violation, not an empty access
+    /// unit — it must be visible in the census, not silently dropped.
+    #[test]
+    fn forbidden_bit_nal_is_recorded_as_sentinel_not_dropped() {
+        // 0xE5 = forbidden bit set, nal_ref_idc 3, type 5 (would-be IDR).
+        let t = tag(TagBody::Video(VideoBody::Nalus {
+            frame_type: FrameType::Key,
+            composition_time: 0,
+            nals: vec![Nal {
+                bytes: Bytes::from_static(&[0xE5, 0x88, 0x80]),
+            }],
+        }));
+        let r = super::record_for(&t, 0);
+        assert_eq!(r.nal_types, vec![255]);
+        assert_eq!(r.nal_ref_idc, vec![255]);
+        assert_eq!(r.slice_types, vec![None]);
+        assert_eq!(r.first_mb, vec![None]);
+    }
+
+    /// M4: a non-ASCII-graphic FourCC must not be lossily mangled into
+    /// U+FFFD (which would also lose the actual bytes the device sent) —
+    /// it is recorded as exact hex instead.
+    #[test]
+    fn non_ascii_fourcc_is_recorded_as_hex_not_lossy_utf8() {
+        let r = super::record_for(
+            &tag(TagBody::Video(VideoBody::Enhanced {
+                packet_type: 1,
+                frame_type: FrameType::Key,
+                fourcc: [0xC2, 0x9B, 0x00, 0xFF],
+            })),
+            0,
+        );
+        assert_eq!(r.fourcc.as_deref(), Some("0xc29b00ff"));
+    }
+
+    /// M4: an ASCII-graphic FourCC is still recorded as its natural string.
+    #[test]
+    fn ascii_fourcc_is_recorded_as_its_string() {
+        let r = super::record_for(
+            &tag(TagBody::Video(VideoBody::Enhanced {
+                packet_type: 0,
+                frame_type: FrameType::Key,
+                fourcc: *b"av01",
+            })),
+            0,
+        );
+        assert_eq!(r.fourcc.as_deref(), Some("av01"));
     }
 }

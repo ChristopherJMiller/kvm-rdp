@@ -85,6 +85,98 @@ async fn byte_cap_mid_tag_stops_cleanly() {
         stats.parse_errors, 0,
         "a partial trailing tag is not an error"
     );
+    // I4: the cap must actually have stopped the read early (this is the
+    // guard the Global Review Focus names for "every capture is bounded by
+    // bytes" — without it the test also passes when the whole fixture is
+    // read), and the file on disk must match exactly what was counted.
+    assert!(
+        stats.bytes < u64::try_from(support::flv_fixture().len()).unwrap(),
+        "the byte cap did not stop the read early: {} bytes read",
+        stats.bytes
+    );
+    assert_eq!(
+        std::fs::metadata(dir.resolve("b.flv").unwrap())
+            .unwrap()
+            .len(),
+        stats.bytes
+    );
+}
+
+/// I3: a symlink planted at the capture name (the threat the sandbox's
+/// read-write `/cap` bind exists to guard against, per `sandbox.rs`) must
+/// be refused, not followed — and the file it points at must be untouched.
+#[tokio::test]
+async fn symlink_at_capture_name_is_refused_and_target_is_untouched() {
+    let stub = support::start_flv_stub().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = CaptureDir::create(&tmp.path().join("captures")).unwrap();
+
+    let outside = tmp.path().join("outside.txt");
+    std::fs::write(&outside, b"do not touch").unwrap();
+    let evil_path = dir.resolve("evil.flv").unwrap();
+    std::os::unix::fs::symlink(&outside, &evil_path).unwrap();
+
+    let mut jsonl = Vec::new();
+    let err = run(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "0.987654",
+        &dir,
+        "evil.flv",
+        &mut jsonl,
+        StopAt::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(err, kvm_probe::kvm::KvmError::Io(_)),
+        "expected a clean Io error for a planted symlink, got {err:?}"
+    );
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"do not touch",
+        "the symlink target must be left untouched"
+    );
+    // The symlink itself must still be a symlink, not replaced/followed.
+    assert!(std::fs::symlink_metadata(&evil_path).unwrap().is_symlink());
+}
+
+/// I1: `run` must not hang past `max_duration` against a peer that accepts
+/// the connection and never answers the `GET /av.flv` request — the
+/// duration cap must cover `open_flv`, not just the body-read loop.
+#[tokio::test]
+async fn run_returns_within_max_duration_against_a_silent_video_peer() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _held = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    let t = KvmTarget {
+        scheme: Scheme::Http,
+        host: "127.0.0.1".into(),
+        login_port: 1,
+        video_port: port,
+        control_port: 1,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = CaptureDir::create(&tmp.path().join("captures")).unwrap();
+    let mut jsonl = Vec::new();
+    let stop = StopAt {
+        max_bytes: u64::MAX,
+        max_duration: std::time::Duration::from_millis(200),
+    };
+
+    let started = std::time::Instant::now();
+    let err = run(&t, None, "0.987654", &dir, "timeout.flv", &mut jsonl, stop)
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "run did not return promptly: took {:?}",
+        started.elapsed()
+    );
+    assert!(matches!(err, kvm_probe::kvm::KvmError::Http(_)));
 }
 
 #[tokio::test]

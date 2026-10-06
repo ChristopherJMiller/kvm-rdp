@@ -4,6 +4,7 @@
 //! sole caller allowed to pass `pin: None` into `client_config`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::pin::SpkiPinVerifier;
 use crate::request::{self, KvmTarget, Scheme};
@@ -42,6 +43,16 @@ pub enum KvmError {
 /// unbounded hostile body (spec §9.2).
 const MAX_LOGIN_BODY: usize = 64 * 1024;
 
+/// Bound for the TCP connect plus (for `Https`) the TLS handshake. The
+/// device is hostile by assumption (§9.2): a peer that accepts the TCP
+/// connection and then never speaks must not hang the probe forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound for the whole login exchange: connect, handshake, request, and
+/// the capped response-body read. Covers a peer that accepts the request
+/// and then never answers.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Build the rustls `ClientConfig` that pins the server's SPKI. `pin: None`
 /// is "accept whatever is presented" (record mode) and is deliberately not
 /// reachable from `connect_to`/`login`/`capture` (R9) — only a later
@@ -57,7 +68,9 @@ pub(crate) fn client_config(pin: Option<&str>) -> tokio_rustls::rustls::ClientCo
 /// Connect to `port` on the KVM: pinned TLS for `Https`, plain TCP for
 /// `Http` (§3.2). `TCP_NODELAY` is set on every socket. An `Https` target
 /// with no pin is refused before any network I/O (R9: there is no
-/// accept-any path reachable from here).
+/// accept-any path reachable from here). The TCP connect and (for `Https`)
+/// the TLS handshake together are bounded by `CONNECT_TIMEOUT`: a silent
+/// peer gets a clean `Connect`/`Tls` error, never a hang.
 pub async fn connect_to(
     target: &KvmTarget,
     port: u16,
@@ -66,6 +79,29 @@ pub async fn connect_to(
     if matches!(target.scheme, Scheme::Https) && pin_sha256_hex.is_none() {
         return Err(KvmError::Tls("pin required for https".into()));
     }
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_and_handshake(target, port, pin_sha256_hex),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(match target.scheme {
+            Scheme::Http => {
+                KvmError::Connect(format!("connect timed out after {CONNECT_TIMEOUT:?}"))
+            }
+            Scheme::Https => KvmError::Tls(format!(
+                "connect/handshake timed out after {CONNECT_TIMEOUT:?}"
+            )),
+        }),
+    }
+}
+
+async fn connect_and_handshake(
+    target: &KvmTarget,
+    port: u16,
+    pin_sha256_hex: Option<&str>,
+) -> Result<BoxedIo, KvmError> {
     let tcp = TcpStream::connect((target.host.as_str(), port))
         .await
         .map_err(|e| KvmError::Connect(e.to_string()))?;
@@ -107,8 +143,31 @@ async fn read_capped_body(mut body: hyper::body::Incoming) -> Result<Vec<u8>, Kv
 /// `POST /cgi-bin/login.lua` and return the `0.<digits>` session token
 /// (§3.1). The returned string is exactly the `Token` that
 /// `kvm_proto::login::parse_login_token` produced — there is no second,
-/// independent parse of the response body.
+/// independent parse of the response body. The whole exchange (connect,
+/// handshake, request, and the capped response read) is bounded by
+/// `LOGIN_TIMEOUT`: a peer that accepts the request and never answers gets
+/// a clean `Login` error, never a hang.
 pub async fn login(
+    target: &KvmTarget,
+    pin: Option<&str>,
+    password: &str,
+    now_unix: i64,
+    timezone: &str,
+) -> Result<String, KvmError> {
+    match tokio::time::timeout(
+        LOGIN_TIMEOUT,
+        login_inner(target, pin, password, now_unix, timezone),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(KvmError::Login(format!(
+            "login timed out after {LOGIN_TIMEOUT:?}"
+        ))),
+    }
+}
+
+async fn login_inner(
     target: &KvmTarget,
     pin: Option<&str>,
     password: &str,

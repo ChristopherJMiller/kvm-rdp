@@ -35,7 +35,7 @@ kvm-proto = { path = "../kvm-proto" }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }  # default features would pull in ring (§4.2)
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util"] }
 bytes = { workspace = true }
 tempfile = "3"
 
