@@ -9,6 +9,9 @@ pub use nal::{NalHeader, NalHeaderError};
 pub use nal::{is_aud, is_idr, is_parameter_set, is_vcl, nal_type_allowed};
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn module_is_reachable() {
