@@ -45,6 +45,38 @@ impl NalHeader {
     }
 }
 
+/// The spec §6.2 allowlist: slices (1), IDR (5), SPS (7), PPS (8), AUD (9).
+/// Everything else (SEI, filler, …) is dropped.
+#[must_use]
+pub fn nal_type_allowed(nal_unit_type: u8) -> bool {
+    matches!(nal_unit_type, 1 | 5 | 7 | 8 | 9)
+}
+
+/// A VCL (slice) NAL: non-IDR coded slice (1) or IDR coded slice (5).
+/// Spec §6.3: only AUs containing a VCL NAL are sent.
+#[must_use]
+pub fn is_vcl(nal_unit_type: u8) -> bool {
+    matches!(nal_unit_type, 1 | 5)
+}
+
+/// An IDR coded slice (5).
+#[must_use]
+pub fn is_idr(nal_unit_type: u8) -> bool {
+    nal_unit_type == 5
+}
+
+/// A parameter set: SPS (7) or PPS (8).
+#[must_use]
+pub fn is_parameter_set(nal_unit_type: u8) -> bool {
+    matches!(nal_unit_type, 7 | 8)
+}
+
+/// An access unit delimiter (9).
+#[must_use]
+pub fn is_aud(nal_unit_type: u8) -> bool {
+    nal_unit_type == 9
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +137,25 @@ mod tests {
     #[test]
     fn from_empty_nal_rejected() {
         assert_eq!(NalHeader::from_nal(&[]), Err(NalHeaderError::Empty));
+    }
+
+    #[test]
+    fn allowlist_matches_spec_6_2() {
+        for t in [1u8, 5, 7, 8, 9] {
+            assert!(nal_type_allowed(t), "type {t} should be allowed");
+        }
+        // SEI(6), filler(12), end-of-seq(10), reserved/unspecified all dropped.
+        for t in [0u8, 2, 3, 4, 6, 10, 11, 12, 20, 31] {
+            assert!(!nal_type_allowed(t), "type {t} should be dropped");
+        }
+    }
+
+    #[test]
+    fn vcl_idr_pps_aud_classifiers() {
+        assert!(is_vcl(1) && is_vcl(5));
+        assert!(!is_vcl(7) && !is_vcl(8) && !is_vcl(9));
+        assert!(is_idr(5) && !is_idr(1));
+        assert!(is_parameter_set(7) && is_parameter_set(8) && !is_parameter_set(9));
+        assert!(is_aud(9) && !is_aud(1));
     }
 }
