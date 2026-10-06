@@ -1,0 +1,12 @@
+# Development resource budget (spec §13): the host is shared and loaded.
+[build]
+jobs = 4
+
+[env]
+RUST_TEST_THREADS = "4"
+
+# CARGO_TARGET_DIR: keep ONE shared target dir across all git worktrees
+# (spec §13) — never one per worktree. The devshell/operator exports an
+# absolute CARGO_TARGET_DIR at the shared tree; it is intentionally NOT
+# hard-coded here (the path is machine-specific). CI overrides build
+# parallelism with the CARGO_BUILD_JOBS env var.
