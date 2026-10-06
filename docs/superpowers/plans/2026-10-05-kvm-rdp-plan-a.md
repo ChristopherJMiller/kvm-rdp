@@ -6160,10 +6160,10 @@ Deviation recorded for the spec revision: §12's "what the Mac sees when the web
    jq -s '[.[] | select(.tag_type == 9) | .recv_ms] | [range(1; length) as $i | .[$i] - .[$i-1]] | sort | .[length/2|floor]' captures/static-1080p30.flv.jsonl   # median inter-tag ms, static
    jq -s '[.[] | select(.tag_type == 9) | .recv_ms] | [range(1; length) as $i | .[$i] - .[$i-1]] | sort | .[length/2|floor]' captures/moving-1080p30.flv.jsonl   # median inter-tag ms, moving
    ```
-   Optional cross-check, and the only source of the PPS's `pic_scaling_matrix_present_flag` and of `vui_parameters_present_flag` (kvm-proto parses only the SPS until Plan B): ffmpeg's `trace_headers` in the same sandbox `sample-range` uses (new session, no network, no home, read-only /nix, niced, 4 threads), with control bytes in its output made visible:
+   Optional cross-check, and the only source of the PPS's `pic_scaling_matrix_present_flag` and of `vui_parameters_present_flag` (kvm-proto parses only the SPS until Plan B): ffmpeg's `trace_headers` in the same sandbox `sample-range` uses (new session, no network, no home, read-only /nix, niced, 4 threads; `captures/` is bound **read-only** here because `-f null` writes nothing, so this run cannot touch any JSONL), with control bytes in its output made visible:
    ```
    nice -n 19 bwrap --new-session --unshare-all --die-with-parent --clearenv --dev /dev --proc /proc --ro-bind /nix /nix \
-     --bind "$PWD/captures" /cap --chdir /cap -- "$(readlink -f "$(command -v ffmpeg)")" \
+     --ro-bind "$PWD/captures" /cap --chdir /cap -- "$(readlink -f "$(command -v ffmpeg)")" \
      -hide_banner -nostdin -threads 4 -i /cap/moving-1080p30.flv -c copy -bsf:v trace_headers -frames:v 1 -f null - 2>&1 \
      | grep -E ' (profile_idc|level_idc|pic_order_cnt_type|max_num_ref_frames|seq_scaling_matrix_present_flag|vui_parameters_present_flag|video_full_range_flag|colour_primaries|matrix_coefficients|bitstream_restriction_flag|max_num_reorder_frames|max_dec_frame_buffering|nal_hrd_parameters_present_flag|vcl_hrd_parameters_present_flag|pic_scaling_matrix_present_flag|frame_cropping_flag) ' \
      | head -n 100 | cat -v
@@ -6178,7 +6178,7 @@ Deviation recorded for the spec revision: §12's "what the Mac sees when the web
    ```
    jq -s '[.[] | select(.tag_type == 9)] as $t | ($t[0].timestamp_ms - $t[0].recv_ms) as $o | [$t[] | select(.recv_ms < 1000 and (.timestamp_ms - .recv_ms - $o) > 100)] | length' captures/moving-1080p30.flv.jsonl
    ```
-   **Second connection triggers an IDR?** Start a 30 s capture `a.flv`; ten seconds in, start a 5 s capture `b.flv` in a second terminal; check whether `a.flv.jsonl` shows an IDR (`nal_types` containing 5) within 200 ms of `b`'s start that is off the regular GOP cadence. **Resolution-change signalling:** during a capture, switch the KVM preset from 1920×1080 to auto (or another size); in the JSONL, a new `avc_packet_type: 0` line means a new sequence header, an in-band `7` in a `avc_packet_type: 1` line means an in-band SPS.
+   **Second connection triggers an IDR?** Start a 30 s capture `a.flv`; ten seconds in, start a 5 s capture `b.flv` in a second terminal; check whether `a.flv.jsonl` shows an IDR (`nal_types` containing 5) within 200 ms of `b`'s start that is off the regular GOP cadence. `b`'s run logs out when it ends; if `a.flv` stops at that moment, a logout on one session ends the other session's stream — record that in the census (it constrains the bridge's reconnect and the break-glass UI) and rerun with `b` ending after `a`. **Resolution-change signalling:** during a capture, switch the KVM preset from 1920×1080 to auto (or another size); in the JSONL, a new `avc_packet_type: 0` line means a new sequence header, an in-band `7` in a `avc_packet_type: 1` line means an in-band SPS.
 
 5. Transport latency (*Leg A — transport*):
    ```
