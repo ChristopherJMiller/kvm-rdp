@@ -1,0 +1,64 @@
+# THROWAWAY Leg C (Task 7.7) rdpgw config TEMPLATE — rdpgw git 16cdaaf.
+#
+# Committed with placeholders only. run.sh renders it into the gitignored
+# state/rdpgw.yaml (0600) with a fresh 32-char PAA key; the key, the cert and
+# every generated .rdp stay in state/ and are never committed.
+#
+# The 2026-10-06 run was loopback-only on rowlett (task constraint: nothing on
+# the LAN): every address below is 127.0.0.x. For the LAN variant the brief
+# describes, GatewayAddress becomes <GW_LAN_HOST>:9443, BindAddress 0.0.0.0,
+# Hosts[0] <LEGB_HOST>:3389, and TrustedProxies the proxy's own address.
+Server:
+  # Self-signed spike cert (run.sh mints it; 2-day lifetime).
+  CertFile: spikes/legc-rdpgw/state/server.pem
+  KeyFile: spikes/legc-rdpgw/state/key.pem
+  # Lands in the .rdp as `gatewayhostname`: the client tunnels straight to
+  # rdpgw. Only /connect goes through the header proxy.
+  GatewayAddress: 127.0.0.1:9443
+  Port: 9443
+  BindAddress: 127.0.0.1
+  Authentication:
+    - header
+  # Operator-curated single host: roundrobin always picks it, so the `any`
+  # mode's RFC1918/loopback block (Unreleased CHANGELOG) does not apply.
+  HostSelection: roundrobin
+  Hosts:
+    - 127.0.0.1:__LEGB_PORT__
+  # X-Forwarded-For is honoured only from the proxy: the token's clientIp is
+  # then the real client's address rather than the proxy's.
+  TrustedProxies:
+    - 127.0.0.2/32
+Header:
+  UserHeader: X-Forwarded-User
+  # Only the header proxy may stamp the user header. With everything on
+  # loopback, 127.0.0.1 is also where an "untrusted" caller comes from, so the
+  # proxy egresses from 127.0.0.2 and only that address is trusted — a direct
+  # request from 127.0.0.1 then plays the "other LAN host" of the brief.
+  TrustedProxies:
+    - 127.0.0.2/32
+Security:
+  # 32 chars, random, NOT a README placeholder (rdpgw refuses placeholders;
+  # config/configuration.go knownDefaultSecrets). run.sh fills it.
+  PAATokenSigningKey: __PAA_SIGNING_KEY__
+  # The brief's spike setting is false: /connect arrives from the proxy and the
+  # tunnel from the client, so without X-Forwarded-For the two never match.
+  # With the proxy stamping XFF and Server.TrustedProxies set (above), the
+  # token carries the client's own address and pinning works (Leg C run C,
+  # LEGC_VERIFY_IP=true).
+  VerifyClientIp: __LEGC_VERIFY_IP__
+Caps:
+  TokenAuth: true
+  # rdpgw sends HTTP_TUNNEL_REDIR_DISABLE_CLIPBOARD (0x08) in the tunnel auth
+  # response unless this is true (protocol/process.go makeRedirectFlags).
+  # FreeRDP 3.31.1 obeys it ("[RDG] policy denies clipboard redirections") and
+  # leaves cliprdr out of its channel list. Leg C finding: the bridge needs it.
+  # Drive/printer/port/PnP stay denied (their flags default to false).
+  EnableClipboard: __LEGC_CLIPBOARD__
+Client:
+  # By default rdpgw writes the proxy identity (X-Forwarded-User) into
+  # `username:s:`. The bridge's RDP user is the fixed `kvm`, so the .rdp
+  # defaults file carries `username:s:kvm` and NoUsername stops rdpgw
+  # overwriting it (a fixed UsernameTemplate without `{{ username }}` is
+  # rejected per request: web.go "Invalid username template").
+  Defaults: spikes/legc-rdpgw/state/defaults.rdp
+  NoUsername: true

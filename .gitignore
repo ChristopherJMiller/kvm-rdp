@@ -41,3 +41,6 @@ spikes/legc-rdpgw/state/
 spikes/legc-rdpgw/src/
 spikes/legc-rdpgw/bin/
 spikes/legc-rdpgw/gomod/
+# generated .rdp files carry a live PAA gateway token
+spikes/legc-rdpgw/**/*.rdp
+/legc.rdp

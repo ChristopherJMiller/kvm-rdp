@@ -163,9 +163,139 @@ them as pass/fail):
 - [ ] Colour A/B: run twice — `LEGB_FIXTURE=$PWD/fixtures/large/1080p30_main_limited.h264`, then `…/1080p30_main_limited_flagfull.h264` (identical slices, only the VUI range flag differs);
       eyeball black level in Windows App; record whether the two differ (does it honour the VUI?). **Add for this device:** does Windows App decode the KVM's Baseline / level-3.1-labelled 1080p stream as is, and with `level_idc` rewritten to 40?
 
-## Leg C — gateway gates
+## Leg C — gateway (rdpgw `16cdaaf`, header mode behind a loopback stub)
 
-*pending* (Part 7). Gateway-token `.rdp` connects (P/F); NLA with pre-filled username (P/F); CLIPRDR opens (P/F); Leg B video gates hold through the gateway (P/F); capability bytes, `queue_depth`, auto-detect through the gateway.
+Run: `bash spikes/legc-rdpgw/run.sh` from the repo root. It builds rdpgw from
+git `16cdaaf` (nixpkgs Go 1.26.7, `nice -n 19`, `GOMAXPROCS=4`), renders
+`spikes/legc-rdpgw/rdpgw.yaml` into the gitignored `state/` with a fresh random
+32-char PAA key, and starts rdpgw on `127.0.0.1:9443` and `header-proxy.py` (the
+stand-in for the oauth2-proxy admin tier) on `127.0.0.1:8443`. `legb-winapp`
+(`LEGB_LISTEN=127.0.0.1:23389`, fixture `1080p30_main_full`) is `Server.Hosts[0]`.
+The client is FreeRDP 3.31.1 on rowlett (R22), following the Windows App flow:
+download the `.rdp` from `/connect` through the proxy, then open it:
+`curl -sk -o legc.rdp https://127.0.0.1:8443/connect`, then
+`env -u LD_LIBRARY_PATH xvfb-run … xfreerdp legc.rdp /p:legb-spike-pw /cert:ignore
+[/gfx:AVC420 /size:1920x1080]`.
+
+How this run differs from the brief, and why:
+- **Loopback only.** The task forbids LAN listeners, so everything binds to
+  127.0.0.x. The stub connects to rdpgw from **127.0.0.2**, and
+  `Header.TrustedProxies` is `127.0.0.2/32`. A direct request from 127.0.0.1
+  therefore plays the brief's "another LAN host".
+- **`/cert:ignore`.** Every certificate here is a throwaway self-signed spike
+  cert on loopback: rdpgw and the stub share one, and `legb-winapp` has its
+  rcgen cert. This is not a production setting.
+- **`username:s:kvm` needs two settings.** By default rdpgw writes the proxy
+  identity (`kvm-admin@example.test`) into `username:s:`. The fix is
+  `Client.Defaults` (a one-line `.rdp` containing `username:s:kvm`) plus
+  `Client.NoUsername: true`. A fixed `Client.UsernameTemplate` without
+  `{{ username }}` would not work: `web.go` rejects it on every request. That
+  last point comes from reading the code; it was not run.
+- **The `.rdp` is only 7 lines.** It holds `gatewayhostname`, `full address`,
+  `username`, `gatewaycredentialssource:i:5`, `gatewayprofileusagemethod:i:1`,
+  `gatewayusagemethod:i:1` and `gatewayaccesstoken`. rdpgw leaves out every
+  setting that equals its own default (`rdp.go` `isZero`). So
+  `redirectclipboard:i:1`, `networkautodetect:i:1` and
+  `enablecredsspsupport:i:1`, which the brief expected, are absent, and the
+  client's own defaults apply.
+- **No key in git.** The committed `rdpgw.yaml` is a template with placeholders.
+  The key, the cert and every `.rdp` stay in gitignored paths. rdpgw does not
+  commit a `go.sum`, so the build first runs `go mod tidy`, as rdpgw's own
+  Makefile does.
+
+### Results — 2026-10-06, FreeRDP 3.31.1 through rdpgw `16cdaaf` (websocket transport)
+
+Three gateway configs were run. **A** is the brief's config as written (no
+`Caps.EnableClipboard`, `VerifyClientIp: false`). **B** is A plus
+`Caps.EnableClipboard: true`. **C** is B plus `VerifyClientIp: true`, with
+`Server.TrustedProxies: [127.0.0.2/32]` and the stub stamping `X-Forwarded-For`.
+Unless a row says otherwise, numbers come from B. 17 sessions completed end to
+end through the gateway.
+
+| Gate / observation | Result | Evidence |
+|---|---|---|
+| Gateway-token `.rdp` connects end to end | **Pass.** FreeRDP opens the downloaded `.rdp`, upgrades `RDG_OUT_DATA` to a websocket, offers PAA, and is tunnelled to `legb-winapp`. The `/gateway:g:…,access-token:…,type:http` CLI form also works | FreeRDP `Upgraded to websocket. RDG_IN_DATA not required`, `extendedAuth=HTTP_EXTENDED_AUTH_PAA`. rdpgw logs `ext auth: 2` → `Tunnel create` → `Tunnel auth` → `Channel create` → `Checking host for user kvm-admin@example.test` → `Connection established` |
+| NLA with the pre-filled username | **Pass.** HYBRID/CredSSP completes for `kvm` with the password given on the command line. FreeRDP puts its own host name into the NTLM domain when the `.rdp` has no `domain:s:`: the mstshash cookie is `ROWLETT\kvm`, against `kvm` when connecting directly. IronRDP accepts it | acceptor `ConnectionRequest … Cookie("ROWLETT\\kvm")`, then `LEGB_CONN on_connection_info` |
+| CLIPRDR: brief config (A) | **Fail: the gateway switches clipboard off.** Unless `Caps.EnableClipboard: true`, rdpgw sends `HTTP_TUNNEL_REDIR_DISABLE_CLIPBOARD`. FreeRDP obeys it and leaves `cliprdr` out of its channel list: through the gateway it requests `rdpdr, rdpsnd, drdynvc`, where a direct connection requests `rdpdr, rdpsnd, cliprdr, drdynvc` | client `[RDG] policy denies clipboard redirections`. acceptor `ConnectInitial … ClientNetworkData` |
+| CLIPRDR: `EnableClipboard: true` (B) | **The channel opens at the MCS level.** `cliprdr` is requested and given ID 1006 (of 1004–1007, with SKIP_CHANNELJOIN). `legb-winapp` registers no CLIPRDR handler, so the channel is never initialised (no Monitor Ready). Clipboard data was not tested; that belongs to Plan C | client log no longer denies clipboard. `ServerNetworkData { channel_ids: [1004, 1005, 1006, 1007] }` |
+| Confirmed capability set has AVC420 | **Pass, same as direct.** With `/gfx:AVC420` the server confirms `V8_1` (`confirmed_has_avc=true`). With the bare `.rdp` (no `/gfx`), FreeRDP advertises 11 sets (`V8`…`V10_7`), the server confirms `V10_7` (`confirmed_has_avc=true`), and the stream decodes | `LEGB_READY` |
+| Capability bytes through the gateway | **Identical to direct**, byte for byte. With `/gfx:AVC420`: `V8` `02000000` and `V8_1` `12000000`. With the bare `.rdp`: the same 11-set ladder as a direct run with no `/gfx`. No re-advertise | `LEGB_CAP advertise entry`, diffed against direct runs on the same day |
+| First-frame ack p95 ≤ 1 s | **Pass.** 10 fresh connections, each with a fresh `.rdp`: min 72, p50 78, **p95 95**, max 95 ms. Direct (Leg B): 77 / 84 / 97 / 97 | `ironrdp_egfx::server` `latency_us` of frame 0 |
+| Steady-state ack latency (1080p30) | 961 acks over a 32 s session that includes one resize: p50 14.1, p95 23.0, p99 30.2, max 80.9 ms; ≤ 2 frames in flight. Leg B direct: 11.4 / 26.6 / 36.2 / 82.4. A direct run on the same day gave p50 15.0, p95 24.2. On loopback the gateway adds nothing measurable | same |
+| Picture returns after a server resize | **Pass.** `picture_return_ms = 37` (direct 34) | `LEGB_RESIZE label=resize`, screenshots of 1080p then 720p |
+| Picture returns after a client re-advertise | **N/A.** FreeRDP never re-advertised (`re_advertise=false`) | `LEGB_READY` |
+| `queue_depth` / ack suspension | **No change.** `queue_depth` was 0 on every ack and `suspended=false` | `LEGB_ACK` |
+| Auto-detect through the gateway | **Y.** 119 of 120 probes answered, RTT 0–3 ms; the first probe goes unanswered, as it does direct | `LEGB_AUTODETECT autodetect_answered=true` |
+| QoE | **Never fired** (as direct) | no `LEGB_QOE` |
+| ErrorInfo 0x7 through the gateway | Delivered. FreeRDP logs `ERRINFO_SERVER_DENIED_CONNECTION` and exits, as it does direct | `LEGB_ERRORINFO`, client log |
+| Transport used | **Websocket** (MS-TSGU over websocket on `/remoteDesktopGateway/`) | `rdpgw_websocket_connections 1` and `rdpgw_legacy_connections 0` while connected |
+| Legacy HTTP transport (FreeRDP `no-websockets`) | **Fail.** `RDG_OUT_DATA` returns 200, then `RDG_IN_DATA` returns **401**: `rejecting reuse of Rdg-Connection-Id … from a different identity`. rdpgw #185 (`628046b`, 2026-04-30) ties the second half-channel to a non-empty user name, but in token (header/openid) mode the gateway endpoint carries no HTTP identity, so the check always fails. **Any client that uses the two-channel HTTP transport cannot connect through 16cdaaf.** Which transport Windows App uses is an acceptance item | FreeRDP `RDG_IN_DATA authorization result: HTTP_STATUS_DENIED [401]`; rdpgw log |
+| RPC transport (`type:rpc`) | **Fail.** rdpgw does not implement RPC-over-HTTP | FreeRDP `rpc_ncacn_http_send_in_channel_request failure` |
+| Token missing | **Refused.** In raw-protocol probes, a handshake that offers no PAA gets `E_PROXY_CAPABILITYMISMATCH`, and a tunnel create with no cookie gets `E_PROXY_COOKIE_AUTHENTICATION_ACCESS_DENIED`. FreeRDP without `access-token` never reaches tunnel create: it expects a 401 auth challenge and gets a 101 instead | raw RDG-over-websocket probe; rdpgw `Invalid PAA cookie` |
+| Token bad | **Refused** (`E_PROXY_COOKIE_AUTHENTICATION_ACCESS_DENIED`). Tried: the real token with its signature altered (both in FreeRDP and in the raw probe), an HS256 token signed with the wrong key, `alg:none`, and garbage. `legb-winapp` never sees a connection | rdpgw `token signature validation failed` / `cannot parse token` |
+| Token expired | **Refused 60 s after `exp`.** rdpgw issues tokens with `exp` = now + 5 min, and go-jose allows 1 min of leeway, so a token works for **6 min** in practice. Used 11 s after `exp`: accepted. Used 66 s after: refused | rdpgw `token is expired (exp)` |
+| Token bound to its host | **Pass.** Changing `full address` in the `.rdp` gets `E_PROXY_RAP_ACCESSDENIED` | rdpgw `Client specified host … does not match token host` |
+| Token reuse | **Accepted.** The same token opened two tunnels. PAA tokens are bearer tokens for their whole lifetime, not single-use; with `VerifyClientIp: false` they work from any address | raw probe, `ERROR_SUCCESS` both times |
+| Exploit guard: `/connect` from outside `Header.TrustedProxies` | **Pass.** A direct request from 127.0.0.1, with or without a forged `X-Forwarded-User`, gets **401 `Untrusted upstream`**. From the trusted 127.0.0.2: no header gets **401 `No authenticated user from proxy`**; with the header, 200. Through the stub, a client-supplied `X-Forwarded-User: mallory@evil.test` is stripped (the token's `sub` is `kvm-admin@example.test`). `/` and `/api/v1/hosts` are gated the same way | curl status codes; rdpgw `header auth: rejecting request from untrusted remote` |
+| **Exploit guard bypass: the session cookie** | **Finding.** The proxied `/connect` response sets rdpgw's own `RDPGWSESSION` cookie (`Max-Age=120`). Presented **directly** from the untrusted address with no header, that cookie gets 200 and a freshly minted token. `header.go` accepts an already-authenticated session before it checks `TrustedProxies`. So the trusted-proxy gate covers only requests without a session. Fix: the edge strips `Set-Cookie: RDPGWSESSION` from `/connect` responses, or `/connect` is reachable only through the proxy | curl; pre-auth cookie gets 401 |
+| IP pinning through the proxy (C) | **Works when the proxy stamps XFF.** With `Server.TrustedProxies` set to the proxy, rdpgw uses the proxy's `X-Forwarded-For` as the token's `clientIp`, so `VerifyClientIp: true` holds: a token minted for 127.0.0.1 connects from 127.0.0.1, and a token minted for 127.0.0.3 is refused (`E_PROXY_RAP_ACCESSDENIED`, `Current client ip address 127.0.0.1 does not match token client ip 127.0.0.3`). The brief's "the two never match" is true only without XFF. Pinning does not stop the cookie bypass above, because that token carries the bypassing caller's own address | token claims; rdpgw log |
+
+Checklist (from the brief). Every "Windows App" item was run with FreeRDP
+3.31.1 instead (R22):
+- [x] The client connects with the gateway-token `.rdp`, end to end through
+      `/remoteDesktopGateway/` (websocket), with the PAA token validated by
+      TokenAuth.
+- [x] NLA completes with the pre-filled username `kvm` (== `rdp.username`).
+- [x] The CLIPRDR channel opens, **but only with `Caps.EnableClipboard: true`**.
+      The brief's config gets it disabled by gateway policy. Note that
+      `redirectclipboard:i:1` is *not* in the `.rdp` (it is rdpgw's default,
+      so rdpgw omits it). `legb-winapp` has no clipboard handler, so "Leg B
+      logs the clipboard channel registering" became "the client requests
+      `cliprdr` and the server assigns it an MCS channel ID".
+- [x] The Leg B video gates hold through the gateway: AVC420 confirmed,
+      first-frame ack p95 95 ms, picture back 37 ms after a resize.
+      Re-advertise is N/A (FreeRDP never re-advertises).
+- [x] Capability bytes captured through the gateway: identical to the direct
+      Leg B ladder, no diff.
+- [x] Every `queue_depth` captured through the gateway: all 0, never
+      suspended. Gatewaying does not change ack behaviour.
+- [x] Auto-detect through the gateway: `autodetect_answered` becomes true
+      (119 of 120 probes).
+- [x] Exploit guard: a `/connect` request reaching rdpgw from outside
+      `Header.TrustedProxies` is refused with 401, **unless it carries a
+      `RDPGWSESSION` cookie** (see the finding above).
+- Leg C did not fail, so the VNC fallback (§14) need not be revisited before
+  Milestone 1.
+
+**Verdict: Leg C passes. The VNC fallback (§14) does not need revisiting.**
+Every Leg B video gate holds through rdpgw with identical capability bytes and no
+measurable latency cost. Before this becomes the bridge's gateway, the design
+needs these changes:
+1. **`Caps.EnableClipboard: true`.** Without it rdpgw tells the client to
+   disable clipboard, and FreeRDP does (§8 paste depends on CLIPRDR). Whether
+   Windows App obeys the redirect flags too goes on Chris's acceptance list.
+2. **Websocket transport only.** rdpgw 16cdaaf refuses the legacy two-channel
+   HTTP transport in token mode (#185), and it has no RPC transport. Chris's
+   Windows App run must show `rdpgw_websocket_connections 1`, or no
+   `Opening RDGOUT` in rdpgw's log. If Windows App falls back to legacy HTTP,
+   rdpgw needs a patch or a different pin.
+3. **Strip `RDPGWSESSION` at the edge,** or keep rdpgw's `/connect`
+   unreachable except through the proxy. Otherwise a 120 s session cookie
+   lets anyone holding it skip the trusted-proxy gate.
+4. **Pin tokens to the client.** Use `Server.TrustedProxies` = the edge,
+   have the edge stamp XFF, and set `VerifyClientIp: true`. Tokens are
+   reusable bearer credentials for about 6 min, so pinning is the only thing
+   that ties one to the client that fetched it. Pinning breaks if the client
+   reaches `/connect` and the tunnel from different addresses (split routing
+   or NAT).
+5. **Username:** use `Client.Defaults` (`username:s:kvm`) with
+   `Client.NoUsername: true`.
+
+Deferred to Chris's acceptance (Windows App): the gateway-token `.rdp` in
+Windows App itself; its transport (websocket vs legacy, item 2); whether it
+honours `HTTP_TUNNEL_REDIR_DISABLE_*`; and whether it accepts the
+`gatewayaccesstoken` flow with a self-signed LAN cert (the brief assumes
+trust-on-first-use).
 
 ## Census gates (go/no-go)
 
