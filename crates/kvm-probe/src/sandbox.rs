@@ -328,11 +328,39 @@ pub fn run_sample_range(
         )));
     }
 
+    let frame = read_output_frame(dir, &out_name, width, height)?;
+    Ok(sample_range_outcome(&stderr, &frame, width, height))
+}
+
+/// Upper bound on a sandbox output frame, as a multiple of the Y plane
+/// (R1, a fix-round-1 regression): the sandbox's `rawvideo` output is the
+/// *whole* frame in the decoder's native planar pix_fmt — Y plane plus
+/// chroma — which for any real planar format is already bigger than the Y
+/// plane alone (`plane_len * 3/2` for 4:2:0). Capping the read at exactly
+/// `plane_len` (as a fix-round-1 change briefly did) made every real
+/// sample-range run fail closed on a legitimate frame. `6` covers the
+/// largest native planar pix_fmt in practice — 4:4:4 at 16 bits (3 full-size
+/// samples * 2 bytes = 6x the Y plane) — while still refusing anything
+/// bigger, never reading unboundedly.
+const FRAME_CAP_PLANE_MULTIPLE: usize = 6;
+
+/// Read the sandbox's `.y` output, bounded at
+/// `FRAME_CAP_PLANE_MULTIPLE * plane_len` bytes rather than `plane_len`
+/// itself (R1) — `y_plane_range` (via `sample_range_outcome`) only ever
+/// reads the frame's first `plane_len` bytes regardless of how much more
+/// is returned here, so accepting the full frame doesn't change what's
+/// measured.
+fn read_output_frame(
+    dir: &CaptureDir,
+    out_name: &str,
+    width: usize,
+    height: usize,
+) -> std::io::Result<Vec<u8>> {
     let plane_len = width
         .checked_mul(height)
         .ok_or_else(|| std::io::Error::other("width*height overflow"))?;
-    let frame = captures::read_capped(dir, &out_name, plane_len)?;
-    Ok(sample_range_outcome(&stderr, &frame, width, height))
+    let frame_cap = plane_len.saturating_mul(FRAME_CAP_PLANE_MULTIPLE);
+    captures::read_capped(dir, out_name, frame_cap)
 }
 
 #[cfg(test)]
@@ -481,6 +509,78 @@ mod tests {
         let input = vec![b'a'; 3 * STDERR_TAIL_FOR_DISPLAY];
         let out = sanitize_for_terminal(&input);
         assert!(out.len() <= STDERR_TAIL_FOR_DISPLAY);
+    }
+
+    /// R1 (fix-round-1 regression): the sandbox's `rawvideo` output is the
+    /// *whole* frame — Y plane plus chroma — not just the Y plane. For
+    /// 4:2:0 that's `plane_len * 3/2`. A real sample-range run must accept
+    /// that and still measure the right Y min/max from the frame's first
+    /// `plane_len` bytes.
+    #[test]
+    fn read_output_frame_accepts_a_full_yuv420p_frame_and_yields_decoded() {
+        let base = tmp_base("full-frame");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("captures");
+        let dir = CaptureDir::create(&root).unwrap();
+
+        let (width, height) = (64usize, 64usize);
+        let plane_len = width.checked_mul(height).unwrap();
+        let chroma_len = plane_len.checked_div(2).unwrap(); // 4:2:0: (U+V) == plane/2
+        let middle_len = plane_len.checked_sub(2).unwrap();
+
+        let mut frame = Vec::new();
+        frame.push(10u8); // Y-plane min, at the very first byte
+        frame.extend(std::iter::repeat_n(200u8, middle_len));
+        frame.push(240u8); // Y-plane max, at the last Y-plane byte
+        frame.extend(std::iter::repeat_n(128u8, chroma_len)); // chroma: ignored by y_plane_range
+
+        std::fs::write(root.join("t.flv.y"), &frame).unwrap();
+
+        let bytes = read_output_frame(&dir, "t.flv.y", width, height).unwrap();
+        assert_eq!(
+            bytes.len(),
+            frame.len(),
+            "a real w*h*3/2 frame must be read in full, not truncated or refused"
+        );
+        let outcome = sample_range_outcome("clean", &bytes, width, height);
+        assert!(
+            matches!(
+                outcome,
+                SampleOutcome::Decoded {
+                    y_min: 10,
+                    y_max: 240
+                }
+            ),
+            "{outcome:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R1: a frame bigger than the 6x-plane upper bound (larger than any
+    /// real planar pix_fmt, up to 4:4:4 at 16 bits) is still refused — the
+    /// fix widens the cap, it does not remove it.
+    #[test]
+    fn read_output_frame_refuses_more_than_six_times_the_plane() {
+        let base = tmp_base("oversize-frame");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("captures");
+        let dir = CaptureDir::create(&root).unwrap();
+
+        let (width, height) = (64usize, 64usize);
+        let plane_len = width.checked_mul(height).unwrap();
+        let frame_cap = plane_len.saturating_mul(6);
+        let oversize_len = frame_cap.saturating_add(1);
+
+        std::fs::write(root.join("t.flv.y"), vec![7u8; oversize_len]).unwrap();
+
+        let result = read_output_frame(&dir, "t.flv.y", width, height);
+        assert!(
+            result.is_err(),
+            "a file larger than 6x the Y plane must still be refused"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
