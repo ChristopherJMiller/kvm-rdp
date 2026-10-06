@@ -9,4 +9,7 @@
     clippy::as_conversions
 )]
 
+mod header;
 mod reader;
+
+pub use header::{FlvError, FlvHeader, FlvLimits};
