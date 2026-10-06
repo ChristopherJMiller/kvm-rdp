@@ -42,7 +42,7 @@ Every value below says how it was obtained. *pending* = not yet measured.
 | **FLV-reconnect → first IDR, 20 trials** | https p50 **183 ms**, p95 **300 ms**; http p50 **97 ms**, p95 **129 ms** (20/20 ok each) | `first-idr --trials 20` |
 | First tag on connect | always an IDR; the GOP restarts at the connection | JSONL |
 | **Burst on connect** | **0 frames** (no GOP-cache replay; 26–29 tags in the first second) | JSONL burst query (Part 6 step 4) |
-| **Second connection triggers an IDR?** | **Yes, for every viewer.** b connected at +12.0 s; a got an extra IDR at +12.2 s (3 frames after its regular one) and a's GOP cadence restarted there. One shared encoder: any new FLV connection forces an IDR into all streams | a/b capture JSONL |
+| **Second connection triggers an IDR?** | **Yes, for every viewer.** b connected at +12.0 s; a got an extra IDR at +12.2 s (3 frames after its regular one) and a's GOP cadence restarted there. One shared encoder: any new FLV connection forces an IDR into all streams. **Same token too:** a second FLV opened on the main stream's own token is served (HTTP 200) while the main stream keeps flowing, and it forced an off-cadence IDR into the main stream (45 frames after the previous one, then the 60-frame cadence restarted) — the side-connection IDR mechanism works end to end (n = 1) | a/b capture JSONL; same-token pair via the HID helper's token + `ffprobe` keyframe list |
 | Resolution-change signalling | Not measured in detail. One observation (n = 1, tentative): while presets were being switched in the KVM UI, a live FLV delivered 8 tags and then ended — a preset change appears to **close live FLV connections** rather than signal in-band. Signal loss does **not** change the SPS: the NO SIGNAL card uses the same SPS bytes at 1920×1080 | 10 s capture during preset switching; JSONL `param_sets_hex` |
 
 ## Leg A — sessions (not in the §12 list; found here and load-bearing for §5)
@@ -76,7 +76,7 @@ Every value below says how it was obtained. *pending* = not yet measured.
 | Grey ramp (0–15, 64/128/192, 236–255) | 15 | 235 | `sample-range` |
 | Pure red `rgb(255,0,0)` (400×400 crop) | Y 63, U 110, V 239 (flat) | | `signalstats` on one decoded frame, in the sandbox |
 
-Verdict: the pixels are **limited range (16–235) and BT.709** — red's Y of 63 matches BT.709 (BT.601 would be ≈ 81; U is off pure red's 102, probably macOS colour management on the Mac's output). The SPS's VUI is **wrong on both counts**: it claims full range (`video_full_range_flag` 1) and BT.601 (primaries 5, matrix 5). A decoder that honours the VUI shows washed-out, slightly mis-tinted colour (an ffmpeg PNG export of "black" came out dark grey); one that assumes BT.709 limited — what RDP AVC420 specifies — shows it correctly.
+Verdict: the pixels are **limited range (16–235) and BT.709** — red's Y of 63 matches BT.709 (BT.601 would be ≈ 81; U is off pure red's 102, probably macOS colour management on the Mac's output). The SPS's VUI is **wrong on both counts**: it claims full range (`video_full_range_flag` 1) and BT.601 (primaries 5, matrix 5). A decoder that honours the VUI shows washed-out, slightly mis-tinted colour (an ffmpeg PNG export of "black" came out dark grey); one that assumes BT.709 limited shows it correctly. Which range Windows App's AVC420 path assumes when it ignores the VUI (the spec reads MS-RDPEGFX as full-range BT.709) is Leg B's colour A/B — if it assumes full range and ignores the VUI, passthrough looks washed out whatever the SPS says.
 
 ## Leg A — crash behaviour
 
@@ -108,7 +108,7 @@ Moved to Plan C's L4 hardware checks (it needs HID input, which `kvm-probe` neve
 - **§5 sessions:** never call logout while another client (the vendor UI as break-glass, the census tool) may be using the device: logout is global. Teardown should close the websocket and the FLV, and let the token lapse.
 - **§6.9 ErrorInfo / `flv_idle_timeout`:** *pending*.
 - **§7.4 `key_repeat_timeout` / `modifier_idle_timeout`:** *pending* (Leg B key matrix).
-- **`video.default_size`:** 1920×1080, and the KVM preset is **pinned to 1920×1080 at 30 fps** (not "auto", not 60 fps): 60 fps would need level 4.2 and double the bitrate for no gain on a remote desktop, and "auto" invites resolution changes. A preset or Mac resolution change is a rare, operator-driven event; the bridge handles it on its existing paths either way — a closed FLV takes the reconnect path, and a new sequence header or in-band SPS goes through `classify_sps_change` (Incompatible → resize).
+- **`video.default_size`:** 1920×1080, and the KVM preset is **pinned to 1920×1080 at 30 fps** (not "auto", not 60 fps): 60 fps would need level 4.2 and double the bitrate for no gain on a remote desktop, and "auto" invites resolution changes. A preset or Mac resolution change is a rare, operator-driven event; the bridge handles it on its existing paths either way — a closed FLV takes the reconnect path, and a new sequence header or in-band SPS goes through `classify_sps_change` (a new size classifies as `Resize`, which takes the §6.4 resize path).
 
 ## Artifacts
 

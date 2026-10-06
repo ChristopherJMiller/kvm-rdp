@@ -600,9 +600,10 @@ served:
   auth, framing, timeout) are counted, never retried and never re-logged-in.
   **Fallback**: if the NeedIdr is still unresolved `idr_side_timeout` after
   the request, `idr_pending` is set again and served by `ReconnectFlv`.
-  Leg A's a/b test used two logins, so two concurrent FLVs on one token are
-  not yet measured; L4 checks it (§15), and a refusal costs only the
-  fallback.
+  Leg A measured it on one token: a second FLV on the main stream's own
+  token is served while the main stream keeps flowing, and it forced an
+  off-cadence IDR into the main stream (n = 1, `census.md`); L4 repeats it
+  over 20 trials (§15), and a refusal would cost only the fallback.
 - `reconnect` — `ReconnectFlv`, make-before-break: Leg A shows the new
   connection forces an IDR, so the old FLV closes once the new one delivers
   its first tag. It is `side`'s fallback, and a policy of its own for a
@@ -1360,7 +1361,7 @@ questions belong to L5.
   `kubectl port-forward` or an SSH local forward to the bridge.
 - Plan C's L4 also carries what Leg A handed on (§12, §15): the Mac's
   behaviour when the websocket dies with a key held, side request → main-FLV
-  IDR latency over 20 trials, two concurrent FLVs on one token, how a preset
+  IDR latency over 20 trials (one-token concurrency seen once in Leg A), how a preset
   change is signalled, how long an abandoned token stays valid, and the KVM's
   HID report rate.
 - L5 checklist (pass/fail, recorded): key matrix; Mac remap profile; paste
@@ -1534,8 +1535,8 @@ timeouts. New from Leg A:
 
 Open for Plan C's L4 (§11.6): what the Mac sees when the websocket dies with
 a key held (moved from Leg A); side request → main-FLV IDR latency over 20
-trials (Leg A saw it once) and whether the ES3 accepts two concurrent FLVs on
-one token (Leg A's a/b test used two logins); how a preset change is
+trials (Leg A saw it once, on one token: the ES3 serves two concurrent FLVs
+on the same token); how a preset change is
 signalled (Leg A: n = 1, tentative); how long an abandoned token stays valid
 and whether the ES3 caps concurrent sessions (the bridge never logs out, so
 every RDP connection leaves one token to lapse); the KVM's HID report rate
