@@ -1,0 +1,18 @@
+{
+  "name": "360p30_main_longgop.h264",
+  "sha256": "e856f41e1823afffffd950506ec219e17674ee603e723dc2cbd3df6dfa42c2c1",
+  "bytes": 419695,
+  "width": 640,
+  "height": 360,
+  "profile_idc": 77,
+  "level_idc": 31,
+  "pic_order_cnt_type": 2,
+  "video_full_range_flag": 1,
+  "bitstream_restriction_flag": 1,
+  "colour_primaries": 1,
+  "matrix_coefficients": 1,
+  "frames": 330,
+  "key_frames": 2,
+  "keyint": 300,
+  "slices_per_au": 1
+}

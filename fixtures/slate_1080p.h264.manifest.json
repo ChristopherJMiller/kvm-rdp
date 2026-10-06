@@ -1,0 +1,18 @@
+{
+  "name": "slate_1080p.h264",
+  "sha256": "f2d2e849f0e8980ee1371516f4878daf1ab1a648f41e96d12d4e016865f920b0",
+  "bytes": 5855,
+  "width": 1920,
+  "height": 1080,
+  "profile_idc": 77,
+  "level_idc": 40,
+  "pic_order_cnt_type": 2,
+  "video_full_range_flag": 1,
+  "bitstream_restriction_flag": 1,
+  "colour_primaries": 1,
+  "matrix_coefficients": 1,
+  "frames": 1,
+  "key_frames": 1,
+  "keyint": 1,
+  "slices_per_au": 1
+}

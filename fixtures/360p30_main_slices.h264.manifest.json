@@ -1,0 +1,18 @@
+{
+  "name": "360p30_main_slices.h264",
+  "sha256": "0a72a781d782c60c7f7a6f9f6ac01d14315e5111c18d908f1cd0217c32d93fff",
+  "bytes": 246375,
+  "width": 640,
+  "height": 360,
+  "profile_idc": 77,
+  "level_idc": 31,
+  "pic_order_cnt_type": 2,
+  "video_full_range_flag": 1,
+  "bitstream_restriction_flag": 1,
+  "colour_primaries": 1,
+  "matrix_coefficients": 1,
+  "frames": 90,
+  "key_frames": 3,
+  "keyint": 30,
+  "slices_per_au": 12
+}

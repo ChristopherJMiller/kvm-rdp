@@ -1,0 +1,18 @@
+{
+  "name": "480p30_main_full.h264",
+  "sha256": "addeef175e7be7e1ce5dc17ab2a53ef3ef7bf88c23c17467ee362e81ce2b17b0",
+  "bytes": 318039,
+  "width": 854,
+  "height": 480,
+  "profile_idc": 77,
+  "level_idc": 31,
+  "pic_order_cnt_type": 2,
+  "video_full_range_flag": 1,
+  "bitstream_restriction_flag": 1,
+  "colour_primaries": 1,
+  "matrix_coefficients": 1,
+  "frames": 90,
+  "key_frames": 3,
+  "keyint": 30,
+  "slices_per_au": 1
+}
