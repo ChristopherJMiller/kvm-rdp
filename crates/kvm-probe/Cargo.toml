@@ -1,0 +1,27 @@
+[package]
+name = "kvm-probe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+publish = false
+autotests = false
+
+[lib]
+name = "kvm_probe"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kvm-probe"
+path = "src/main.rs"
+
+[dependencies]
+sha2 = "0.10"
+
+[lints.clippy]
+indexing_slicing = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
