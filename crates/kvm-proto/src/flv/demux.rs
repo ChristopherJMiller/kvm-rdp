@@ -1,3 +1,4 @@
+use crate::flv::avc::{VideoBody, parse_video_body};
 use crate::flv::header::{
     FlvError, FlvLimits, HEADER_LEN, PREV_TAG_SIZE_LEN, TAG_HEADER_LEN, parse_flv_header,
     parse_tag_header,
@@ -108,6 +109,51 @@ impl FlvDemuxer {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TagBody {
+    Audio,
+    ScriptData,
+    Video(VideoBody),
+    Other(u8),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FlvTag {
+    pub tag_type: u8,
+    pub data_size: u32,
+    pub timestamp: u32,
+    pub body: TagBody,
+}
+
+impl FlvDemuxer {
+    /// Parsed next tag (§6.2). Video tags decode into `VideoBody` with
+    /// zero-copy NAL/SPS/PPS slices; audio (8) and script-data (18) tags are
+    /// framed and surfaced but their bodies are not parsed.
+    pub fn next_tag(&mut self) -> Result<Option<FlvTag>, FlvError> {
+        let Some(raw) = self.next_raw_tag()? else {
+            return Ok(None);
+        };
+        let body = match raw.tag_type {
+            8 => TagBody::Audio,
+            18 => TagBody::ScriptData,
+            9 => {
+                let vb = parse_video_body(&raw.body, self.length_size)?;
+                if let VideoBody::SequenceHeader(ref cfg) = vb {
+                    self.length_size = Some(cfg.length_size_minus_one.wrapping_add(1));
+                }
+                TagBody::Video(vb)
+            }
+            other => TagBody::Other(other),
+        };
+        Ok(Some(FlvTag {
+            tag_type: raw.tag_type,
+            data_size: raw.data_size,
+            timestamp: raw.timestamp,
+            body,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -120,6 +166,7 @@ mod tests {
     )]
     use super::*;
     use crate::flv::header::FlvLimits;
+    use crate::flv::{FrameType, TagBody, VideoBody};
 
     /// Hand-built FLV: header + a video sequence-header tag + a video NALU
     /// (IDR) tag. No real capture is used.
@@ -191,5 +238,90 @@ mod tests {
             0, 0,
         ]);
         assert_eq!(d.next_raw_tag(), Err(FlvError::OversizeTag));
+    }
+
+    #[test]
+    fn next_tag_parses_seqheader_then_idr() {
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&build_flv());
+        let t1 = d.next_tag().unwrap().unwrap();
+        match t1.body {
+            TagBody::Video(VideoBody::SequenceHeader(cfg)) => {
+                assert_eq!(cfg.length_size_minus_one, 3);
+                assert_eq!(cfg.sps.len(), 1);
+                assert_eq!(cfg.pps.len(), 1);
+            }
+            other => panic!("expected seq header, got {other:?}"),
+        }
+        let t2 = d.next_tag().unwrap().unwrap();
+        match t2.body {
+            TagBody::Video(VideoBody::Nalus {
+                frame_type,
+                composition_time,
+                nals,
+            }) => {
+                assert_eq!(frame_type, FrameType::Key);
+                assert_eq!(composition_time, 0);
+                assert_eq!(nals.len(), 1);
+                assert_eq!(nals[0].unit_type(), Some(5));
+            }
+            other => panic!("expected NALU AU, got {other:?}"),
+        }
+        assert!(d.next_tag().unwrap().is_none());
+    }
+
+    #[test]
+    fn nalu_before_sequence_header_is_fatal() {
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&[b'F', b'L', b'V', 1, 1, 0, 0, 0, 9, 0, 0, 0, 0]);
+        // a video NALU tag (data_size 13) with no prior seq header
+        d.push(&[
+            0x09, 0x00, 0x00, 0x0D, 0, 0, 0, 0, 0, 0, 0, 0x17, 0x01, 0, 0, 0, 0x00, 0x00, 0x00,
+            0x04, 0x65, 0x88, 0x80, 0x10, 0, 0, 0, 24,
+        ]);
+        assert_eq!(d.next_tag(), Err(FlvError::NalBeforeSequenceHeader));
+    }
+
+    #[test]
+    fn audio_and_script_tags_surface_without_body_parse() {
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&[b'F', b'L', b'V', 1, 0x05, 0, 0, 0, 9, 0, 0, 0, 0]);
+        // one audio tag (type 8, data_size 1), then one script tag (type 18, data_size 1)
+        d.push(&[
+            0x08, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0xAF, 0, 0, 0, 12,
+        ]);
+        d.push(&[
+            0x12, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0x00, 0, 0, 0, 12,
+        ]);
+        assert!(matches!(
+            d.next_tag().unwrap().unwrap().body,
+            TagBody::Audio
+        ));
+        assert!(matches!(
+            d.next_tag().unwrap().unwrap().body,
+            TagBody::ScriptData
+        ));
+    }
+
+    #[test]
+    fn enhanced_rtmp_hevc_tag_is_surfaced_not_misread_as_avc() {
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&[b'F', b'L', b'V', 1, 1, 0, 0, 0, 9, 0, 0, 0, 0]);
+        // video tag, data_size 5: IsExHeader|FrameType=1(key)|PacketType=0, FourCC "hvc1"
+        d.push(&[
+            0x09, 0x00, 0x00, 0x05, 0, 0, 0, 0, 0, 0, 0, 0x90, b'h', b'v', b'c', b'1', 0, 0, 0, 16,
+        ]);
+        match d.next_tag().unwrap().unwrap().body {
+            TagBody::Video(VideoBody::Enhanced {
+                packet_type,
+                frame_type,
+                fourcc,
+            }) => {
+                assert_eq!(packet_type, 0);
+                assert_eq!(frame_type, FrameType::Key);
+                assert_eq!(&fourcc, b"hvc1");
+            }
+            other => panic!("expected Enhanced, got {other:?}"),
+        }
     }
 }

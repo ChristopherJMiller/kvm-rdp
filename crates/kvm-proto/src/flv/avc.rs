@@ -128,6 +128,97 @@ fn read_len(bytes: &[u8]) -> usize {
     v
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameType {
+    Key,
+    Inter,
+    Other(u8),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VideoBody {
+    SequenceHeader(AvcConfig),
+    Nalus {
+        frame_type: FrameType,
+        composition_time: i32,
+        nals: Vec<Nal>,
+    },
+    EndOfSequence,
+    NonAvc {
+        codec_id: u8,
+        frame_type: FrameType,
+    },
+    /// Enhanced-RTMP `IsExHeader` tag: bits 6..4 frame type, bits 3..0
+    /// packet type, then a 4-byte FourCC (`hvc1`, `av01`, …).
+    Enhanced {
+        packet_type: u8,
+        frame_type: FrameType,
+        fourcc: [u8; 4],
+    },
+}
+
+const AVC_HEADER_LEN: usize = 5;
+const CODEC_AVC: u8 = 7;
+const IS_EX_HEADER: u8 = 0x80;
+
+/// Parse an FLV video tag body (§6.2). `length_size` is the current
+/// `lengthSizeMinusOne + 1`, needed for NALU tags.
+pub(crate) fn parse_video_body(
+    body: &Bytes,
+    length_size: Option<u8>,
+) -> Result<VideoBody, FlvError> {
+    let mut c = Cur::new(body.as_ref());
+    let b0 = c.u8().ok_or(FlvError::MalformedVideoTag)?;
+    if b0 & IS_EX_HEADER != 0 {
+        let frame_type = match b0.wrapping_shr(4) & 0x07 {
+            1 => FrameType::Key,
+            2 => FrameType::Inter,
+            other => FrameType::Other(other),
+        };
+        let fourcc = [
+            c.u8().ok_or(FlvError::MalformedVideoTag)?,
+            c.u8().ok_or(FlvError::MalformedVideoTag)?,
+            c.u8().ok_or(FlvError::MalformedVideoTag)?,
+            c.u8().ok_or(FlvError::MalformedVideoTag)?,
+        ];
+        return Ok(VideoBody::Enhanced {
+            packet_type: b0 & 0x0F,
+            frame_type,
+            fourcc,
+        });
+    }
+    let frame_type = match b0.wrapping_shr(4) {
+        1 => FrameType::Key,
+        2 => FrameType::Inter,
+        other => FrameType::Other(other),
+    };
+    let codec_id = b0 & 0x0F;
+    if codec_id != CODEC_AVC {
+        return Ok(VideoBody::NonAvc {
+            codec_id,
+            frame_type,
+        });
+    }
+    let packet_type = c.u8().ok_or(FlvError::MalformedVideoTag)?;
+    let composition_time = c.i24().ok_or(FlvError::MalformedVideoTag)?;
+    match packet_type {
+        0 => Ok(VideoBody::SequenceHeader(parse_avc_config(
+            body,
+            AVC_HEADER_LEN,
+        )?)),
+        1 => {
+            let ls = length_size.ok_or(FlvError::NalBeforeSequenceHeader)?;
+            Ok(VideoBody::Nalus {
+                frame_type,
+                composition_time,
+                nals: parse_nalus(body, AVC_HEADER_LEN, ls)?,
+            })
+        }
+        2 => Ok(VideoBody::EndOfSequence),
+        _ => Err(FlvError::MalformedVideoTag),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

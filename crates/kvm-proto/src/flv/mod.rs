@@ -14,6 +14,6 @@ mod demux;
 mod header;
 mod reader;
 
-pub use avc::{AvcConfig, Nal};
-pub use demux::FlvDemuxer;
+pub use avc::{AvcConfig, FrameType, Nal, VideoBody};
+pub use demux::{FlvDemuxer, FlvTag, TagBody};
 pub use header::{FlvError, FlvHeader, FlvLimits};
