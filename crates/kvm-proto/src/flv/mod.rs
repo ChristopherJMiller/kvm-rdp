@@ -9,7 +9,9 @@
     clippy::as_conversions
 )]
 
+mod demux;
 mod header;
 mod reader;
 
+pub use demux::FlvDemuxer;
 pub use header::{FlvError, FlvHeader, FlvLimits};
