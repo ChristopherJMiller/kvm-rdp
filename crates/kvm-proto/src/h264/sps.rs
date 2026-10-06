@@ -226,6 +226,81 @@ pub fn check_sps_limits(s: &SpsSummary, limits: &SpsLimits) -> Result<(), SpsLim
     Ok(())
 }
 
+/// A pinned SPS field (spec §6.1): fixed after the first SPS of a KVM session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedField {
+    ProfileIdc,
+    ChromaFormat,
+    BitDepth,
+    PicOrderCntType,
+}
+
+/// Why an SPS change is incompatible (fatal `stream_incompatible`, §6.9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpsIncompatibleReason {
+    /// The new SPS is outside the §6.1 limits.
+    OutsideLimits(SpsLimitViolation),
+    /// A pinned field changed from the previous SPS.
+    PinnedFieldChanged(PinnedField),
+}
+
+/// Classification of an SPS relative to the previous one (spec §6.1 table).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpsChange {
+    /// No previous SPS (first of the session / forced after an FLV (re)open).
+    Initial,
+    /// Dimensions or level changed, within limits.
+    Resize,
+    /// Any other within-limits change (num_ref_frames, VUI, cropping, …).
+    Other,
+    /// Fatal: a pinned field changed or the SPS is outside the limits.
+    Incompatible(SpsIncompatibleReason),
+}
+
+/// Classify a new SPS against the previous one (spec §6.1). `previous = None`
+/// yields `Initial` (still after a limits check). Pinned-field comparison is
+/// against `previous`; because any earlier out-of-pin SPS would already have
+/// been `Incompatible` and ended the session, that equals comparing to the
+/// session's first SPS.
+pub fn classify_sps_change(
+    previous: Option<&SpsSummary>,
+    new: &SpsSummary,
+    limits: &SpsLimits,
+) -> SpsChange {
+    if let Err(v) = check_sps_limits(new, limits) {
+        return SpsChange::Incompatible(SpsIncompatibleReason::OutsideLimits(v));
+    }
+    let Some(prev) = previous else {
+        return SpsChange::Initial;
+    };
+    if prev.profile_idc != new.profile_idc {
+        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
+            PinnedField::ProfileIdc,
+        ));
+    }
+    if prev.chroma_format_idc != new.chroma_format_idc {
+        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
+            PinnedField::ChromaFormat,
+        ));
+    }
+    if prev.bit_depth_luma_minus8 != new.bit_depth_luma_minus8
+        || prev.bit_depth_chroma_minus8 != new.bit_depth_chroma_minus8
+    {
+        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
+            PinnedField::BitDepth,
+        ));
+    }
+    if prev.pic_order_cnt_type != new.pic_order_cnt_type {
+        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
+            PinnedField::PicOrderCntType,
+        ));
+    }
+    if prev.width != new.width || prev.height != new.height || prev.level_idc != new.level_idc {
+        return SpsChange::Resize;
+    }
+    SpsChange::Other
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -407,6 +482,109 @@ mod tests {
         assert_eq!(
             check_sps_limits(&s, &lim),
             Err(SpsLimitViolation::HrdPresent)
+        );
+    }
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::tests::ok_summary;
+    use super::*;
+
+    #[test]
+    fn no_previous_is_initial() {
+        let lim = SpsLimits::default();
+        assert_eq!(
+            classify_sps_change(None, &ok_summary(), &lim),
+            SpsChange::Initial
+        );
+    }
+
+    #[test]
+    fn new_outside_limits_is_incompatible() {
+        let lim = SpsLimits::default();
+        let mut new = ok_summary();
+        new.profile_idc = 244;
+        assert_eq!(
+            classify_sps_change(Some(&ok_summary()), &new, &lim),
+            SpsChange::Incompatible(SpsIncompatibleReason::OutsideLimits(
+                SpsLimitViolation::Profile(244)
+            ))
+        );
+    }
+
+    #[test]
+    fn pinned_profile_change_is_incompatible() {
+        let lim = SpsLimits::default();
+        let prev = ok_summary(); // profile 77
+        let mut new = ok_summary();
+        new.profile_idc = 100; // still within limits, but pinned
+        assert_eq!(
+            classify_sps_change(Some(&prev), &new, &lim),
+            SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
+                PinnedField::ProfileIdc
+            ))
+        );
+    }
+
+    #[test]
+    fn pinned_poc_type_change_is_incompatible() {
+        let lim = SpsLimits::default();
+        let prev = ok_summary(); // poc type 2
+        let mut new = ok_summary();
+        new.pic_order_cnt_type = 0;
+        assert_eq!(
+            classify_sps_change(Some(&prev), &new, &lim),
+            SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
+                PinnedField::PicOrderCntType
+            ))
+        );
+    }
+
+    #[test]
+    fn dimension_change_is_resize() {
+        let lim = SpsLimits::default();
+        let prev = ok_summary();
+        let mut new = ok_summary();
+        new.width = 1280;
+        new.height = 720;
+        assert_eq!(
+            classify_sps_change(Some(&prev), &new, &lim),
+            SpsChange::Resize
+        );
+    }
+
+    #[test]
+    fn level_change_is_resize() {
+        let lim = SpsLimits::default();
+        let prev = ok_summary();
+        let mut new = ok_summary();
+        new.level_idc = 40;
+        assert_eq!(
+            classify_sps_change(Some(&prev), &new, &lim),
+            SpsChange::Resize
+        );
+    }
+
+    #[test]
+    fn num_ref_frames_change_only_is_other() {
+        let lim = SpsLimits::default();
+        let prev = ok_summary();
+        let mut new = ok_summary();
+        new.num_ref_frames = 3; // still <= 16; not a pinned field, not dims/level
+        assert_eq!(
+            classify_sps_change(Some(&prev), &new, &lim),
+            SpsChange::Other
+        );
+    }
+
+    #[test]
+    fn identical_sps_is_other() {
+        let lim = SpsLimits::default();
+        let prev = ok_summary();
+        assert_eq!(
+            classify_sps_change(Some(&prev), &ok_summary(), &lim),
+            SpsChange::Other
         );
     }
 }
