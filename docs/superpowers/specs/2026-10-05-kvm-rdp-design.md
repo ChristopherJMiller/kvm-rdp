@@ -2,11 +2,26 @@
 
 | | |
 |---|---|
-| Status | Draft rev 5, for review. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks |
+| Status | Draft rev 5.1, for review. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1) |
 | Repo | `github.com/ChristopherJMiller/kvm-rdp` (public, MIT OR Apache-2.0) |
 | First target | Angeet/Yeeso ES3 "ONE KVM" wired to a Mac Studio |
 | Client | Microsoft Windows App on macOS, through an rdpgw RD Gateway on 443 |
 | Companion spec | Deployment, gateway, edge gating and KVM isolation live in `luma-homeops` (separate spec, written after Milestone 0). §9.4 lists what this spec requires of it |
+
+**Rev 5.1 — Leg A census amendments (2026-10-06).** Applies only the
+`docs/census.md` Leg A findings that no Leg B or C result can change; Legs B
+and C are pending and Plan A's Task 9.1 still makes the full census revision
+(§12). Transport: one self-signed certificate (one SPKI pin) on all three TLS
+ports, TLS 1.3 negotiates with rustls, `https` confirmed (§3.2). Sessions:
+logins coexist but **logout is global**, so the bridge never logs out (§3.2,
+§5.1, §5.2, §11.3). HID: the session-start pointer report no longer parks the
+pointer at (0, 0) (§3.3, §7.4). Video: the ES3's measured stream is recorded
+and the preset pinned to 1080p30 (§6.1, §10.3); `CompositionTime` must be
+constant, not 0 (§6.1); tag = AU, burst 0 (§6.2); a short side FLV
+connection becomes the primary IDR mechanism, with N = 1.8 s (§6.5); the SPS
+rewrite becomes required — `level_idc` and a mislabelled VUI (§6.8); a preset
+change closing the FLV needs no new mechanism (§6.4). Config, tests,
+milestones and open questions follow (§4.4, §11, §12, §15).
 
 ## 1. Goal
 
@@ -28,8 +43,9 @@ interactive (§10.3 bounds); the bridge costs almost nothing to run (§10.1).
 - Re-encoding. A client that cannot take AVC420 is disconnected with a clear
   error (§6.7). A re-encode mode may come later if the census demands it, and
   is never silent.
-- A bridge-side GOP cache. Getting a keyframe is `reconnect` or `wait` (§6.5);
-  a cache is designed only if the census shows neither meets §10.3.
+- A bridge-side GOP cache. Getting a keyframe means provoking one from the
+  KVM's shared encoder or waiting for one (§6.5); Leg A's measurements meet
+  §10.3 without a cache (`census.md`, Census gates).
 - More than one client at a time (a new connection replaces the old), or more
   than one KVM per process (more machines = more instances).
 
@@ -44,44 +60,62 @@ interactive (§10.3 bounds); the bridge costs almost nothing to run (§10.1).
 - **The work Mac must not be exposed to the internet.** Every path is
   authenticated before it reaches the bridge.
 - **The KVM's video is fixed.** Its UI offers resolution and fps only — no
-  codec, GOP, profile, range or bitrate control.
+  codec, GOP, profile, range or bitrate control. What it sends at the pinned
+  1080p30 preset is in §6.1 and §6.8.
 - **The development host is shared and loaded** (§13).
 
 ## 3. The KVM interface
 
 Reverse-engineered from the ES3 web UI (`kvm.js`, `index.js`, `common.js`).
-Items marked *(census)* are unverified until Milestone 0.
+Items still marked *(census)* are unverified; rev 5.1 fills what Leg A
+measured (`census.md`).
 
 ### 3.1 Endpoints
 
 | Function | How |
 |---|---|
-| Login | `POST /cgi-bin/login.lua`, body `{"pass","timezone","time"}` → token `0.<digits>` |
-| Logout | `GET /cgi-bin/login.lua?logout` |
-| Video | `GET /av.flv?token=…` on the video port. HTTP-FLV, H.264 *(census)*. The vendor calls FLV "high compatibility" and WebRTC (SRS, :1988) "low latency", so FLV source latency is *(census)* |
+| Login | `POST /cgi-bin/login.lua`, body `{"pass","timezone","time"}` → token `0.<digits>`. Concurrent logins coexist (§3.2) |
+| Logout | `GET /cgi-bin/login.lua?logout`. **Global**: invalidates every session's token (§3.2). The bridge never calls it |
+| Video | `GET /av.flv?token=…` on the video port. HTTP-FLV, H.264 Baseline (§6.1). One encoder serves every viewer (§6.5). The vendor calls FLV "high compatibility" and WebRTC (SRS, :1988) "low latency", so FLV source latency is *(census)* |
 | Input | WebSocket `/websocket` on the control port |
 | Mode | `88 88 01 <0x30+type>` sets HID type; type 0 = absolute mouse. `88 88 03 …` is UART text (unused) |
 
 ### 3.2 Transport
 
-- **Scheme `https` by default** for login, video and websocket, on ports 443 /
+- **Scheme `https`** for login, video and websocket, on ports 443 /
   8881 / 8889 (config, not read from `mapping.lua`). The KVM's certificate is
   self-signed, so it is **pinned by SHA-256 of its SPKI** from config;
-  `kvm-probe --print-fingerprint` records it once. A mismatch refuses the
-  connection. There is no accept-any verifier.
-- Scheme `http` (80 / 8880 / 8888) is a config option, allowed only if the
-  census shows rustls cannot negotiate with the KVM or TLS costs measurable
-  latency, and only on the isolated segment. TLS here buys confidentiality
-  against the LAN, not trust in the device.
+  `kvm-probe fingerprint` records it once. The ES3 serves **one certificate on
+  all three TLS ports**, so one pin (`kvm.spki_sha256`) covers them. A
+  mismatch refuses the connection. There is no accept-any verifier.
+  (`census.md`, Leg A — transport.)
+- Leg A confirmed `https`: rustls negotiates TLS 1.3
+  (`TLS_AES_256_GCM_SHA384`) on all three ports; TLS costs ~90 ms on each
+  connection open (FLV open → first IDR p50 183 vs 97 ms over `http`) and
+  nothing measurable in steady state (inter-tag jitter on a moving screen is
+  the same or better). Scheme `http` (80 / 8880 / 8888) stays a config option
+  for diagnosis on the isolated segment only; neither of the conditions that
+  would have justified it (rustls cannot negotiate, measurable TLS latency)
+  holds. TLS here buys confidentiality against the LAN, not trust in the
+  device.
 - After login the token is sent as `Cookie: token=<token>` on **every** request
-  — FLV, websocket upgrade, logout — and as the `token` query parameter on the
+  — FLV and websocket upgrade — and as the `token` query parameter on the
   FLV URL.
+- **Sessions** (`census.md`, Leg A — sessions): concurrent logins coexist (a
+  second login leaves the first token valid); **logout is global** — one
+  session's logout invalidates every token, including the vendor web UI's;
+  an FLV already open survives another session's logout. So an operator
+  logging out of the vendor UI also invalidates the bridge's token: the open
+  FLV keeps running, and the next FLV or websocket open fails auth and
+  re-logs in once (§6.9).
 - Clients: hyper and tokio-tungstenite over tokio-rustls (aws-lc provider,
   default features off). `TCP_NODELAY` on every KVM socket.
 - Websocket limits: max message and frame 4 KiB, small write buffer; inbound
   data messages are read and discarded; an oversize message closes the socket
   without buffering it.
-- Teardown calls logout, best effort, bounded by `kvm.logout_timeout`.
+- **The bridge never calls logout.** Because logout is global, it would end
+  the operator's break-glass web-UI session (and any `kvm-probe` run).
+  Teardown closes the websocket and the FLV and lets the token lapse (§5.1).
 
 ### 3.3 HID frames
 
@@ -94,7 +128,16 @@ Byte-exact with `kvm.js`:
 | Wheel | `AA AA 04 20 btn 00 00 w` — `w` = `01` up / `FF` down; `btn` = current button mask |
 
 Session-start sequence on every websocket (re)open: `88 88 01 30` (absolute
-mode), an all-zero keyboard report, a zero-button absolute report.
+mode), an all-zero keyboard report, and a zero-button absolute report **at the
+last position the bridge sent** — or no mouse report at all if it has sent
+none in this process, until the client's first pointer event. Never a fixed
+(0, 0): Leg A found that a zero-button report at (0, 0) parks the pointer in
+the top-left corner on every websocket (re)open, which on macOS reveals the
+menu bar over full-screen apps (`census.md`, Derived decisions, §7 input).
+
+Keyboard frames are verified on the real device: they drive macOS as
+specified, US layout, Cmd = GUI modifier bit `0x08` (`census.md`, Derived
+decisions).
 
 `kvm.js` does not resend held keys. Its 100 ms timer is a focus heartbeat
 feeding a browser-side watchdog that sends an all-zero report after 500 ms
@@ -200,7 +243,8 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   `FlvOpened{gen, origin: first | transient | commanded}`,
   `UpstreamFatal(Cause)`, `BacklogSample` and `RttSample`; its commands include
   `SendDvc`, `SendSlate`, `DisplayResize`, `ReleaseAll`, `OpenFlv`,
-  `ReconnectFlv`, `CancelReconnect`, `SetMaxFramesInFlight`, `InjectSuspendAck`,
+  `RequestIdr`, `ReconnectFlv`, `CancelIdrRequest`, `SetMaxFramesInFlight`,
+  `InjectSuspendAck`,
   `ProbeRtt` and `Disconnect(Cause)`. The
   lists are the minimum; the implementation may add variants but not fold
   decisions back into the async shells, which only take locks, call `step`,
@@ -218,20 +262,21 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   its timers (AVC420 negotiation, stall, IDR wait, suppression, disconnect
   watchdog). All KVM work runs in one `KvmSession` actor that processes
   `Start{gen}` and `Stop{gen}` strictly in order; a `Stop` completes
-  (release-all flushed, websocket and FLV closed, logout attempted) before the
-  next `Start` begins. Every `ServerEvent` send, including `Disconnect`, is only
-  made for the current generation. Events already queued in IronRDP when a
-  connection ends are dropped by IronRDP (§4.2 patch 3), not by the bridge.
+  (release-all flushed, websocket, FLV and any side FLV closed; never a
+  logout, §3.2) before the next `Start` begins. Every `ServerEvent` send,
+  including `Disconnect`, is only made for the current generation. Events
+  already queued in IronRDP when a connection ends are dropped by IronRDP
+  (§4.2 patch 3), not by the bridge.
 - **KVM → pump: one ordered stream.** Control messages (`SessionStart/Stop`,
   `SpsChanged`, `FlvOpened`, `UpstreamFatal`) and AUs share one channel, so
   they never reorder. AUs are sent with `try_send` and dropped when the channel
   is full (a flow cause, §6.5; metric); control messages are sent with
   `send().await` and are never dropped (the KVM actor briefly pauses FLV
   reading; the pump drains continuously). SPS/PPS are classified on the KVM
-  side and travel as `SpsChanged`, so a dropped AU can never lose a parameter
-  set; the pump's SPS/PPS cache updates only from this stream. Capacity:
-  ≥ the hard cap (§6.6). The FLV is otherwise drained at line rate; the KVM
-  never sees back-pressure.
+  side (SPSs after the rewrite, §6.8) and travel as `SpsChanged`, so a
+  dropped AU can never lose a parameter set; the pump's SPS/PPS cache updates
+  only from this stream. Capacity: ≥ the hard cap (§6.6). The FLV is
+  otherwise drained at line rate; the KVM never sees back-pressure.
 - **Input path** (§7.3) and the **HID writer** never block the RDP runtime.
 
 ### 4.4 Configuration
@@ -254,27 +299,28 @@ Defaults (every duration is configurable; values marked *census* are set in
 | `rdp.listen` | `0.0.0.0:3389` | |
 | `rdp.username` | `kvm` | Exact, case-sensitive match (§9.1) |
 | `admin.listen` | `0.0.0.0:9464` | §4.5 |
-| `kvm.host`, `kvm.spki_sha256` | required | |
-| `kvm.scheme` / ports | `https` / 443, 8881, 8889 | *census* (§3.2) |
-| `kvm.connect_timeout` / `login_timeout` / `logout_timeout` | 3 s / 5 s / 1 s | |
+| `kvm.host`, `kvm.spki_sha256` | required | One pin covers all three TLS ports (§3.2) |
+| `kvm.scheme` / ports | `https` / 443, 8881, 8889 | Confirmed by Leg A (§3.2) |
+| `kvm.connect_timeout` / `login_timeout` | 3 s / 5 s | No logout timeout: the bridge never logs out (§3.2) |
 | `kvm.backoff` | 250 ms ×2 → 8 s, ±20% jitter | Transient reconnects (§6.9). One backoff state per connection (FLV, websocket): the FLV's resets when a new FLV delivers its first tag, the websocket's once a reopened websocket has sent the session-start sequence |
 | `kvm.upstream_deadline` | 20 s | §6.9 |
-| `video.default_size` | 1920×1080 | `size()` before any SPS |
-| `video.max_fps` | 60 | Sizes the hard cap |
+| `video.default_size` | 1920×1080 | `size()` before any SPS; the ES3 preset is pinned to it (§6.1) |
+| `video.max_fps` | 30 | The ES3 preset is pinned to 30 fps (§6.1). Sizes the hard cap and the rewritten level (§6.8) |
 | `video.soft_gate` | 500 ms | Age of the oldest unacked live frame (§6.6) |
-| `video.hard_cap` | 2 s | hard = ceil(2 s × `max_fps`) + census max burst (§6.6) |
+| `video.hard_cap` | 2 s | hard = ceil(2 s × `max_fps`) + census max burst (0) = 60 frames (§6.6) |
 | `video.backlog_limit` | 4 MiB | §6.6 |
 | `video.standing_delay_limit` | 500 ms | Used only when auto-detect is negotiated (§6.6) |
 | `video.rtt_probe_interval` | 250 ms | §6.6 |
 | `video.first_ack_grace` | *census*: first-frame ack p95 + `soft_gate`, default 1.5 s | §6.6 |
 | `video.stall_timeout` | 10 s | §6.6 |
-| `video.idr_policy` | *census* | `reconnect` or `wait` (§6.5) |
+| `video.idr_policy` | `side` | Leg A (§6.5); `reconnect` and `wait` remain options |
+| `video.idr_side_timeout` | 1 s | A side request with no IDR by then falls back to `ReconnectFlv` (§6.5) |
 | `video.idr_wait_max` | 3 s | Cumulative open-gate time (§6.5) |
 | `video.flv_reconnect_interval_setup` | 1 s | §6.5 |
 | `video.flv_reconnect_interval_flow` | 10 s | §6.5 |
 | `video.flv_idle_timeout` | *census*, default 10 s | §6.9 |
 | `video.burst_chunk` | 8 frames | §6.5 |
-| `video.sps_rewrite` | *census*, default off | §6.8 |
+| `video.sps_rewrite` | `["level", "vui"]` | Required on the ES3 (§6.8); `"restriction"` is added if Leg B's stranding test needs it (*census*) |
 | `video.avc420_timeout` | 10 s from `on_connection_info` | §6.7 |
 | `video.suppress_debounce` | 1 s | §6.6 |
 | `video.disconnect_watchdog` | 5 s | §6.9 |
@@ -332,6 +378,13 @@ Defaults (every duration is configurable; values marked *census* are set in
   FLV open.
 - **`on_disconnected`** and eviction invalidate the generation and send
   `Stop{gen}` (§4.3).
+- **The KVM token** lives from `Start` to `Stop`: one login per `Start`; FLV,
+  side-FLV and websocket reopens reuse the token, and the bridge logs in again
+  only on an auth failure (§6.9). **It never logs out** — ES3 logout is global
+  and would end the operator's break-glass web-UI session (§3.2,
+  `census.md` Leg A — sessions). `Stop` closes the websocket and the FLV and
+  drops the token, which lapses on the KVM; a takeover is `Stop` then
+  `Start`, so it costs one new login and no logout.
 - `size()` returns the last-known KVM resolution, held in memory per process;
   a restart falls back to `video.default_size`. If the first SPS disagrees, the
   resolution change runs after the first Setup (§6.4).
@@ -343,24 +396,29 @@ Defaults (every duration is configurable; values marked *census* are set in
 
 On SIGTERM or SIGINT: stop accepting; release-all and wait for the websocket
 flush (≤ 500 ms); disconnect the client with cause `shutdown`; close FLV and
-websocket; logout (≤ `kvm.logout_timeout`); exit within 5 s. Release builds use
+websocket (no logout, §5.1); exit within 5 s. Release builds use
 `panic = "abort"`. A crash cannot release keys: what the Mac does when the
-websocket TCP connection dies with a key held is a census item (§12), and the
-answer goes in §9.3.
+websocket TCP connection dies with a key held moved from Leg A to Plan C's L4
+hardware checks (§12), and the answer goes in §9.3.
 
 ## 6. Video: EGFX AVC420 passthrough
 
 ### 6.1 Admission
 
 Checked on the KVM side (`kvm-proto`) on the first sequence header and on every
-SPS/PPS after it:
+SPS/PPS after it. SPS checks run on the **rewritten** SPS (§6.8): the ES3's
+SPS as sent fails them.
 
 - FLV `CodecID == 7` (AVC). `12` or Enhanced-RTMP `hvc1` (HEVC) is refused:
   EGFX has no HEVC codec.
-- `CompositionTime == 0` on every tag (no B-frames).
+- `CompositionTime` **constant per stream** on coded (NALU) tags (no
+  B-frames): the first coded tag after each FLV open sets it, and a coded tag
+  that differs is refused. Sequence-header tags are exempt. The ES3 sends a
+  constant 16 ms (0 on the sequence header), so a `== 0` rule would refuse it
+  (`census.md`, Leg A — stream).
 - **SPS limits**: `profile_idc ∈ {66, 77, 100}`; chroma 4:2:0, 8-bit;
   `frame_mbs_only_flag == 1`; level ≤ 5.1; width ≤ 4096 and height ≤ 2304,
-  both even; `num_ref_frames` ≤ the census value (≤ 16);
+  both even; `num_ref_frames` ≤ the census value (1 on the ES3);
   `seq_scaling_matrix_present_flag == 0` and VUI
   `nal/vcl_hrd_parameters_present_flag == 0`, unless `census.md` records the
   KVM using them, in which case the exact values are pinned.
@@ -369,6 +427,28 @@ SPS/PPS after it:
 - **Slice headers**: `slice_type ∈ {0, 2, 5, 7}` (P and I only); `pps_id` refers
   to a validated PPS; `first_mb_in_slice < PicSizeInMbs`; POC strictly
   increasing in decode order within a GOP.
+
+**The ES3's stream** (`census.md`, Leg A — stream; 1920×1080 at 30 fps, the
+only preset measured). These are the values kvm-sim's ES3 profile, the
+fixtures and the limits above are held to:
+
+| Field | ES3 value | Consequence |
+|---|---|---|
+| Codec | AVC (`CodecID 7`), no Enhanced-RTMP FourCC | Admitted |
+| Profile / constraints / level | Baseline (66), `constraint_set0–5` all 0, `level_idc` 31 | Level rewritten to 40 before any check (§6.8); `constraint_set1_flag` is a Leg B question (§15) |
+| Size | 120×68 MBs (1920×1088), `frame_cropping` bottom 8 → 1920×1080 | `video.default_size`; the slate matches |
+| POC type / refs | POC type 0, `log2_max_frame_num_minus4` 4; `max_num_ref_frames` 1; progressive | `num_ref_frames` limit 1 |
+| Entropy / PPS | CAVLC, 1 slice group, no scaling matrices, no HRD | The slice-group, scaling-matrix and HRD rules above hold as written |
+| VUI | Present; claims full range, BT.601 (primaries 5, matrix 5); no timing, no `bitstream_restriction` | Wrong: rewritten (§6.8) |
+| Cadence | 30 fps (timestamp steps 33/34 ms), one tag every 33 ms static or moving; GOP 60 frames (2 s) | No idle gaps; `wait` would give N = 2.5 s (§6.5) |
+| Framing | tag = AU (no multi-picture, continuation or non-VCL-picture tags in ≈ 2 700); AVCC length size 4; coded tags carry only NAL types 1 and 5 (no AUD, SEI or in-band SPS/PPS) | No AU assembler (§6.2) |
+
+**The KVM preset is pinned to 1920×1080 at 30 fps** — not "auto", which
+invites resolution changes (and lets the Mac drive 4K at level 5.1), and not
+60 fps, which would need level 4.2 and double the bitrate for no gain on a
+remote desktop. Display sleep does not change the SPS: the KVM switches to
+its own NO SIGNAL card (all-intra, every frame an IDR) with the same SPS
+bytes, so it raises no resize.
 
 **SPS changes.** After the first SPS of a KVM session, `profile_idc`, chroma
 format, bit depth and POC type are pinned; the pins and the "previous SPS"
@@ -402,11 +482,14 @@ resync scanning.
 - **Any NAL containing `00 00 00`, `00 00 01` or `00 00 02` is refused**, or
   the client's start-code scanner would find NALs we never checked.
 - Limits: tag 4 MiB, 128 NALs per AU, 4 SPS, 16 PPS.
-- One FLV tag is assumed to be one access unit *(census)*. If not, an AU
-  assembler (FLV timestamp plus `first_mb_in_slice` / AUD) goes in `kvm-proto`.
+- One FLV tag is one access unit: Leg A found no multi-picture, continuation
+  or non-VCL-picture tags in ≈ 2 700 (`census.md`). There is no AU assembler;
+  a tag that is not exactly one picture (a second picture start, or a first
+  slice with `first_mb_in_slice ≠ 0`) is a framing violation (§6.9).
 - **Bursts**: an AU whose FLV timestamp runs more than 100 ms ahead of its
   receive time (measured since the FLV connection's first tag) is marked
-  `burst` — a GOP-caching source replaying on connect.
+  `burst` — a GOP-caching source replaying on connect. The ES3 sends none
+  (burst on connect 0 frames, `census.md`); the marking stays as a defence.
 - Parser modules deny `clippy::{indexing_slicing, unwrap_used, expect_used,
   panic, arithmetic_side_effects, as_conversions}`.
 - Ownership: the demuxer splits AU payloads out of the FLV buffer as
@@ -417,8 +500,9 @@ resync scanning.
 
 - Annex-B with 4-byte start codes, one access unit per `send_avc420_frame`,
   converted by our code (never IronRDP's `avc_to_annex_b`).
-- Each sent AU = [AUD if present] + the cached SPS/PPS (IDR only) + the source
-  AU's allowlisted VCL NALs, in order. Only AUs with a VCL NAL are sent.
+- Each sent AU = [AUD if present] + the cached SPS (as rewritten, §6.8) and
+  PPS (IDR only) + the source AU's allowlisted VCL NALs, in order. Only AUs
+  with a VCL NAL are sent.
 - Region `Avc420Region::full_frame(w, h, video.region_qp)` (exclusive bounds,
   QP ≤ 63). Surface = display size; the 16-aligned coded size is cropped by
   the SPS.
@@ -442,7 +526,7 @@ arm suppression, does not count for delivery metrics, and oracles start at the
 first KVM IDR.
 
 **NeedIdr** means P-frames are dropped until an IDR is handed to IronRDP. Two
-flags drive what it does while waiting (§6.5): `reopen_pending` and the
+flags drive what it does while waiting (§6.5): `idr_pending` and the
 idr-wait accounting.
 
 **ReactivationComplete** is an `updates()` call made while in
@@ -458,7 +542,7 @@ the same suppression edge.**
 | State ↓ / Input → | `OnReady` (AVC420) | `OnReady` (no AVC420) | `SpsChanged` initial/resize needing a resize | `SpsChanged` initial (same size) / other | `FlvOpened` | `ReactivationComplete` | Suppress on (debounced) | Suppress off (debounced) | IDR AU | P AU | Gate closes | Fatal / timeout |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **WaitReady** | Setup (+ slate, `OpenFlv` if first); if `pending_size`: start resize; else → NeedIdr | first negotiation: wait `avc420_timeout`, then → Closing(`no_avc420`) | set `pending_size` | update cache | ignore | ignore | ignore | ignore | drop | drop | — | → Closing |
-| **NeedIdr** | Setup → NeedIdr (Setup cause) | → Closing(`no_avc420`) | start resize | update cache; `other` is a flow cause | satisfies `reopen_pending`, resets idr-wait | ignore | → Paused | — | gates open: send → Live; closed: drop, flow cause | drop | flow cause | → Closing |
+| **NeedIdr** | Setup → NeedIdr (Setup cause) | → Closing(`no_avc420`) | start resize | update cache; `other` is a flow cause | satisfies `idr_pending`, resets idr-wait | ignore | → Paused | — | gates open: send → Live; closed: drop, flow cause | drop | flow cause | → Closing |
 | **Live** | Setup → NeedIdr (Setup cause) | → Closing(`no_avc420`) | start resize | update cache; `other` → NeedIdr (flow cause) | → NeedIdr (await this connection's first IDR) | ignore | → Paused | — | send if gates open, else → NeedIdr (flow cause) | send if gates open, else → NeedIdr (flow cause) | → NeedIdr (flow cause) | → Closing |
 | **WaitReactivation** | record (merged) | → Closing(`no_avc420`) | set `pending_size` (latest wins) | update cache | ignore | Setup at the reactivated size; if `pending_size` is set and differs: clear it, start resize again; else if suppressed or `return_to_paused` → Paused; else if `on_ready` was never seen → WaitReady; else → NeedIdr (Setup cause) | ReleaseAll; record | record | drop | drop | — | → Closing |
 | **Paused** | Setup; stay Paused | → Closing(`no_avc420`) | start resize with `return_to_paused` | update cache | stay Paused | ignore | — | → NeedIdr (Setup cause) | drop | drop | — | → Closing |
@@ -470,65 +554,104 @@ current updates stream; continue per the `ReactivationComplete` cell. Never a
 channel-only surface swap (it blinks on Windows App). AUs arriving during
 `WaitReactivation` are dropped.
 
+**Resolution change on the ES3.** One tentative observation (n = 1,
+`census.md`): while presets were switched in the KVM UI, a live FLV delivered
+8 tags and ended — a preset change appears to **close live FLV connections**
+rather than signal in-band. No new mechanism is needed either way: a closed
+FLV is a transient reconnect (§6.9), and the new FLV's first SPS is
+classified `initial` and, at a new size, starts a resize; a new sequence
+header or in-band SPS on a live FLV is classified `resize`. With the preset
+pinned (§6.1), this is a rare, operator-driven event.
+
 The stall timer (§6.6) is frozen in `Paused` and `WaitReactivation`.
 
 ### 6.5 Getting an IDR
 
-Passthrough can wait for an IDR or provoke one, never make one.
+Passthrough can wait for an IDR or provoke one, never make one. Leg A
+measured how the ES3 can be provoked (`census.md`, Leg A — stream): it has
+**one encoder shared by every viewer, and any new FLV connection forces an
+IDR into every open stream** and restarts its GOP (a second viewer connecting
+at +12.0 s gave the first an extra IDR at +12.2 s, off its regular cadence).
+A new connection's first tag is always an IDR; FLV open → first IDR is p50
+183 ms, p95 300 ms over https (20 trials); nothing is replayed on connect
+(burst 0); the GOP is 60 frames (2 s).
 
 - **Setup cause**: a Setup (connect, re-advertise, resize), leaving Paused.
 - **Flow cause**: a gate closes (§6.6), an IDR is dropped because a gate is
   closed, `send_avc420_frame` returns `None`, an AU is dropped on a full
   channel, a burst is truncated at the hard cap, `SpsChanged other`.
 - **FLV opened** (`FlvOpened`, any origin): the NeedIdr waits for that
-  connection's first IDR; it never issues `ReconnectFlv` by itself.
+  connection's first IDR; it never requests one by itself.
 
-`video.idr_policy` (from the census):
+Under `side` and `reconnect`, a Setup cause sets `idr_pending`, except for
+the first Setup, whose `OpenFlv` already serves; a flow cause starts idr-wait
+accounting, and once the gates have been open for a cumulative
+`idr_wait_max` (flapping does not reset it) it sets `idr_pending` — usually
+the 2 s GOP answers first. `video.idr_policy` says how `idr_pending` is
+served:
 
-- `reconnect` — a Setup cause sets `reopen_pending`, which issues
-  `ReconnectFlv` (make-before-break if the census shows a second connection
-  triggers an IDR), except for the first Setup, whose `OpenFlv` already serves.
-  A flow cause starts idr-wait accounting: once the gates have been open for a
-  cumulative `idr_wait_max` (flapping does not reset it), it sets
-  `reopen_pending`.
-- `wait` — every NeedIdr waits for the next periodic IDR; `reopen_pending` is
-  never set after the first open. Chosen only if the census shows reconnecting
-  is not faster.
+- `side` (default, from Leg A) — `RequestIdr`: the KVM actor opens a short
+  **side FLV connection** with the session's token, reads it through the
+  §6.2 demuxer and limits until its first tag, then closes it and discards
+  everything it read. The main FLV keeps flowing and carries the forced IDR,
+  so there is no `FlvOpened`, no `initial` SPS and no gap. The side
+  connection is closed at its first tag or after `idr_side_timeout`,
+  whichever comes first; it never feeds the pump, and its failures (refused,
+  auth, framing, timeout) are counted, never retried and never re-logged-in.
+  **Fallback**: if the NeedIdr is still unresolved `idr_side_timeout` after
+  the request, `idr_pending` is set again and served by `ReconnectFlv`.
+  Leg A's a/b test used two logins, so two concurrent FLVs on one token are
+  not yet measured; L4 checks it (§15), and a refusal costs only the
+  fallback.
+- `reconnect` — `ReconnectFlv`, make-before-break: Leg A shows the new
+  connection forces an IDR, so the old FLV closes once the new one delivers
+  its first tag. It is `side`'s fallback, and a policy of its own for a
+  source whose encoder is not shared.
+- `wait` — `idr_pending` is never set; every NeedIdr waits for the next
+  periodic IDR.
 
 **Rate limits and cancellation.** Two clocks, `flv_reconnect_interval_setup`
-(Setup-caused reopens) and `flv_reconnect_interval_flow` (idr-wait reopens).
-**Any** FLV open (first, transient, commanded) clears `reopen_pending`,
-cancels a deferred `ReconnectFlv`, resets idr-wait accounting, and restarts
-both clocks. A `ReconnectFlv` that falls inside its clock's window is
-**deferred** to the window's end, not dropped — and **cancelled** if, before it
-fires, an IDR is handed to IronRDP or the pump leaves NeedIdr (Paused,
-`WaitReactivation`, Closing); a later cause requests it again. Websocket-only
-failures never touch NeedIdr.
+(Setup-caused requests) and `flv_reconnect_interval_flow` (idr-wait
+requests), limit how often the bridge forces an IDR on every viewer. **Any**
+FLV open (first, transient, commanded) and every `RequestIdr` clears
+`idr_pending`, cancels a deferred request, resets idr-wait accounting, and
+restarts both clocks. A `RequestIdr` or `ReconnectFlv` that falls inside its
+clock's window is **deferred** to the window's end, not dropped — and
+**cancelled** (`CancelIdrRequest`) if, before it fires, an IDR is handed to
+IronRDP or the pump leaves NeedIdr (Paused, `WaitReactivation`, Closing); a
+later cause requests it again. A side fallback is a request like any other;
+with the 1 s defaults its `ReconnectFlv` lands at the end of the window its
+side request opened. Websocket-only failures never touch NeedIdr.
 
 **Source bursts** (§6.2): burst AUs are exempt from the soft gate, count
 against the hard cap and backlog gate, and go out in chunks of `burst_chunk`
 frames, one `ServerEvent` per chunk, yielding between chunks so input PDUs
-interleave. The hard cap includes the census maximum burst length (§6.6), so a
-burst within that length is never truncated; a longer one is truncated (a flow
-cause). Census gate (§12): max burst ≤ hard cap and ≤ channel capacity.
+interleave. The hard cap includes the census maximum burst length (§6.6) —
+0 on the ES3, so the term is 0 — and a burst within that length is never
+truncated; a longer one is truncated (a flow cause). Census gate (§12): max
+burst ≤ hard cap and ≤ channel capacity — passed.
 
 **Bound.** The picture must return within N of any Setup cause (§10.3). For
-`reconnect`, N = `flv_reconnect_interval_setup` + census
-FLV-reconnect→first-IDR p95 + 0.5 s (the worst case is a reopen deferred by a
-full window); for `wait`, N = census GOP length + 0.5 s. The census gate is
-N ≤ 3 s for the chosen policy (for `reconnect` with a 1 s interval: p95 ≤
-1.5 s). If neither policy passes, the census spec revision designs a
-bridge-side GOP cache before Plan C.
+`side` and `reconnect`, N = `flv_reconnect_interval_setup` + census
+FLV-open→first-IDR p95 + 0.5 s (the worst case is a request deferred by a
+full window) = 1 s + 0.3 s + 0.5 s = **1.8 s** over https. A side request's
+IDR comes from the same connection open and the same shared encoder; Leg A
+saw it once (~0.2 s), so N uses the 20-trial p95 and L4 re-measures the side
+path. A side request that falls back adds `idr_side_timeout`: 2.8 s worst
+case, still within §10.3's 3 s. For `wait`, N = GOP length + 0.5 s = 2.5 s.
+The census gate — N ≤ 3 s for the chosen policy (for `reconnect` with a 1 s
+interval: p95 ≤ 1.5 s) — passes with p95 300 ms (`census.md`, Census gates),
+so there is no bridge-side GOP cache.
 
 ### 6.6 Flow control
 
 IronRDP must never drop a P-frame silently; the bridge gates at GOP
 granularity.
 
-- **Hard cap** = ceil(`hard_cap` × `max_fps`) + census max burst →
-  IronRDP's `max_frames_in_flight`, set at every Setup. A memory backstop only;
-  never `u32::MAX`, never the default 3. Static: it does not follow measured
-  fps.
+- **Hard cap** = ceil(`hard_cap` × `max_fps`) + census max burst (60 + 0 on
+  the ES3) → IronRDP's `max_frames_in_flight`, set at every Setup. A memory
+  backstop only; never `u32::MAX`, never the default 3. Static: it does not
+  follow measured fps.
 - **Unacked set.** The pump records `sent_at` for every frame id it sends
   (burst and grace frames flagged) and removes ids on ack. It mirrors IronRDP's
   tracker: the set is cleared at every Setup, re-advertise and suspend ack;
@@ -596,22 +719,54 @@ way it logs every advertised capability set and disconnects with cause
 
 ### 6.8 Census-dependent risks
 
+Leg A's results (`census.md`, Leg A — stream and colour) are in each row.
+
 | Finding | Effect | Response |
 |---|---|---|
-| Limited-range or BT.601 samples | MS-RDPEGFX fixes AVC420 to full-range BT.709; conformant clients ignore the VUI, so blacks lift to ~6% grey | Measured on **decoded** samples, not flags. Look for a KVM or EDID fix; otherwise ship passthrough with documented contrast loss. A colour-correct re-encode is a later opt-in mode with its own CPU budget |
-| POC type 0 without `bitstream_restriction` | Client decoders may hold frames | `video.sps_rewrite = on` (set statically from `census.md`): `kvm-proto` rewrites every SPS to add `max_num_reorder_frames = 0` and `max_dec_frame_buffering = max(num_ref_frames, 1)`; any parse anomaly passes the SPS through unchanged. Safe because §6.1 already refuses B-slices and non-increasing POC. Measured in Windows App |
-| Encoder stops sending on a static screen | Some clients hold the last ~2 frames, so the last keystroke never appears | Tested in Windows App with the barcode fixture before being treated as a re-encode trigger. `flv_idle_timeout` is set above the static-screen cadence |
+| Level below the coded size. **Found**: 1920×1080 labelled `level_idc` 31, but 8160 MBs > level 3.1's MaxFS 3600 | h264-reader — so `kvm-proto`'s `parse_sps` — refuses the SPS as sent (`FieldValueTooLarge { pic_size_in_map_units: 8160 }`); a strict client decoder may too | Rewrite (a), below |
+| Limited-range or BT.601 samples. **Found**: the pixels are limited-range BT.709 (decoded Y: black 16, white 233–236; pure red Y 63, where BT.601 would give ≈ 81), but the VUI claims full range (`video_full_range_flag` 1) and BT.601 (primaries 5, matrix 5) | MS-RDPEGFX fixes AVC420 to full-range BT.709; conformant clients ignore the VUI, so blacks lift to ~6% grey. A decoder that honours the VUI as sent shows washed-out, slightly mis-tinted colour | Measured on **decoded** samples, not flags. Rewrite (b), below, makes the VUI true, which is right whichever way a client treats it. Whether Windows App honours the VUI is Leg B's colour A/B (§15); if it does not, look for a KVM or EDID fix, otherwise ship passthrough with documented contrast loss. A colour-correct re-encode is a later opt-in mode with its own CPU budget |
+| POC type 0 without `bitstream_restriction`. **Found** | Client decoders may hold frames | Rewrite (c), below, if Leg B's barcode stranding test shows Windows App holding frames (Plan A Task 9.1). Safe because §6.1 already refuses B-slices and non-increasing POC |
+| Encoder stops sending on a static screen. **Not found**: one tag every 33 ms whether the screen is static or moving | Some clients hold the last ~2 frames, so the last keystroke never appears | Cannot strand a keystroke on the ES3 at 30 fps; Leg B's barcode stranding test still runs for the POC row. `flv_idle_timeout` sits far above the 33 ms cadence |
+
+**The SPS rewrite (`video.sps_rewrite`) is required**, not conditional: the
+ES3's SPS as sent fails §6.1. It runs on the KVM side, on every SPS
+(sequence header or in-band), **before** anything parses or checks it;
+h264-reader parses only its output, and the rewritten SPS is what is
+admitted, classified, cached and sent to IronRDP (§6.1, §6.3). `kvm-proto`
+reads the input with its own bounded bit reader (h264-reader refuses it), and
+Plan B builds the rewriter (§12).
+
+- (a) `"level"`: `level_idc` is raised to the lowest level whose MaxFS and
+  MaxMBPS (H.264 Table A-1) admit the coded size at `video.max_fps`, and never
+  lowered — **31 → 40** for the ES3's 1080p30 (MaxFS 8192 ≥ 8160 MBs; MaxMBPS
+  245 760 ≥ 8160 × 30 = 244 800; 60 fps would need 4.2). `level_idc` is the
+  SPS's third payload byte, before any Exp-Golomb field, so on its own this is
+  a one-byte patch with no emulation-prevention change.
+- (b) `"vui"`: `video_full_range_flag` 0 and colour description **1/1/1**
+  (BT.709 primaries, transfer characteristics and matrix), with
+  `video_signal_type_present_flag` and `colour_description_present_flag` set
+  — what the pixels measure. These fields come after Exp-Golomb fields, so
+  this is a bit-level re-serialisation of the SPS with emulation prevention
+  re-applied.
+- (c) `"restriction"` (*census*, Leg B): add `max_num_reorder_frames = 0` and
+  `max_dec_frame_buffering = max(num_ref_frames, 1)` — the same
+  re-serialisation, so it costs nothing extra.
+
+An SPS the rewriter cannot read (it reads only what §6.1 admits), or whose
+output h264-reader does not parse back to the input's fields apart from the
+rewritten ones, is `stream_incompatible` (§6.9). There is no pass-through:
+without the rewrite the ES3's stream cannot be admitted at all.
 
 ### 6.9 Upstream failure taxonomy and disconnects
 
 | Class | Events | Response |
 |---|---|---|
-| Transient (FLV) | connect refused or timeout; FLV EOF; end of sequence; HTTP 5xx; FLV open but silent for `flv_idle_timeout` | Reconnect with `kvm.backoff`, keep the last picture; the new FLV's `FlvOpened` puts the pump in NeedIdr for its first IDR (§6.4) |
+| Transient (FLV) | connect refused or timeout; FLV EOF (including a KVM preset change, §6.4); end of sequence; HTTP 5xx; FLV open but silent for `flv_idle_timeout` | Reconnect with `kvm.backoff`, keep the last picture; the new FLV's `FlvOpened` puts the pump in NeedIdr for its first IDR (§6.4) |
 | Transient (websocket) | websocket close or oversize message; a write exceeding `hid_write_timeout` | Reconnect with `kvm.backoff`; the session-start sequence; no NeedIdr |
-| Auth | login rejected; HTTP 401/403 or `result: 403` on FLV/WS | Re-login once. A second consecutive failure, with no successful re-login in between, is fatal: `kvm_auth_failed` |
+| Auth | login rejected; HTTP 401/403 or `result: 403` on FLV/WS — e.g. after any session's logout, which is global (§3.2). Side FLVs are excluded (§6.5) | Re-login once (the only time the bridge logs in again within a session, §5.1). A second consecutive failure, with no successful re-login in between, is fatal: `kvm_auth_failed` |
 | Certificate | SPKI mismatch | Fatal immediately, no login sent: `kvm_cert_mismatch` |
-| Stream-incompatible | HEVC; B-frames; outside §6.1 limits; a pinned field changes; a slice/PPS check fails | Fatal immediately: `stream_incompatible` |
-| Framing violation | bad header, encrypted tag, `StreamID ≠ 0`, bad `PrevTagSize`, oversize tag, start code in a NAL, NAL limits, NALU before any sequence header | Transient (FLV reconnect, `parse_errors{kind}`); three within 60 s is fatal: `stream_corrupt` |
+| Stream-incompatible | HEVC; B-frames (including a `CompositionTime` change); outside §6.1 limits; a pinned field changes; a slice/PPS check fails; an SPS the rewriter cannot read or verify (§6.8) | Fatal immediately: `stream_incompatible` |
+| Framing violation | bad header, encrypted tag, `StreamID ≠ 0`, bad `PrevTagSize`, oversize tag, start code in a NAL, NAL limits, NALU before any sequence header, a tag that is not one picture (§6.2) | Transient (FLV reconnect, `parse_errors{kind}`); three within 60 s is fatal: `stream_corrupt` |
 | Deadline | No successful login within `upstream_deadline` of `on_connection_info`; or no FLV tag within `upstream_deadline` of the first FLV open, or since the FLV connection was lost, despite reconnecting | Fatal: `kvm_unreachable` |
 
 Paused, NeedIdr and `WaitReactivation` never count toward the
@@ -623,7 +778,7 @@ EGFX sends, then sends `Disconnect(ErrorInfo)` through
 `on_disconnected` has not fired when the watchdog expires, the bridge
 releases all keys, sends `Stop{gen}` to the KVM side anyway, and aborts the
 connection (§4.2 patch 4) — so a client that has stopped reading cannot hold
-the session or the KVM login open.
+the session or the KVM connections open.
 
 Codes are explicit server-initiated ErrorInfo values (MS-RDPBCGR 2.2.5.1.1),
 so the client does not auto-reconnect into a loop; the log line names the
@@ -693,11 +848,13 @@ for each and revises the table if needed (e.g. `0x19` SERVER_SHUTDOWN may suit
 
 RDP gives the server no focus-loss signal. **Release-all** — for every trigger
 — resets the handler's state to nothing pressed and sends an all-zero keyboard
-report and a zero-button mouse report. Keys and buttons that were held at that
-moment are marked *released-by-bridge*: further `Pressed` events for them
-(typematic repeats) are ignored until the client sends their `Released`, after
-which they behave normally. So a release never turns into a down-up-down
-glitch, and a reconnect never re-presses anything. Mouse position is kept.
+report and a zero-button mouse report at the last position sent (none if no
+position has been sent yet; never (0, 0), §3.3). Keys and buttons that were
+held at that moment are marked *released-by-bridge*: further `Pressed`
+events for them (typematic repeats) are ignored until the client sends their
+`Released`, after which they behave normally. So a release never turns into
+a down-up-down glitch, and a reconnect never re-presses anything. Mouse
+position is kept.
 
 Triggers:
 
@@ -735,6 +892,10 @@ One way only, laptop → Mac.
 **Report sequence.** Each character is one press report and one all-zero
 release report; a shifted character carries Shift in the press report's
 modifier byte. `paste.pace` separates every report (so ~30 ms per character).
+`paste.pace` is provisional: in Leg A an 842-character URL sent at one report
+per 20 ms took ~60–90 s to land in Edge's address bar (the omnibox's
+per-keystroke work is mixed in), so Plan C measures the KVM's own HID report
+rate (L4) before the pace is fixed (`census.md`, Derived decisions).
 
 While typing:
 
@@ -810,7 +971,7 @@ pasted text are never logged (§4.5). Secrets come only from files (§4.4).
 | Anyone who can reach the KVM types into the Mac (port 8888 is the CVE port) | WAN egress blocked; isolation (§9.4) | Until isolation lands, the LAN, the tailnet, and every galaxy pod and hostNetwork process can reach :8888/:8889 |
 | Session hijack | Dex + gateway token + NLA (+ NetworkPolicy/firewall if enforced) | In-cluster attacker: NLA only. An in-cluster caller can occupy Preempt's single 10 s candidate slot, delaying a takeover by 10 s per attempt |
 | A client that stops reading pins the session | `Closing` + disconnect watchdog + hard abort (§6.9) | — |
-| Bridge crash with a key held | `panic = "abort"`; release on every orderly path | Depends on the KVM's behaviour on websocket loss (census) |
+| Bridge crash with a key held | `panic = "abort"`; release on every orderly path | Depends on the KVM's behaviour on websocket loss (Plan C L4, §12) |
 | Census capture leaks or attacks the dev host | Sandbox (§12) | — |
 
 ### 9.4 Requirements on the companion spec
@@ -918,14 +1079,17 @@ memory on the same schedule — p50 and p99 of each, never subtracted.
   phone camera next to the Windows App window; ≥ 20 samples. **p50 ≤ the
   vendor WebRTC baseline + 30 ms direct, + 50 ms through rdpgw.**
 - Picture after connect, reconnect, resize or re-advertise within **N (§6.5),
-  ≤ 3 s**, for the census-chosen policy.
-- Tune the KVM's presets (pinning 1920×1080 is expected; the Mac may otherwise
-  drive 4K at level 5.1). Each result is recorded as pass or fail.
+  ≤ 3 s** — 1.8 s for the `side` policy Leg A chose.
+- The KVM preset is pinned to 1920×1080 at 30 fps (§6.1): not auto (the Mac
+  may otherwise drive 4K at level 5.1), not 60 fps (level 4.2, twice the
+  bitrate). Each result is recorded as pass or fail.
 
 ### 10.4 Metrics
 
 FLV bytes and tags; frames by type; frame bytes; inter-arrival; fps; parse
-errors by kind; upstream reconnects by reason; frames dropped by reason (soft
+errors by kind; upstream reconnects by reason; IDR requests by policy (side
+requests, side failures by kind, side fallbacks); SPS rewrites by field;
+re-logins; frames dropped by reason (soft
 gate, backlog gate, standing delay, backpressure, `send_avc420_frame` =
 `None`, awaiting IDR, not ready, channel full, Paused, `WaitReactivation`,
 burst truncated, Closing); enqueue latency; oldest-unacked age; EGFX
@@ -957,8 +1121,8 @@ frame (`alloc-stats` builds).
 
 | Tier | Where | What |
 |---|---|---|
-| L0 unit | `kvm-proto` | Goldens (HID encoders, scancode table, AVCC→Annex-B, SPS fields); SPS rewriter output goldens plus pass-through goldens for (a) `bitstream_restriction` already present, (b) a parse anomaly → SPS byte-identical to input; FLV mux→demux round-trip property tests; parse of a committed ffmpeg-muxed FLV; burst marking; mouse scaling at the edges; **one hostile vector per §6.1/§6.2 rule, each asserting its specific error kind**; SPS-change classification per §6.1's table; a pre-buffer test (`DataSize = 0xFFFFFF` rejected after ≤ 11 bytes, nothing reserved); sans-IO cores with injected clock (release epoch and released-by-bridge rule, both key timers including two keys held with repeats of the second only → no release, backoff, paste pacing and text handling, debounce) |
-| L0 fuzz | `fuzz/` | FLV demux, AVCC, sanitiser, SPS/PPS/slice checks, SPS rewriter, login response; a differential mux→demux target. Output invariants in every target: emitted NAL types ∈ {1,5,7,8,9}; no emitted NAL contains `00 00 0[0-2]`; re-splitting the Annex-B yields exactly the emitted NALs; any emitted SPS is byte-identical to the last admitted (after rewrite) SPS and its pinned fields equal the first SPS's. Rewriter: the output re-parses with every field equal to the input except `max_num_reorder_frames`, `max_dec_frame_buffering` and `bitstream_restriction_flag`. 5 s per target per PR, longer nightly. CI-only |
+| L0 unit | `kvm-proto` | Goldens (HID encoders, scancode table, AVCC→Annex-B, SPS fields); SPS rewriter goldens: the ES3's SPS (`census.md` `sps_hex`) → `level_idc` 40 and VUI full-range 0, colour 1/1/1, emulation prevention re-applied, and the output accepted by h264-reader; a level that already admits the size is never lowered; an SPS already labelled BT.709 limited and at an adequate level is byte-identical; a re-serialisation that produces `00 00 0[0-3]` gains an emulation-prevention byte; with `"restriction"`, `bitstream_restriction` already present is kept; an unreadable SPS → `stream_incompatible`; `CompositionTime` constant (16) is admitted and a change refused; FLV mux→demux round-trip property tests; parse of a committed ffmpeg-muxed FLV; burst marking; mouse scaling at the edges; **one hostile vector per §6.1/§6.2 rule, each asserting its specific error kind**; SPS-change classification per §6.1's table; a pre-buffer test (`DataSize = 0xFFFFFF` rejected after ≤ 11 bytes, nothing reserved); sans-IO cores with injected clock (release epoch and released-by-bridge rule, both key timers including two keys held with repeats of the second only → no release, backoff, paste pacing and text handling, debounce) |
+| L0 fuzz | `fuzz/` | FLV demux, AVCC, sanitiser, SPS/PPS/slice checks, SPS rewriter, login response; a differential mux→demux target. Output invariants in every target: emitted NAL types ∈ {1,5,7,8,9}; no emitted NAL contains `00 00 0[0-2]`; re-splitting the Annex-B yields exactly the emitted NALs; any emitted SPS is byte-identical to the last admitted (after rewrite) SPS and its pinned fields equal the first SPS's. Rewriter: the output re-parses with every field equal to the input except `level_idc` (never lower than the input's), the VUI's video-signal-type and colour-description fields, and, with `"restriction"`, `max_num_reorder_frames`, `max_dec_frame_buffering` and `bitstream_restriction_flag`. 5 s per target per PR, longer nightly. CI-only |
 | L1 sans-IO | `kvm-rdp` | `Pump::step` and `GraphicsPipelineServer` ↔ `GraphicsPipelineClient` in memory (cases below). IronRDP goldens: `encode_avc420_bitmap_stream(full_frame(640,360,22))` bytes and the ResetGraphics monitor bytes — required on every pin bump |
 | L2 full stack | `kvm-rdp` (one test binary) | Bridge + kvm-sim + in-process IronRDP client over loopback (§11.3) |
 | L3 interop | CI, `#[ignore]` test | FreeRDP 3 from the flake (§11.4) |
@@ -977,17 +1141,23 @@ L1 cases:
   ResetGraphics (w, h, one monitor), CreateSurface, MapSurfaceToOutput,
   StartFrame, WireToSurface1 (IDR with SPS/PPS), EndFrame — no DeleteSurface,
   no P-frame before the IDR.
-- `reconnect` policy: connecting costs exactly one FLV open (the first Setup's
-  `OpenFlv`; no `ReconnectFlv`); a later Setup → `ReconnectFlv`, first AU sent
-  is an IDR; an `FlvOpened` never commands a reconnect; two Setup causes 300 ms
-  apart → exactly two `ReconnectFlv`, the second deferred to the window's end;
-  a deferred `ReconnectFlv` whose NeedIdr is resolved by an IDR inside the
-  window → zero further `ReconnectFlv`; a transient reconnect clears
-  `reopen_pending` and restarts both clocks; a flow cause → nothing until a
-  live IDR, and `ReconnectFlv` only after cumulative open-gate time reaches
-  `idr_wait_max`; an IDR dropped at a closed gate counts as a flow cause.
-  `wait` policy: nothing until the next live IDR; no `ReconnectFlv` after the
-  first open.
+- Every policy: connecting costs exactly one FLV open (the first Setup's
+  `OpenFlv`; no `RequestIdr`, no `ReconnectFlv`); an `FlvOpened` never
+  requests an IDR; a transient reconnect clears `idr_pending` and restarts
+  both clocks; a flow cause → nothing until a live IDR, and a request only
+  after cumulative open-gate time reaches `idr_wait_max`; an IDR dropped at a
+  closed gate counts as a flow cause.
+  `side` policy: a later Setup → `RequestIdr` (no `ReconnectFlv`, no
+  `FlvOpened`), and the first AU sent after it is an IDR from the main
+  stream; two Setup causes 300 ms apart → exactly two `RequestIdr`, the second
+  deferred to the window's end; a deferred request whose NeedIdr is resolved
+  by an IDR inside the window → `CancelIdrRequest`, zero further requests; no
+  IDR within `idr_side_timeout` of a `RequestIdr` → exactly one
+  `ReconnectFlv`, at the window's end.
+  `reconnect` policy: the same cases with `ReconnectFlv` in place of
+  `RequestIdr`, and no side fallback.
+  `wait` policy: nothing until the next live IDR; no request after the first
+  open.
 - `SpsChanged`: `initial` at the current size raises no NeedIdr; `initial` at a
   different size (including a reconnect after a mode change) starts a resize;
   `other` is a flow cause and never commands a reconnect.
@@ -1040,8 +1210,9 @@ time is budgeted for the harness itself. The video cases run once per
   frames, and kvm-sim records **zero new TCP accepts on all its ports**. A raw
   TCP connect sending garbage → zero kvm-sim accepts.
 - **Preemption**: kvm-sim sees exactly release-all → websocket close → FLV
-  close → logout (with the token cookie) → login → websocket open →
-  session-start sequence, never two concurrent websockets; the evicted client
+  close → login → websocket open → session-start sequence (its pointer report
+  at the evicted session's last position, §3.3), **no logout request**, and
+  never two concurrent websockets; the evicted client
   gets `ERRINFO_DISCONNECTED_BY_OTHERCONNECTION`. A retake from the same source
   address within 5 s of an eviction is refused and the live session is
   unaffected.
@@ -1054,18 +1225,30 @@ time is budgeted for the harness itself. The video cases run once per
   the default surface, then DeactivateAll and a 640×360 surface before any KVM
   frame, login count 1 throughout; a reconnect sends no Resize; after
   disconnect kvm-sim's open-connection gauge reaches 0; a client with no
-  decoder → `no_avc420` (0x7).
-- **Resolution change**, injected both as a new sequence header and as an
-  in-band SPS (using the second-resolution fixture): DeactivateAll; ResetGraphics
-  and CreateSurface at the new size; first KVM AU after is an IDR with the new
-  SPS; no EGFX PDU between DeactivateAll and the reactivated Demand Active;
+  decoder → `no_avc420` (0x7). In every L2 case kvm-sim records zero logout
+  requests.
+- **Side IDR** (kvm-sim's shared-encoder mode, `side` policy): a re-advertise
+  → kvm-sim sees one extra FLV connection, closed by the bridge after its
+  first tag; the main FLV never closes; the first KVM AU after the
+  re-advertise is the main FLV's forced IDR; with side connections refused,
+  exactly one make-before-break `ReconnectFlv` after `idr_side_timeout`, and
+  no re-login.
+- **Resolution change**, injected as a new sequence header, as an in-band
+  SPS, and as an FLV close followed by a new FLV at the new size (the ES3's
+  observed behaviour, §6.4), using the second-resolution fixture:
+  DeactivateAll; ResetGraphics and CreateSurface at the new size; first KVM
+  AU after is an IDR with the new SPS; no EGFX PDU between DeactivateAll and
+  the reactivated Demand Active;
   login count unchanged; a second resize in the same session works.
 - **Faults**, each asserted against its §6.9 class and ErrorInfo: oversize tag,
-  bad `PrevTagSize`, encrypted tag, HEVC codec id, nonzero CompositionTime,
+  bad `PrevTagSize`, encrypted tag, HEVC codec id, a `CompositionTime` change
+  within a stream (a constant 16 ms is admitted), a tag holding two pictures,
   B-slice, start code inside a NAL, NALU before sequence header, end of
   sequence, FLV drop, FLV silent past `flv_idle_timeout` (reconnect, no
   disconnect), token expiry twice in one session with a successful re-login
-  between (no disconnect), a second consecutive auth failure (fatal), websocket
+  between (no disconnect), another session's logout while streaming (kvm-sim
+  invalidates every token: the open FLV continues, the next reopen re-logs in
+  once, no disconnect), a second consecutive auth failure (fatal), websocket
   drop (reconnect + session-start, no NeedIdr), a 64 MiB websocket message
   (closed at the 4 KiB limit without buffering, reconnect, RSS bounded), KVM
   unreachable (disconnect at the deadline), wrong KVM certificate (no login
@@ -1075,12 +1258,16 @@ time is budgeted for the harness itself. The video cases run once per
   > 0) its sent-frame counter does not advance again before Closing,
   `egfx_in_flight` ≤ hard throughout, and the session closes with
   `client_stalled`; a client that **stops reading** → the session still ends
-  (Closing + watchdog + abort) and kvm-sim sees the logout; a client that
+  (Closing + watchdog + abort) and kvm-sim sees the websocket and FLV close
+  (and no logout); a client that
   suspends acks but keeps reading is never disconnected.
 - **Input**: every input event → byte-exact HID frames; a full queue resyncs to
   the correct final state; a blocked websocket write reconnects; with reports
   queued behind a blocked write, a release trigger produces only the zero
-  reports and then current state — no queued report is sent after it.
+  reports and then current state — no queued report is sent after it; a
+  websocket reopen's session-start sequence carries the pointer report at the
+  last position sent, and none before the client's first pointer event — never
+  (0, 0) unless the client put the pointer there.
 - **Stuck keys**: every §7.4 trigger releases all; a key held across a release
   is not re-pressed by later repeats until its `Released`; typematic repeats at
   0.2× the timeout for 2× the timeout → no release; no repeats → release; two
@@ -1127,8 +1314,17 @@ questions belong to L5.
 
 - kvm-sim serves login, logout, FLV (muxed live by `kvm-proto`'s muxer,
   controlling length-prefix size 1/2/4, pacing, bursts and faults) and the
-  websocket (recording every HID frame), over TLS with a test certificate the
-  test config pins.
+  websocket (recording every HID frame), over TLS with one test certificate
+  on all its ports, which the test config pins.
+- Its default profile is the ES3's (`census.md`, Artifacts — parameter sets
+  only, never frame data): AVCC length size 4, 30 fps, GOP 60, no burst on
+  connect, tag = AU, `CompositionTime` 16 ms; a **shared encoder** — every
+  new FLV connection forces an IDR into every open FLV and restarts the GOP;
+  concurrent logins coexist and **logout is global** (it invalidates every
+  token; open FLVs continue). It counts logout requests so tests can assert
+  there are none. The ES3's SPS/PPS bytes (`sps_hex`, `pps_hex`) are L0
+  rewriter goldens, not kvm-sim streams: they do not match any fixture's
+  slices.
 - Fixtures: ≤ 9 small Annex-B streams (≤ 0.5 MB each), generated by
   `scripts/gen-fixtures.sh` with the flake's pinned ffmpeg/x264 and committed:
   - full-range BT.709, baseline and main profile (360p);
@@ -1162,6 +1358,11 @@ questions belong to L5.
   bridge's network identity with the bridge scaled to 0, or on the dedicated
   host with the bridge service stopped (§9.4). L5 "direct" becomes a
   `kubectl port-forward` or an SSH local forward to the bridge.
+- Plan C's L4 also carries what Leg A handed on (§12, §15): the Mac's
+  behaviour when the websocket dies with a key held, side request → main-FLV
+  IDR latency over 20 trials, two concurrent FLVs on one token, how a preset
+  change is signalled, how long an abandoned token stays valid, and the KVM's
+  HID report rate.
 - L5 checklist (pass/fail, recorded): key matrix; Mac remap profile; paste
   (including newline handling); reconnect and a takeover of a stale session;
   resize; display sleep/wake; each fatal cause's dialog (no auto-reconnect);
@@ -1175,6 +1376,21 @@ the unhardened subset of `kvm-proto` it needs (FLV tag reader, AVCC→NAL split,
 NAL header, SPS/slice inspection via h264-reader, login parsing),
 `gen-fixtures.sh`, `kvm-probe`, and opening the upstream IronRDP PR (§4.2).
 Milestone 1 hardens these parsers rather than writing them.
+
+**Status (rev 5.1).** **Leg A is done** (2026-10-06, two sessions; results
+in `docs/census.md`, applied by rev 5.1), and both census gates pass on its
+numbers. Recorded deviations from the Leg A list below: the pin is recorded
+by the `kvm-probe fingerprint` subcommand, not `--print-fingerprint`; what
+the Mac sees when the websocket dies with a key held moved to Plan C's L4
+(it needs HID input, which the probe never sends); "every open TCP port"
+became the KVM's documented service ports; "HID round trip" became
+control-websocket open latency (`kvm-probe ws-open`); only the 1920×1080 /
+30 fps preset was measured — auto and 60 fps deliberately not, since the
+preset is pinned (§6.1). Left open by Leg A: the firmware version (no
+`Server` header; it is read from the UI's about page), and resolution-change
+signalling rests on one tentative observation (§6.4). **Legs B and C are
+pending**; Plan A's Task 9.1 still completes the census revision and records
+the Milestone 0 verdict.
 
 - **Leg A — census** (`kvm-probe`):
   - Logs in, saves raw FLV, and writes one JSONL line per tag: receive time,
@@ -1228,7 +1444,8 @@ Milestone 1 hardens these parsers rather than writing them.
   Milestone 1.
 - **Census gates**: max burst length ≤ the resulting hard cap and ≤ the
   KVM→pump channel capacity; N ≤ 3 s for the chosen policy (§6.5; for
-  `reconnect`, reconnect→first-IDR p95 ≤ 1.5 s).
+  `reconnect`, reconnect→first-IDR p95 ≤ 1.5 s). Both pass on Leg A: burst
+  0; p95 300 ms (https), N = 1.8 s.
 - **Output**: a committed `census.md` with derived parameters only (no screen
   content); the kvm-sim profile; the capability and key-matrix fixtures; the
   decisions for §3.2's scheme, §6.1's pinned values, §6.5's policy and N,
@@ -1245,7 +1462,7 @@ before `census.md` is committed):
 | Plan | Covers |
 |---|---|
 | A | Milestone 0 (with the `kvm-proto` subset, fixtures, `kvm-probe`, spikes, the upstream PR) → `census.md` + spec revision |
-| B | M1 + M2, including the AU assembler, SPS rewriter and a GOP cache only if `census.md` requires them |
+| B | M1 + M2, including the SPS rewriter — required: level patch and VUI re-serialisation, plus `bitstream_restriction` if Leg B needs it (§6.8) — and kvm-sim's ES3 profile. No AU assembler and no GOP cache: Leg A needs neither (§6.2, §6.5) |
 | C | M3a: config, logging, admin endpoints, metrics, shutdown, lifecycle, NLA, EGFX pump and state machine, the websocket, the HID writer skeleton and release epoch, L1 and video/lifecycle L2. Requires the upstream patches (§4.2) or their fallbacks |
 | D | M3b + M4: keyboard and mouse mapping, stuck-key timers and the released-by-bridge rule, the Typist, and their L2 cases |
 | E | M5 + M6: L3, CI, image, perf pass |
@@ -1285,18 +1502,45 @@ The host is shared and loaded (16 cores, ~12 GiB free RAM, 143 GB free disk at
 | An RDP server (macrdp) on the Mac itself | Installing a remote-access server on the managed Mac is what IT disabled Screen Sharing to prevent |
 | crates.io IronRDP 0.13 | §4.2 |
 | Re-encode fallback in v1 | No clean decline path; a C decoder on hostile input; breaks the CPU target |
-| Bridge-side GOP cache in v1 | Interacts with every gate and cap; `reconnect`/`wait` plus source bursts may suffice — designed only if the census says otherwise |
+| Bridge-side GOP cache in v1 | Interacts with every gate and cap, and Leg A makes it unnecessary: any new FLV connection forces an IDR from the ES3's shared encoder (p95 300 ms) and nothing is replayed on connect (§6.5) |
 | Frame-count soft gate from measured fps | Stalls on idle → motion transitions; the oldest-unacked-age gate does not depend on frame rate |
 | RTT auto-detect as the only suspension bound | It is timestamped when written, so it cannot see the server-side queue; kept only as the downstream standing-delay signal |
 | Go or TypeScript RDP server | None exists server-side (`grdp`, `gopher-rdp` are client-only; `node-rdpjs` abandoned) |
 
 ## 15. Open questions
 
-Settled by Milestone 0: every *(census)* item; Windows App's capability ladder,
-ack-suspension, auto-detect, typematic and ErrorInfo behaviour; whether stock
-IronRDP HEAD completes NLA + AVC420 with Windows App, directly and through
-rdpgw; colour; presentation hold; the IDR policy and N; the Mac remap; the KVM
-transport scheme.
+Settled by Leg A (rev 5.1, `census.md`): the KVM transport scheme (`https`,
+one pin for all ports); session semantics (logout is global, so the bridge
+never logs out); the stream's parameters and the 1080p30 preset pin; tag =
+AU; burst on connect (0); static-screen cadence (no skipped frames); the IDR
+policy (`side`, fallback `reconnect`) and N (1.8 s); the pixels' range and
+matrix (limited BT.709) and the VUI's mislabel; the level mislabel.
+
+Still to be settled by Legs B and C (Task 9.1): Windows App's capability
+ladder, ack-suspension, auto-detect, typematic and ErrorInfo behaviour;
+whether stock IronRDP HEAD completes NLA + AVC420 with Windows App, directly
+and through rdpgw; presentation hold (and with it the `"restriction"`
+rewrite); the Mac remap; `first_ack_grace`, `flv_idle_timeout` and §7.4's
+timeouts. New from Leg A:
+
+- **Does Windows App decode the ES3's Baseline stream with
+  `constraint_set1_flag` 0** (constrained Baseline not signalled; Leg A saw
+  one slice group and no ASO)? If not, the rewrite also sets it. And does it
+  decode the stream as labelled (level 3.1), or only with the rewritten 40?
+  The level rewrite is required either way (§6.8).
+- **Does Windows App honour the VUI?** Leg B's colour A/B decides whether the
+  corrected VUI (§6.8) fixes colour or the AVC420 fixed conversion leaves the
+  contrast loss in place.
+
+Open for Plan C's L4 (§11.6): what the Mac sees when the websocket dies with
+a key held (moved from Leg A); side request → main-FLV IDR latency over 20
+trials (Leg A saw it once) and whether the ES3 accepts two concurrent FLVs on
+one token (Leg A's a/b test used two logins); how a preset change is
+signalled (Leg A: n = 1, tentative); how long an abandoned token stays valid
+and whether the ES3 caps concurrent sessions (the bridge never logs out, so
+every RDP connection leaves one token to lapse); the KVM's HID report rate
+before `paste.pace` is fixed (§8). Still to be recorded in `census.md`: the
+firmware version (from the UI's about page).
 
 Watched: the upstream IronRDP PR (§4.2); IronRDP API churn and an upstream
 SVC/DVC reassembly cap (monthly pin review); FLV source latency — if SRS
