@@ -10,10 +10,12 @@
 )]
 
 mod avc;
+mod burst;
 mod demux;
 mod header;
 mod reader;
 
 pub use avc::{AvcConfig, FrameType, Nal, VideoBody};
+pub use burst::BurstMarker;
 pub use demux::{FlvDemuxer, FlvTag, TagBody};
 pub use header::{FlvError, FlvHeader, FlvLimits};
