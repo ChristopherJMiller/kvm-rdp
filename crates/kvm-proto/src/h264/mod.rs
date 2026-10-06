@@ -7,6 +7,8 @@ pub use annexb::{AvccError, avcc_to_annex_b};
 mod nal;
 pub use nal::{NalHeader, NalHeaderError};
 pub use nal::{is_aud, is_idr, is_parameter_set, is_vcl, nal_type_allowed};
+mod sps;
+pub use sps::{SpsParseError, SpsSummary, SpsSummaryError, parse_sps};
 
 #[cfg(test)]
 pub(crate) mod test_support;
