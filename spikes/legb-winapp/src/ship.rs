@@ -52,9 +52,24 @@ pub async fn run_ship(
     }
 
     let epoch = Instant::now();
-    let frame_dt = Duration::from_millis(1000 / 30); // fixture cadence (30 fps)
+    // Absolute pacing clock (tokio's, so `sleep_until` can target it
+    // directly) — kept separate from `epoch` above, which stamps the
+    // wire-visible AU timestamp and has no reason to share a clock type
+    // with the scheduler.
+    let sched_epoch = tokio::time::Instant::now();
+    // Exact 30fps (matches the fixtures' real `rate=30` encode,
+    // scripts/gen-fixtures.sh), not `Duration::from_millis(1000 / 30)`
+    // (33ms, truncated from 33.33ms — drifts low over a long run).
+    let frame_dt = Duration::from_secs_f64(1.0 / 30.0);
     let mut stranded = false;
     let mut rtt_tick = Instant::now();
+    // Frame index into the absolute schedule `sched_epoch + frame_idx *
+    // frame_dt` (minor fix): ticks every loop iteration regardless of
+    // `stranded`, so pacing tracks wall-clock time instead of accumulating
+    // drift from per-iteration `sleep(frame_dt)` calls that each start
+    // after a variable amount of per-frame work, and so resuming from a
+    // STRAND never sends a catch-up burst.
+    let mut frame_idx: u32 = 0;
 
     loop {
         for au in &aus {
@@ -90,11 +105,22 @@ pub async fn run_ship(
             if rtt_tick.elapsed() >= Duration::from_millis(250) {
                 let _ = sender.send(ServerEvent::AutoDetectRttRequest);
                 let rtt = rtt_handle.load(Ordering::Relaxed);
-                tracing::info!(
-                    rtt_ms = rtt,
-                    autodetect_answered = (rtt != u32::MAX),
-                    "LEGB_AUTODETECT probe"
-                );
+                let answered = rtt != u32::MAX;
+                // I2: `rtt_ms` is only meaningful when the client actually
+                // answered — the `u32::MAX` sentinel is not a millisecond
+                // value, so it must never appear under a field literally
+                // named `rtt_ms` (a naive downstream aggregation that
+                // forgets to filter on `autodetect_answered` would average
+                // in 4294967295).
+                if answered {
+                    tracing::info!(
+                        rtt_ms = rtt,
+                        autodetect_answered = true,
+                        "LEGB_AUTODETECT probe"
+                    );
+                } else {
+                    tracing::info!(autodetect_answered = false, "LEGB_AUTODETECT probe");
+                }
                 rtt_tick = Instant::now();
             }
 
@@ -103,7 +129,9 @@ pub async fn run_ship(
                     tracing::error!(error = %e, "LEGB_SHIP: ship failed");
                 }
             }
-            tokio::time::sleep(frame_dt).await;
+
+            frame_idx += 1;
+            tokio::time::sleep_until(sched_epoch + frame_dt * frame_idx).await;
         }
     }
 }

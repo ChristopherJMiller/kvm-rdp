@@ -28,8 +28,15 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,legb_winapp=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // `ironrdp_egfx=debug` surfaces IronRDP's own FrameAcknowledge
+                // log (ironrdp-egfx/src/server.rs:2118-2130), which carries
+                // `latency_us` computed from the library's own internal
+                // `sent_at` Instant — a more precise ack-latency figure than
+                // reconstructing it by correlating LEGB_SHIP/LEGB_ACK
+                // timestamps by frame_id (I1).
+                tracing_subscriber::EnvFilter::new("info,legb_winapp=debug,ironrdp_egfx=debug")
+            }),
         )
         .init();
 

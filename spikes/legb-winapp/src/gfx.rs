@@ -118,18 +118,31 @@ impl GraphicsPipelineHandler for SpikeHandler {
     }
 
     fn on_ready(&mut self, negotiated: &CapabilitySet) {
+        // C1 fix: do NOT lock `c.handle` in here. IronRDP invokes this
+        // callback synchronously while it already holds that exact
+        // GfxServerHandle mutex (GfxDvcBridge::process ->
+        // GraphicsPipelineServer::process -> handle_capabilities_advertise ->
+        // self.handler.on_ready — ironrdp-egfx/src/server.rs:2065,2107,
+        // ironrdp-server/src/gfx.rs:76-81), all on one thread, under one
+        // MutexGuard that only drops when `on_ready` returns. A second
+        // `.lock()` here on that same, non-reentrant std::sync::Mutex
+        // self-deadlocks on the very first successful negotiation — and
+        // since the `ctx` lock is held across this whole block too,
+        // `Gfx::snapshot()` (polled by `run_ship`'s readiness wait) wedges
+        // right along with it. `avc` below is already authoritative:
+        // `caps_indicate_avc` mirrors IronRDP's own
+        // `CodecCapabilities::from_capability_set` exactly (see its doc
+        // comment), so it agrees with what `supports_avc420()` would report
+        // without re-entering the handle.
         let avc = caps_indicate_avc(negotiated);
         if let Some(c) = self.ctx.lock().expect("ctx mutex").as_mut() {
             c.ready = true;
             c.avc420 = avc;
             c.ready_count += 1;
             let is_readvertise = c.ready_count > 1;
-            // Confirm against the server's own view too.
-            let server_avc = c.handle.lock().expect("gfx handle").supports_avc420();
             tracing::info!(
                 confirmed = ?negotiated,
                 confirmed_has_avc = avc,
-                server_supports_avc420 = server_avc,
                 ready_count = c.ready_count,
                 re_advertise = is_readvertise,
                 "LEGB_READY on_ready (negotiated/confirmed capability set)"
@@ -204,20 +217,30 @@ impl GraphicsPipelineHandler for SpikeHandler {
     }
 }
 
-/// Positive AVC420 signal only (mirrors macrdp's verified `caps_indicate_avc`).
+/// AVC420 signal, kept byte-for-byte in agreement with IronRDP's own
+/// `CodecCapabilities::from_capability_set`'s `avc420` field
+/// (ironrdp-egfx/src/server.rs:730-779 at rev 38b074e). That function is
+/// private to the `ironrdp-egfx` crate, so this mirrors its match arms
+/// rather than calling it — in particular `V10_1` carries no flags at all,
+/// and the library treats negotiating that version as unconditionally
+/// AVC420/AVC444-capable (`avc420: true` there), NOT as "no signal" (C2:
+/// an earlier version of this function wrongly matched V10_1 to `false`,
+/// which would have silently stalled `run_ship`'s AVC420-ready wait on any
+/// negotiation that landed on V10_1).
 fn caps_indicate_avc(c: &CapabilitySet) -> bool {
     match c {
+        CapabilitySet::V8 { .. } => false,
         CapabilitySet::V8_1 { flags } => flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
         CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
             !flags.contains(CapabilitiesV10Flags::AVC_DISABLED)
         }
+        CapabilitySet::V10_1 => true,
         CapabilitySet::V10_3 { flags } => !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
         CapabilitySet::V10_4 { flags }
         | CapabilitySet::V10_5 { flags }
         | CapabilitySet::V10_6 { flags }
         | CapabilitySet::V10_6Err { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
         CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-        CapabilitySet::V8 { .. } | CapabilitySet::V10_1 => false,
     }
 }
 
@@ -227,4 +250,197 @@ fn hex(bytes: &[u8]) -> String {
         s.push_str(&format!("{b:02x}"));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use super::*;
+
+    /// Every variant of `caps_indicate_avc`, cross-checked by hand against
+    /// IronRDP's own `CodecCapabilities::from_capability_set` avc420 field
+    /// (ironrdp-egfx/src/server.rs:730-779 at 38b074e) — the regression
+    /// target for C2 (V10_1 must be `true`, not `false`).
+    #[test]
+    fn caps_indicate_avc_matches_ironrdp_codec_capabilities_for_every_version() {
+        let cases: &[(CapabilitySet, bool)] = &[
+            (
+                CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::empty(),
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V8 {
+                    flags: CapabilitiesV8Flags::SMALL_CACHE,
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V8_1 {
+                    flags: CapabilitiesV81Flags::empty(),
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V8_1 {
+                    flags: CapabilitiesV81Flags::AVC420_ENABLED,
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10 {
+                    flags: CapabilitiesV10Flags::empty(),
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10 {
+                    flags: CapabilitiesV10Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (CapabilitySet::V10_1, true),
+            (
+                CapabilitySet::V10_2 {
+                    flags: CapabilitiesV10Flags::empty(),
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10_2 {
+                    flags: CapabilitiesV10Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V10_3 {
+                    flags: CapabilitiesV103Flags::empty(),
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10_3 {
+                    flags: CapabilitiesV103Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V10_4 {
+                    flags: CapabilitiesV104Flags::empty(),
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10_4 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V10_5 {
+                    flags: CapabilitiesV104Flags::empty(),
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10_5 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V10_6 {
+                    flags: CapabilitiesV104Flags::empty(),
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10_6 {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V10_6Err {
+                    flags: CapabilitiesV104Flags::empty(),
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10_6Err {
+                    flags: CapabilitiesV104Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::empty(),
+                },
+                true,
+            ),
+            (
+                CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+        ];
+        for (cap, want) in cases {
+            assert_eq!(
+                caps_indicate_avc(cap),
+                *want,
+                "caps_indicate_avc({cap:?}) must be {want}"
+            );
+        }
+    }
+
+    /// Regression test for C1: the real IronRDP call path invokes
+    /// `on_ready` while the caller already holds `handle`'s mutex
+    /// (GfxDvcBridge::process -> GraphicsPipelineServer::process ->
+    /// handle_capabilities_advertise -> handler.on_ready, all on one
+    /// thread, under one guard). Reproduce that precondition — hold the
+    /// lock here — then run `on_ready` on a second thread. A regression
+    /// that re-locks `handle` inside `on_ready` blocks that thread for as
+    /// long as this guard is held, so it never sends on `tx` in time and
+    /// the `recv_timeout` below fails instead of hanging the whole suite.
+    #[test]
+    fn on_ready_does_not_relock_the_already_held_server_handle() {
+        let inner_ctx = Arc::new(Mutex::new(None));
+        let handle: GfxServerHandle = Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(
+            SpikeHandler {
+                ctx: inner_ctx,
+                hard_cap: 5,
+            },
+        ))));
+        let ctx = Arc::new(Mutex::new(Some(SpikeCtx {
+            handle: handle.clone(),
+            ready: false,
+            avc420: false,
+            ready_count: 0,
+            surface_id: None,
+        })));
+        let mut handler = SpikeHandler { ctx, hard_cap: 5 };
+
+        let (tx, rx) = mpsc::channel();
+        let outcome = {
+            // Simulate the real call path: hold `handle`'s lock across the
+            // whole `on_ready` call, exactly as IronRDP's own event loop does.
+            let _guard = handle.lock().expect("gfx handle");
+            std::thread::spawn(move || {
+                handler.on_ready(&CapabilitySet::V10_1);
+                let _ = tx.send(());
+            });
+            rx.recv_timeout(Duration::from_secs(2))
+            // `_guard` drops here, after the recv attempt — releasing the
+            // lock too early would let a buggy re-lock succeed and mask C1.
+        };
+        assert!(
+            outcome.is_ok(),
+            "on_ready did not return while the caller held `handle`'s lock — \
+             it must not re-lock the server handle (C1)"
+        );
+    }
 }
