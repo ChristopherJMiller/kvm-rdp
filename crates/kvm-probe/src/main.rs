@@ -49,11 +49,14 @@ fn password(conn: &Conn) -> Result<String, String> {
     secret::read_password_file(&conn.password_file)
 }
 
-/// Log in on the web port, run `work` with the token, then log out with
-/// it — always, even if the work failed (final review m1,
-/// `kvm::with_session`). A failed login is this function's error; a
-/// failed logout is best effort: printed (escaped and bounded, never the
-/// token or device text beyond that) and otherwise ignored.
+/// Log in on the web port, run `work` with the token, then — only when
+/// `conn.logout` (`--logout`) is set — log out with it, even if the work
+/// failed (final review m1, `kvm::with_session`). Off by default: logout
+/// is global on this KVM (R21) and would end every other open session,
+/// including the vendor web UI. A failed login is this function's error;
+/// a failed logout (only possible with `--logout`) is best effort: printed
+/// (escaped and bounded, never the token or device text beyond that) and
+/// otherwise ignored.
 async fn session<T>(
     conn: &Conn,
     password: &str,
@@ -65,6 +68,7 @@ async fn session<T>(
         password,
         unix_now()?,
         kvm::PROBE_TIMEZONE,
+        conn.logout,
         work,
     )
     .await?;
@@ -82,8 +86,10 @@ fn unix_now() -> Result<i64, KvmError> {
 
 /// A failed logout is best effort (final review m1): one line, escaped and
 /// bounded (never the token or device text beyond that), then carry on.
-fn warn_if_logout_failed(logout: &Result<(), KvmError>) {
-    if let Err(e) = logout {
+/// `None` means logout was never attempted (the default: no `--logout`) —
+/// nothing to warn about.
+fn warn_if_logout_failed(logout: &Option<Result<(), KvmError>>) {
+    if let Some(Err(e)) = logout {
         eprintln!(
             "kvm-probe: logout failed (best effort, ignored): {}",
             kvm::bounded_debug(e)
@@ -191,8 +197,10 @@ async fn run(cli: Cli) -> Result<(), String> {
                 pause: Duration::from_secs(1),
             };
             // m1 (corrected): ONE login, every trial reopens av.flv on that
-            // token, ONE best-effort logout at the end. m7: a failed trial
-            // is printed with a bounded, escaped reason and the run goes on.
+            // token. R21: no logout by default (global on this KVM); with
+            // `--logout`, ONE best-effort logout at the end. m7: a failed
+            // trial is printed with a bounded, escaped reason and the run
+            // goes on.
             let s = trial::first_idr_run(
                 &target(&conn),
                 conn.pin_for(Port::Web),
@@ -200,6 +208,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 &pw,
                 unix_now().map_err(|e| format!("{e:?}"))?,
                 &plan,
+                conn.logout,
                 |n, line| println!("trial {n}/{trials}: {line}"),
             )
             .await

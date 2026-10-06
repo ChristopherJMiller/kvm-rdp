@@ -101,6 +101,14 @@ pub struct Conn {
     /// File holding the KVM password (never pass it on the command line).
     #[arg(long)]
     pub password_file: PathBuf,
+    /// Log out when the run ends. Off by default: on this KVM, logout is
+    /// global — one session logging out ends every other open session
+    /// too, including an operator's own vendor web UI session — so only
+    /// pass this when you know no one else could be using the KVM. With
+    /// it, logout is best effort and bounded, and a failed logout never
+    /// fails the run.
+    #[arg(long)]
+    pub logout: bool,
 }
 
 /// Which of the KVM's three services a connection goes to.
@@ -162,8 +170,9 @@ pub enum Cmd {
     },
     /// Capture av.flv to captures/<name> plus captures/<name>.jsonl.
     ///
-    /// Logs in, captures until --seconds or --max-mb, then logs out (best
-    /// effort). Each JSONL line also carries the hex of any SPS/PPS in the tag.
+    /// Logs in, captures until --seconds or --max-mb, then leaves the
+    /// session open unless --logout is given (logout is global on this
+    /// KVM). Each JSONL line also carries the hex of any SPS/PPS in the tag.
     Capture {
         #[command(flatten)]
         conn: Conn,
@@ -178,11 +187,12 @@ pub enum Cmd {
     ///
     /// Logs in once; every trial reopens av.flv with that one token (the
     /// bridge's reconnect-on-the-same-session path) and times FLV open →
-    /// first IDR; logs out once at the end (best effort), also when trials
-    /// failed. A failed trial (a timeout, or the KVM refusing the token) is
-    /// printed and counted, and the run goes on; p50/p95 are over the
-    /// successful trials. Exits non-zero if the login fails or no trial
-    /// succeeded.
+    /// first IDR; leaves the session open at the end unless --logout is
+    /// given (logout is global on this KVM), in which case it logs out
+    /// once at the end (best effort), also when trials failed. A failed
+    /// trial (a timeout, or the KVM refusing the token) is printed and
+    /// counted, and the run goes on; p50/p95 are over the successful
+    /// trials. Exits non-zero if the login fails or no trial succeeded.
     FirstIdr {
         #[command(flatten)]
         conn: Conn,
@@ -191,7 +201,8 @@ pub enum Cmd {
     },
     /// Open the control websocket with the token cookie, then close (no frames sent).
     ///
-    /// Logs in first and logs out after (best effort).
+    /// Logs in first, then leaves the session open unless --logout is
+    /// given (logout is global on this KVM).
     WsOpen {
         #[command(flatten)]
         conn: Conn,
@@ -468,6 +479,55 @@ mod tests {
                 "{w}x{h}"
             );
         }
+    }
+
+    /// `--logout` defaults to `false` (the device's logout is global — see
+    /// `Conn::logout`'s doc) and is settable per the shared `Conn` args on
+    /// every logged-in subcommand.
+    #[test]
+    fn logout_flag_defaults_off_and_is_settable() {
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "ws-open",
+            "--host",
+            "h",
+            "--pin",
+            "ab",
+            "--password-file",
+            "/tmp/pw",
+        ])
+        .unwrap();
+        assert!(!conn_of(&c).logout);
+
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "capture",
+            "--host",
+            "h",
+            "--pin",
+            "ab",
+            "--password-file",
+            "/tmp/pw",
+            "--name",
+            "c.flv",
+            "--logout",
+        ])
+        .unwrap();
+        assert!(conn_of(&c).logout);
+
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "first-idr",
+            "--host",
+            "h",
+            "--pin",
+            "ab",
+            "--password-file",
+            "/tmp/pw",
+            "--logout",
+        ])
+        .unwrap();
+        assert!(conn_of(&c).logout);
     }
 
     #[test]

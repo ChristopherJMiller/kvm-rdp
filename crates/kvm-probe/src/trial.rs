@@ -154,13 +154,17 @@ pub struct TrialPlan {
 /// **once** on the web port, run every trial on that one token — each
 /// trial reopens `av.flv` and times FLV open → first IDR, the bridge's
 /// reconnect-on-the-same-session path (a fresh login per trial could
-/// itself trigger an IDR and bias the measurement) — then log out
-/// **once**, best effort, also when trials failed (`kvm::with_session`).
+/// itself trigger an IDR and bias the measurement) — then, only when
+/// `do_logout` is true, log out **once**, best effort, also when trials
+/// failed (`kvm::with_session`). `do_logout` is off by default at the CLI
+/// (R21: logout is global on this KVM and would end every other open
+/// session, including the vendor web UI).
 ///
 /// A failed trial — a timeout, a refused open, the KVM rejecting the
 /// token — is recorded in the report like any other and the run goes on;
 /// `on_trial(n, line)` is called after each trial with its printable line.
 /// The only error is a failed login (no trial can run without a token).
+#[allow(clippy::too_many_arguments)] // `do_logout` (R21) pushed this past 7; all 8 are load-bearing, not a cohesive sub-struct.
 pub async fn first_idr_run(
     target: &KvmTarget,
     web_pin: Option<&str>,
@@ -168,6 +172,7 @@ pub async fn first_idr_run(
     password: &str,
     now_unix: i64,
     plan: &TrialPlan,
+    do_logout: bool,
     mut on_trial: impl FnMut(u32, &str),
 ) -> Result<kvm::Session<TrialReport>, KvmError> {
     kvm::with_session(
@@ -176,6 +181,7 @@ pub async fn first_idr_run(
         password,
         now_unix,
         kvm::PROBE_TIMEZONE,
+        do_logout,
         async |token: &str| {
             let mut report = TrialReport::default();
             for n in 1..=plan.trials {

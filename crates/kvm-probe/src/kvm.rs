@@ -273,31 +273,46 @@ async fn logout_inner(target: &KvmTarget, pin: Option<&str>, token: &str) -> Res
 pub const PROBE_TIMEZONE: &str = "UTC";
 
 /// What a logged-in session produced: the work's output, and how its
-/// logout went (final review m1).
+/// logout went (final review m1). `logout` is `None` when the caller did
+/// not ask to log out at all (R21: logout is global on the ES3 — see
+/// `with_session`'s `do_logout`), `Some(Err(_))` for a best-effort logout
+/// that failed, `Some(Ok(()))` otherwise.
 #[derive(Debug)]
 pub struct Session<T> {
     pub output: T,
-    pub logout: Result<(), KvmError>,
+    pub logout: Option<Result<(), KvmError>>,
 }
 
-/// Log in, run `work` with the token, then log out with it — always, even
-/// when the work itself failed (final review m1): every kvm-probe run that
-/// logs in releases its KVM session, so a census of many runs never piles up live
-/// sessions against the device's session cap. A failed login is the error (there is no token,
-/// so nothing to log out); a failed logout is reported in
-/// `Session::logout`, never turned into the session's error.
+/// Log in, run `work` with the token, then — only when `do_logout` is
+/// true — log out with it, even when the work itself failed (final review
+/// m1). `do_logout` defaults to `false` at the CLI (R21): this device's
+/// `GET /cgi-bin/login.lua?logout` is **global** — it invalidates every
+/// other open session's token too, including an operator's own vendor web
+/// UI session — so a census run must not log out unless the operator
+/// explicitly opted in knowing no one else is using the KVM. A failed
+/// login is the error (there is no token, so nothing to log out); a
+/// failed logout is reported in `Session::logout`, never turned into the
+/// session's error.
 pub async fn with_session<T>(
     target: &KvmTarget,
     pin: Option<&str>,
     password: &str,
     now_unix: i64,
     timezone: &str,
+    do_logout: bool,
     work: impl AsyncFnOnce(&str) -> T,
 ) -> Result<Session<T>, KvmError> {
     let token = login(target, pin, password, now_unix, timezone).await?;
     let output = work(&token).await;
-    let logout = logout(target, pin, &token).await;
-    Ok(Session { output, logout })
+    let session_logout = if do_logout {
+        Some(logout(target, pin, &token).await)
+    } else {
+        None
+    };
+    Ok(Session {
+        output,
+        logout: session_logout,
+    })
 }
 
 /// §9.2's bound on device-influenced text reaching the terminal.

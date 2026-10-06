@@ -231,11 +231,12 @@ async fn logout_sends_get_logout_with_the_token_cookie() {
     );
 }
 
-/// m1: a logged-in session logs out after its work — login, the work
-/// with the token, then the logout carrying that token's cookie — so the
-/// census's many runs never pile up live KVM sessions.
+/// R21: logout is global on this KVM (one session's logout ends every
+/// other open session too, including the vendor web UI), so
+/// `with_session`'s default (`do_logout = false`) must send no logout
+/// request at all — just the login, and the session is left open.
 #[tokio::test]
-async fn with_session_logs_out_after_the_work_with_the_token_cookie() {
+async fn with_session_does_not_log_out_by_default() {
     let stub = support::start_login_stub().await;
     let s = kvm_probe::kvm::with_session(
         &target(stub.port),
@@ -243,12 +244,43 @@ async fn with_session_logs_out_after_the_work_with_the_token_cookie() {
         "pw",
         1_759_680_000,
         "UTC",
+        false,
         async |token: &str| token.to_string(),
     )
     .await
     .unwrap();
     assert_eq!(s.output, "0.987654");
-    assert!(s.logout.is_ok(), "{:?}", s.logout);
+    assert!(s.logout.is_none(), "{:?}", s.logout);
+    let reqs = stub.requests.lock().unwrap();
+    let [login] = reqs.as_slice() else {
+        panic!("expected exactly one request (login only, no logout): {reqs:?}");
+    };
+    assert!(
+        login.starts_with("POST /cgi-bin/login.lua HTTP/1.1\r\n"),
+        "{login}"
+    );
+}
+
+/// m1/R21: with `do_logout = true` (the CLI's `--logout`), a logged-in
+/// session logs out after its work — login, the work with the token,
+/// then the logout carrying that token's cookie — so an operator who
+/// opts in never piles up live KVM sessions.
+#[tokio::test]
+async fn with_session_logs_out_when_requested() {
+    let stub = support::start_login_stub().await;
+    let s = kvm_probe::kvm::with_session(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "pw",
+        1_759_680_000,
+        "UTC",
+        true,
+        async |token: &str| token.to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.output, "0.987654");
+    assert!(matches!(s.logout, Some(Ok(()))), "{:?}", s.logout);
     let reqs = stub.requests.lock().unwrap();
     let [login, logout] = reqs.as_slice() else {
         panic!("expected login then logout: {reqs:?}");
@@ -269,10 +301,11 @@ async fn with_session_logs_out_after_the_work_with_the_token_cookie() {
     );
 }
 
-/// m1: the logout happens even when the work fails (a first-idr run whose
-/// trials all failed still releases its session).
+/// R21: the default (no `--logout`) sends no logout even when the work
+/// itself failed — a failed trial doesn't change the "leave the session
+/// open" default.
 #[tokio::test]
-async fn with_session_logs_out_even_when_the_work_fails() {
+async fn with_session_sends_no_logout_by_default_even_when_the_work_fails() {
     let stub = support::start_login_stub().await;
     let s = kvm_probe::kvm::with_session(
         &target(stub.port),
@@ -280,6 +313,30 @@ async fn with_session_logs_out_even_when_the_work_fails() {
         "pw",
         1_759_680_000,
         "UTC",
+        false,
+        async |_token: &str| -> Result<(), &str> { Err("trial failed") },
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.output, Err("trial failed"));
+    assert!(s.logout.is_none(), "{:?}", s.logout);
+    let reqs = stub.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 1, "{reqs:?}");
+}
+
+/// m1: with `--logout`, the logout happens even when the work fails (a
+/// first-idr run whose trials all failed still releases its session when
+/// the operator asked to release it).
+#[tokio::test]
+async fn with_session_logs_out_even_when_the_work_fails_when_requested() {
+    let stub = support::start_login_stub().await;
+    let s = kvm_probe::kvm::with_session(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "pw",
+        1_759_680_000,
+        "UTC",
+        true,
         async |_token: &str| -> Result<(), &str> { Err("trial failed") },
     )
     .await
@@ -294,7 +351,8 @@ async fn with_session_logs_out_even_when_the_work_fails() {
 }
 
 /// m1: no token, no logout — a failed login is the session's error and
-/// nothing else is sent.
+/// nothing else is sent, regardless of `do_logout` (set here to `true` to
+/// prove it: login fails before the flag would ever be consulted).
 #[tokio::test]
 async fn with_session_sends_no_logout_when_login_fails() {
     let stub = support::start_http_stub(support::http_response(
@@ -309,6 +367,7 @@ async fn with_session_sends_no_logout_when_login_fails() {
         "pw",
         1_759_680_000,
         "UTC",
+        true,
         async |_token: &str| (),
     )
     .await;

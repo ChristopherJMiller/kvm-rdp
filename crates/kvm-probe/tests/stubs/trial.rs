@@ -229,13 +229,14 @@ fn tally(reqs: &[String]) -> (usize, usize, usize, bool, bool) {
     )
 }
 
-/// m1 correction (final review): a first-idr run logs in ONCE, every trial
-/// reopens av.flv with that same token (the bridge's reconnect-on-same-
-/// session path — a fresh login per trial could itself trigger an IDR and
-/// bias the measurement), and logs out ONCE at the end — for any trial
-/// count.
+/// m1 correction (final review) / R21: a first-idr run logs in ONCE, every
+/// trial reopens av.flv with that same token (the bridge's reconnect-on-
+/// same-session path — a fresh login per trial could itself trigger an
+/// IDR and bias the measurement), and by default — no `--logout` — never
+/// logs out at all, for any trial count: logout is global on this KVM and
+/// would end every other open session, including the vendor web UI.
 #[tokio::test]
-async fn first_idr_run_logs_in_once_and_out_once_for_any_trial_count() {
+async fn first_idr_run_logs_in_once_and_does_not_log_out_by_default() {
     for trials in [1u32, 3] {
         let stub = support::start_kvm_stub(true).await;
         let mut lines = Vec::new();
@@ -246,6 +247,7 @@ async fn first_idr_run_logs_in_once_and_out_once_for_any_trial_count() {
             "pw",
             1_759_680_000,
             &plan(trials),
+            false,
             |n, line| lines.push(format!("{n}: {line}")),
         )
         .await
@@ -257,14 +259,14 @@ async fn first_idr_run_logs_in_once_and_out_once_for_any_trial_count() {
             s.output.failures
         );
         assert!(s.output.failures.is_empty());
-        assert!(s.logout.is_ok(), "{:?}", s.logout);
+        assert!(s.logout.is_none(), "{:?}", s.logout);
         assert_eq!(lines.len(), usize::try_from(trials).unwrap());
 
         let reqs = stub.requests.lock().unwrap();
         let expected_opens = usize::try_from(trials).unwrap();
         assert_eq!(
             tally(&reqs),
-            (1, expected_opens, 1, true, true),
+            (1, expected_opens, 0, true, false),
             "trials={trials}: {reqs:#?}"
         );
         // Every trial carries the one login's token, as query and cookie.
@@ -279,12 +281,51 @@ async fn first_idr_run_logs_in_once_and_out_once_for_any_trial_count() {
     }
 }
 
-/// m1 correction: a trial that fails because the KVM refuses the token on
-/// av.flv is recorded as a failed trial like any other, the run goes on,
-/// and there is still exactly one login and one logout — the logout
-/// happens even though every trial failed.
+/// m1 / R21: with `--logout` (`do_logout = true`), a first-idr run still
+/// logs in ONCE and logs out ONCE at the end — for any trial count.
 #[tokio::test]
-async fn rejected_token_trials_fail_and_the_run_still_logs_out_once() {
+async fn first_idr_run_logs_out_once_when_requested_for_any_trial_count() {
+    for trials in [1u32, 3] {
+        let stub = support::start_kvm_stub(true).await;
+        let mut lines = Vec::new();
+        let s = kvm_probe::trial::first_idr_run(
+            &kvm_target(stub.port),
+            Some(&stub.pin_hex),
+            Some(&stub.pin_hex),
+            "pw",
+            1_759_680_000,
+            &plan(trials),
+            true,
+            |n, line| lines.push(format!("{n}: {line}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.output.successes.len(),
+            usize::try_from(trials).unwrap(),
+            "{lines:?} {:?}",
+            s.output.failures
+        );
+        assert!(s.output.failures.is_empty());
+        assert!(matches!(s.logout, Some(Ok(()))), "{:?}", s.logout);
+        assert_eq!(lines.len(), usize::try_from(trials).unwrap());
+
+        let reqs = stub.requests.lock().unwrap();
+        let expected_opens = usize::try_from(trials).unwrap();
+        assert_eq!(
+            tally(&reqs),
+            (1, expected_opens, 1, true, true),
+            "trials={trials}: {reqs:#?}"
+        );
+    }
+}
+
+/// m1 correction / R21: a trial that fails because the KVM refuses the
+/// token on av.flv is recorded as a failed trial like any other, the run
+/// goes on, and by default there is still exactly one login and no
+/// logout at all — even though every trial failed.
+#[tokio::test]
+async fn rejected_token_trials_fail_and_the_run_still_sends_no_logout_by_default() {
     let stub = support::start_kvm_stub(false).await;
     let s = kvm_probe::trial::first_idr_run(
         &kvm_target(stub.port),
@@ -293,6 +334,7 @@ async fn rejected_token_trials_fail_and_the_run_still_logs_out_once() {
         "pw",
         1_759_680_000,
         &plan(3),
+        false,
         |_, _| {},
     )
     .await
@@ -305,7 +347,32 @@ async fn rejected_token_trials_fail_and_the_run_still_logs_out_once() {
         s.output.failures
     );
     assert!(s.output.all_failed());
-    assert!(s.logout.is_ok(), "{:?}", s.logout);
+    assert!(s.logout.is_none(), "{:?}", s.logout);
+    let reqs = stub.requests.lock().unwrap();
+    assert_eq!(tally(&reqs), (1, 3, 0, true, false), "{reqs:#?}");
+}
+
+/// m1: with `--logout`, the run still logs out exactly once even when
+/// every trial failed.
+#[tokio::test]
+async fn rejected_token_trials_fail_and_the_run_still_logs_out_once_when_requested() {
+    let stub = support::start_kvm_stub(false).await;
+    let s = kvm_probe::trial::first_idr_run(
+        &kvm_target(stub.port),
+        Some(&stub.pin_hex),
+        Some(&stub.pin_hex),
+        "pw",
+        1_759_680_000,
+        &plan(3),
+        true,
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    assert!(s.output.successes.is_empty());
+    assert_eq!(s.output.failures.len(), 3, "{:?}", s.output.failures);
+    assert!(s.output.all_failed());
+    assert!(matches!(s.logout, Some(Ok(()))), "{:?}", s.logout);
     let reqs = stub.requests.lock().unwrap();
     assert_eq!(tally(&reqs), (1, 3, 1, true, true), "{reqs:#?}");
 }
