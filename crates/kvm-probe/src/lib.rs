@@ -1,2 +1,3 @@
 pub mod fingerprint;
+pub mod record;
 pub mod request;
