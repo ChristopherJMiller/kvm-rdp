@@ -4,3 +4,24 @@ members = ["crates/*"]
 # Plan A resolves to kvm-proto + kvm-probe (crates/*). kvm-rdp, kvm-sim and
 # kvm-bench arrive in later plans as new crate dirs; fuzz/ is its own
 # workspace at the repo root (spec §4.1, §12).
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ChristopherJMiller/kvm-rdp"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 16
+debug = "line-tables-only"
+panic = "abort"
+
+# profile.bench inherits profile.release (Cargo default); there is
+# deliberately no fat-LTO profile (spec §13).
