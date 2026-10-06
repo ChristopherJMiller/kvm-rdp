@@ -72,3 +72,20 @@ pub async fn start_login_stub() -> Stub {
     ))
     .await
 }
+
+pub fn flv_fixture() -> Vec<u8> {
+    std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../fixtures/360p30_main_full.flv"
+    ))
+    .unwrap()
+}
+
+/// Serve the committed fixture with a close-delimited body, exactly as a
+/// streaming FLV endpoint does.
+pub async fn start_flv_stub() -> Stub {
+    let mut resp =
+        b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\nConnection: close\r\n\r\n".to_vec();
+    resp.extend_from_slice(&flv_fixture());
+    start_http_stub(resp).await
+}

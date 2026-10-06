@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod captures;
 pub mod fingerprint;
 pub mod kvm;
