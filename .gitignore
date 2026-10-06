@@ -22,3 +22,14 @@ rustc-ice-*.txt
 #  and can be added to the global gitignore or merged into this file.  For a more nuclear
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
+
+# nix
+/result
+/result-*
+.direnv/
+
+# census captures (0700, wiped each session; never committed — spec §11.5, §12)
+/captures/
+
+# on-demand large fixtures (1080p spike/bench streams; regenerate with scripts/gen-fixtures.sh large)
+/fixtures/large/
