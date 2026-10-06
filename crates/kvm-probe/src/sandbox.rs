@@ -305,6 +305,10 @@ fn sanitize_for_terminal(bytes: &[u8]) -> String {
 /// `&str` names (never `resolve`'s host `PathBuf`) are handed to
 /// `build_ffmpeg_sandbox_argv`, which maps them to fixed `/cap/<name>` paths
 /// inside the sandbox.
+///
+/// `width`/`height` must each lie in `SAMPLE_DIMENSION_RANGE` (checked
+/// before anything is resolved or spawned), and the decoded frame must be
+/// exactly one 8-bit 4:2:0 frame of that size (`check_frame_layout`).
 pub fn run_sample_range(
     ffmpeg: &Path,
     dir: &CaptureDir,
@@ -312,6 +316,16 @@ pub fn run_sample_range(
     width: usize,
     height: usize,
 ) -> std::io::Result<SampleOutcome> {
+    if !SAMPLE_DIMENSION_RANGE.contains(&width) || !SAMPLE_DIMENSION_RANGE.contains(&height) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "--width/--height must each be in {}..={} (got {width}x{height})",
+                SAMPLE_DIMENSION_RANGE.start(),
+                SAMPLE_DIMENSION_RANGE.end()
+            ),
+        ));
+    }
     let cap_in_host = dir.resolve(capture_name)?;
     let out_name = format!("{capture_name}.y");
     let out_host = dir.resolve(&out_name)?;
@@ -338,8 +352,131 @@ pub fn run_sample_range(
         )));
     }
 
+    // A scaler is reported in preference to anything about the frame (it
+    // changed the pixels, so the frame's size and contents describe
+    // ffmpeg's resampler, not the device) — checked before the frame is
+    // read, so a scaled frame's size can't turn this into a layout error.
+    if ffmpeg_inserted_scaler(&stderr) {
+        return Ok(SampleOutcome::ScalerInserted);
+    }
+
     let frame = read_output_frame(dir, &out_name, width, height)?;
     Ok(sample_range_outcome(&stderr, &frame, width, height))
+}
+
+/// `sample-range`'s accepted `--width`/`--height`, each (final review m2):
+/// never a zero-area or absurd frame, and never a read cap
+/// (`FRAME_CAP_PLANE_MULTIPLE` × w × h) past a few hundred MiB.
+pub const SAMPLE_DIMENSION_RANGE: std::ops::RangeInclusive<usize> = 16..=8192;
+
+/// The planar layouts a native `rawvideo` frame from ffmpeg's H.264 decoder
+/// can have (final review m2). `Bit16` covers every 9–16-bit depth, which
+/// rawvideo stores in two bytes per sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanarLayout {
+    Yuv420p8,
+    Yuv422p8,
+    Yuv444p8,
+    Yuv420p16,
+    Yuv422p16,
+    Yuv444p16,
+}
+
+impl PlanarLayout {
+    const ALL: [PlanarLayout; 6] = [
+        PlanarLayout::Yuv420p8,
+        PlanarLayout::Yuv422p8,
+        PlanarLayout::Yuv444p8,
+        PlanarLayout::Yuv420p16,
+        PlanarLayout::Yuv422p16,
+        PlanarLayout::Yuv444p16,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            PlanarLayout::Yuv420p8 => "8-bit 4:2:0",
+            PlanarLayout::Yuv422p8 => "8-bit 4:2:2",
+            PlanarLayout::Yuv444p8 => "8-bit 4:4:4",
+            PlanarLayout::Yuv420p16 => "16-bit 4:2:0",
+            PlanarLayout::Yuv422p16 => "16-bit 4:2:2",
+            PlanarLayout::Yuv444p16 => "16-bit 4:4:4",
+        }
+    }
+
+    /// Exact byte length of one `width`×`height` frame in this layout, as
+    /// ffmpeg lays rawvideo out: a full-size Y plane plus two chroma
+    /// planes of `ceil(w/2)`×`ceil(h/2)` (4:2:0), `ceil(w/2)`×`h` (4:2:2)
+    /// or `w`×`h` (4:4:4), times two bytes per sample for `Bit16`.
+    /// `None` only on overflow.
+    fn frame_len(self, width: usize, height: usize) -> Option<usize> {
+        let luma = width.checked_mul(height)?;
+        let half_w = width.div_ceil(2);
+        let half_h = height.div_ceil(2);
+        let chroma_plane = match self {
+            PlanarLayout::Yuv420p8 | PlanarLayout::Yuv420p16 => half_w.checked_mul(half_h)?,
+            PlanarLayout::Yuv422p8 | PlanarLayout::Yuv422p16 => half_w.checked_mul(height)?,
+            PlanarLayout::Yuv444p8 | PlanarLayout::Yuv444p16 => luma,
+        };
+        let samples = luma.checked_add(chroma_plane.checked_mul(2)?)?;
+        match self {
+            PlanarLayout::Yuv420p8 | PlanarLayout::Yuv422p8 | PlanarLayout::Yuv444p8 => {
+                Some(samples)
+            }
+            PlanarLayout::Yuv420p16 | PlanarLayout::Yuv422p16 | PlanarLayout::Yuv444p16 => {
+                samples.checked_mul(2)
+            }
+        }
+    }
+}
+
+/// Require the decoded frame to be exactly one known planar frame of
+/// `width`×`height` — and to be 8-bit 4:2:0, the one layout whose Y range
+/// this tool measures (final review m2).
+///
+/// - A length that is no known layout's size means `--width`/`--height`
+///   do not describe this frame: refused, instead of silently measuring
+///   part of it (the old behaviour accepted anything up to 6× the plane).
+/// - A length that is exactly a *different* known layout's size is named
+///   in the error but not measured. That is stricter than measuring every
+///   8-bit layout, for two reasons: such a stream is outside §6.1 anyway
+///   (summarize's `check_sps_limits` verdict says so), and a size match
+///   alone cannot tell layouts apart — a 1920×1080 4:2:0 frame is byte for
+///   byte a 1440×1080 4:2:2 frame, and 3× the plane is both 8-bit 4:4:4
+///   and 16-bit 4:2:0 — so measuring them could still report a wrong range
+///   with no error. For 4:2:0 itself a same-length frame of another
+///   `width`×`height` has the same area, so its Y plane is the same bytes
+///   and the range is still right.
+fn check_frame_layout(len: usize, width: usize, height: usize) -> std::io::Result<PlanarLayout> {
+    let matches: Vec<PlanarLayout> = PlanarLayout::ALL
+        .into_iter()
+        .filter(|l| l.frame_len(width, height) == Some(len))
+        .collect();
+    if matches.as_slice() == [PlanarLayout::Yuv420p8] {
+        return Ok(PlanarLayout::Yuv420p8);
+    }
+    if matches.is_empty() {
+        let known: Vec<String> = PlanarLayout::ALL
+            .into_iter()
+            .map(|l| match l.frame_len(width, height) {
+                Some(n) => format!("{} {n}", l.name()),
+                None => format!("{} overflow", l.name()),
+            })
+            .collect();
+        return Err(std::io::Error::other(format!(
+            "decoded frame is {len} bytes, which is not a known planar size for \
+             {width}x{height} ({}); pass the stream's own size as --width/--height \
+             (summarize's SPS width/height)",
+            known.join(", ")
+        )));
+    }
+    let names: Vec<&str> = matches.into_iter().map(PlanarLayout::name).collect();
+    Err(std::io::Error::other(format!(
+        "decoded frame is {len} bytes: the size of a {width}x{height} frame in {}, \
+         not 8-bit 4:2:0 — the only layout §6.1 admits and the only one \
+         sample-range measures (check summarize's SPS chroma_format_idc/bit depth \
+         and width/height)",
+        names.join(" or ")
+    )))
 }
 
 /// Upper bound on a sandbox output frame, as a multiple of the Y plane
@@ -356,10 +493,10 @@ const FRAME_CAP_PLANE_MULTIPLE: usize = 6;
 
 /// Read the sandbox's `.y` output, bounded at
 /// `FRAME_CAP_PLANE_MULTIPLE * plane_len` bytes rather than `plane_len`
-/// itself (R1) — `y_plane_range` (via `sample_range_outcome`) only ever
-/// reads the frame's first `plane_len` bytes regardless of how much more
-/// is returned here, so accepting the full frame doesn't change what's
-/// measured.
+/// itself (R1), then require it to be exactly one 8-bit 4:2:0 frame of
+/// `width`×`height` (`check_frame_layout`, final review m2) —
+/// `y_plane_range` (via `sample_range_outcome`) reads the frame's first
+/// `plane_len` bytes, which is the whole Y plane only when that holds.
 fn read_output_frame(
     dir: &CaptureDir,
     out_name: &str,
@@ -370,7 +507,9 @@ fn read_output_frame(
         .checked_mul(height)
         .ok_or_else(|| std::io::Error::other("width*height overflow"))?;
     let frame_cap = plane_len.saturating_mul(FRAME_CAP_PLANE_MULTIPLE);
-    captures::read_capped(dir, out_name, frame_cap)
+    let frame = captures::read_capped(dir, out_name, frame_cap)?;
+    check_frame_layout(frame.len(), width, height)?;
+    Ok(frame)
 }
 
 #[cfg(test)]
@@ -590,6 +729,111 @@ mod tests {
             "a file larger than 6x the Y plane must still be refused"
         );
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// m2 (final review): the failure the exact-size check exists for. An
+    /// operator `--width`/`--height` smaller than the real frame used to be
+    /// accepted (anything up to 6x the plane was) and silently measured only
+    /// the top rows. A real 64x64 8-bit 4:2:0 frame (6144 bytes) read as
+    /// 40x40 matches no known layout for 40x40 (2400/3200/4800 8-bit,
+    /// 4800/6400/9600 16-bit), so it must be refused.
+    #[test]
+    fn read_output_frame_refuses_a_frame_that_is_not_exactly_a_known_size() {
+        let base = tmp_base("wrong-dims");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("captures");
+        let dir = CaptureDir::create(&root).unwrap();
+        std::fs::write(root.join("t.flv.y"), vec![16u8; 6144]).unwrap();
+
+        let result = read_output_frame(&dir, "t.flv.y", 40, 40);
+        assert!(
+            result.is_err(),
+            "a 64x64 frame read as 40x40 must be refused, not part-measured"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// m2: an exact 8-bit 4:2:0 frame is accepted at even and odd sizes
+    /// (odd: chroma planes are ceil(w/2) x ceil(h/2), as ffmpeg lays out
+    /// yuv420p rawvideo).
+    #[test]
+    fn frame_layout_accepts_an_exact_8bit_420_frame_even_and_odd() {
+        // 64x64: 4096 + 2 * 32 * 32.
+        assert_eq!(
+            check_frame_layout(6144, 64, 64).unwrap(),
+            PlanarLayout::Yuv420p8
+        );
+        // 17x17: 289 + 2 * 9 * 9.
+        assert_eq!(
+            check_frame_layout(451, 17, 17).unwrap(),
+            PlanarLayout::Yuv420p8
+        );
+        // The real thing: 1920x1080 yuv420p.
+        assert_eq!(
+            check_frame_layout(3_110_400, 1920, 1080).unwrap(),
+            PlanarLayout::Yuv420p8
+        );
+    }
+
+    /// m2: a length that is no known layout's size for w x h is refused —
+    /// including one byte either side of an exact 4:2:0 frame, and empty.
+    #[test]
+    fn frame_layout_refuses_a_length_that_matches_no_known_layout() {
+        let err = check_frame_layout(6144, 40, 40).unwrap_err();
+        assert!(err.to_string().contains("not a known planar size"), "{err}");
+        for len in [6143, 6145, 0] {
+            assert!(check_frame_layout(len, 64, 64).is_err(), "{len}");
+        }
+    }
+
+    /// m2: a length that is exactly another known layout's size is named
+    /// in the error, never measured as if it were 8-bit 4:2:0. At 64x64:
+    /// 8-bit 4:2:2 = 8192, 8-bit 4:4:4 = 12288 (= 16-bit 4:2:0), 16-bit
+    /// 4:2:2 = 16384, 16-bit 4:4:4 = 24576.
+    #[test]
+    fn frame_layout_names_other_known_layouts_but_does_not_measure_them() {
+        for (len, name) in [
+            (8192, "8-bit 4:2:2"),
+            (12288, "8-bit 4:4:4"),
+            (12288, "16-bit 4:2:0"),
+            (16384, "16-bit 4:2:2"),
+            (24576, "16-bit 4:4:4"),
+        ] {
+            let err = check_frame_layout(len, 64, 64).unwrap_err();
+            assert!(err.to_string().contains(name), "{len} {name}: {err}");
+        }
+    }
+
+    /// m2: why other layouts are not measured — a size match alone is
+    /// ambiguous. A real 1920x1080 4:2:0 frame (3,110,400 bytes) is exactly
+    /// a 1440x1080 4:2:2 frame; measuring that would read only the top 810
+    /// rows of the real Y plane with no error.
+    #[test]
+    fn a_1080p_420_frame_passed_as_1440x1080_is_refused_not_part_measured() {
+        let err = check_frame_layout(3_110_400, 1440, 1080).unwrap_err();
+        assert!(err.to_string().contains("8-bit 4:2:2"), "{err}");
+    }
+
+    /// m2: `--width`/`--height` outside 16..=8192 are refused before
+    /// anything is spawned or touched (the ffmpeg path does not even exist,
+    /// so this needs no bwrap/ffmpeg).
+    #[test]
+    fn run_sample_range_refuses_dimensions_outside_16_to_8192_before_spawning() {
+        let base = tmp_base("dims");
+        let _ = std::fs::remove_dir_all(&base);
+        let dir = CaptureDir::create(&base.join("captures")).unwrap();
+        for (w, h) in [(15, 1080), (1920, 15), (8193, 1080), (1920, 8193), (0, 0)] {
+            let err = run_sample_range(Path::new("/nonexistent/ffmpeg"), &dir, "x.flv", w, h)
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{w}x{h}: {err}"
+            );
+            assert!(err.to_string().contains("16..=8192"), "{err}");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

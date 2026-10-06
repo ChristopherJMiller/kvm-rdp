@@ -54,6 +54,19 @@ impl Cli {
     }
 }
 
+/// `sample-range --width/--height` value parser (final review m2): a
+/// decimal in `sandbox::SAMPLE_DIMENSION_RANGE` (16..=8192), else a clap
+/// usage error. `run_sample_range` checks the same range again.
+fn sample_dimension(s: &str) -> Result<usize, String> {
+    let v: usize = s.parse().map_err(|e| format!("{e}"))?;
+    let range = crate::sandbox::SAMPLE_DIMENSION_RANGE;
+    if range.contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("must be in {}..={}", range.start(), range.end()))
+    }
+}
+
 #[derive(clap::Args, Debug, Clone)]
 pub struct Conn {
     #[arg(long)]
@@ -101,12 +114,15 @@ pub enum Cmd {
         conn: Conn,
     },
     /// Decode one frame of captures/<name> in the sandbox; report native Y min/max.
+    /// The frame must be exactly one 8-bit 4:2:0 frame of --width x --height.
     SampleRange {
         #[arg(long)]
         name: String,
-        #[arg(long)]
+        /// The stream's width in pixels (summarize's SPS width), 16..=8192.
+        #[arg(long, value_parser = sample_dimension)]
         width: usize,
-        #[arg(long)]
+        /// The stream's height in pixels (summarize's SPS height), 16..=8192.
+        #[arg(long, value_parser = sample_dimension)]
         height: usize,
     },
     /// Summarise captures/<name>.jsonl.
@@ -229,6 +245,41 @@ mod tests {
     fn fingerprint_is_exempt_from_pin_validation() {
         let c = Cli::try_parse_from(["kvm-probe", "fingerprint", "--host", "h"]).unwrap();
         assert!(c.validate().is_ok());
+    }
+
+    /// m2 (final review): `sample-range --width/--height` are each clamped
+    /// to 16..=8192 at parse time — a usage error, not a later surprise.
+    #[test]
+    fn sample_range_dimensions_must_be_16_through_8192() {
+        let parse = |w: &str, h: &str| {
+            Cli::try_parse_from([
+                "kvm-probe",
+                "sample-range",
+                "--name",
+                "r.flv",
+                "--width",
+                w,
+                "--height",
+                h,
+            ])
+        };
+        assert!(parse("16", "16").is_ok());
+        assert!(parse("8192", "8192").is_ok());
+        assert!(parse("1920", "1080").is_ok());
+        for (w, h) in [
+            ("15", "1080"),
+            ("1920", "15"),
+            ("8193", "1080"),
+            ("1920", "8193"),
+            ("0", "0"),
+        ] {
+            let err = parse(w, h).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{w}x{h}"
+            );
+        }
     }
 
     #[test]
