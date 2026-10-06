@@ -2,11 +2,32 @@
 
 | | |
 |---|---|
-| Status | Draft rev 5.1, for review. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1) |
+| Status | Draft rev 6 — census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
 | Repo | `github.com/ChristopherJMiller/kvm-rdp` (public, MIT OR Apache-2.0) |
 | First target | Angeet/Yeeso ES3 "ONE KVM" wired to a Mac Studio |
 | Client | Microsoft Windows App on macOS, through an rdpgw RD Gateway on 443 |
 | Companion spec | Deployment, gateway, edge gating and KVM isolation live in `luma-homeops` (separate spec, written after Milestone 0). §9.4 lists what this spec requires of it |
+
+**Rev 6 — census-filled (2026-10-06).** Fills every census-dependent value
+from `docs/census.md` — Leg A, Leg B (direct) and Leg C (through rdpgw
+`16cdaaf`) — and records the Milestone 0 verdict: **go for passthrough**
+(§12). Legs B and C ran with FreeRDP 3.31.1 as the stand-in client, because
+Windows App could not easily be tested yet; everything only Windows App can
+answer is an explicit owner acceptance checklist (§12), and the values that
+depend on it ship with safe defaults until then. Video: the SPS rewrite
+always adds `bitstream_restriction` (§6.8); `first_ack_grace` 1.6 s and
+`flv_idle_timeout` 10 s (§4.4); FreeRDP ignores the VUI, so the ES3's
+limited-range pixels show mildly washed out — a known limitation (§6.8,
+§10.3, §15); the channel-only resize is broken on FreeRDP, so the real
+resize path is the only one (§6.4); the ErrorInfo table is confirmed for
+0x7 only (§6.9). Input: `key_repeat_timeout` 10 s and `mac_remap` off until
+the key matrix is captured (§7.1, §7.4). Gateway: rdpgw token mode works
+only over the websocket transport, clipboard needs `Caps.EnableClipboard`,
+the username comes from `Client.Defaults`, the `RDPGWSESSION` cookie must be
+stripped at the edge, and tokens are reusable for about 6 min, so they are
+pinned to the client's address (§8, §9). IronRDP: the four patches are on a
+fork branch that Plan C git-pins; the upstream PR waits for the owner
+(§4.2). Plan A's deviations from this spec are recorded (§9.4, §11.5, §12).
 
 **Rev 5.1 — Leg A census amendments (2026-10-06).** Applies only the
 `docs/census.md` Leg A findings that no Leg B or C result can change; Legs B
@@ -66,9 +87,9 @@ interactive (§10.3 bounds); the bridge costs almost nothing to run (§10.1).
 
 ## 3. The KVM interface
 
-Reverse-engineered from the ES3 web UI (`kvm.js`, `index.js`, `common.js`).
-Items still marked *(census)* are unverified; rev 5.1 fills what Leg A
-measured (`census.md`).
+Reverse-engineered from the ES3 web UI (`kvm.js`, `index.js`, `common.js`),
+and checked against the device by the Leg A census (`census.md`). The one
+item the census did not measure is marked *open*.
 
 ### 3.1 Endpoints
 
@@ -76,7 +97,7 @@ measured (`census.md`).
 |---|---|
 | Login | `POST /cgi-bin/login.lua`, body `{"pass","timezone","time"}` → token `0.<digits>`. Concurrent logins coexist (§3.2) |
 | Logout | `GET /cgi-bin/login.lua?logout`. **Global**: invalidates every session's token (§3.2). The bridge never calls it |
-| Video | `GET /av.flv?token=…` on the video port. HTTP-FLV, H.264 Baseline (§6.1). One encoder serves every viewer (§6.5). The vendor calls FLV "high compatibility" and WebRTC (SRS, :1988) "low latency", so FLV source latency is *(census)* |
+| Video | `GET /av.flv?token=…` on the video port. HTTP-FLV, H.264 Baseline (§6.1). One encoder serves every viewer (§6.5). The vendor calls FLV "high compatibility" and WebRTC (SRS, :1988) "low latency". FLV source latency is *open*: the census measured FLV open → first IDR and inter-tag jitter, not glass-to-glass; Milestone 6 compares it with the WebRTC baseline (§10.3, §15) |
 | Input | WebSocket `/websocket` on the control port |
 | Mode | `88 88 01 <0x30+type>` sets HID type; type 0 = absolute mouse. `88 88 03 …` is UART text (unused) |
 
@@ -174,16 +195,20 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
 
 ### 4.2 Dependencies
 
-- **IronRDP is git-pinned**: one rev, at or after `38b074e` (2026-10-01), for
-  every `ironrdp-*` crate used (including `ironrdp-pdu`, for ErrorInfo codes),
+- **IronRDP is git-pinned**: one rev, at or after `38b074e` (2026-10-01; for
+  Plan C, a rev on the fork branch below), for every `ironrdp-*` crate used
+  (including `ironrdp-pdu`, for ErrorInfo codes),
   as direct git dependencies in `[workspace.dependencies]` — no
   `[patch.crates-io]`. crates.io `ironrdp-server 0.13.0` / `ironrdp-egfx 0.3.0`
   lack `ConnectionPolicy::Preempt`, `on_connection_info`, the full EGFX
   capability ladder, re-advertise recovery, the ack-suspend fix and the pre-TLS
   DoS fix (#1515), and their `Avc420Region` bounds are inclusive where HEAD's
   are exclusive.
-- **Upstream prerequisites for Plan C.** Plan A opens one IronRDP PR (each
-  patch is roughly 30–50 lines plus a test):
+- **Upstream prerequisites for Plan C.** Plan A writes four IronRDP patches
+  (each roughly 30–50 lines plus a test) on branch `kvm-rdp-egfx-patches`,
+  off `38b074e`, of the owner's public fork
+  (`github.com/ChristopherJMiller/IronRDP`, cloned at `~/Repos/IronRDP`).
+  The upstream PR is deferred until the owner says to open it:
   1. **Ack suspension survives resets.** (a) `FrameTracker::clear()` keeps
      `ack_suspended` — used by `resize_with_monitors`, i.e. every Setup;
      MS-RDPEGFX's ResetGraphics says nothing about acknowledgement. (b) The
@@ -214,9 +239,12 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
      blocked on a peer that stopped reading; and a bounded write of the
      SetErrorInfo PDU on bridge-initiated disconnects.
 
-  If the PR is not merged when Plan C starts, the pin moves to a fork branch
-  carrying only these patches — a documented, temporary exception, reverted
-  when upstream merges. (Patch 1 alone can be replaced by its fallback.)
+  **Plan C git-pins the fork branch**, which carries only these patches — a
+  documented, temporary exception to "upstream IronRDP", reverted when the
+  patches merge upstream (the PR is opened only when the owner says so).
+  Patch 1 alone can be replaced by its fallback; Leg B gave no reason to
+  prefer either, because FreeRDP never suspended acks (§6.6, `census.md`
+  Leg B), and Windows App's suspension behaviour is an acceptance item (§12).
 - CI fails if `cargo tree -d` shows a duplicate `ironrdp-*` crate. A pin bump
   is its own PR, reviewed monthly, and must pass the IronRDP golden tests (§11.2).
 - `ironrdp-server` with `default-features = false, features = ["egfx", "helper"]`.
@@ -291,8 +319,9 @@ runs graceful shutdown (§5.2) and exits 0 so its supervisor (Kubernetes, or
 systemd on a dedicated host) restarts it — CredSSP binds to the public key read
 at startup.
 
-Defaults (every duration is configurable; values marked *census* are set in
-`census.md`):
+Defaults (every duration is configurable). Census-derived values cite
+`census.md`; values marked *acceptance* are safe defaults that the owner's
+Windows App run retunes (§12):
 
 | Key | Default | Notes |
 |---|---|---|
@@ -311,25 +340,25 @@ Defaults (every duration is configurable; values marked *census* are set in
 | `video.backlog_limit` | 4 MiB | §6.6 |
 | `video.standing_delay_limit` | 500 ms | Used only when auto-detect is negotiated (§6.6) |
 | `video.rtt_probe_interval` | 250 ms | §6.6 |
-| `video.first_ack_grace` | *census*: first-frame ack p95 + `soft_gate`, default 1.5 s | §6.6 |
+| `video.first_ack_grace` | 1.6 s (*acceptance*) | FreeRDP's first-frame ack p95, 97 ms direct (95 ms through rdpgw), + the 1.5 s pre-census default as margin, because Windows App's p95 is unmeasured (`census.md`, Leg B and Leg C). Once it is measured: its p95 + `soft_gate` (§6.6, §12) |
 | `video.stall_timeout` | 10 s | §6.6 |
 | `video.idr_policy` | `side` | Leg A (§6.5); `reconnect` and `wait` remain options |
 | `video.idr_side_timeout` | 1 s | A side request with no IDR by then falls back to `ReconnectFlv` (§6.5) |
 | `video.idr_wait_max` | 3 s | Cumulative open-gate time (§6.5) |
 | `video.flv_reconnect_interval_setup` | 1 s | §6.5 |
 | `video.flv_reconnect_interval_flow` | 10 s | §6.5 |
-| `video.flv_idle_timeout` | *census*, default 10 s | §6.9 |
+| `video.flv_idle_timeout` | 10 s | Far above the ES3's cadence: one tag every 33 ms, static or moving; inter-tag max 136 ms (`census.md`, Leg A — stream and transport). §6.9 |
 | `video.burst_chunk` | 8 frames | §6.5 |
-| `video.sps_rewrite` | `["level", "vui"]` | Required on the ES3 (§6.8); `"restriction"` is added if Leg B's stranding test needs it (*census*) |
+| `video.sps_rewrite` | `["level", "vui", "restriction"]` | Required on the ES3 (§6.8): `level_idc` 31 → 40, the VUI made true, and `bitstream_restriction` added (POC type 0 without it, `census.md` Leg A — stream) |
 | `video.avc420_timeout` | 10 s from `on_connection_info` | §6.7 |
 | `video.suppress_debounce` | 1 s | §6.6 |
 | `video.disconnect_watchdog` | 5 s | §6.9 |
 | `video.region_qp` | 22 | Constant; client hint only |
 | `input.queue` | 256 reports | §7.3 |
 | `input.hid_write_timeout` | 1 s | |
-| `input.key_repeat_timeout` | *census*: measured max initial delay + 2 × repeat interval + 250 ms, floor 1 s; 10 s if repeats aren't confirmed | §7.4 |
-| `input.modifier_idle_timeout` | 30 s | §7.4 |
-| `input.mac_remap` | off | §7.1 |
+| `input.key_repeat_timeout` | 10 s (*acceptance*) | Repeats are not yet confirmed: the typematic capture needs Windows App (`census.md`, Leg B — deferred). Then: measured max initial delay + 2 × repeat interval + 250 ms, floor 1 s (§7.4, §12) |
+| `input.modifier_idle_timeout` | 30 s | Confirmed; nothing in the census bears on it (§7.4) |
+| `input.mac_remap` | off (*acceptance*) | Until the key-matrix capture shows Windows App's Cmd rewrite can be told apart from a real Ctrl+key (§7.1, §12) |
 | `paste.chord` | Ctrl+Option+Shift+V (raw scancodes) | §8 |
 | `paste.pace` | 15 ms between HID reports | §8 |
 | `paste.max_chars` / `max_bytes` / `modifier_wait` | 4096 / 64 KiB / 5 s | |
@@ -377,7 +406,9 @@ Defaults (every duration is configurable; values marked *census* are set in
   that never negotiates AVC420 costs no video, and connecting costs exactly one
   FLV open.
 - **`on_disconnected`** and eviction invalidate the generation and send
-  `Stop{gen}` (§4.3).
+  `Stop{gen}` (§4.3). A client killed mid-session through rdpgw reaches the
+  server as a TLS read error (`AlertReceived(DecodeError)`), where a direct
+  kill closes cleanly (Leg C); both are a client disconnect.
 - **The KVM token** lives from `Start` to `Stop`: one login per `Start`; FLV,
   side-FLV and websocket reopens reuse the token, and the bridge logs in again
   only on an auth failure (§6.9). **It never logs out** — ES3 logout is global
@@ -416,14 +447,19 @@ SPS as sent fails them.
   that differs is refused. Sequence-header tags are exempt. The ES3 sends a
   constant 16 ms (0 on the sequence header), so a `== 0` rule would refuse it
   (`census.md`, Leg A — stream).
-- **SPS limits**: `profile_idc ∈ {66, 77, 100}`; chroma 4:2:0, 8-bit;
-  `frame_mbs_only_flag == 1`; level ≤ 5.1; width ≤ 4096 and height ≤ 2304,
-  both even; `num_ref_frames` ≤ the census value (1 on the ES3);
+- **SPS limits**: `profile_idc ∈ {66, 77, 100}` — the ES3 sends 66, and 77
+  and 100 stay admitted for the committed fixtures (Main) and other sources;
+  within a KVM session the first SPS pins the profile (below); chroma 4:2:0,
+  8-bit; `frame_mbs_only_flag == 1`; level ≤ 5.1; width ≤ 4096 and height ≤
+  2304, both even; `num_ref_frames` ≤ 1, the census value (`census.md`,
+  Leg A — stream), and never above 16 (`SpsLimits`' ceiling; tests that
+  replay fixtures with more reference frames raise it, never past 16);
   `seq_scaling_matrix_present_flag == 0` and VUI
-  `nal/vcl_hrd_parameters_present_flag == 0`, unless `census.md` records the
-  KVM using them, in which case the exact values are pinned.
+  `nal/vcl_hrd_parameters_present_flag == 0` — the ES3 uses neither
+  (`census.md`: no scaling matrices, `nal_hrd` 0, `vcl_hrd` 0), so these stay
+  refusals and no values are pinned.
 - **PPS**: `num_slice_groups_minus1 == 0`; `num_ref_idx` defaults bounded;
-  `pic_scaling_matrix_present_flag == 0` unless the census pins it.
+  `pic_scaling_matrix_present_flag == 0` (the ES3 has none, `census.md`).
 - **Slice headers**: `slice_type ∈ {0, 2, 5, 7}` (P and I only); `pps_id` refers
   to a validated PPS; `first_mb_in_slice < PicSizeInMbs`; POC strictly
   increasing in decode order within a GOP.
@@ -435,11 +471,11 @@ fixtures and the limits above are held to:
 | Field | ES3 value | Consequence |
 |---|---|---|
 | Codec | AVC (`CodecID 7`), no Enhanced-RTMP FourCC | Admitted |
-| Profile / constraints / level | Baseline (66), `constraint_set0–5` all 0, `level_idc` 31 | Level rewritten to 40 before any check (§6.8); `constraint_set1_flag` is a Leg B question (§15) |
+| Profile / constraints / level | Baseline (66), `constraint_set0–5` all 0, `level_idc` 31 | Level rewritten to 40 before any check (§6.8). FreeRDP decodes an ES3-shaped x264 stream as labelled (level 31, `constraint_set1_flag` 0) and with level 40 alike (`census.md`, Leg B); Windows App is an acceptance item (§12) |
 | Size | 120×68 MBs (1920×1088), `frame_cropping` bottom 8 → 1920×1080 | `video.default_size`; the slate matches |
 | POC type / refs | POC type 0, `log2_max_frame_num_minus4` 4; `max_num_ref_frames` 1; progressive | `num_ref_frames` limit 1 |
 | Entropy / PPS | CAVLC, 1 slice group, no scaling matrices, no HRD | The slice-group, scaling-matrix and HRD rules above hold as written |
-| VUI | Present; claims full range, BT.601 (primaries 5, matrix 5); no timing, no `bitstream_restriction` | Wrong: rewritten (§6.8) |
+| VUI | Present; claims full range, BT.601 (primaries 5, matrix 5); no timing, no `bitstream_restriction` | Wrong: rewritten, and `bitstream_restriction` added (§6.8) |
 | Cadence | 30 fps (timestamp steps 33/34 ms), one tag every 33 ms static or moving; GOP 60 frames (2 s) | No idle gaps; `wait` would give N = 2.5 s (§6.5) |
 | Framing | tag = AU (no multi-picture, continuation or non-VCL-picture tags in ≈ 2 700); AVCC length size 4; coded tags carry only NAL types 1 and 5 (no AUD, SEI or in-band SPS/PPS) | No AU assembler (§6.2) |
 
@@ -550,9 +586,15 @@ the same suppression edge.**
 
 *Start resize*: stop sends (→ `WaitReactivation`); update the size used by
 `size()` and `request_initial_size()`; emit `DisplayUpdate::Resize` on the
-current updates stream; continue per the `ReactivationComplete` cell. Never a
-channel-only surface swap (it blinks on Windows App). AUs arriving during
-`WaitReactivation` are dropped.
+current updates stream; continue per the `ReactivationComplete` cell. AUs
+arriving during `WaitReactivation` are dropped. **This is the only resize
+path.** Leg B measured it on FreeRDP: `DisplayUpdate::Resize` → reactivation
+→ Setup → new-size IDR brought the picture back in 34 ms (37 ms through
+rdpgw, Leg C). A channel-only surface swap is never used: it blinks on
+Windows App, and on FreeRDP it is broken outright — Leg B's channel-only
+Setup (the same 1080p stream on a 1280×720 surface) made FreeRDP reject
+every later frame (`areRectsValid: … outside of bounding frame`)
+(`census.md`, Leg B).
 
 **Resolution change on the ES3.** One tentative observation (n = 1,
 `census.md`): while presets were switched in the KVM UI, a live FLV delivered
@@ -642,7 +684,10 @@ path. A side request that falls back adds `idr_side_timeout`: 2.8 s worst
 case, still within §10.3's 3 s. For `wait`, N = GOP length + 0.5 s = 2.5 s.
 The census gate — N ≤ 3 s for the chosen policy (for `reconnect` with a 1 s
 interval: p95 ≤ 1.5 s) — passes with p95 300 ms (`census.md`, Census gates),
-so there is no bridge-side GOP cache.
+so there is no bridge-side GOP cache. The RDP side adds little: Leg B's
+picture returned 34 ms after a server resize (37 ms through rdpgw), but it
+replayed a fixture that starts at an IDR, so it measures the RDP path only;
+N's KVM term is Leg A's.
 
 ### 6.6 Flow control
 
@@ -675,9 +720,11 @@ granularity.
     CapsConfirm and CacheImportReply, which IronRDP sends itself, are not
     counted. "Written" means accepted into TLS and the kernel socket buffer, so
     this gate is a lower bound on queueing, not end-to-end latency;
-  - *standing delay* (only when the client negotiated auto-detect, a census
-    item): IronRDP sends RTT probes only on request, so while auto-detect is
-    negotiated the pump issues `ProbeRtt` (`ServerEvent::AutoDetectRttRequest`,
+  - *standing delay* (only when the client negotiated auto-detect; FreeRDP
+    does and answers the probes — RTT 0–4 ms direct, 119 of 120 answered
+    through rdpgw — `census.md`, Leg B and Leg C; Windows App is an
+    acceptance item, §12): IronRDP sends RTT probes only on request, so
+    while auto-detect is negotiated the pump issues `ProbeRtt` (`ServerEvent::AutoDetectRttRequest`,
     current generation only) every `rtt_probe_interval` and reads
     `autodetect_rtt_handle` after each probe as an `RttSample`. Standing delay =
     median of the last 8 samples − the pump's own baseline (minimum since
@@ -701,7 +748,12 @@ granularity.
   `should_backpressure()` are bypassed, the stall timer is disabled, and the
   bounds are the backlog gate and standing delay (flow causes); backlog
   continuously ≥ `backlog_limit` for `stall_timeout` → Closing(`client_stalled`).
-  A non-suspend ack restores normal gating.
+  A non-suspend ack restores normal gating. FreeRDP never suspended:
+  `queue_depth` was 0 on every ack, direct (895 acks) and through rdpgw
+  (`census.md`, Leg B and Leg C); L3 exercises suspension with
+  `/gfx:frame-ack:off` (§11.4), and whether Windows App suspends — and
+  re-sends a suspend ack after a re-advertise or a server resize — is an
+  acceptance item (§12).
 - **`send_avc420_frame` returns `None` anyway** → a flow cause and a metric.
 - **Display suppression.** IronRDP exposes it as a polled flag that clients
   pulse (mstsc sends `SuppressOutput` during connect). The pump samples
@@ -720,14 +772,33 @@ way it logs every advertised capability set and disconnects with cause
 
 ### 6.8 Census-dependent risks
 
-Leg A's results (`census.md`, Leg A — stream and colour) are in each row.
+Leg A's results (`census.md`, Leg A — stream and colour) and Leg B's
+(`census.md`, Leg B — FreeRDP 3.31.1, direct) are in each row.
 
 | Finding | Effect | Response |
 |---|---|---|
-| Level below the coded size. **Found**: 1920×1080 labelled `level_idc` 31, but 8160 MBs > level 3.1's MaxFS 3600 | h264-reader — so `kvm-proto`'s `parse_sps` — refuses the SPS as sent (`FieldValueTooLarge { pic_size_in_map_units: 8160 }`); a strict client decoder may too | Rewrite (a), below |
-| Limited-range or BT.601 samples. **Found**: the pixels are limited-range BT.709 (decoded Y: black 16, white 233–236; pure red Y 63, where BT.601 would give ≈ 81), but the VUI claims full range (`video_full_range_flag` 1) and BT.601 (primaries 5, matrix 5) | MS-RDPEGFX fixes AVC420 to full-range BT.709; conformant clients ignore the VUI, so blacks lift to ~6% grey. A decoder that honours the VUI as sent shows washed-out, slightly mis-tinted colour | Measured on **decoded** samples, not flags. Rewrite (b), below, makes the VUI true, which is right whichever way a client treats it. Whether Windows App honours the VUI is Leg B's colour A/B (§15); if it does not, look for a KVM or EDID fix, otherwise ship passthrough with documented contrast loss. A colour-correct re-encode is a later opt-in mode with its own CPU budget |
-| POC type 0 without `bitstream_restriction`. **Found** | Client decoders may hold frames | Rewrite (c), below, if Leg B's barcode stranding test shows Windows App holding frames (Plan A Task 9.1). Safe because §6.1 already refuses B-slices and non-increasing POC |
-| Encoder stops sending on a static screen. **Not found**: one tag every 33 ms whether the screen is static or moving | Some clients hold the last ~2 frames, so the last keystroke never appears | Cannot strand a keystroke on the ES3 at 30 fps; Leg B's barcode stranding test still runs for the POC row. `flv_idle_timeout` sits far above the 33 ms cadence |
+| Level below the coded size. **Found**: 1920×1080 labelled `level_idc` 31, but 8160 MBs > level 3.1's MaxFS 3600 | h264-reader — so `kvm-proto`'s `parse_sps` — refuses the SPS as sent (`FieldValueTooLarge { pic_size_in_map_units: 8160 }`); a strict client decoder may too. FreeRDP does not care: an ES3-shaped x264 stream decodes the same at level 31 and 40 (Leg B) | Rewrite (a), below — required for `kvm-proto`'s own checks whatever the client does. Whether Windows App decodes the stream as labelled is an acceptance item (§12) |
+| Limited-range or BT.601 samples. **Found**: the pixels are limited-range BT.709 (decoded Y: black 16, white 233–236; pure red Y 63, where BT.601 would give ≈ 81), but the VUI claims full range (`video_full_range_flag` 1) and BT.601 (primaries 5, matrix 5) | MS-RDPEGFX fixes AVC420 to full-range BT.709. A client that applies that fixed conversion ignores the VUI and shows limited-range pixels **mildly washed out**: black → 16, white → 235 (~14 % contrast loss). **FreeRDP does exactly this**: Y 16 / 235 render as RGB 16,16,16 / 235,235,235 whether the VUI says full or limited (Leg B). A decoder that honours the VUI as sent shows washed-out, slightly mis-tinted colour | Measured on **decoded** samples, not flags. Rewrite (b), below, makes the VUI true — right for a client that honours it, but it cannot change a client that applies the fixed conversion. **Known limitation**, below |
+| POC type 0 without `bitstream_restriction`. **Found** | Client decoders may hold frames | Rewrite (c), below, **always** — decided in Plan A's Task 9.1 instead of a POC-0 presentation-hold experiment: the SPS is re-serialised for (b) anyway, and the structure is valid for Baseline. Safe because §6.1 already refuses B-slices and non-increasing POC. Leg B's stranding test passed on FreeRDP, but with x264 fixtures, not a POC-0 stream; whether Windows App holds frames on the rewritten stream is an acceptance item (§12) |
+| Encoder stops sending on a static screen. **Not found**: one tag every 33 ms whether the screen is static or moving | Some clients hold the last ~2 frames, so the last keystroke never appears | Cannot strand a keystroke on the ES3 at 30 fps. Leg B's barcode stranding test passed on FreeRDP: while stranded, the last frame stays fully displayed (screens 3 s apart byte-identical; no blank, no partial frame). `flv_idle_timeout` (10 s) sits far above the 33 ms cadence |
+
+**Known limitation: mild wash-out on fixed-conversion clients.** The ES3's
+pixels are limited-range, and a client that follows MS-RDPEGFX's fixed
+full-range AVC420 conversion shows them with black at 16 and white at 235 —
+no VUI rewrite can change that (`census.md`, Leg B). The options:
+
+1. **Accept it** — the v1 default. The picture is mildly washed out, not
+   wrong; L5 records it (§11.6).
+2. **A KVM encoder setting for full range** — the vendor UI has no range
+   control (§2), so this means finding one elsewhere on the device. If one
+   exists, rewrite (b) changes with it: the VUI must say what the pixels
+   measure.
+3. **Re-encode** — rejected (§14): a C decoder on hostile input and the CPU
+   target broken, to fix a mild contrast loss.
+
+Whether Windows App honours the VUI is the **first** owner acceptance item
+(§12): if it does, rewrite (b) fixes colour there and the limitation is
+FreeRDP's alone.
 
 **The SPS rewrite (`video.sps_rewrite`) is required**, not conditional: the
 ES3's SPS as sent fails §6.1. It runs on the KVM side, on every SPS
@@ -735,7 +806,8 @@ ES3's SPS as sent fails §6.1. It runs on the KVM side, on every SPS
 h264-reader parses only its output, and the rewritten SPS is what is
 admitted, classified, cached and sent to IronRDP (§6.1, §6.3). `kvm-proto`
 reads the input with its own bounded bit reader (h264-reader refuses it), and
-Plan B builds the rewriter (§12).
+Plan B builds the rewriter, with the POC-type-0 fixture (§11.5, §12).
+`video.sps_rewrite` is `["level", "vui", "restriction"]`.
 
 - (a) `"level"`: `level_idc` is raised to the lowest level whose MaxFS and
   MaxMBPS (H.264 Table A-1) admit the coded size at `video.max_fps`, and never
@@ -749,9 +821,13 @@ Plan B builds the rewriter (§12).
   — what the pixels measure. These fields come after Exp-Golomb fields, so
   this is a bit-level re-serialisation of the SPS with emulation prevention
   re-applied.
-- (c) `"restriction"` (*census*, Leg B): add `max_num_reorder_frames = 0` and
-  `max_dec_frame_buffering = max(num_ref_frames, 1)` — the same
-  re-serialisation, so it costs nothing extra.
+- (c) `"restriction"`: add `bitstream_restriction` with
+  `max_num_reorder_frames = 0` and `max_dec_frame_buffering =
+  max(num_ref_frames, 1)` — **0 and 1** on the ES3 (`max_num_ref_frames` 1,
+  `census.md` Leg A — stream) — and the structure's other fields at the
+  values H.264 infers when it is absent, so nothing else changes. An SPS that
+  already carries `bitstream_restriction` keeps it. The same
+  re-serialisation as (b), so it costs nothing extra.
 
 An SPS the rewriter cannot read (it reads only what §6.1 admits), or whose
 output h264-reader does not parse back to the input's fields apart from the
@@ -783,9 +859,12 @@ the session or the KVM connections open.
 
 Codes are explicit server-initiated ErrorInfo values (MS-RDPBCGR 2.2.5.1.1),
 so the client does not auto-reconnect into a loop; the log line names the
-cause. Milestone 0 Leg B verifies Windows App's dialog and reconnect behaviour
-for each and revises the table if needed (e.g. `0x19` SERVER_SHUTDOWN may suit
-`shutdown` better).
+cause. **Confirmed for 0x7 on FreeRDP only**: FreeRDP logs
+`ERRINFO_SERVER_DENIED_CONNECTION` and exits without auto-reconnecting,
+directly and through rdpgw (`census.md`, Leg B and Leg C). The table stands
+as written; Windows App's dialog and reconnect behaviour for each code
+(0x1, 0x5, 0x7, 0x9), and whether `0x19` SERVER_SHUTDOWN suits `shutdown`
+better, are an acceptance item (§12) that may revise it.
 
 | Cause | ErrorInfo |
 |---|---|
@@ -808,8 +887,10 @@ for each and revises the table if needed (e.g. `0x19` SERVER_SHUTDOWN may suit
 - **Mac remap**: Windows App rewrites Cmd+C/V/X/A/Z/F/W to Ctrl+… and sends
   other Cmd chords as the Windows key; Cmd+Tab, Cmd+Space and Cmd+Q stay on the
   laptop. A config-driven remap table can undo this; it ships **off** until
-  Milestone 0's key-matrix capture shows whether the rewrite can be told apart
-  from a real Ctrl+key.
+  the key-matrix capture shows whether the rewrite can be told apart from a
+  real Ctrl+key. Leg B could not capture it — FreeRDP has no Windows App
+  rewrite — so it is an owner acceptance item (`census.md`, Leg B — deferred;
+  §12).
 - Known limits: no horizontal scroll (the server does not advertise
   `TS_MOUSE_HWHEEL`); Pause arrives as LCtrl+NumLock (`EXTENDED1` is dropped).
 
@@ -867,7 +948,9 @@ Triggers:
 - **timers** (mouse events never reset them):
   - non-modifier keys held and no `Pressed` repeat of **any** held
     non-modifier key for `key_repeat_timeout` (typematic repeats only the most
-    recently pressed key);
+    recently pressed key). It is 10 s — the value for unconfirmed repeats —
+    until the owner's Windows App typematic capture sets it from §4.4's
+    formula (§12);
   - modifiers held and no keyboard event of any kind for
     `modifier_idle_timeout`.
 
@@ -927,8 +1010,15 @@ Limits and hygiene:
   abusive NLA-authenticated client is the accepted failure mode. An upstream
   reassembly cap for SVC and DVC is tracked in the pin review.
 - Contents are never logged; `FormatDataResponse` is never `Debug`-formatted.
-- Deployment must enable the channel (`EnableClipboard` in rdpgw,
-  `redirectclipboard:i:1` in the `.rdp`) or CLIPRDR never opens.
+- Deployment must enable the channel or CLIPRDR never opens: rdpgw needs
+  **`Caps.EnableClipboard: true`**. Without it rdpgw sends
+  `HTTP_TUNNEL_REDIR_DISABLE_CLIPBOARD` and FreeRDP leaves `cliprdr` out of
+  its channel list; with it, `cliprdr` is requested and given an MCS channel
+  (`census.md`, Leg C; clipboard data itself is Plan C's to test).
+  `redirectclipboard:i:1` is rdpgw's own default, so rdpgw leaves it out of
+  the `.rdp` (it writes no field equal to its default) and the client's
+  default applies. Whether Windows App obeys rdpgw's redirect flags is an
+  acceptance item (§12).
 - Milestone 4 compares our typing with the KVM's own `hid.lua?type=text`
   endpoint; ours stays the default unless the device's paces better.
 
@@ -938,7 +1028,14 @@ Limits and hygiene:
 
 1. **rdpgw** (companion spec): `/connect` sits behind the oauth2-proxy admin
    tier (Dex; one allowlisted address); the gateway hands out an `.rdp` with a
-   gateway token. Requirements in §9.4.
+   gateway token. Leg C (rdpgw `16cdaaf`, header mode behind a stand-in
+   proxy, `census.md`) showed the gateway refuses a missing, tampered,
+   wrongly signed, `alg:none` or expired token, and a token whose host was
+   changed. Two properties shape the edge (§9.3): a token is a **reusable
+   bearer credential** until `exp` + 60 s (rdpgw sets `exp` = now + 5 min and
+   allows 1 min of leeway, so about 6 min), and rdpgw's own `RDPGWSESSION`
+   cookie lets a direct `/connect` skip its trusted-proxy check.
+   Requirements in §9.4.
 2. **Network**: a NetworkPolicy (or, on a dedicated host, a host firewall)
    admitting only rdpgw to the RDP port counts as a layer **only if the
    companion spec shows it is enforced**.
@@ -949,11 +1046,16 @@ Limits and hygiene:
      never compiled in. CI checks the published image rejects any other mode.
    - One static username and password via `set_credentials`. The username
      compare is exact and case-sensitive; it must equal what rdpgw pre-fills.
+     A client may add its own host name as the NTLM domain: through rdpgw,
+     FreeRDP sent `ROWLETT\kvm` (direct: `kvm`) and IronRDP accepted it
+     (`census.md`, Leg C), so the domain is not part of the compare.
    - The password is stored recoverably (NTLM needs it), ≥ 128 random bits, as
      a SealedSecret.
    - TLS: our own rustls `ServerConfig` (not `TlsIdentityCtx::make_acceptor`,
      which honours `SSLKEYLOGFILE`), with our own RSA certificate for the name
-     in the `.rdp` — never the edge wildcard.
+     in the `.rdp` — never the edge wildcard. (FreeRDP also completes NLA
+     with an ECDSA certificate, `census.md` Leg B; RSA stays because Windows
+     App has not been tried with one.)
    - `on_accept` rate-limits attempts (`security.accept_rate`).
 
 ### 9.2 Secrets and logging
@@ -971,6 +1073,8 @@ pasted text are never logged (§4.5). Secrets come only from files (§4.4).
 | Compromised KVM injects keystrokes on its own | Factory reset (or reflash, if a vendor image exists) before first use and after isolation lands; power the KVM or its USB link off when not in use; alert on the router's NO-WAN drop rule (forward rule 120, `NO-WAN-v4`) and on KVM-originated LAN flows (companion spec) | Isolation limits who can reach the KVM, not what it does |
 | Anyone who can reach the KVM types into the Mac (port 8888 is the CVE port) | WAN egress blocked; isolation (§9.4) | Until isolation lands, the LAN, the tailnet, and every galaxy pod and hostNetwork process can reach :8888/:8889 |
 | Session hijack | Dex + gateway token + NLA (+ NetworkPolicy/firewall if enforced) | In-cluster attacker: NLA only. An in-cluster caller can occupy Preempt's single 10 s candidate slot, delaying a takeover by 10 s per attempt |
+| A gateway token is replayed (a leaked `.rdp`) | Tokens are bound to the bridge's host; **`VerifyClientIp: true`** with `Server.TrustedProxies` = the edge and the edge stamping `X-Forwarded-For`, so a token works only from the address that fetched it — Leg C: a token minted for another address is refused (`E_PROXY_RAP_ACCESSDENIED`); NLA still applies (§9.4) | A token is reusable — Leg C opened two tunnels with one — until `exp` + 60 s (about 6 min) from the pinned address. Pinning refuses legitimate connections if `/connect` and the tunnel reach rdpgw from different addresses (split routing, NAT) |
+| rdpgw's session cookie bypasses its trusted-proxy check | **The edge strips `Set-Cookie: RDPGWSESSION`** from `/connect` responses, and `/connect` is reachable only through the auth proxy (§9.4). Leg C: the cookie from a proxied `/connect`, sent directly from an untrusted address with no identity header, got 200 and a fresh token, because rdpgw accepts an authenticated session before it checks `TrustedProxies`; IP pinning does not help, since that token carries the caller's own address | If a cookie escapes anyway, it mints tokens for its 120 s lifetime (`Max-Age=120`) |
 | A client that stops reading pins the session | `Closing` + disconnect watchdog + hard abort (§6.9) | — |
 | Bridge crash with a key held | `panic = "abort"`; release on every orderly path | Depends on the KVM's behaviour on websocket loss (Plan C L4, §12) |
 | Census capture leaks or attacks the dev host | Sandbox (§12) | — |
@@ -990,25 +1094,52 @@ pasted text are never logged (§4.5). Secrets come only from files (§4.4).
     the service stopped, and L5 "direct" over an SSH local forward; or
   - a **dedicated pod interface** (Multus/macvlan) on that VLAN.
 
-  Verified by TCP connects to **every port the census finds open on the KVM**
-  (at least :80/:443/:1988/:8880/:8881/:8888/:8889) from a non-bridge pod, a
-  node shell and the tailnet — all must fail.
+  Verified by TCP connects to **every KVM service port** — :80/:443/:1988/
+  :8880/:8881/:8888/:8889, the vendor's documented ports, all open in Leg A —
+  plus a full TCP port scan (Leg A connected to the documented ports only, not
+  every port; `census.md`, Leg A — transport), from a non-bridge pod, a node
+  shell and the tailnet — all must fail.
 - Remove the KVM's Tailscale `/32` route once the bridge works.
 - On Kubernetes: whether the CNI enforces NetworkPolicy; if it does, policies
   admitting rdpgw to 3389, and Prometheus plus the node CIDR (kubelet probes)
   to 9464, only.
-- rdpgw:
+- rdpgw (Leg C findings at `16cdaaf`, `census.md`; any other pin is
+  re-checked against them):
   - Header trust local to the pod: an oauth2-proxy (admin tier) sidecar with
     rdpgw bound to `127.0.0.1` and `header.trustedproxies = [127.0.0.1/32]` —
     or rdpgw's openid mode against Dex. Never trust a pod-network address.
   - `caps.tokenauth: true`; host selection fixed to the bridge's name and port
     (never `any`); `/remoteDesktopGateway/` is the only path exempt from
     forward-auth, and `/`, `/connect` and `/api/v1/*` are never exposed without
-    it. `VerifyClientIp` set for Traefik.
-  - `EnableClipboard`; `.rdp` with `redirectclipboard:i:1`, a pre-filled
-    username equal to `rdp.username`, and a full-address name that resolves to
-    the bridge from the rdpgw pod.
-  - Check: a `GET /connect` with a forged auth header from another pod is
+    it — path-level routing, since the tunnel shares `/connect`'s port.
+  - **Strip `Set-Cookie: RDPGWSESSION`** from `/connect` responses at the edge
+    (§9.3): rdpgw's session cookie otherwise lets a direct `/connect` from an
+    untrusted address mint a token.
+  - **Pin tokens to the client**: `VerifyClientIp: true`, `Server.TrustedProxies`
+    = the edge, and the edge stamping `X-Forwarded-For`. Leg C showed rdpgw
+    then takes the token's client address from that header and refuses the
+    token from any other address. The companion spec shows that `/connect`
+    and the tunnel reach rdpgw with the same client address.
+  - **Websocket transport only.** In token mode `16cdaaf` refuses the legacy
+    two-channel HTTP transport (`RDG_IN_DATA` gets 401: rdpgw #185 ties the
+    second half-channel to a non-empty user name, and in token mode the
+    gateway endpoint carries no HTTP identity), and
+    rdpgw implements no RPC transport. Windows App's transport is an
+    acceptance item (§12); if it uses legacy HTTP, rdpgw needs a patch or a
+    different pin.
+  - **`Caps.EnableClipboard: true`** (§8).
+  - `.rdp` username: **`Client.Defaults`** (a one-line `.rdp` holding
+    `username:s:kvm`, equal to `rdp.username`) plus **`Client.NoUsername:
+    true`**. By default rdpgw writes the proxy identity into `username:s:`,
+    and a fixed `Client.UsernameTemplate` without `{{ username }}` is
+    rejected on every request (read in rdpgw's code, not run). A full-address
+    name that resolves to the bridge from the rdpgw pod. rdpgw writes only
+    fields that differ from its defaults, so the `.rdp` has 7 lines and the
+    client's defaults apply to the rest (`redirectclipboard`,
+    `networkautodetect`, `enablecredsspsupport`).
+  - Checks: a `GET /connect` with a forged auth header from another pod is
+    refused (Leg C: 401 `Untrusted upstream`); so is a direct `/connect`
+    carrying an `RDPGWSESSION` cookie; a token used from another address is
     refused.
 - A certificate for that name, with a restart on rotation (§4.4).
 - A memory limit (container or systemd) sized from §10.1's stalled-client bound
@@ -1084,6 +1215,11 @@ memory on the same schedule — p50 and p99 of each, never subtracted.
 - The KVM preset is pinned to 1920×1080 at 30 fps (§6.1): not auto (the Mac
   may otherwise drive 4K at level 5.1), not 60 fps (level 4.2, twice the
   bitrate). Each result is recorded as pass or fail.
+- **Colour is a known limitation, not a bound.** On a client that applies
+  MS-RDPEGFX's fixed full-range AVC420 conversion — FreeRDP does — the ES3's
+  limited-range pixels show mildly washed out (black 16, white 235;
+  `census.md`, Leg B). §6.8 has the options; L5 records what Windows App
+  shows.
 
 ### 10.4 Metrics
 
@@ -1122,7 +1258,7 @@ frame (`alloc-stats` builds).
 
 | Tier | Where | What |
 |---|---|---|
-| L0 unit | `kvm-proto` | Goldens (HID encoders, scancode table, AVCC→Annex-B, SPS fields); SPS rewriter goldens: the ES3's SPS (`census.md` `sps_hex`) → `level_idc` 40 and VUI full-range 0, colour 1/1/1, emulation prevention re-applied, and the output accepted by h264-reader; a level that already admits the size is never lowered; an SPS already labelled BT.709 limited and at an adequate level is byte-identical; a re-serialisation that produces `00 00 0[0-3]` gains an emulation-prevention byte; with `"restriction"`, `bitstream_restriction` already present is kept; an unreadable SPS → `stream_incompatible`; `CompositionTime` constant (16) is admitted and a change refused; FLV mux→demux round-trip property tests; parse of a committed ffmpeg-muxed FLV; burst marking; mouse scaling at the edges; **one hostile vector per §6.1/§6.2 rule, each asserting its specific error kind**; SPS-change classification per §6.1's table; a pre-buffer test (`DataSize = 0xFFFFFF` rejected after ≤ 11 bytes, nothing reserved); sans-IO cores with injected clock (release epoch and released-by-bridge rule, both key timers including two keys held with repeats of the second only → no release, backoff, paste pacing and text handling, debounce) |
+| L0 unit | `kvm-proto` | Goldens (HID encoders, scancode table, AVCC→Annex-B, SPS fields); SPS rewriter goldens: the ES3's SPS (`census.md` `sps_hex`) → `level_idc` 40, VUI full-range 0, colour 1/1/1 and `bitstream_restriction` added (`max_num_reorder_frames` 0, `max_dec_frame_buffering` 1), emulation prevention re-applied, and the output accepted by h264-reader; a level that already admits the size is never lowered; an SPS already labelled BT.709 limited, at an adequate level and carrying `bitstream_restriction` is byte-identical; a re-serialisation that produces `00 00 0[0-3]` gains an emulation-prevention byte; with `"restriction"`, `bitstream_restriction` already present is kept; an unreadable SPS → `stream_incompatible`; `CompositionTime` constant (16) is admitted and a change refused; FLV mux→demux round-trip property tests; parse of a committed ffmpeg-muxed FLV; burst marking; mouse scaling at the edges; **one hostile vector per §6.1/§6.2 rule, each asserting its specific error kind**; SPS-change classification per §6.1's table; a pre-buffer test (`DataSize = 0xFFFFFF` rejected after ≤ 11 bytes, nothing reserved); sans-IO cores with injected clock (release epoch and released-by-bridge rule, both key timers including two keys held with repeats of the second only → no release, backoff, paste pacing and text handling, debounce) |
 | L0 fuzz | `fuzz/` | FLV demux, AVCC, sanitiser, SPS/PPS/slice checks, SPS rewriter, login response; a differential mux→demux target. Output invariants in every target: emitted NAL types ∈ {1,5,7,8,9}; no emitted NAL contains `00 00 0[0-2]`; re-splitting the Annex-B yields exactly the emitted NALs; any emitted SPS is byte-identical to the last admitted (after rewrite) SPS and its pinned fields equal the first SPS's. Rewriter: the output re-parses with every field equal to the input except `level_idc` (never lower than the input's), the VUI's video-signal-type and colour-description fields, and, with `"restriction"`, `max_num_reorder_frames`, `max_dec_frame_buffering` and `bitstream_restriction_flag`. 5 s per target per PR, longer nightly. CI-only |
 | L1 sans-IO | `kvm-rdp` | `Pump::step` and `GraphicsPipelineServer` ↔ `GraphicsPipelineClient` in memory (cases below). IronRDP goldens: `encode_avc420_bitmap_stream(full_frame(640,360,22))` bytes and the ResetGraphics monitor bytes — required on every pin bump |
 | L2 full stack | `kvm-rdp` (one test binary) | Bridge + kvm-sim + in-process IronRDP client over loopback (§11.3) |
@@ -1133,11 +1269,16 @@ frame (`alloc-stats` builds).
 L1 cases:
 
 - **Every cell of the §6.4 state × input table**, one case each.
-- Each replayed `CapabilitiesAdvertise` (Windows App direct, through rdpgw, and
-  any re-advertise; FreeRDP — Milestone 0 fixtures) yields exactly the
+- Each replayed `CapabilitiesAdvertise` yields exactly the
   CapabilitiesConfirm recorded in `census.md`; only AVC420 `WireToSurface1` is
-  ever sent. A re-advertise whose confirmed set lacks AVC420 → Closing(`no_avc420`)
-  at once.
+  ever sent. FreeRDP's are recorded (Leg B): with `/gfx:AVC420`, `V8`
+  `02000000` and `V8_1` `12000000` → `V8_1`; without it, an 11-set ladder
+  `V8`…`V10_7` → `V10_7` (`census.md` names these sets but not their bytes,
+  so Plan C captures them from the flake's FreeRDP); byte-identical through
+  rdpgw (Leg C), and FreeRDP never re-advertised. Windows App's (direct,
+  through rdpgw, any re-advertise) are added from the owner's acceptance run
+  (§12). A re-advertise whose confirmed set lacks AVC420 →
+  Closing(`no_avc420`) at once.
 - After Live, a second CapsAdvertise produces exactly: CapabilitiesConfirm,
   ResetGraphics (w, h, one monitor), CreateSurface, MapSurfaceToOutput,
   StartFrame, WireToSurface1 (IDR with SPS/PPS), EndFrame — no DeleteSurface,
@@ -1197,8 +1338,9 @@ L1 cases:
 
 ### 11.3 L2 cases
 
-Each asserts something exact. The in-process client advertises the Milestone 0
-Windows App capability bytes and uses a capture decoder that records bytes and
+Each asserts something exact. The in-process client advertises Windows App's
+capability bytes once the acceptance run records them (FreeRDP's `V8` /
+`V8_1` pair from `census.md` until then) and uses a capture decoder that records bytes and
 returns a dummy frame; a wrapper `DvcProcessor` can withhold or suspend
 `FrameAcknowledge`, and the client can stop reading its socket. IronRDP's
 `OpenH264Decoder` is never an oracle (it expects length-prefixed input). No
@@ -1338,11 +1480,16 @@ questions belong to L5.
     `log2_max_pic_order_cnt_lsb` set, restriction removed,
     `pic_order_cnt_lsb = 2 × frame_num` inserted in each slice header with
     re-escaping), verified by `trace_headers` and a decoded-frame md5 equal to
-    the source;
+    the source. **Moved to Plan B** (a Plan A deviation): the transform needs
+    the same bit-level SPS re-serialisation as the rewriter (§6.8), so Plan B
+    builds both together;
   - a second-resolution stream (480p) for resize cases.
 
   Plus one small ffmpeg-muxed `.flv` (`-c copy -f flv`) as an independent demux
-  oracle, and the 1920×1080 connecting slate.
+  oracle, and the 1920×1080 connecting slate. Plan A built all of these but
+  the POC-type-0 variant. `gen-fixtures.sh large` also generates gitignored
+  1080p30 (full range, limited range and its full-range-flag twin) and 720p30
+  streams for the spikes and benches.
 - Flags pinned: `-bf 0 -threads 1 -x264-params
   sliced-threads=0:keyint=N:min-keyint=N:scenecut=0:aud=1`; each frame carries a
   16-bit barcode.
@@ -1367,31 +1514,61 @@ questions belong to L5.
 - L5 checklist (pass/fail, recorded): key matrix; Mac remap profile; paste
   (including newline handling); reconnect and a takeover of a stale session;
   resize; display sleep/wake; each fatal cause's dialog (no auto-reconnect);
-  **washed-out blacks?**; **does the last keystroke appear without further
-  input?**; picture within N (§10.3); glass-to-glass bounds (§10.3).
+  **washed-out blacks?** (the §6.8 known limitation); **does the last
+  keystroke appear without further input?**; picture within N (§10.3);
+  glass-to-glass bounds (§10.3). The owner acceptance checklist (§12) asks
+  the Milestone 0 questions only Windows App can answer; L5 repeats its items
+  against the finished bridge.
 
 ## 12. Milestones and planning units
 
 **Milestone 0 — census and spikes (go/no-go for passthrough).** It includes
 the unhardened subset of `kvm-proto` it needs (FLV tag reader, AVCC→NAL split,
 NAL header, SPS/slice inspection via h264-reader, login parsing),
-`gen-fixtures.sh`, `kvm-probe`, and opening the upstream IronRDP PR (§4.2).
+`gen-fixtures.sh`, `kvm-probe`, and the four IronRDP patches on the owner's
+fork (§4.2; the upstream PR waits for the owner).
 Milestone 1 hardens these parsers rather than writing them.
 
-**Status (rev 5.1).** **Leg A is done** (2026-10-06, two sessions; results
-in `docs/census.md`, applied by rev 5.1), and both census gates pass on its
-numbers. Recorded deviations from the Leg A list below: the pin is recorded
-by the `kvm-probe fingerprint` subcommand, not `--print-fingerprint`; what
-the Mac sees when the websocket dies with a key held moved to Plan C's L4
-(it needs HID input, which the probe never sends); "every open TCP port"
-became the KVM's documented service ports; "HID round trip" became
-control-websocket open latency (`kvm-probe ws-open`); only the 1920×1080 /
-30 fps preset was measured — auto and 60 fps deliberately not, since the
-preset is pinned (§6.1). Left open by Leg A: the firmware version (no
-`Server` header; it is read from the UI's about page), and resolution-change
-signalling rests on one tentative observation (§6.4). **Legs B and C are
-pending**; Plan A's Task 9.1 still completes the census revision and records
-the Milestone 0 verdict.
+**Status (rev 6).** **The census is done** (2026-10-06; results in
+`docs/census.md`) and the verdict is **go for passthrough** (Milestone 0
+verdict, below). Leg A ran against the ES3 in two sessions. **Legs B and C
+ran with FreeRDP 3.31.1 standing in for Windows App**, which could not
+easily be tested yet: stock IronRDP HEAD `38b074e` replaying committed
+fixtures, direct (Leg B) and through rdpgw `16cdaaf` (Leg C). Every
+Windows App run step below became a FreeRDP run; what only Windows App can
+answer is the owner acceptance checklist (below). Recorded deviations from
+the lists below:
+
+- Leg A: the pin is recorded by the `kvm-probe fingerprint` subcommand, not
+  `--print-fingerprint`; what the Mac sees when the websocket dies with a key
+  held moved to Plan C's L4 (it needs HID input, which the probe never
+  sends); "every open TCP port" became the KVM's documented service ports
+  (so §9.4 adds a full scan); "HID round trip" became control-websocket open
+  latency (`kvm-probe ws-open`); only the 1920×1080 / 30 fps preset was
+  measured — auto and 60 fps deliberately not, since the preset is pinned
+  (§6.1).
+- Leg B: it also replayed an ES3-shaped local x264 stream (Baseline,
+  1080p30, `level_idc` 31, VUI full range and BT.601, and the same at level
+  40), generated into `captures/` and not committed. The barcode stranding
+  test replayed x264 fixtures, not a POC-0 stream; the POC-0
+  presentation-hold check was replaced by always adding
+  `bitstream_restriction` (§6.8), and the POC-type-0 fixture moved to Plan B
+  (§11.5). FreeRDP's capability bytes are recorded in `census.md`, not as a
+  separate fixture file; Windows App's capability and key-matrix fixtures
+  wait for the acceptance run.
+- Leg C: everything ran on loopback, so the stand-in proxy's source address
+  (127.0.0.2) played the trusted proxy and 127.0.0.1 "another LAN host";
+  every certificate was a throwaway self-signed one (`/cert:ignore`).
+- The IronRDP patches are written on the owner's fork, branch
+  `kvm-rdp-egfx-patches` (cloned at `~/Repos/IronRDP`); the upstream PR is
+  deferred until the owner says so, and Plan C git-pins the fork (§4.2).
+
+Left open: the firmware version (no `Server` header; it is read from the
+UI's about page), and resolution-change signalling rests on one tentative
+observation (§6.4).
+
+The legs as planned (results in `census.md`; verdict and acceptance
+checklist at the end of this section):
 
 - **Leg A — census** (`kvm-probe`):
   - Logs in, saves raw FLV, and writes one JSONL line per tag: receive time,
@@ -1421,7 +1598,7 @@ the Milestone 0 verdict.
     /nix --bind $CAPDIR /cap …`). During captures the Mac shows only test
     patterns or the lock screen.
 - **Leg B — Windows App spike, direct** (stock IronRDP HEAD, throwaway code,
-  replaying committed fixtures). Logs and commits every capability set and the
+  replaying committed fixtures; run with FreeRDP 3.31.1, Status above). Logs and commits every capability set and the
   confirmed one (with FreeRDP's), ack latency and every `queue_depth` (does
   Windows App suspend acks; does it re-send a suspend ack after its own
   re-advertise or after a server resize?), whether it negotiates the
@@ -1436,7 +1613,8 @@ the Milestone 0 verdict.
   after a server-initiated resize and after a re-advertise; colour A/B;
   barcode stranding test.
 - **Leg C — gateway**: rdpgw on the LAN (not internet-facing), header mode
-  behind a throwaway local proxy — the Dex part belongs to the companion spec.
+  behind a throwaway local proxy — the Dex part belongs to the companion spec
+  (run on loopback with FreeRDP 3.31.1, Status above).
   Logs and commits the capability bytes (initial and any re-advertise), every
   `queue_depth`, and whether auto-detect works through the gateway. **Gates**:
   Windows App connects with a gateway-token `.rdp`; NLA with the pre-filled
@@ -1462,13 +1640,88 @@ before `census.md` is committed):
 
 | Plan | Covers |
 |---|---|
-| A | Milestone 0 (with the `kvm-proto` subset, fixtures, `kvm-probe`, spikes, the upstream PR) → `census.md` + spec revision |
-| B | M1 + M2, including the SPS rewriter — required: level patch and VUI re-serialisation, plus `bitstream_restriction` if Leg B needs it (§6.8) — and kvm-sim's ES3 profile. No AU assembler and no GOP cache: Leg A needs neither (§6.2, §6.5) |
-| C | M3a: config, logging, admin endpoints, metrics, shutdown, lifecycle, NLA, EGFX pump and state machine, the websocket, the HID writer skeleton and release epoch, L1 and video/lifecycle L2. Requires the upstream patches (§4.2) or their fallbacks |
+| A | Milestone 0 (with the `kvm-proto` subset, fixtures, `kvm-probe`, spikes, the IronRDP fork patches) → `census.md` + spec revision |
+| B | M1 + M2, including the SPS rewriter — required: level patch, VUI re-serialisation and `bitstream_restriction` (§6.8), with the POC-type-0 fixture (§11.5) — and kvm-sim's ES3 profile. No AU assembler and no GOP cache: Leg A needs neither (§6.2, §6.5) |
+| C | M3a: config, logging, admin endpoints, metrics, shutdown, lifecycle, NLA, EGFX pump and state machine, the websocket, the HID writer skeleton and release epoch, L1 and video/lifecycle L2. Requires the four IronRDP patches, git-pinned from the fork branch (§4.2), or their fallbacks |
 | D | M3b + M4: keyboard and mouse mapping, stuck-key timers and the released-by-bridge rule, the Typist, and their L2 cases |
 | E | M5 + M6: L3, CI, image, perf pass |
 
-The companion `luma-homeops` spec is written once Milestone 0 passes.
+The companion `luma-homeops` spec is written once Milestone 0 passes. It has
+(verdict below), so the companion spec can be written; it takes §9.4,
+including Leg C's rdpgw findings, as input.
+
+### Milestone 0 verdict
+
+**Go for passthrough** (2026-10-06). Every census gate passes, so Plans B–E
+may be written, and the §14 VNC fallback is not revisited: Leg C did not
+fail. The protocol gates were validated with FreeRDP 3.31.1 standing in for
+Windows App; what only Windows App can settle is the acceptance checklist
+below. If Windows App rejects something FreeRDP accepted, the bridge adapts
+— or, if it cannot, the §14 fallback is reconsidered then.
+
+| Gate | Result | `census.md` |
+|---|---|---|
+| AVC420 in the confirmed set | **Pass**: `V8_1` with `/gfx:AVC420`, `V10_7` with FreeRDP's full 11-set ladder (`confirmed_has_avc=true`) | Leg B, Leg C |
+| NLA completes | **Pass**: direct with an ECDSA certificate; through rdpgw with the pre-filled username `kvm` | Leg B, Leg C |
+| First-frame ack p95 ≤ 1 s | **Pass**: 97 ms direct, 95 ms through rdpgw (10 fresh connections each) | Leg B, Leg C |
+| Picture within N after a server resize | **Pass**: 34 ms direct, 37 ms through rdpgw, on the real resize path (§6.4) | Leg B, Leg C |
+| Picture within N after a re-advertise | **N/A**: FreeRDP never re-advertised — acceptance item 8 | Leg B, Leg C |
+| Colour A/B | **Recorded, not a gate**: FreeRDP ignores the VUI; mild wash-out on limited-range pixels (§6.8 known limitation) — acceptance item 1 | Leg B |
+| Barcode stranding | **Pass**: the last frame stays fully displayed while stranded | Leg B |
+| N ≤ 3 s for the chosen policy | **Pass**: FLV open → first IDR p95 300 ms over https; N = 1.8 s for `side` (§6.5) | Leg A, Census gates |
+| Max burst ≤ hard cap and ≤ channel capacity | **Pass**: burst on connect 0 frames; hard cap 60 frames (§6.6) | Leg A, Census gates |
+| Leg C: the gateway-token `.rdp` connects | **Pass** over the websocket transport; legacy HTTP and RPC fail at `16cdaaf` (§9.4) — acceptance item 2 | Leg C |
+| Leg C: NLA with the pre-filled username | **Pass** (`Client.Defaults` + `Client.NoUsername`, §9.4) | Leg C |
+| Leg C: the CLIPRDR channel opens | **Pass with `Caps.EnableClipboard: true`**; rdpgw's default disables it (§8) | Leg C |
+| Leg C: the Leg B video gates hold through the gateway | **Pass**: identical capability bytes, AVC420, ack p95 95 ms, resize 37 ms; nothing measurable added on loopback | Leg C |
+
+### Owner acceptance checklist (Windows App)
+
+Every Milestone 0 item that only Windows App can answer, run by the owner
+with Windows App on macOS, direct and through rdpgw — against the Leg B/C
+spikes (`spikes/legb-winapp`, `spikes/legc-rdpgw`) or, once it exists, the
+bridge. Each result goes into `census.md`, and the values marked
+*acceptance* in §4.4 are retuned from it. In priority order:
+
+1. **VUI and colour.** Does Windows App honour the VUI? Replay
+   `fixtures/large/1080p30_main_limited.h264` and its `…_flagfull` twin
+   (identical slices; only the range flag differs) and compare black
+   levels. Honoured: rewrite (b) fixes colour on Windows App. Not honoured:
+   the §6.8 known limitation stands, with its options.
+2. **Gateway transport through rdpgw.** Windows App must use the websocket
+   transport: `rdpgw_websocket_connections` 1 while connected, and no
+   `Opening RDGOUT` in rdpgw's log. If it falls back to the legacy HTTP
+   transport, rdpgw `16cdaaf` refuses it (#185): patch rdpgw or change the
+   pin before deploying. Also: does it accept the `gatewayaccesstoken` `.rdp`
+   with a self-signed LAN certificate, and does it obey rdpgw's
+   `HTTP_TUNNEL_REDIR_DISABLE_*` flags (§8)?
+3. **Baseline and level decode.** Does Windows App decode the ES3-shaped
+   stream (Baseline, `constraint_set1_flag` 0) as labelled (level 3.1), and
+   with the rewrite (level 40, VUI corrected, `bitstream_restriction`
+   added)? Does the last frame appear without further input (barcode
+   stranding)? If only the rewritten stream decodes, the rewrite is
+   confirmed; if neither does, the rewrite also sets `constraint_set1_flag`
+   (§15).
+4. **Key matrix and typematic.** Every physical key and chord → scancode,
+   extended flag and Windows App's Cmd rewrite; ≥ 20 typematic samples at
+   default macOS settings. Sets `input.key_repeat_timeout` (max initial delay
+   + 2 × repeat interval + 250 ms, floor 1 s, §7.4) and decides
+   `input.mac_remap` (on only if the Cmd rewrite can be told apart from a
+   real Ctrl+key, §7.1); committed as the remap-table fixture.
+5. **ErrorInfo dialogs and auto-reconnect** for 0x1, 0x5, 0x7 and 0x9 (no
+   auto-reconnect loop), and whether `0x19` SERVER_SHUTDOWN suits `shutdown`
+   better (§6.9).
+6. **First-frame ack p95** over ≥ 20 reconnects. Must be ≤ 1 s; sets
+   `video.first_ack_grace` = p95 + `soft_gate` (§6.6).
+7. **Ack suspension.** Does Windows App suspend acks (`queue_depth`
+   0xFFFFFFFF), and does it re-send a suspend ack after its own re-advertise
+   and after a server resize (§4.2 patch 1, §6.6)? Also: does it negotiate
+   auto-detect and answer RTT probes (the standing-delay gate, §6.6), and
+   does it send QoE?
+8. **Re-advertise.** Does Windows App re-advertise, and does the picture
+   return within N (§6.5) after it? Record every capability set it
+   advertises, direct and through rdpgw, as the L1/L2 fixture (§11.2,
+   §11.3).
 
 ## 13. Development resource budget
 
@@ -1498,11 +1751,11 @@ The host is shared and loaded (16 cores, ~12 GiB free RAM, 143 GB free disk at
 | Alternative | Why not |
 |---|---|
 | xrdp or Weston session showing a player or browser | Decodes and re-encodes every frame: ~200–350 ms and 2–4 cores at 1080p30 |
-| VNC bridge (neatvnc) through a Pomerium tunnel | Viable; kept as the fallback if Milestone 0 Leg C fails. RDP preferred for the App Store client and plain HTTPS through the gateway |
+| VNC bridge (neatvnc) through a Pomerium tunnel | Viable; was the fallback had Milestone 0 Leg C failed. Leg C passed (§12), so it is reconsidered only if Windows App fails acceptance in a way the bridge cannot adapt to. RDP preferred for the App Store client and plain HTTPS through the gateway |
 | Tailscale on the work laptop | Unofficial without admin rights; most likely to trip endpoint security |
 | An RDP server (macrdp) on the Mac itself | Installing a remote-access server on the managed Mac is what IT disabled Screen Sharing to prevent |
 | crates.io IronRDP 0.13 | §4.2 |
-| Re-encode fallback in v1 | No clean decline path; a C decoder on hostile input; breaks the CPU target |
+| Re-encode fallback in v1 | No clean decline path; a C decoder on hostile input; breaks the CPU target. Nor is it worth it for colour: the ES3's limited range costs a mild wash-out on fixed-conversion clients (§6.8) |
 | Bridge-side GOP cache in v1 | Interacts with every gate and cap, and Leg A makes it unnecessary: any new FLV connection forces an IDR from the ES3's shared encoder (p95 300 ms) and nothing is replayed on connect (§6.5) |
 | Frame-count soft gate from measured fps | Stalls on idle → motion transitions; the oldest-unacked-age gate does not depend on frame rate |
 | RTT auto-detect as the only suspension bound | It is timestamped when written, so it cannot see the server-side queue; kept only as the downstream standing-delay signal |
@@ -1517,21 +1770,37 @@ AU; burst on connect (0); static-screen cadence (no skipped frames); the IDR
 policy (`side`, fallback `reconnect`) and N (1.8 s); the pixels' range and
 matrix (limited BT.709) and the VUI's mislabel; the level mislabel.
 
-Still to be settled by Legs B and C (Task 9.1): Windows App's capability
-ladder, ack-suspension, auto-detect, typematic and ErrorInfo behaviour;
-whether stock IronRDP HEAD completes NLA + AVC420 with Windows App, directly
-and through rdpgw; presentation hold (and with it the `"restriction"`
-rewrite); the Mac remap; `first_ack_grace`, `flv_idle_timeout` and §7.4's
-timeouts. New from Leg A:
+Settled by Legs B and C (rev 6, `census.md`, with FreeRDP 3.31.1 standing
+in for Windows App): stock IronRDP HEAD completes NLA (an ECDSA certificate
+is enough for FreeRDP) and confirms AVC420, directly and through rdpgw, with
+identical capability bytes; first-frame ack p95 97 ms (95 ms through rdpgw),
+so `first_ack_grace` is 1.6 s until Windows App is measured; the real resize
+path is the only resize path (§6.4); FreeRDP neither suspends acks nor
+re-advertises, and answers auto-detect; the stranding test passes;
+`flv_idle_timeout` is 10 s; the `"restriction"` rewrite is always applied
+(§6.8); ErrorInfo 0x7 ends the session without auto-reconnect; rdpgw
+`16cdaaf` works in token mode over websocket only, needs
+`Caps.EnableClipboard`, `Client.Defaults` + `Client.NoUsername`, the
+`RDPGWSESSION` cookie stripped at the edge and tokens pinned to the client
+(§9.4).
 
-- **Does Windows App decode the ES3's Baseline stream with
-  `constraint_set1_flag` 0** (constrained Baseline not signalled; Leg A saw
-  one slice group and no ASO)? If not, the rewrite also sets it. And does it
-  decode the stream as labelled (level 3.1), or only with the rewritten 40?
-  The level rewrite is required either way (§6.8).
-- **Does Windows App honour the VUI?** Leg B's colour A/B decides whether the
-  corrected VUI (§6.8) fixes colour or the AVC420 fixed conversion leaves the
-  contrast loss in place.
+**Known limitation** (not open; options in §6.8): FreeRDP applies
+MS-RDPEGFX's fixed full-range AVC420 conversion and ignores the VUI, so the
+ES3's limited-range pixels show mildly washed out (black 16, white 235).
+The VUI rewrite cannot help such a client; a KVM-side full-range setting
+could; re-encoding is rejected (§14).
+
+**Open for the owner's Windows App acceptance run** (§12, in priority
+order): whether Windows App honours the VUI; whether it uses rdpgw's
+websocket transport (the biggest open risk: legacy HTTP fails at
+`16cdaaf`); whether it decodes the ES3's Baseline stream with
+`constraint_set1_flag` 0 as labelled (level 3.1) and with the rewrite — if
+neither, the rewrite also sets `constraint_set1_flag` (Leg A saw one slice
+group and no ASO); the key matrix and typematic (`key_repeat_timeout`,
+`mac_remap`); the ErrorInfo dialogs and auto-reconnect (and `0x19` for
+`shutdown`); its first-frame ack p95 (`first_ack_grace`); its ack
+suspension, auto-detect and QoE; its re-advertise behaviour and capability
+ladder.
 
 Open for Plan C's L4 (§11.6): what the Mac sees when the websocket dies with
 a key held (moved from Leg A); side request → main-FLV IDR latency over 20
@@ -1543,6 +1812,9 @@ every RDP connection leaves one token to lapse); the KVM's HID report rate
 before `paste.pace` is fixed (§8). Still to be recorded in `census.md`: the
 firmware version (from the UI's about page).
 
-Watched: the upstream IronRDP PR (§4.2); IronRDP API churn and an upstream
-SVC/DVC reassembly cap (monthly pin review); FLV source latency — if SRS
-buffers ~350 ms, the WebRTC source on :1988 becomes a future option.
+Watched: the IronRDP fork branch `kvm-rdp-egfx-patches` and, once the owner
+opens it, its upstream PR (§4.2); IronRDP API churn and an upstream SVC/DVC
+reassembly cap (monthly pin review); rdpgw's legacy-transport refusal in
+token mode (#185) and any pin past `16cdaaf` (§9.4); FLV source latency —
+*open*, not measured by the census: if SRS buffers ~350 ms, the WebRTC
+source on :1988 becomes a future option (§3.1, §10.3).
