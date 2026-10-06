@@ -10,8 +10,9 @@ use clap::Parser;
 
 use kvm_probe::captures::{self, CaptureDir};
 use kvm_probe::cli::{Cli, Cmd, Conn, Port, SchemeArg};
+use kvm_probe::kvm::KvmError;
 use kvm_probe::request::{KvmTarget, Scheme};
-use kvm_probe::{capture, fingerprint, kvm, report, sandbox, secret, stats, trial, wsprobe};
+use kvm_probe::{capture, fingerprint, kvm, report, sandbox, secret, trial, wsprobe};
 
 /// The repo-root `/captures/` directory (gitignored, §11.5) — anchored at
 /// build time via `CARGO_MANIFEST_DIR`, never relative to the operator's
@@ -57,11 +58,11 @@ async fn session<T>(
     conn: &Conn,
     password: &str,
     work: impl AsyncFnOnce(&str) -> T,
-) -> Result<T, String> {
+) -> Result<T, KvmError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?;
-    let now = i64::try_from(now.as_secs()).map_err(|e| e.to_string())?;
+        .map_err(|e| KvmError::Io(format!("system clock: {e}")))?;
+    let now = i64::try_from(now.as_secs()).map_err(|e| KvmError::Io(e.to_string()))?;
     let s = kvm::with_session(
         &target(conn),
         conn.pin_for(Port::Web),
@@ -70,8 +71,7 @@ async fn session<T>(
         "UTC",
         work,
     )
-    .await
-    .map_err(|e| format!("{e:?}"))?;
+    .await?;
     if let Err(e) = &s.logout {
         eprintln!(
             "kvm-probe: logout failed (best effort, ignored): {}",
@@ -166,7 +166,8 @@ async fn run(cli: Cli) -> Result<(), String> {
                     }
                 },
             )
-            .await??;
+            .await
+            .map_err(|e| format!("{e:?}"))??;
             println!(
                 "tags={} bytes={} parse_errors={} first_error={:?}",
                 s.tags, s.bytes, s.parse_errors, s.first_error
@@ -175,12 +176,12 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::FirstIdr { conn, trials } => {
             let pw = password(&conn)?;
             let t = target(&conn);
-            let mut samples = Vec::new();
-            for _ in 0..trials {
+            let mut report = trial::TrialReport::default();
+            for n in 1..=trials {
                 // m1: each trial is its own session — log in, time the FLV
                 // open → first IDR (login excluded), log out — so 20
                 // trials never hold 20 live KVM sessions.
-                let d = session(&conn, &pw, async |tok: &str| {
+                let outcome = session(&conn, &pw, async |tok: &str| {
                     trial::first_idr_latency(
                         &t,
                         conn.pin_for(Port::Video),
@@ -189,17 +190,22 @@ async fn run(cli: Cli) -> Result<(), String> {
                     )
                     .await
                 })
-                .await?
-                .map_err(|e| format!("{e:?}"))?;
-                println!("trial: {} ms", d.as_millis());
-                samples.push(d);
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                .await
+                .and_then(|trial| trial);
+                // m7: a failed trial (login included) is recorded with a
+                // bounded, escaped reason, and the run carries on.
+                println!("trial {n}/{trials}: {}", report.record(outcome));
+                if n < trials {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
-            println!(
-                "p50={:?} p95={:?}",
-                stats::percentile(&samples, 50),
-                stats::percentile(&samples, 95)
-            );
+            println!("{}", report.summary());
+            if report.all_failed() {
+                return Err(format!(
+                    "no first-idr trial succeeded ({} of {trials} failed)",
+                    report.failures.len()
+                ));
+            }
         }
         Cmd::WsOpen { conn } => {
             let pw = password(&conn)?;
@@ -207,7 +213,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             let d = session(&conn, &pw, async |tok: &str| {
                 wsprobe::open_control_websocket(&t, conn.pin_for(Port::Control), tok).await
             })
-            .await?
+            .await
+            .and_then(|opened| opened)
             .map_err(|e| format!("{e:?}"))?;
             println!("websocket upgrade: {} ms", d.as_millis());
         }

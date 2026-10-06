@@ -8,8 +8,9 @@ use kvm_proto::flv::{FlvDemuxer, FlvLimits};
 use tokio::time::Instant as TokioInstant;
 
 use crate::capture::{open_flv, record_for};
-use crate::kvm::KvmError;
+use crate::kvm::{self, KvmError};
 use crate::request::KvmTarget;
+use crate::stats;
 
 /// Hostile-input bound (§9.2): a peer that never sends an IDR must not be
 /// used to exhaust memory. The trial stops at the first IDR; this is just
@@ -83,5 +84,108 @@ pub async fn first_idr_latency_capped(
                 return Ok(started.elapsed());
             }
         }
+    }
+}
+
+/// The results of a `first-idr` run (final review m7). A failed trial —
+/// a timeout, a refused FLV open, a failed login — is itself census data
+/// (it bears on the p95 gate), so it is recorded and the run carries on;
+/// percentiles are over the successful trials only.
+#[derive(Debug, Default)]
+pub struct TrialReport {
+    /// Latency of each successful trial, in run order.
+    pub successes: Vec<Duration>,
+    /// One reason per failed trial, escaped and bounded for the terminal
+    /// (`kvm::bounded_debug`).
+    pub failures: Vec<String>,
+}
+
+impl TrialReport {
+    /// Record one trial's outcome and return its line for the operator:
+    /// `"<n> ms"`, or `"failed: <bounded, escaped reason>"`.
+    pub fn record(&mut self, outcome: Result<Duration, KvmError>) -> String {
+        match outcome {
+            Ok(d) => {
+                self.successes.push(d);
+                format!("{} ms", d.as_millis())
+            }
+            Err(e) => {
+                let reason = kvm::bounded_debug(&e);
+                let line = format!("failed: {reason}");
+                self.failures.push(reason);
+                line
+            }
+        }
+    }
+
+    /// `ok=<n> failed=<n> p50=<d> p95=<d>`, percentiles over the successful
+    /// trials only (`n/a` when there are none).
+    pub fn summary(&self) -> String {
+        let pct = |p| match stats::percentile(&self.successes, p) {
+            Some(d) => format!("{d:?}"),
+            None => "n/a".to_string(),
+        };
+        format!(
+            "ok={} failed={} p50={} p95={} (percentiles over successful trials only)",
+            self.successes.len(),
+            self.failures.len(),
+            pct(50),
+            pct(95)
+        )
+    }
+
+    /// True when no trial succeeded (every trial failed, or none ran) —
+    /// the only case in which `first-idr` exits non-zero.
+    pub fn all_failed(&self) -> bool {
+        self.successes.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// m7 (final review): a failed trial is data, not the end of the run:
+    /// it is counted with a bounded, escaped reason, and the percentiles
+    /// are over the successful trials only.
+    #[test]
+    fn failed_trials_are_counted_with_bounded_reasons_and_left_out_of_percentiles() {
+        let mut r = TrialReport::default();
+        let long = format!("\u{1b}[2J{}", "x".repeat(500));
+        let lines = [
+            r.record(Ok(Duration::from_millis(100))),
+            r.record(Err(KvmError::Http("no IDR within 10s".into()))),
+            r.record(Ok(Duration::from_millis(300))),
+            r.record(Err(KvmError::Http(long))),
+        ];
+        assert_eq!(r.successes.len(), 2);
+        assert_eq!(r.failures.len(), 2);
+        for reason in &r.failures {
+            assert!(reason.len() <= 203, "{reason}");
+            assert!(!reason.chars().any(char::is_control), "{reason:?}");
+        }
+        let [ok1, failed1, _, failed2] = &lines;
+        assert_eq!(ok1, "100 ms");
+        assert!(
+            failed1.starts_with("failed: ") && failed1.contains("no IDR"),
+            "{failed1}"
+        );
+        assert!(!failed2.chars().any(char::is_control), "{failed2:?}");
+        assert!(!r.all_failed());
+        let summary = r.summary();
+        assert!(summary.contains("ok=2 failed=2"), "{summary}");
+        assert!(summary.contains("p50=100ms p95=300ms"), "{summary}");
+    }
+
+    /// m7: the run fails (non-zero exit) only when no trial succeeded.
+    #[test]
+    fn all_failed_only_when_no_trial_succeeded() {
+        let mut r = TrialReport::default();
+        assert!(r.all_failed(), "no trials, no data");
+        r.record(Err(KvmError::Http("no IDR within 10s".into())));
+        assert!(r.all_failed());
+        r.record(Ok(Duration::from_millis(250)));
+        assert!(!r.all_failed());
+        assert!(r.summary().contains("ok=1 failed=1"), "{}", r.summary());
     }
 }

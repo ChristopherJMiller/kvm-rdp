@@ -161,6 +161,9 @@ pub enum Cmd {
         port: u16,
     },
     /// Capture av.flv to captures/<name> plus captures/<name>.jsonl.
+    ///
+    /// Logs in, captures until --seconds or --max-mb, then logs out (best
+    /// effort). Each JSONL line also carries the hex of any SPS/PPS in the tag.
     Capture {
         #[command(flatten)]
         conn: Conn,
@@ -171,7 +174,12 @@ pub enum Cmd {
         #[arg(long, default_value_t = 64)]
         max_mb: u64,
     },
-    /// FLV-open → first-IDR latency over N trials; prints p50/p95.
+    /// FLV-open → first-IDR latency over N trials; prints ok/failed and p50/p95.
+    ///
+    /// Each trial logs in, times FLV open → first IDR (the login is not timed),
+    /// then logs out. A failed trial is printed and counted, and the run goes
+    /// on; p50/p95 are over the successful trials. Exits non-zero only if no
+    /// trial succeeded.
     FirstIdr {
         #[command(flatten)]
         conn: Conn,
@@ -179,12 +187,16 @@ pub enum Cmd {
         trials: u32,
     },
     /// Open the control websocket with the token cookie, then close (no frames sent).
+    ///
+    /// Logs in first and logs out after (best effort).
     WsOpen {
         #[command(flatten)]
         conn: Conn,
     },
     /// Decode one frame of captures/<name> in the sandbox; report native Y min/max.
-    /// The frame must be exactly one 8-bit 4:2:0 frame of --width x --height.
+    ///
+    /// The decoded frame must be exactly one 8-bit 4:2:0 frame of --width x
+    /// --height (summarize's SPS width/height); anything else is refused.
     SampleRange {
         #[arg(long)]
         name: String,
@@ -196,6 +208,11 @@ pub enum Cmd {
         height: usize,
     },
     /// Summarise captures/<name>.jsonl.
+    ///
+    /// Prints tag and picture counts, GOP length, the three tag != AU counts
+    /// (multi_picture_tags, continuation_tags, non_vcl_picture_tags), and each
+    /// distinct SPS run through kvm-proto (SpsSummary, the 6.1 limits verdict,
+    /// the change against the first SPS) with its hex, plus each PPS's hex.
     Summarize {
         #[arg(long)]
         name: String,
