@@ -71,6 +71,16 @@ fn create_output_file(dir: &CaptureDir, name: &str) -> Result<std::fs::File, Str
         .map_err(|e| format!("cannot create {}: {e}", path.display()))
 }
 
+/// Write out and fsync the tag JSONL (final review m6). `into_inner`
+/// flushes the buffer and returns its error instead of dropping it.
+fn finish_jsonl(jsonl: std::io::BufWriter<std::fs::File>) -> Result<(), String> {
+    let file = jsonl
+        .into_inner()
+        .map_err(|e| format!("writing the tag JSONL: {}", e.error()))?;
+    file.sync_all()
+        .map_err(|e| format!("syncing the tag JSONL: {e}"))
+}
+
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.cmd {
         Cmd::Fingerprint { host, port } => {
@@ -102,7 +112,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 max_bytes: max_mb.saturating_mul(1024 * 1024),
                 max_duration: Duration::from_secs(seconds),
             };
-            let s = capture::run(
+            let result = capture::run(
                 &target(&conn),
                 conn.pin.as_deref(),
                 &tok,
@@ -112,7 +122,16 @@ async fn run(cli: Cli) -> Result<(), String> {
                 stop,
             )
             .await
-            .map_err(|e| format!("{e:?}"))?;
+            .map_err(|e| format!("{e:?}"));
+            // m6: write out and fsync the JSONL on every path, success or
+            // not, and report a failure — never leave it to the
+            // `BufWriter`'s drop, which swallows the error.
+            let finished = finish_jsonl(jsonl);
+            let s = match (result, finished) {
+                (Ok(s), Ok(())) => s,
+                (Err(e), Ok(())) | (Ok(_), Err(e)) => return Err(e),
+                (Err(e), Err(f)) => return Err(format!("{e}; and {f}")),
+            };
             println!(
                 "tags={} bytes={} parse_errors={} first_error={:?}",
                 s.tags, s.bytes, s.parse_errors, s.first_error

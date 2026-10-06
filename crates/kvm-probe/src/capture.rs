@@ -339,6 +339,13 @@ pub async fn run(
         }
     }
     file.flush().map_err(|e| KvmError::Io(e.to_string()))?;
+    // m6 (final review): flush the JSONL here, so a write error buffered
+    // in the caller's `BufWriter` (a full disk) is an error from `run`,
+    // not swallowed on drop with the JSONL silently truncated. The CLI
+    // also flushes and syncs it on its error paths (`main.rs`).
+    jsonl
+        .flush()
+        .map_err(|e| KvmError::Io(format!("flushing the tag JSONL: {e}")))?;
     Ok(stats)
 }
 

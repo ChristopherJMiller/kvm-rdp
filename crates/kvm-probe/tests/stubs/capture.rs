@@ -316,3 +316,51 @@ async fn non_200_flv_is_an_http_error() {
     .unwrap_err();
     assert!(format!("{err:?}").contains("403"));
 }
+
+/// A JSONL sink whose writes succeed but whose flush fails, like a full
+/// disk discovered when a buffer is finally written out.
+struct FlushFails {
+    written: Vec<u8>,
+}
+
+impl std::io::Write for FlushFails {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Err(std::io::Error::other("disk full (test)"))
+    }
+}
+
+/// m6 (final review): `run` flushes the JSONL writer itself before
+/// returning, and a flush error is an error — never left to a
+/// `BufWriter`'s drop, which swallows it and silently truncates the JSONL.
+#[tokio::test]
+async fn a_jsonl_flush_error_is_an_error_not_swallowed() {
+    let stub = support::start_flv_stub().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = CaptureDir::create(&tmp.path().join("captures")).unwrap();
+    let mut jsonl = FlushFails {
+        written: Vec::new(),
+    };
+    let err = run(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "0.987654",
+        &dir,
+        "f.flv",
+        &mut jsonl,
+        StopAt::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, kvm_probe::kvm::KvmError::Io(m) if m.contains("disk full")),
+        "{err:?}"
+    );
+    assert!(
+        !jsonl.written.is_empty(),
+        "lines were written before the flush"
+    );
+}
