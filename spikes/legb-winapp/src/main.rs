@@ -86,13 +86,14 @@ async fn main() -> anyhow::Result<()> {
 
     let tls = tls::self_signed("kvm-bridge.spike")?;
     let gfx = gfx::Gfx::new(cfg::HARD_CAP);
+    let ctl = display::DisplayCtl::new(w, h);
 
     let addr: SocketAddr = cfg::RDP_LISTEN.parse()?;
     let mut server = RdpServer::builder()
         .with_addr(addr)
         .with_hybrid(tls.acceptor, tls.spki_pub_key)
         .with_input_handler(display::SpikeInput)
-        .with_display_handler(display::SpikeDisplay { w, h })
+        .with_display_handler(display::SpikeDisplay { ctl: ctl.clone() })
         .with_gfx_factory(Some(Box::new(gfx.clone())))
         .with_connection_policy(ironrdp_server::ConnectionPolicy::Preempt)
         .with_connection_handler(Some(Box::new(LogHandler)))
@@ -107,6 +108,22 @@ async fn main() -> anyhow::Result<()> {
 
     let rtt_handle = server.autodetect_rtt_handle();
 
+    // Target size for both resize paths. `resize` (the real path) pairs this
+    // with LEGB_FIXTURE_RESIZE below; `resize-channel` (the old, channel-only
+    // path, kept for comparison) uses the same size with no second fixture —
+    // deviation from the brief's literal `ShipCmd::ResizeChannel(1280, 720)`
+    // stdin mapping, which hardcoded the size inline: sharing LEGB_RESIZE_W/H
+    // lets a census run configure one target size for both paths instead of
+    // silently diverging if an operator only overrides one of them.
+    let resize_w: u16 = std::env::var("LEGB_RESIZE_W")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1280);
+    let resize_h: u16 = std::env::var("LEGB_RESIZE_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(720);
+
     // stdin command reader -> ship task.
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ship::ShipCmd>(8);
     tokio::spawn(async move {
@@ -114,11 +131,12 @@ async fn main() -> anyhow::Result<()> {
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let cmd = match line.trim() {
-                "resize" => Some(ship::ShipCmd::Resize(1280, 720)),
+                "resize" => Some(ship::ShipCmd::Resize),
+                "resize-channel" => Some(ship::ShipCmd::ResizeChannel(resize_w, resize_h)),
                 "strand" => Some(ship::ShipCmd::Strand),
                 "resume" => Some(ship::ShipCmd::Resume),
                 other => {
-                    tracing::warn!(%other, "unknown command (resize|strand|resume)");
+                    tracing::warn!(%other, "unknown command (resize|resize-channel|strand|resume)");
                     None
                 }
             };
@@ -128,6 +146,23 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    // The real resize path's second-size fixture (optional): `resize` on
+    // stdin needs this set, or it logs an error and no-ops (ship.rs).
+    let resize_to = match std::env::var("LEGB_FIXTURE_RESIZE") {
+        Ok(p) => {
+            let resize_aus = replay::load_fixture(std::path::Path::new(&p))?;
+            tracing::info!(
+                fixture = %p,
+                aus = resize_aus.len(),
+                w = resize_w,
+                h = resize_h,
+                "LEGB loaded resize fixture"
+            );
+            Some((resize_aus, resize_w, resize_h))
+        }
+        Err(_) => None,
+    };
+
     tokio::spawn(ship::run_ship(
         gfx,
         aus,
@@ -136,6 +171,8 @@ async fn main() -> anyhow::Result<()> {
         cfg::HARD_CAP,
         rtt_handle,
         cmd_rx,
+        ctl.clone(),
+        resize_to,
     ));
 
     tracing::info!(%addr, "LEGB listening (Hybrid/NLA, Preempt, autodetect on)");

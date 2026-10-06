@@ -8,11 +8,21 @@ use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{EgfxServerMessage, ServerEvent};
 use ironrdp_svc::ChannelFlags;
 
+use crate::display::DisplayCtl;
 use crate::gfx::Gfx;
 use crate::replay::AccessUnit;
 
 pub enum ShipCmd {
-    Resize(u16, u16),
+    /// The real resize path (spec §6.4): `DisplayUpdate::Resize` on the
+    /// current display-updates stream, wait for reactivation, Setup at the
+    /// new size, then switch the replayed stream to `resize_to`'s fixture
+    /// (passed into `run_ship`, not carried on the command itself — there is
+    /// only one second-size fixture configured per run).
+    Resize,
+    /// The old path, kept for comparison: a channel-level Setup swap with no
+    /// resize/reactivation and no stream switch (what Task 5's `resize`
+    /// command did; the research saw it blink on Windows App).
+    ResizeChannel(u16, u16),
     Strand,
     Resume,
 }
@@ -25,6 +35,8 @@ pub async fn run_ship(
     hard_cap: u32,
     rtt_handle: Arc<AtomicU32>,
     mut cmd_rx: tokio::sync::mpsc::Receiver<ShipCmd>,
+    ctl: DisplayCtl,
+    resize_to: Option<(Vec<AccessUnit>, u16, u16)>,
 ) {
     // Wait for the connection to become AVC420-ready.
     let (handle, _avc, _sid) = loop {
@@ -63,76 +75,150 @@ pub async fn run_ship(
     let frame_dt = Duration::from_secs_f64(1.0 / 30.0);
     let mut stranded = false;
     let mut rtt_tick = Instant::now();
+    // Index-based replay so the stream itself can be switched (the real
+    // resize path hands `ShipCmd::Resize` a different fixture once the
+    // reactivation completes): `current` is the AU list in flight, `i` the
+    // index into it.
+    let mut current = aus;
+    let mut resize_to = resize_to;
+    let mut i: usize = 0;
     // Frame index into the absolute schedule `sched_epoch + frame_idx *
-    // frame_dt` (minor fix): ticks every loop iteration regardless of
-    // `stranded`, so pacing tracks wall-clock time instead of accumulating
-    // drift from per-iteration `sleep(frame_dt)` calls that each start
-    // after a variable amount of per-frame work, and so resuming from a
-    // STRAND never sends a catch-up burst.
+    // frame_dt`: ticks every loop iteration regardless of `stranded`, so
+    // pacing tracks wall-clock time instead of accumulating drift from
+    // per-iteration `sleep(frame_dt)` calls that each start after a
+    // variable amount of per-frame work. The end-of-loop step below detects
+    // when a slot has already passed — e.g. the `Resize` branch can block
+    // on reactivation for up to 10s — and skips forward to the next FUTURE
+    // slot instead of letting `sleep_until` return immediately and firing a
+    // burst of catch-up frames; see the end of the loop for the skip log.
     let mut frame_idx: u32 = 0;
 
     loop {
-        for au in &aus {
-            // Drain stdin-driven census commands between frames.
-            while let Ok(cmd) = cmd_rx.try_recv() {
-                match cmd {
-                    ShipCmd::Strand => {
-                        stranded = true;
-                        tracing::warn!(
-                            "LEGB_SHIP: STRAND — stopped sending (observe last-frame hold)"
-                        );
-                    }
-                    ShipCmd::Resume => {
-                        stranded = false;
-                        tracing::warn!("LEGB_SHIP: RESUME");
-                    }
-                    ShipCmd::Resize(nw, nh) => {
-                        w = nw;
-                        h = nh;
-                        tracing::warn!(
-                            nw,
-                            nh,
-                            "LEGB_SHIP: server-initiated RESIZE (§6.4 Setup cause)"
-                        );
-                        if let Err(e) = setup(&gfx, &handle, &sender, w, h, hard_cap) {
-                            tracing::error!(error = %e, "LEGB_SHIP: re-setup failed");
-                        }
-                    }
+        // Drain stdin-driven census commands between frames.
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            match cmd {
+                ShipCmd::Strand => {
+                    stranded = true;
+                    tracing::warn!("LEGB_SHIP: STRAND — stopped sending (observe last-frame hold)");
                 }
-            }
-
-            // Periodic auto-detect probe + log whether the client answers.
-            if rtt_tick.elapsed() >= Duration::from_millis(250) {
-                let _ = sender.send(ServerEvent::AutoDetectRttRequest);
-                let rtt = rtt_handle.load(Ordering::Relaxed);
-                let answered = rtt != u32::MAX;
-                // I2: `rtt_ms` is only meaningful when the client actually
-                // answered — the `u32::MAX` sentinel is not a millisecond
-                // value, so it must never appear under a field literally
-                // named `rtt_ms` (a naive downstream aggregation that
-                // forgets to filter on `autodetect_answered` would average
-                // in 4294967295).
-                if answered {
-                    tracing::info!(
-                        rtt_ms = rtt,
-                        autodetect_answered = true,
-                        "LEGB_AUTODETECT probe"
+                ShipCmd::Resume => {
+                    stranded = false;
+                    tracing::warn!("LEGB_SHIP: RESUME");
+                }
+                ShipCmd::ResizeChannel(nw, nh) => {
+                    // Old path, kept for comparison: channel-level re-Setup, same stream.
+                    w = nw;
+                    h = nh;
+                    tracing::warn!(
+                        nw,
+                        nh,
+                        "LEGB_SHIP: RESIZE-CHANNEL (channel-only Setup, same stream)"
                     );
-                } else {
-                    tracing::info!(autodetect_answered = false, "LEGB_AUTODETECT probe");
+                    if let Err(e) = setup(&gfx, &handle, &sender, w, h, hard_cap) {
+                        tracing::error!(error = %e, "LEGB_SHIP: re-setup failed");
+                    }
                 }
-                rtt_tick = Instant::now();
+                ShipCmd::Resize => {
+                    let Some((next, nw, nh)) = resize_to.take() else {
+                        tracing::error!("LEGB_SHIP: RESIZE needs LEGB_FIXTURE_RESIZE");
+                        continue;
+                    };
+                    let t0 = Instant::now();
+                    let before = ctl.updates_calls();
+                    ctl.set_size(nw, nh);
+                    if !ctl.send_resize(nw, nh) {
+                        tracing::error!("LEGB_SHIP: no updates stream to send Resize on");
+                        continue;
+                    }
+                    tracing::warn!(
+                        nw,
+                        nh,
+                        "LEGB_SHIP: RESIZE emitted (DisplayUpdate::Resize); awaiting reactivation"
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while ctl.updates_calls() == before && Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    tracing::warn!(
+                        reactivated = ctl.updates_calls() != before,
+                        ms = t0.elapsed().as_millis(),
+                        "LEGB_SHIP: reactivation"
+                    );
+                    w = nw;
+                    h = nh;
+                    if let Err(e) = setup(&gfx, &handle, &sender, w, h, hard_cap) {
+                        tracing::error!(error = %e, "LEGB_SHIP: post-resize setup failed");
+                    }
+                    current = next;
+                    i = current.iter().position(|au| au.is_idr).unwrap_or(0);
+                    tracing::warn!(
+                        ms = t0.elapsed().as_millis(),
+                        "LEGB_SHIP: new-size stream starts at IDR"
+                    );
+                    // No explicit pacing resync here: the end-of-loop step
+                    // below (shared with every other source of lateness —
+                    // a stall, STRAND/RESUME) detects that the schedule has
+                    // fallen behind `now` and skips forward to the next
+                    // future slot rather than bursting, logging how many
+                    // slots were skipped.
+                }
             }
+        }
 
-            if !stranded {
+        // Periodic auto-detect probe + log whether the client answers.
+        if rtt_tick.elapsed() >= Duration::from_millis(250) {
+            let _ = sender.send(ServerEvent::AutoDetectRttRequest);
+            let rtt = rtt_handle.load(Ordering::Relaxed);
+            let answered = rtt != u32::MAX;
+            // I2: `rtt_ms` is only meaningful when the client actually
+            // answered — the `u32::MAX` sentinel is not a millisecond
+            // value, so it must never appear under a field literally
+            // named `rtt_ms` (a naive downstream aggregation that
+            // forgets to filter on `autodetect_answered` would average
+            // in 4294967295).
+            if answered {
+                tracing::info!(
+                    rtt_ms = rtt,
+                    autodetect_answered = true,
+                    "LEGB_AUTODETECT probe"
+                );
+            } else {
+                tracing::info!(autodetect_answered = false, "LEGB_AUTODETECT probe");
+            }
+            rtt_tick = Instant::now();
+        }
+
+        if !stranded {
+            if let Some(au) = current.get(i % current.len().max(1)) {
                 if let Err(e) = ship_one(&gfx, &handle, &sender, au, w, h, &epoch) {
                     tracing::error!(error = %e, "LEGB_SHIP: ship failed");
                 }
             }
-
-            frame_idx += 1;
-            tokio::time::sleep_until(sched_epoch + frame_dt * frame_idx).await;
+            i = i.wrapping_add(1);
         }
+
+        // Advance to the next absolute slot, skipping forward over any slot
+        // already in the past (minor fix, carried from B15's re-review: no
+        // catch-up burst after a stall, STRAND/RESUME, or a resize — this
+        // loop ships at most one frame per iteration no matter how far
+        // behind the schedule fell).
+        frame_idx += 1;
+        let mut target = sched_epoch + frame_dt * frame_idx;
+        let now = tokio::time::Instant::now();
+        if target <= now {
+            let elapsed = now.saturating_duration_since(sched_epoch);
+            let behind = (elapsed.as_secs_f64() / frame_dt.as_secs_f64()).floor() as u32 + 1;
+            let skipped = behind.saturating_sub(frame_idx);
+            if skipped > 0 {
+                tracing::warn!(
+                    skipped,
+                    "LEGB_SHIP: pacing fell behind schedule, skipped frame slot(s) (no catch-up burst)"
+                );
+            }
+            frame_idx = behind;
+            target = sched_epoch + frame_dt * frame_idx;
+        }
+        tokio::time::sleep_until(target).await;
     }
 }
 
