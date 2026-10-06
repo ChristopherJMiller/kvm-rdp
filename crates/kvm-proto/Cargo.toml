@@ -11,3 +11,11 @@ autotests = false
 [dependencies]
 bytes = { workspace = true }
 h264-reader = { workspace = true }
+
+[dev-dependencies]
+sha2 = "0.10"
+serde_json = "1"
+
+[[test]]
+name = "fixtures"
+path = "tests/fixtures.rs"
