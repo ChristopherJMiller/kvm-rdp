@@ -6108,7 +6108,7 @@ The census template, then the live Leg A run against the real KVM.
 
 ### Task 6.2: run the Leg A census (live, with Chris)
 
-Checklist task, not TDD: it uses the finished `kvm-probe` against the real ES3 and fills the Leg A sections of `docs/census.md`. Rules for the whole session (spec §12): the Mac shows **only** the test patterns below or its lock screen; every capture stays in `captures/` (0700, gitignored); any ffmpeg run on a capture goes through `kvm-probe sample-range` (bubblewrap sandbox); `captures/` is deleted at the end. The probe only logs in, reads the video stream, and opens/closes the control websocket — it sends no keyboard or mouse input.
+Checklist task, not TDD: it uses the finished `kvm-probe` against the real ES3 and fills the Leg A sections of `docs/census.md`. Rules for the whole session (spec §12): the Mac shows **only** the test patterns below or its lock screen; every capture stays in `captures/` (0700, gitignored); any ffmpeg run on a capture goes through `kvm-probe sample-range` or the optional sandboxed cross-check in step 3 (bubblewrap, new session); **`summarize` every capture before any ffmpeg run** — the sandbox can write the whole `captures/` directory, so a decoder exploited by one capture could otherwise tamper with another capture's JSONL; `captures/` is deleted at the end. The probe only logs in, reads the video stream, and opens/closes the control websocket — it sends no keyboard or mouse input. Every logged-in run logs out when it ends (best effort, bounded at 5 s; a failed logout prints one line and is otherwise ignored), and `first-idr` logs in and out once per trial, so the session never piles up live KVM logins.
 
 Deviation recorded for the spec revision: §12's "what the Mac sees when the websocket TCP connection is killed with a key held" needs HID input, which the probe deliberately never sends; it moves to Plan C's L4 hardware checks, where the bridge exists.
 
@@ -6137,33 +6137,44 @@ Deviation recorded for the spec revision: §12's "what the Mac sees when the web
    $P fingerprint --host $KVM --port 8889
    for p in 443 8881 8889; do openssl s_client -connect $KVM:$p -brief </dev/null 2>&1 | grep -E 'Protocol version|Ciphersuite|Peer signature|Server Temp Key'; done
    ```
-   Census → *Leg A — transport*: the pin (not secret), TLS version, cipher and key per port, and whether `fingerprint` succeeded (rustls negotiates). Set `PIN=<value>` for the steps below. Also record the video server's identity (SRS or the vendor daemon — SRS implies a GOP cache and merged writes, §15): `curl -sk -D - -o /dev/null --max-time 2 "https://$KVM:8881/av.flv" | grep -i '^server:'`.
+   Census → *Leg A — transport*: the pin (not secret), TLS version, cipher and key per port, and whether `fingerprint` succeeded (rustls negotiates). Each port's pin feeds its own flag: 443 → `--pin` (web port: login and logout), 8881 → `--video-pin` (`av.flv`), 8889 → `--control-pin` (websocket). The last two default to `--pin`, so if all three pins are equal `--pin` alone is enough; if they differ, note it for Task 9.1 (§3.2 assumes a single `kvm.spki_sha256`). Set the flags once for the steps below (an array, so it expands the same in bash and zsh):
+   ```
+   PINS=(--pin <443-pin> --video-pin <8881-pin> --control-pin <8889-pin>)
+   ```
+   Also record the video server's identity (SRS or the vendor daemon — SRS implies a GOP cache and merged writes, §15): `curl -sk -D - -o /dev/null --max-time 2 "https://$KVM:8881/av.flv" | grep -i '^server:'`.
 
 3. Captures at each preset the bridge might ship (change the preset in the KVM web UI between rows: 1920×1080 vs auto; 30 vs 60 fps). For each preset, with the moving clock on screen, then with a static screen:
    ```
-   $P capture --host $KVM --pin $PIN --password-file ~/.config/kvm-rdp-census.pw --name moving-1080p30.flv --seconds 30
-   $P capture --host $KVM --pin $PIN --password-file ~/.config/kvm-rdp-census.pw --name static-1080p30.flv --seconds 30
+   $P capture --host $KVM "${PINS[@]}" --password-file ~/.config/kvm-rdp-census.pw --name moving-1080p30.flv --seconds 30
+   $P capture --host $KVM "${PINS[@]}" --password-file ~/.config/kvm-rdp-census.pw --name static-1080p30.flv --seconds 30
    $P summarize --name moving-1080p30.flv
+   $P summarize --name static-1080p30.flv
    ```
-   From each summary and JSONL, fill *Leg A — stream shape*: codec (`codecs`/`fourccs` — any `hvc1` means stop: passthrough is impossible), profile/level/POC type/VUI/`bitstream_restriction`/scaling/HRD/`num_ref_frames` (from the first sequence-header line's parameter sets, via the next command), GOP length (`gop_len`), **tag = AU** (`multi_picture_tags == 0`), and cadence:
+   Run `summarize` on every capture as soon as it is taken — before any `sample-range` run or the cross-check below (see the session rules). From each summary and JSONL, fill *Leg A — stream shape*:
+   - codec (`codecs`/`fourccs`): any `hvc1` FourCC, or `12` in `codecs` (classic-FLV HEVC), means stop — passthrough is impossible;
+   - the SPS fields, from summarize's `sps` list (kvm-proto's own parser and §6.1 checks run on the KVM's own SPS): each distinct SPS's `summary` gives `profile_idc`, `level_idc`, `pic_order_cnt_type`, `num_ref_frames`, `seq_scaling_matrix_present`, `nal_hrd_present`/`vcl_hrd_present`, the VUI's `video_full_range_flag`/`colour_primaries`/`matrix_coefficients`, and `bitstream_restriction`'s `max_num_reorder_frames`/`max_dec_frame_buffering` (`None` = absent); `limits` is the §6.1 verdict (anything but `Ok(())` is a finding); `change_vs_first` classifies every later SPS (`Resize`, `Other`, or a fatal `Incompatible`). `param_sets_skipped` and `param_sets_unreported` should be 0;
+   - GOP length (`gop_len`, in pictures);
+   - **tag = AU** only if `multi_picture_tags`, `continuation_tags` and `non_vcl_picture_tags` are **all 0** — a picture split across tags, or an AUD/SEI/SPS-only tag, means Plan B needs the AU assembler;
+   - and cadence:
    ```
    jq -s '[.[] | select(.tag_type == 9) | .recv_ms] | [range(1; length) as $i | .[$i] - .[$i-1]] | sort | .[length/2|floor]' captures/static-1080p30.flv.jsonl   # median inter-tag ms, static
    jq -s '[.[] | select(.tag_type == 9) | .recv_ms] | [range(1; length) as $i | .[$i] - .[$i-1]] | sort | .[length/2|floor]' captures/moving-1080p30.flv.jsonl   # median inter-tag ms, moving
    ```
-   SPS/PPS fields come from ffmpeg's `trace_headers` on the capture, run inside the same sandbox `kvm-probe sample-range` uses (no network, no home, read-only /nix):
+   Optional cross-check, and the only source of the PPS's `pic_scaling_matrix_present_flag` and of `vui_parameters_present_flag` (kvm-proto parses only the SPS until Plan B): ffmpeg's `trace_headers` in the same sandbox `sample-range` uses (new session, no network, no home, read-only /nix, niced, 4 threads), with control bytes in its output made visible:
    ```
-   bwrap --unshare-all --die-with-parent --clearenv --dev /dev --proc /proc --ro-bind /nix /nix \
+   nice -n 19 bwrap --new-session --unshare-all --die-with-parent --clearenv --dev /dev --proc /proc --ro-bind /nix /nix \
      --bind "$PWD/captures" /cap --chdir /cap -- "$(readlink -f "$(command -v ffmpeg)")" \
-     -hide_banner -nostdin -i /cap/moving-1080p30.flv -c copy -bsf:v trace_headers -frames:v 1 -f null - 2>&1 \
-     | grep -E ' (profile_idc|level_idc|pic_order_cnt_type|num_ref_frames|seq_scaling_matrix_present_flag|vui_parameters_present_flag|video_full_range_flag|colour_primaries|matrix_coefficients|bitstream_restriction_flag|max_num_reorder_frames|max_dec_frame_buffering|nal_hrd_parameters_present_flag|vcl_hrd_parameters_present_flag|pic_scaling_matrix_present_flag|frame_cropping_flag) '
+     -hide_banner -nostdin -threads 4 -i /cap/moving-1080p30.flv -c copy -bsf:v trace_headers -frames:v 1 -f null - 2>&1 \
+     | grep -E ' (profile_idc|level_idc|pic_order_cnt_type|max_num_ref_frames|seq_scaling_matrix_present_flag|vui_parameters_present_flag|video_full_range_flag|colour_primaries|matrix_coefficients|bitstream_restriction_flag|max_num_reorder_frames|max_dec_frame_buffering|nal_hrd_parameters_present_flag|vcl_hrd_parameters_present_flag|pic_scaling_matrix_present_flag|frame_cropping_flag) ' \
+     | head -n 100 | cat -v
    ```
 
 4. IDR behaviour (*Leg A — IDR behaviour*):
    ```
-   $P first-idr --host $KVM --pin $PIN --password-file ~/.config/kvm-rdp-census.pw --trials 20
+   $P first-idr --host $KVM "${PINS[@]}" --password-file ~/.config/kvm-rdp-census.pw --trials 20
    $P first-idr --host $KVM --scheme http --password-file ~/.config/kvm-rdp-census.pw --trials 20
    ```
-   Record p50/p95 for both schemes (gate for `reconnect`: p95 ≤ 1.5 s). **Burst on connect** — from a fresh capture's first second, count the video tags whose FLV timestamp runs more than 100 ms ahead of their receive time:
+   Each trial logs in, times FLV open → first IDR (the login is not timed) and logs out, so every trial is a fresh session — say so in census.md (the bridge's FLV reconnect reuses its session). A failed trial prints its reason and the run goes on; the last line is `ok=… failed=… p50=… p95=…`, with p50/p95 over the successful trials only, and the command exits non-zero only if every trial failed. Record ok/failed and p50/p95 for both schemes (gate for `reconnect`: p95 ≤ 1.5 s — a failed trial, no IDR within 10 s, is far over that, so p95 over the successes alone cannot pass a run that had failures; record `failed=` beside it). **Burst on connect** — from a fresh capture's first second, count the video tags whose FLV timestamp runs more than 100 ms ahead of their receive time:
    ```
    jq -s '[.[] | select(.tag_type == 9)] as $t | ($t[0].timestamp_ms - $t[0].recv_ms) as $o | [$t[] | select(.recv_ms < 1000 and (.timestamp_ms - .recv_ms - $o) > 100)] | length' captures/moving-1080p30.flv.jsonl
    ```
@@ -6171,19 +6182,20 @@ Deviation recorded for the spec revision: §12's "what the Mac sees when the web
 
 5. Transport latency (*Leg A — transport*):
    ```
-   $P ws-open --host $KVM --pin $PIN --password-file ~/.config/kvm-rdp-census.pw
+   $P ws-open --host $KVM "${PINS[@]}" --password-file ~/.config/kvm-rdp-census.pw
    $P ws-open --host $KVM --scheme http --password-file ~/.config/kvm-rdp-census.pw
    ```
    With step 4's two `first-idr` runs and the moving captures' inter-tag jitter, decide §3.2's scheme (`https` unless rustls failed in step 2 or TLS costs measurable latency).
 
-6. Decoded sample range (*Leg A — colour*): for each of black, white and the grey ramp, capture 5 s and decode one frame in the sandbox:
+6. Decoded sample range (*Leg A — colour*): for each of black, white and the grey ramp, capture 5 s, summarize it, then decode one frame in the sandbox with `--width`/`--height` set to that summary's SPS `width`/`height`:
    ```
-   $P capture --host $KVM --pin $PIN --password-file ~/.config/kvm-rdp-census.pw --name ramp.flv --seconds 5
+   $P capture --host $KVM "${PINS[@]}" --password-file ~/.config/kvm-rdp-census.pw --name ramp.flv --seconds 5
+   $P summarize --name ramp.flv
    $P sample-range --name ramp.flv --width 1920 --height 1080
    ```
-   Record Y min/max; `ScalerInserted` fails the measurement (rerun after checking the native pix_fmt). Limited range shows black ≈ 16 and white ≈ 235.
+   Every capture of the session must already be summarized before the first `sample-range`. `sample-range` takes 16..=8192 for each dimension and refuses a decoded frame that is not exactly one 8-bit 4:2:0 frame of `--width`×`--height`: a size that fits no layout means the dimensions are wrong; another known layout means the stream is outside §6.1 (the summary's `limits` already says so). Record Y min/max; `ScalerInserted` fails the measurement (rerun after checking the native pix_fmt). Limited range shows black ≈ 16 and white ≈ 235.
 
-7. Fill the kvm-sim profile block in `docs/census.md` (derived numbers only): AVCC length size (from the sequence header), fps, GOP length, burst length, tag = AU, and the hex of the KVM's SPS and PPS (parameter sets only — never slice data or frames).
+7. Fill the kvm-sim profile block in `docs/census.md` (derived numbers only): AVCC length size (from the sequence header), fps, GOP length (`gop_len`), burst length, tag = AU (all three counts 0, step 3), and the hex of the KVM's SPS and PPS — summarize's `sps[].hex` and `pps_hex` (parameter sets only: the probe hexes nothing else, never slice data or frames).
 
 8. Wipe and commit:
    ```
