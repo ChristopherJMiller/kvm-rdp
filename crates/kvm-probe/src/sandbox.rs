@@ -9,6 +9,15 @@ use crate::captures::{self, CaptureDir};
 /// frame to a raw Y/UV plane in the decoder's native pix_fmt, with no scaler
 /// (§12). `capture_name`/`out_name` must already be CaptureDir-validated
 /// simple names.
+///
+/// `--new-session` comes first (final review I1): bwrap `setsid`s the
+/// sandboxed ffmpeg, so it has no controlling terminal. Without it, `--dev
+/// /dev` still exposes `/dev/tty`, and a decoder compromised by a hostile
+/// stream could open it and write escape sequences straight to the
+/// operator's terminal (bypassing the stderr sanitising below) or, where
+/// `dev.tty.legacy_tiocsti` is on, inject keystrokes with `TIOCSTI`
+/// (CVE-2017-5226 — the bwrap man page tells callers to pass
+/// `--new-session` for exactly this).
 pub fn build_ffmpeg_sandbox_argv(
     ffmpeg: &Path,
     cap_host_dir: &Path,
@@ -22,6 +31,7 @@ pub fn build_ffmpeg_sandbox_argv(
         "-n".to_string(),
         "19".to_string(),
         "bwrap".to_string(),
+        "--new-session".to_string(),
         "--unshare-all".to_string(),
         "--die-with-parent".to_string(),
         "--clearenv".to_string(),
@@ -643,6 +653,7 @@ mod tests {
                 "-n",
                 "19",
                 "bwrap",
+                "--new-session",
                 "--unshare-all",
                 "--die-with-parent",
                 "--clearenv",
@@ -686,6 +697,17 @@ mod tests {
         );
         // Network namespace is unshared.
         assert!(argv.contains(&"--unshare-all".to_string()));
+        // I1 (final review): bwrap must put ffmpeg in a new session
+        // (setsid) straight away, so a compromised decoder has no
+        // controlling terminal — no `/dev/tty` writes (escape-sequence
+        // injection) and no TIOCSTI keystroke injection (CVE-2017-5226).
+        assert_eq!(
+            argv.iter().position(|a| a == "--new-session"),
+            argv.iter()
+                .position(|a| a == "bwrap")
+                .and_then(|i| i.checked_add(1)),
+            "--new-session must come right after bwrap"
+        );
     }
 
     #[test]
