@@ -29,4 +29,10 @@ mod tests {
     fn name_is_stable() {
         assert_eq!(name(), "kvm-proto");
     }
+
+    #[test]
+    fn bytes_dependency_links() {
+        let buf = bytes::BytesMut::with_capacity(16);
+        assert!(buf.is_empty());
+    }
 }

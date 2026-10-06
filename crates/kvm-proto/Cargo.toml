@@ -7,3 +7,7 @@ license.workspace = true
 repository.workspace = true
 publish = false
 autotests = false
+
+[dependencies]
+bytes = { workspace = true }
+h264-reader = { workspace = true }
