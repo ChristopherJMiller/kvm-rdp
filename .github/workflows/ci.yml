@@ -32,3 +32,26 @@ jobs:
           # Plan C turns it into a hard gate that fails on a duplicate
           # ironrdp-* crate (spec §4.2). Until then it must not fail CI.
           cargo tree --workspace --duplicates || true
+      - name: No ring in the dependency graph (spec §4.2)
+        run: |
+          # aws-lc-rs is the one crypto provider; nothing may pull in ring.
+          # `cargo tree -i ring` exits 0 with "nothing to print" when ring
+          # is in Cargo.lock but never activated (it is: an optional
+          # dependency of rustls-webpki), and exits non-zero with "did not
+          # match any packages" when it is not in Cargo.lock at all. Both
+          # mean "absent", so the gate is on the printed tree, not the exit
+          # code: any tree on stdout fails CI.
+          set +e
+          tree=$(cargo tree --workspace --target all -i ring 2>"$RUNNER_TEMP/ring.err")
+          rc=$?
+          set -e
+          if [ -n "$tree" ]; then
+            echo "::error::ring is in the dependency graph (spec §4.2 forbids it):"
+            echo "$tree"
+            exit 1
+          fi
+          if [ "$rc" -ne 0 ] && ! grep -q 'did not match any packages' "$RUNNER_TEMP/ring.err"; then
+            cat "$RUNNER_TEMP/ring.err"
+            exit "$rc"
+          fi
+          echo "ring: not in the dependency graph"
