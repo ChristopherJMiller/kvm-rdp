@@ -4,7 +4,7 @@
 
 use crate::captures::CaptureDir;
 use crate::kvm::{self, KvmError};
-use crate::record::TagRecord;
+use crate::record::{MAX_PARAM_SET_BYTES, MAX_PARAM_SETS_PER_TAG, TagRecord};
 use crate::request::{self, KvmTarget};
 use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
@@ -80,6 +80,34 @@ fn push_nal(r: &mut TagRecord, nal: &[u8]) {
     };
     r.slice_types.push(slice_type);
     r.first_mb.push(first_mb);
+    if ty == 7 || ty == 8 {
+        push_param_set(r, nal);
+    }
+}
+
+/// Hex one SPS/PPS NAL into `param_sets_hex` (final review I3), bounded:
+/// past `MAX_PARAM_SETS_PER_TAG` entries in this tag, or longer than
+/// `MAX_PARAM_SET_BYTES`, it is counted in `param_sets_skipped` instead.
+/// Only `push_nal` calls this, and only for a NAL whose own parsed header
+/// says type 7 or 8 — so slice data (screen content) can never land here,
+/// whichever list or tag it arrived in.
+fn push_param_set(r: &mut TagRecord, nal: &[u8]) {
+    if r.param_sets_hex.len() >= MAX_PARAM_SETS_PER_TAG || nal.len() > MAX_PARAM_SET_BYTES {
+        r.param_sets_skipped = r.param_sets_skipped.saturating_add(1);
+        return;
+    }
+    r.param_sets_hex.push(hex_lower(nal));
+}
+
+/// Lowercase hex, two digits per byte.
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len().saturating_mul(2));
+    for b in bytes {
+        // Writing to a `String` cannot fail.
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Render a 4-byte Enhanced-RTMP FourCC for the census JSONL (M4). ASCII
@@ -120,6 +148,8 @@ pub fn record_for(tag: &FlvTag, recv_ms: u64) -> TagRecord {
         slice_types: Vec::new(),
         first_mb: Vec::new(),
         size: usize::try_from(tag.data_size).unwrap_or(usize::MAX),
+        param_sets_hex: Vec::new(),
+        param_sets_skipped: 0,
     };
     if let TagBody::Video(v) = &tag.body {
         match v {
@@ -369,6 +399,89 @@ mod tests {
         let r = super::record_for(&tag(TagBody::Video(VideoBody::SequenceHeader(cfg))), 0);
         assert_eq!((r.codec_id, r.avc_packet_type), (Some(7), Some(0)));
         assert_eq!(r.nal_types, vec![7, 8]);
+        // I3 (final review): the parameter sets themselves, as lowercase
+        // hex, header byte included.
+        assert_eq!(r.param_sets_hex, vec!["674d001f", "68ce3c80"]);
+        assert_eq!(r.param_sets_skipped, 0);
+    }
+
+    fn nal(bytes: &[u8]) -> Nal {
+        Nal {
+            bytes: Bytes::copy_from_slice(bytes),
+        }
+    }
+
+    fn nalus(nals: Vec<Nal>) -> FlvTag {
+        tag(TagBody::Video(VideoBody::Nalus {
+            frame_type: FrameType::Key,
+            composition_time: 0,
+            nals,
+        }))
+    }
+
+    /// I3: in-band SPS/PPS in a NALU tag are hexed; the AUD, SEI and slice
+    /// next to them never are — slice data is screen content.
+    #[test]
+    fn in_band_parameter_sets_are_hexed_but_slices_never_are() {
+        let r = super::record_for(
+            &nalus(vec![
+                nal(&[0x09, 0x10]),
+                nal(&[0x67, 0x4D, 0x00, 0x1F]),
+                nal(&[0x68, 0xCE, 0x3C, 0x80]),
+                nal(&[0x06, 0x05, 0x01, 0x00]),
+                nal(&[0x65, 0x88, 0x80]),
+            ]),
+            0,
+        );
+        assert_eq!(r.nal_types, vec![9, 7, 8, 6, 5]);
+        assert_eq!(r.param_sets_hex, vec!["674d001f", "68ce3c80"]);
+        assert_eq!(r.param_sets_skipped, 0);
+    }
+
+    /// I3: what gets hexed is decided by each NAL's own header, not by
+    /// where it sits — a slice smuggled into the config record's SPS list
+    /// (hostile device) is never hexed, and neither is a forbidden-bit
+    /// "SPS" (0xE7: a framing violation, recorded as the sentinel).
+    #[test]
+    fn only_nals_whose_header_says_sps_or_pps_are_hexed() {
+        let cfg = kvm_proto::flv::AvcConfig {
+            length_size_minus_one: 3,
+            profile_idc: 77,
+            level_idc: 31,
+            sps: vec![
+                Bytes::from_static(&[0x65, 0x88, 0x80]),
+                Bytes::from_static(&[0xE7, 0x4D, 0x00, 0x1F]),
+            ],
+            pps: vec![Bytes::from_static(&[0x68, 0xCE, 0x3C, 0x80])],
+        };
+        let r = super::record_for(&tag(TagBody::Video(VideoBody::SequenceHeader(cfg))), 0);
+        assert_eq!(r.nal_types, vec![5, 255, 8]);
+        assert_eq!(r.param_sets_hex, vec!["68ce3c80"]);
+        assert_eq!(r.param_sets_skipped, 0);
+    }
+
+    /// I3: hexing is bounded — at most 32 parameter sets per tag, each at
+    /// most 1 KiB of NAL; anything past either bound is skipped and
+    /// counted, never hexed.
+    #[test]
+    fn param_set_hex_is_bounded_per_tag_and_per_nal() {
+        // 33 distinct PPS NALs: the 33rd is skipped.
+        let r = super::record_for(&nalus((0u8..33).map(|i| nal(&[0x68, i])).collect()), 0);
+        assert_eq!(r.param_sets_hex.len(), 32);
+        assert_eq!(r.param_sets_hex.first().map(String::as_str), Some("6800"));
+        assert_eq!(r.param_sets_hex.last().map(String::as_str), Some("681f"));
+        assert_eq!(r.param_sets_skipped, 1);
+
+        // A 1024-byte SPS NAL is hexed; a 1025-byte one is skipped.
+        let mut at_cap = vec![0x67u8];
+        at_cap.resize(1024, 0xAA);
+        let mut over_cap = vec![0x67u8];
+        over_cap.resize(1025, 0xAA);
+        let r = super::record_for(&nalus(vec![nal(&at_cap), nal(&over_cap)]), 0);
+        assert_eq!(r.param_sets_hex.len(), 1);
+        assert_eq!(r.param_sets_hex.first().map(String::len), Some(2048));
+        assert_eq!(r.param_sets_skipped, 1);
+        assert_eq!(r.nal_types, vec![7, 7]);
     }
 
     #[test]

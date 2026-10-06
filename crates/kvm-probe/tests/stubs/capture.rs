@@ -124,6 +124,57 @@ async fn fixture_summary_is_tag_equals_au_with_the_manifest_gop() {
     );
 }
 
+/// I3 (final review), end to end: the fixture's SPS travels capture →
+/// JSONL `param_sets_hex` → summarize → kvm-proto's parser, and comes out
+/// matching ffmpeg's view of it (the manifest). x264 repeats SPS/PPS
+/// in-band before every IDR; those byte-identical repeats are recorded in
+/// the JSONL but reported once, as first seen in the sequence header. No
+/// slice NAL is ever hexed: every recorded entry is an SPS (67…) or PPS
+/// (68…).
+#[tokio::test]
+async fn fixture_sps_through_capture_and_summarize_matches_the_manifest() {
+    let (records, m) = fixture_records().await;
+    let in_band_entries = records
+        .iter()
+        .filter(|r| r.avc_packet_type == Some(1))
+        .map(|r| r.param_sets_hex.len())
+        .sum::<usize>();
+    assert!(
+        in_band_entries > 0,
+        "expected x264's in-band SPS/PPS repeats"
+    );
+    assert!(
+        records
+            .iter()
+            .flat_map(|r| r.param_sets_hex.iter())
+            .all(|h| h.starts_with("67") || h.starts_with("68"))
+    );
+
+    let s = kvm_probe::report::summarize(&records);
+    assert_eq!(s.sps.len(), 1, "{:?}", s.sps);
+    assert_eq!(s.pps_hex.len(), 1, "{:?}", s.pps_hex);
+    let rep = &s.sps[0];
+    assert!(!rep.in_band, "first seen in the sequence header");
+    let sum = rep.summary.as_ref().unwrap();
+    assert_eq!(u64::from(sum.width), m["width"].as_u64().unwrap());
+    assert_eq!(u64::from(sum.height), m["height"].as_u64().unwrap());
+    assert_eq!(
+        u64::from(sum.profile_idc),
+        m["profile_idc"].as_u64().unwrap()
+    );
+    assert_eq!(u64::from(sum.level_idc), m["level_idc"].as_u64().unwrap());
+    assert_eq!(
+        u64::from(sum.pic_order_cnt_type),
+        m["pic_order_cnt_type"].as_u64().unwrap()
+    );
+    assert_eq!(rep.limits, Some(Ok(())));
+    assert_eq!(
+        rep.change_vs_first,
+        Some(kvm_proto::h264::SpsChange::Initial)
+    );
+    assert_eq!((s.param_sets_skipped, s.param_sets_unreported), (0, 0));
+}
+
 #[tokio::test]
 async fn byte_cap_mid_tag_stops_cleanly() {
     let stub = support::start_flv_stub().await;
