@@ -4,6 +4,8 @@
 
 mod annexb;
 pub use annexb::{AvccError, avcc_to_annex_b};
+mod nal;
+pub use nal::{NalHeader, NalHeaderError};
 
 #[cfg(test)]
 mod tests {
