@@ -8,6 +8,7 @@ pub mod record;
 pub mod report;
 pub mod request;
 pub mod sandbox;
+pub mod secret;
 pub mod stats;
 pub mod trial;
 pub mod wsprobe;

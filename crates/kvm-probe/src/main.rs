@@ -2,21 +2,27 @@
 //! provider is the very first thing this binary does (R20) so every TLS
 //! path below has a default provider to use.
 
-use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 
-use kvm_probe::captures::CaptureDir;
+use kvm_probe::captures::{self, CaptureDir};
 use kvm_probe::cli::{Cli, Cmd, Conn, SchemeArg};
 use kvm_probe::request::{KvmTarget, Scheme};
-use kvm_probe::{capture, fingerprint, kvm, report, sandbox, stats, trial, wsprobe};
+use kvm_probe::{capture, fingerprint, kvm, report, sandbox, secret, stats, trial, wsprobe};
 
-/// Local-file bound on the password file (§9.2): never buffer an
-/// unbounded file, local or not. 4 KiB is generous for any real password.
-const MAX_PASSWORD_FILE_BYTES: u64 = 4 * 1024;
+/// The repo-root `/captures/` directory (gitignored, §11.5) — anchored at
+/// build time via `CARGO_MANIFEST_DIR`, never relative to the operator's
+/// current directory (I5): a run from any cwd must land captures in the
+/// one place `.gitignore`'s anchored `/captures/` actually excludes,
+/// exactly as `sandbox.rs`'s `live_sample_range` test is anchored (R12).
+const CAPTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../captures");
+
+/// Cap on `summarize`'s JSONL read (I3): large enough for any real
+/// capture, but never unbounded.
+const SUMMARIZE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn target(conn: &Conn) -> KvmTarget {
     match conn.scheme {
@@ -37,49 +43,8 @@ fn target(conn: &Conn) -> KvmTarget {
     }
 }
 
-/// Strip exactly one trailing newline (`\n` or `\r\n`), the way a text
-/// editor or `echo` leaves one at end of file. Never strips more than one,
-/// so a password that itself ends in a blank line is not silently mangled.
-fn strip_one_trailing_newline(mut s: String) -> String {
-    if s.ends_with('\n') {
-        s.pop();
-        if s.ends_with('\r') {
-            s.pop();
-        }
-    }
-    s
-}
-
-/// Read the KVM password from `path` — the only place a password may come
-/// from; it is never accepted as a CLI argument or an environment variable
-/// (§9.2). The read is bounded at `MAX_PASSWORD_FILE_BYTES` (refused, not
-/// truncated, past that) and one trailing newline is stripped. Every error
-/// here names only `path`, never the file's contents, and the password
-/// itself is never logged, printed, or included in any error produced
-/// anywhere in this binary.
-fn read_password_file(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|_| format!("cannot read password file {}", path.display()))?;
-    let cap = MAX_PASSWORD_FILE_BYTES.saturating_add(1);
-    let mut limited = (&mut file).take(cap);
-    let mut buf = Vec::new();
-    limited
-        .read_to_end(&mut buf)
-        .map_err(|_| format!("cannot read password file {}", path.display()))?;
-    let len = u64::try_from(buf.len()).unwrap_or(u64::MAX);
-    if len > MAX_PASSWORD_FILE_BYTES {
-        return Err(format!(
-            "password file {} exceeds the {MAX_PASSWORD_FILE_BYTES}-byte cap",
-            path.display()
-        ));
-    }
-    let text = String::from_utf8(buf)
-        .map_err(|_| format!("password file {} is not valid UTF-8", path.display()))?;
-    Ok(strip_one_trailing_newline(text))
-}
-
 async fn token(conn: &Conn) -> Result<String, String> {
-    let pw = read_password_file(&conn.password_file)?;
+    let pw = secret::read_password_file(&conn.password_file)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?;
@@ -90,7 +55,7 @@ async fn token(conn: &Conn) -> Result<String, String> {
 }
 
 fn captures_dir() -> Result<CaptureDir, String> {
-    CaptureDir::create(Path::new("captures")).map_err(|e| format!("{e:?}"))
+    CaptureDir::create(Path::new(CAPTURES_DIR)).map_err(|e| format!("{e:?}"))
 }
 
 /// Create `<dir>/<name>` for writing, via the same no-clobber,
@@ -194,15 +159,26 @@ async fn run(cli: Cli) -> Result<(), String> {
             println!("{out:?}");
         }
         Cmd::Summarize { name } => {
-            let path = captures_dir()?
-                .resolve(&format!("{name}.jsonl"))
-                .map_err(|e| format!("{e:?}"))?;
-            let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-            let recs: Vec<kvm_probe::record::TagRecord> = text
-                .lines()
-                .map(serde_json::from_str)
-                .collect::<Result<_, _>>()
-                .map_err(|e| e.to_string())?;
+            let dir = captures_dir()?;
+            let jsonl_name = format!("{name}.jsonl");
+            let path = dir.resolve(&jsonl_name).map_err(|e| format!("{e:?}"))?;
+            // I3: never follow a symlink, never block on a FIFO, never
+            // buffer past the cap — the captures dir is rw-mounted into
+            // the ffmpeg sandbox, so a compromised decode could have
+            // planted any entry type at this name.
+            let bytes = captures::read_capped(&dir, &jsonl_name, SUMMARIZE_MAX_BYTES)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            let text = String::from_utf8(bytes)
+                .map_err(|_| format!("{} is not valid UTF-8", path.display()))?;
+            let mut recs = Vec::new();
+            for (i, line) in text.lines().enumerate() {
+                // M5: name the path and the 1-based line number, not just
+                // serde's own ever-"line 1" (each line is parsed on its own).
+                let n = i.saturating_add(1);
+                let rec: kvm_probe::record::TagRecord = serde_json::from_str(line)
+                    .map_err(|e| format!("{}: line {n}: {e}", path.display()))?;
+                recs.push(rec);
+            }
             println!("{:#?}", report::summarize(&recs));
         }
     }
@@ -212,7 +188,14 @@ async fn run(cli: Cli) -> Result<(), String> {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    if let Err(e) = run(Cli::parse()).await {
+    let cli = Cli::parse();
+    // I1: catches `scheme == Https` (explicit or default) without `--pin`
+    // — `required_if_eq` alone misses the default-scheme case. `exit()`
+    // prints clap's usual usage-error text and exits with its usual code.
+    if let Err(e) = cli.validate() {
+        e.exit();
+    }
+    if let Err(e) = run(cli).await {
         eprintln!("kvm-probe: {e}");
         std::process::exit(1);
     }

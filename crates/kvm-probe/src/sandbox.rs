@@ -1,10 +1,9 @@
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::captures::CaptureDir;
+use crate::captures::{self, CaptureDir};
 
 /// Build the `nice -n 19 bwrap … ffmpeg …` argv that decodes a capture's first
 /// frame to a raw Y/UV plane in the decoder's native pix_fmt, with no scaler
@@ -129,12 +128,29 @@ const STDERR_CAP: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// The only process spawn in this module: argv[0] is the sandbox. A spawn
-/// failure is returned as-is; there is no unsandboxed fallback. The child is
-/// bounded by `FFMPEG_WALL_CLOCK_LIMIT` — exceeding it kills the child and
-/// returns an error rather than waiting forever — and its stderr is read on
-/// a separate thread, capped at `STDERR_CAP` bytes, so neither a slow exit
-/// nor a chatty hostile decode can hang or unbound this call.
+/// failure is returned as-is; there is no unsandboxed fallback. Delegates
+/// to `run_argv_bounded` with the crate's real wall-clock limit and stderr
+/// cap (`run_argv_bounded` exists as a seam so a test can use a short limit
+/// and a tiny cap instead of the real ones, per I2).
 fn run_argv(argv: &[String]) -> std::io::Result<Output> {
+    run_argv_bounded(argv, FFMPEG_WALL_CLOCK_LIMIT, STDERR_CAP)
+}
+
+/// Spawn `argv`, bounded by `wall_clock_limit` and with stderr capped at
+/// `stderr_cap` bytes (I2). The reader thread drains stderr all the way to
+/// EOF — past the cap, into a sink — so the child is never SIGPIPE'd by a
+/// pipe nobody is reading from any more; if that drain shows the log was
+/// longer than the cap, if the read itself failed, or if the reader thread
+/// could not be joined, the run fails closed rather than returning
+/// whatever partial log it has. A truncated log could have hidden exactly
+/// the one line (`ffmpeg_inserted_scaler`'s match) that fails the
+/// measurement closed, so a run whose own log can't be fully vouched for
+/// is itself a failure, never a silent "clean".
+fn run_argv_bounded(
+    argv: &[String],
+    wall_clock_limit: Duration,
+    stderr_cap: usize,
+) -> std::io::Result<Output> {
     let (head, tail) = argv
         .split_first()
         .ok_or_else(|| std::io::Error::other("empty argv"))?;
@@ -149,14 +165,29 @@ fn run_argv(argv: &[String]) -> std::io::Result<Output> {
         .stderr
         .take()
         .ok_or_else(|| std::io::Error::other("no stderr pipe"))?;
-    let cap = u64::try_from(STDERR_CAP).unwrap_or(u64::MAX);
+    let cap = u64::try_from(stderr_cap).unwrap_or(u64::MAX);
     // Read stderr on its own thread so a child that fills the pipe while
     // the wait loop below is polling can't deadlock this call.
-    let stderr_handle = std::thread::spawn(move || {
+    let stderr_handle = std::thread::spawn(move || -> std::io::Result<(Vec<u8>, bool)> {
+        let mut pipe = stderr_pipe;
         let mut buf = Vec::new();
-        let mut limited = stderr_pipe.take(cap);
-        let _ = limited.read_to_end(&mut buf);
-        buf
+        {
+            let mut limited = (&mut pipe).take(cap);
+            limited.read_to_end(&mut buf)?;
+        }
+        // Keep draining to EOF so the child is never SIGPIPE'd by a reader
+        // that stopped at the cap; discard the bytes, but remember whether
+        // there were any more — that's truncation.
+        let mut truncated = false;
+        let mut sink = [0u8; 8192];
+        loop {
+            let n = pipe.read(&mut sink)?;
+            if n == 0 {
+                break;
+            }
+            truncated = true;
+        }
+        Ok((buf, truncated))
     });
 
     let started = Instant::now();
@@ -164,16 +195,31 @@ fn run_argv(argv: &[String]) -> std::io::Result<Output> {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        if started.elapsed() >= FFMPEG_WALL_CLOCK_LIMIT {
+        if started.elapsed() >= wall_clock_limit {
             let _ = child.kill();
             let _ = child.wait();
             return Err(std::io::Error::other(format!(
-                "sandboxed ffmpeg exceeded the {FFMPEG_WALL_CLOCK_LIMIT:?} wall-clock limit; killed"
+                "sandboxed ffmpeg exceeded the {wall_clock_limit:?} wall-clock limit; killed"
             )));
         }
-        std::thread::sleep(POLL_INTERVAL);
+        std::thread::sleep(POLL_INTERVAL.min(wall_clock_limit));
     };
-    let stderr = stderr_handle.join().unwrap_or_default();
+
+    let (stderr, truncated) = match stderr_handle.join() {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(std::io::Error::other(
+                "ffmpeg stderr reader thread panicked",
+            ));
+        }
+    };
+    if truncated {
+        return Err(std::io::Error::other(format!(
+            "ffmpeg stderr exceeded the {stderr_cap}-byte cap; cannot verify no scaler was inserted"
+        )));
+    }
+
     Ok(Output {
         status,
         stdout: Vec::new(),
@@ -215,22 +261,31 @@ fn remove_stale_output(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Open `path` host-side without ever following a symlink (`O_NOFOLLOW`
-/// fails the open if `path` is itself a symlink — the rw-mounted captures
-/// dir is where a compromised sandboxed ffmpeg could have planted one), and
-/// read at most `max_len + 1` bytes: enough to know the data is at least
-/// `max_len` bytes (what the Y-plane measurement needs) without ever
-/// buffering an unbounded hostile file.
-fn read_capped_no_symlink(path: &Path, max_len: usize) -> std::io::Result<Vec<u8>> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    let cap = u64::try_from(max_len.saturating_add(1)).unwrap_or(u64::MAX);
-    let mut limited = file.take(cap);
-    let mut buf = Vec::new();
-    limited.read_to_end(&mut buf)?;
-    Ok(buf)
+/// How much of ffmpeg's stderr ever reaches the operator's terminal on
+/// failure (I4, §9.2): a compromised ffmpeg's log is hostile input, so only
+/// a short tail is kept.
+const STDERR_TAIL_FOR_DISPLAY: usize = 4 * 1024;
+
+/// Render (a tail of) ffmpeg's stderr for a human terminal: at most the
+/// last `STDERR_TAIL_FOR_DISPLAY` bytes, lossily decoded, with every
+/// control character other than `\n`/`\t` escaped (`char::is_control`
+/// covers C0, DEL and C1 together). A compromised ffmpeg's log is hostile
+/// input (§9.2) — without this, raw ESC/OSC bytes in it would reach the
+/// operator's terminal verbatim (escape-sequence injection: title/clipboard
+/// writes, emulator bugs), and up to a megabyte of it at that (`STDERR_CAP`).
+fn sanitize_for_terminal(bytes: &[u8]) -> String {
+    let tail_start = bytes.len().saturating_sub(STDERR_TAIL_FOR_DISPLAY);
+    let tail = bytes.get(tail_start..).unwrap_or(&[]);
+    let text = String::from_utf8_lossy(tail);
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() && c != '\n' && c != '\t' {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Spawn the sandbox, enforce no scaler, read the native Y-plane range. Live only.
@@ -260,17 +315,23 @@ pub fn run_sample_range(
 
     let argv = build_ffmpeg_sandbox_argv(ffmpeg, &cap_host_dir, capture_name, &out_name);
     let output = run_argv(&argv)?;
+    // `run_argv` already fails closed if this log was truncated (I2), so
+    // it's complete (and bounded at `STDERR_CAP`) — safe to use whole for
+    // the scaler check. Only the *displayed* error below gets the extra
+    // tail+escape treatment (I4): that's about what reaches a terminal,
+    // not about what the scaler check is allowed to see.
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     if !output.status.success() {
         return Err(std::io::Error::other(format!(
-            "sandboxed ffmpeg failed: {stderr}"
+            "sandboxed ffmpeg failed: {}",
+            sanitize_for_terminal(&output.stderr)
         )));
     }
 
     let plane_len = width
         .checked_mul(height)
         .ok_or_else(|| std::io::Error::other("width*height overflow"))?;
-    let frame = read_capped_no_symlink(&out_host, plane_len)?;
+    let frame = captures::read_capped(dir, &out_name, plane_len)?;
     Ok(sample_range_outcome(&stderr, &frame, width, height))
 }
 
@@ -327,52 +388,99 @@ mod tests {
         p
     }
 
+    /// M1: the shipped argv[0] is `nice`, not `bwrap` directly — a missing
+    /// `bwrap` surfaces as `nice` exiting 127 (its exec-failure code), which
+    /// must land in the non-success branch, never a panic or a false
+    /// "success".
     #[test]
-    fn read_capped_no_symlink_refuses_a_symlink() {
-        let base = tmp_base("symlink");
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        let real = base.join("real.y");
-        std::fs::write(&real, [1u8, 2, 3]).unwrap();
-        let link = base.join("link.y");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let result = read_capped_no_symlink(&link, 10);
-        assert!(result.is_err(), "a symlink must never be followed");
-
-        let _ = std::fs::remove_dir_all(&base);
+    fn nice_wrapped_missing_bwrap_fails_closed_not_panics() {
+        let argv = vec![
+            "nice".to_string(),
+            "-n".to_string(),
+            "19".to_string(),
+            "/nonexistent/bwrap".to_string(),
+            "--".to_string(),
+            "x".to_string(),
+        ];
+        let out = run_argv(&argv).unwrap();
+        assert!(
+            !out.status.success(),
+            "nice exiting 127 for a missing bwrap must not look like success"
+        );
     }
 
+    /// I2: a child that outlives the wall-clock limit is killed and the
+    /// run fails closed, within the bound — not a multi-second real wait,
+    /// since the limit itself is a test-only short one via the
+    /// `run_argv_bounded` seam.
     #[test]
-    fn read_capped_no_symlink_bounds_the_read() {
-        let base = tmp_base("cap");
+    fn run_argv_bounded_kills_a_child_that_outlives_the_limit() {
+        let argv = vec!["sleep".to_string(), "30".to_string()];
+        let limit = Duration::from_millis(100);
+        let started = Instant::now();
+        let err = run_argv_bounded(&argv, limit, STDERR_CAP).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            format!("{err}").contains("wall-clock"),
+            "expected a wall-clock-limit error, got {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "must not wait anywhere near the child's real 30s sleep: took {elapsed:?}"
+        );
+    }
+
+    /// I2: stderr longer than the cap must fail closed rather than return
+    /// a silently truncated ("clean") log — a truncated log could have
+    /// hidden the one line that fails the scaler check.
+    #[test]
+    fn run_argv_bounded_fails_closed_on_truncated_stderr() {
+        let base = tmp_base("big-stderr");
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
-        let path = base.join("big.y");
-        std::fs::write(&path, vec![7u8; 1000]).unwrap();
+        let bigfile = base.join("big.txt");
+        std::fs::write(&bigfile, vec![b'a'; 200_000]).unwrap();
 
-        let bytes = read_capped_no_symlink(&path, 10).unwrap();
-        assert_eq!(
-            bytes.len(),
-            11,
-            "read must stop at max_len+1, never buffer the whole file"
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("cat {} >&2", bigfile.display()),
+        ];
+        let err = run_argv_bounded(&argv, Duration::from_secs(10), 1024).unwrap_err();
+        assert!(
+            format!("{err}").contains("cap"),
+            "expected a stderr-cap error, got {err}"
         );
 
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// I4: a hostile ffmpeg's stderr must never reach the operator's
+    /// terminal with raw control bytes — this is the one channel a
+    /// compromised sandboxed decoder would have into escape-sequence
+    /// injection (title/clipboard writes, emulator bugs).
     #[test]
-    fn read_capped_no_symlink_reads_a_short_file_fully() {
-        let base = tmp_base("short");
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
-        let path = base.join("small.y");
-        std::fs::write(&path, [9u8, 8, 7]).unwrap();
+    fn sanitize_for_terminal_escapes_control_bytes_and_keeps_the_text() {
+        let input = b"before\x1b]0;evil-title\x07after\n";
+        let out = sanitize_for_terminal(input);
+        assert!(out.starts_with("before"));
+        assert!(out.ends_with("after\n"));
+        assert!(
+            !out.chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "a raw control byte survived sanitization: {out:?}"
+        );
+        // The escaped form is still visible (not silently dropped).
+        assert!(out.contains("\\u{1b}") || out.contains("1b"), "{out:?}");
+    }
 
-        let bytes = read_capped_no_symlink(&path, 10).unwrap();
-        assert_eq!(bytes, vec![9u8, 8, 7]);
-
-        let _ = std::fs::remove_dir_all(&base);
+    /// I4: only a bounded tail is ever kept, even if the input itself was
+    /// within the (already-enforced-elsewhere) stderr cap.
+    #[test]
+    fn sanitize_for_terminal_keeps_only_a_bounded_tail() {
+        let input = vec![b'a'; 3 * STDERR_TAIL_FOR_DISPLAY];
+        let out = sanitize_for_terminal(&input);
+        assert!(out.len() <= STDERR_TAIL_FOR_DISPLAY);
     }
 
     #[test]
