@@ -1,0 +1,6 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+# Plan A resolves to kvm-proto + kvm-probe (crates/*). kvm-rdp, kvm-sim and
+# kvm-bench arrive in later plans as new crate dirs; fuzz/ is its own
+# workspace at the repo root (spec §4.1, §12).
