@@ -176,10 +176,13 @@ pub enum Cmd {
     },
     /// FLV-open → first-IDR latency over N trials; prints ok/failed and p50/p95.
     ///
-    /// Each trial logs in, times FLV open → first IDR (the login is not timed),
-    /// then logs out. A failed trial is printed and counted, and the run goes
-    /// on; p50/p95 are over the successful trials. Exits non-zero only if no
-    /// trial succeeded.
+    /// Logs in once; every trial reopens av.flv with that one token (the
+    /// bridge's reconnect-on-the-same-session path) and times FLV open →
+    /// first IDR; logs out once at the end (best effort), also when trials
+    /// failed. A failed trial (a timeout, or the KVM refusing the token) is
+    /// printed and counted, and the run goes on; p50/p95 are over the
+    /// successful trials. Exits non-zero if the login fails or no trial
+    /// succeeded.
     FirstIdr {
         #[command(flatten)]
         conn: Conn,

@@ -59,26 +59,36 @@ async fn session<T>(
     password: &str,
     work: impl AsyncFnOnce(&str) -> T,
 ) -> Result<T, KvmError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| KvmError::Io(format!("system clock: {e}")))?;
-    let now = i64::try_from(now.as_secs()).map_err(|e| KvmError::Io(e.to_string()))?;
     let s = kvm::with_session(
         &target(conn),
         conn.pin_for(Port::Web),
         password,
-        now,
-        "UTC",
+        unix_now()?,
+        kvm::PROBE_TIMEZONE,
         work,
     )
     .await?;
-    if let Err(e) = &s.logout {
+    warn_if_logout_failed(&s.logout);
+    Ok(s.output)
+}
+
+/// Seconds since the Unix epoch, for the login body's `time` field.
+fn unix_now() -> Result<i64, KvmError> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| KvmError::Io(format!("system clock: {e}")))?;
+    i64::try_from(now.as_secs()).map_err(|e| KvmError::Io(e.to_string()))
+}
+
+/// A failed logout is best effort (final review m1): one line, escaped and
+/// bounded (never the token or device text beyond that), then carry on.
+fn warn_if_logout_failed(logout: &Result<(), KvmError>) {
+    if let Err(e) = logout {
         eprintln!(
             "kvm-probe: logout failed (best effort, ignored): {}",
             kvm::bounded_debug(e)
         );
     }
-    Ok(s.output)
 }
 
 fn captures_dir() -> Result<CaptureDir, String> {
@@ -175,35 +185,31 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Cmd::FirstIdr { conn, trials } => {
             let pw = password(&conn)?;
-            let t = target(&conn);
-            let mut report = trial::TrialReport::default();
-            for n in 1..=trials {
-                // m1: each trial is its own session — log in, time the FLV
-                // open → first IDR (login excluded), log out — so 20
-                // trials never hold 20 live KVM sessions.
-                let outcome = session(&conn, &pw, async |tok: &str| {
-                    trial::first_idr_latency(
-                        &t,
-                        conn.pin_for(Port::Video),
-                        tok,
-                        Duration::from_secs(10),
-                    )
-                    .await
-                })
-                .await
-                .and_then(|trial| trial);
-                // m7: a failed trial (login included) is recorded with a
-                // bounded, escaped reason, and the run carries on.
-                println!("trial {n}/{trials}: {}", report.record(outcome));
-                if n < trials {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-            println!("{}", report.summary());
-            if report.all_failed() {
+            let plan = trial::TrialPlan {
+                trials,
+                timeout: Duration::from_secs(10),
+                pause: Duration::from_secs(1),
+            };
+            // m1 (corrected): ONE login, every trial reopens av.flv on that
+            // token, ONE best-effort logout at the end. m7: a failed trial
+            // is printed with a bounded, escaped reason and the run goes on.
+            let s = trial::first_idr_run(
+                &target(&conn),
+                conn.pin_for(Port::Web),
+                conn.pin_for(Port::Video),
+                &pw,
+                unix_now().map_err(|e| format!("{e:?}"))?,
+                &plan,
+                |n, line| println!("trial {n}/{trials}: {line}"),
+            )
+            .await
+            .map_err(|e| format!("{e:?}"))?;
+            warn_if_logout_failed(&s.logout);
+            println!("{}", s.output.summary());
+            if s.output.all_failed() {
                 return Err(format!(
                     "no first-idr trial succeeded ({} of {trials} failed)",
-                    report.failures.len()
+                    s.output.failures.len()
                 ));
             }
         }

@@ -174,3 +174,76 @@ pub async fn start_ws_stub() -> WsStub {
         data_frames,
     }
 }
+
+/// A loopback TLS stub answering like the KVM on a single port (final
+/// review m1 correction): `POST /cgi-bin/login.lua` → the login token,
+/// `GET /cgi-bin/login.lua?logout` → 200, `GET /av.flv?…` → the committed
+/// fixture (or `403 Forbidden` when `flv_ok` is false — the KVM refusing
+/// the token), anything else → 404. Every request head is recorded in
+/// arrival order, so a test can count logins, FLV opens and logouts.
+pub async fn start_kvm_stub(flv_ok: bool) -> Stub {
+    let (acceptor, pin_hex) = tls_acceptor_and_pin();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let login = Arc::new(http_response(
+        "200 OK",
+        "application/json",
+        br#"{"result":0,"token":"0.987654","role":"admin"}"#,
+    ));
+    let logout = Arc::new(http_response(
+        "200 OK",
+        "application/json",
+        br#"{"result":0}"#,
+    ));
+    let flv = Arc::new(if flv_ok {
+        let mut r =
+            b"HTTP/1.1 200 OK\r\nContent-Type: video/x-flv\r\nConnection: close\r\n\r\n".to_vec();
+        r.extend_from_slice(&flv_fixture());
+        r
+    } else {
+        http_response("403 Forbidden", "text/plain", b"bad token")
+    });
+    let not_found = Arc::new(http_response("404 Not Found", "text/plain", b""));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    tokio::spawn(async move {
+        loop {
+            let (tcp, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let acceptor = acceptor.clone();
+            let recorded = recorded.clone();
+            let (login, logout, flv, not_found) = (
+                login.clone(),
+                logout.clone(),
+                flv.clone(),
+                not_found.clone(),
+            );
+            tokio::spawn(async move {
+                let mut tls = match acceptor.accept(tcp).await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let head = read_head(&mut tls).await;
+                let response = if head.starts_with("POST /cgi-bin/login.lua ") {
+                    login
+                } else if head.starts_with("GET /cgi-bin/login.lua?logout ") {
+                    logout
+                } else if head.starts_with("GET /av.flv?") {
+                    flv
+                } else {
+                    not_found
+                };
+                recorded.lock().unwrap().push(head);
+                let _ = tls.write_all(&response).await;
+                let _ = tls.shutdown().await;
+            });
+        }
+    });
+    Stub {
+        port,
+        pin_hex,
+        requests,
+    }
+}

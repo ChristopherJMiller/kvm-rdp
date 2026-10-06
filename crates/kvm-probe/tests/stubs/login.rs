@@ -269,8 +269,8 @@ async fn with_session_logs_out_after_the_work_with_the_token_cookie() {
     );
 }
 
-/// m1: the logout happens even when the work fails (a failed first-IDR
-/// trial still releases its session).
+/// m1: the logout happens even when the work fails (a first-idr run whose
+/// trials all failed still releases its session).
 #[tokio::test]
 async fn with_session_logs_out_even_when_the_work_fails() {
     let stub = support::start_login_stub().await;

@@ -268,6 +268,10 @@ async fn logout_inner(target: &KvmTarget, pin: Option<&str>, token: &str) -> Res
     }
 }
 
+/// The timezone every kvm-probe login reports (`login.lua`'s `timezone`
+/// field): the probe has no reason to reveal the operator's.
+pub const PROBE_TIMEZONE: &str = "UTC";
+
 /// What a logged-in session produced: the work's output, and how its
 /// logout went (final review m1).
 #[derive(Debug)]
@@ -278,9 +282,8 @@ pub struct Session<T> {
 
 /// Log in, run `work` with the token, then log out with it — always, even
 /// when the work itself failed (final review m1): every kvm-probe run that
-/// logs in releases its KVM session, so a census of many runs (20
-/// first-IDR trials each) never piles up live sessions against the
-/// device's session cap. A failed login is the error (there is no token,
+/// logs in releases its KVM session, so a census of many runs never piles up live
+/// sessions against the device's session cap. A failed login is the error (there is no token,
 /// so nothing to log out); a failed logout is reported in
 /// `Session::logout`, never turned into the session's error.
 pub async fn with_session<T>(

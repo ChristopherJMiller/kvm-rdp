@@ -194,3 +194,118 @@ async fn first_idr_latency_capped_stops_at_the_byte_cap_with_no_idr() {
         "{err:?}"
     );
 }
+
+/// One port serving login, av.flv and logout, as `start_kvm_stub` does.
+fn kvm_target(port: u16) -> KvmTarget {
+    KvmTarget {
+        scheme: Scheme::Https,
+        host: "127.0.0.1".into(),
+        login_port: port,
+        video_port: port,
+        control_port: 1,
+    }
+}
+
+fn plan(trials: u32) -> kvm_probe::trial::TrialPlan {
+    kvm_probe::trial::TrialPlan {
+        trials,
+        timeout: Duration::from_secs(5),
+        pause: Duration::from_millis(1),
+    }
+}
+
+/// (logins, av.flv opens, logouts) in a stub's recorded requests, and
+/// whether the first request was the login and the last the logout.
+fn tally(reqs: &[String]) -> (usize, usize, usize, bool, bool) {
+    let count = |p: &str| reqs.iter().filter(|r| r.starts_with(p)).count();
+    (
+        count("POST /cgi-bin/login.lua "),
+        count("GET /av.flv?"),
+        count("GET /cgi-bin/login.lua?logout "),
+        reqs.first()
+            .is_some_and(|r| r.starts_with("POST /cgi-bin/login.lua ")),
+        reqs.last()
+            .is_some_and(|r| r.starts_with("GET /cgi-bin/login.lua?logout ")),
+    )
+}
+
+/// m1 correction (final review): a first-idr run logs in ONCE, every trial
+/// reopens av.flv with that same token (the bridge's reconnect-on-same-
+/// session path — a fresh login per trial could itself trigger an IDR and
+/// bias the measurement), and logs out ONCE at the end — for any trial
+/// count.
+#[tokio::test]
+async fn first_idr_run_logs_in_once_and_out_once_for_any_trial_count() {
+    for trials in [1u32, 3] {
+        let stub = support::start_kvm_stub(true).await;
+        let mut lines = Vec::new();
+        let s = kvm_probe::trial::first_idr_run(
+            &kvm_target(stub.port),
+            Some(&stub.pin_hex),
+            Some(&stub.pin_hex),
+            "pw",
+            1_759_680_000,
+            &plan(trials),
+            |n, line| lines.push(format!("{n}: {line}")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.output.successes.len(),
+            usize::try_from(trials).unwrap(),
+            "{lines:?} {:?}",
+            s.output.failures
+        );
+        assert!(s.output.failures.is_empty());
+        assert!(s.logout.is_ok(), "{:?}", s.logout);
+        assert_eq!(lines.len(), usize::try_from(trials).unwrap());
+
+        let reqs = stub.requests.lock().unwrap();
+        let expected_opens = usize::try_from(trials).unwrap();
+        assert_eq!(
+            tally(&reqs),
+            (1, expected_opens, 1, true, true),
+            "trials={trials}: {reqs:#?}"
+        );
+        // Every trial carries the one login's token, as query and cookie.
+        for r in reqs.iter().filter(|r| r.starts_with("GET /av.flv?")) {
+            assert!(r.starts_with("GET /av.flv?token=0.987654 "), "{r}");
+            assert!(
+                r.to_ascii_lowercase()
+                    .contains("\r\ncookie: token=0.987654\r\n"),
+                "{r}"
+            );
+        }
+    }
+}
+
+/// m1 correction: a trial that fails because the KVM refuses the token on
+/// av.flv is recorded as a failed trial like any other, the run goes on,
+/// and there is still exactly one login and one logout — the logout
+/// happens even though every trial failed.
+#[tokio::test]
+async fn rejected_token_trials_fail_and_the_run_still_logs_out_once() {
+    let stub = support::start_kvm_stub(false).await;
+    let s = kvm_probe::trial::first_idr_run(
+        &kvm_target(stub.port),
+        Some(&stub.pin_hex),
+        Some(&stub.pin_hex),
+        "pw",
+        1_759_680_000,
+        &plan(3),
+        |_, _| {},
+    )
+    .await
+    .unwrap();
+    assert!(s.output.successes.is_empty());
+    assert_eq!(s.output.failures.len(), 3, "{:?}", s.output.failures);
+    assert!(
+        s.output.failures.iter().all(|f| f.contains("403")),
+        "{:?}",
+        s.output.failures
+    );
+    assert!(s.output.all_failed());
+    assert!(s.logout.is_ok(), "{:?}", s.logout);
+    let reqs = stub.requests.lock().unwrap();
+    assert_eq!(tally(&reqs), (1, 3, 1, true, true), "{reqs:#?}");
+}

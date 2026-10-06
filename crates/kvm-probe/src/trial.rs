@@ -141,6 +141,57 @@ impl TrialReport {
     }
 }
 
+/// How a `first-idr` run is paced: how many trials, each bounded by
+/// `timeout`, with `pause` between consecutive trials.
+#[derive(Debug, Clone)]
+pub struct TrialPlan {
+    pub trials: u32,
+    pub timeout: Duration,
+    pub pause: Duration,
+}
+
+/// The whole `first-idr` run (final review m1, as corrected): log in
+/// **once** on the web port, run every trial on that one token — each
+/// trial reopens `av.flv` and times FLV open → first IDR, the bridge's
+/// reconnect-on-the-same-session path (a fresh login per trial could
+/// itself trigger an IDR and bias the measurement) — then log out
+/// **once**, best effort, also when trials failed (`kvm::with_session`).
+///
+/// A failed trial — a timeout, a refused open, the KVM rejecting the
+/// token — is recorded in the report like any other and the run goes on;
+/// `on_trial(n, line)` is called after each trial with its printable line.
+/// The only error is a failed login (no trial can run without a token).
+pub async fn first_idr_run(
+    target: &KvmTarget,
+    web_pin: Option<&str>,
+    video_pin: Option<&str>,
+    password: &str,
+    now_unix: i64,
+    plan: &TrialPlan,
+    mut on_trial: impl FnMut(u32, &str),
+) -> Result<kvm::Session<TrialReport>, KvmError> {
+    kvm::with_session(
+        target,
+        web_pin,
+        password,
+        now_unix,
+        kvm::PROBE_TIMEZONE,
+        async |token: &str| {
+            let mut report = TrialReport::default();
+            for n in 1..=plan.trials {
+                let outcome = first_idr_latency(target, video_pin, token, plan.timeout).await;
+                let line = report.record(outcome);
+                on_trial(n, &line);
+                if n < plan.trials {
+                    tokio::time::sleep(plan.pause).await;
+                }
+            }
+            report
+        },
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
