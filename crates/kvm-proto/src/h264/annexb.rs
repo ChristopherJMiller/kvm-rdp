@@ -27,6 +27,11 @@ pub enum AvccError {
 /// into `out` (the caller owns clearing/reuse — spec §6.2/§6.3 build an AU by
 /// concatenating cached SPS/PPS and VCL NALs into one reused buffer).
 ///
+/// Contract: on `Ok`, the converted NALs are appended to `out`. On `Err`,
+/// `out` is left exactly as it was on entry — a rejected AU never leaves a
+/// partial fragment behind for the next `avcc_to_annex_b` call to splice
+/// onto (spec §6.3: `out` is reused across access units).
+///
 /// `nal_length_size` is the NAL length-prefix width in bytes: 1, 2 or 4
 /// (= `AVCDecoderConfigurationRecord.lengthSizeMinusOne + 1`; §6.2 admits
 /// `lengthSizeMinusOne ∈ {0,1,3}`).
@@ -38,6 +43,13 @@ pub fn avcc_to_annex_b(
     if !matches!(nal_length_size, 1 | 2 | 4) {
         return Err(AvccError::BadLengthSize(nal_length_size));
     }
+    let start_len = out.len();
+    convert_all(data, nal_length_size, out).inspect_err(|_| out.truncate(start_len))
+}
+
+/// Does the actual appending; on error, `out` may hold a partial AU — the
+/// caller (`avcc_to_annex_b`) truncates it back to the entry length.
+fn convert_all(data: &[u8], nal_length_size: usize, out: &mut Vec<u8>) -> Result<(), AvccError> {
     let mut rest = data;
     while !rest.is_empty() {
         let (prefix, after_prefix) = rest
@@ -139,5 +151,26 @@ mod tests {
             avcc_to_annex_b(&[0, 0], 4, &mut out),
             Err(AvccError::TruncatedPrefix)
         );
+    }
+
+    #[test]
+    fn error_leaves_out_unchanged() {
+        // One valid NAL [0x67, 0x42], then a second length prefix claiming 9
+        // bytes with only 2 remaining -> NalExceedsBuffer. `out` must come
+        // back exactly as it went in, not with the first NAL spliced on.
+        let avcc = [
+            0, 0, 0, 2, 0x67, 0x42, // valid NAL
+            0, 0, 0, 9, 0xaa, 0xbb, // overrunning NAL
+        ];
+        let mut out = vec![0xde, 0xad, 0xbe, 0xef];
+        let seeded = out.clone();
+        assert_eq!(
+            avcc_to_annex_b(&avcc, 4, &mut out),
+            Err(AvccError::NalExceedsBuffer {
+                nal_len: 9,
+                remaining: 2
+            })
+        );
+        assert_eq!(out, seeded);
     }
 }
