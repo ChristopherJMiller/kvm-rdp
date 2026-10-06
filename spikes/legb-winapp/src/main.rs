@@ -14,6 +14,8 @@ mod cfg {
 
 mod tls;
 
+mod replay;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // One crypto provider, aws-lc-rs, installed idempotently (spec §4.2).
