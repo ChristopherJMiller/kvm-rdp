@@ -32,12 +32,14 @@ hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 kvm-proto = { path = "../kvm-proto" }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }  # default features would pull in ring (§4.2)
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "test-util"] }
 bytes = { workspace = true }
 tempfile = "3"
+futures-util = "0.3"
 
 [lints.clippy]
 indexing_slicing = "deny"

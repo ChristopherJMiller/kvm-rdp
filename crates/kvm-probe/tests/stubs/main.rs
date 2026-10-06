@@ -15,3 +15,4 @@ mod support;
 
 mod capture;
 mod login;
+mod ws;

@@ -6,3 +6,4 @@ pub mod pin;
 pub mod record;
 pub mod request;
 pub mod sandbox;
+pub mod wsprobe;

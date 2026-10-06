@@ -89,3 +89,62 @@ pub async fn start_flv_stub() -> Stub {
     resp.extend_from_slice(&flv_fixture());
     start_http_stub(resp).await
 }
+
+pub struct WsStub {
+    pub port: u16,
+    pub pin_hex: String,
+    pub saw_cookie: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub data_frames: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A loopback TLS websocket stub (Task 5.10). Accepts exactly one
+/// connection, records whether the upgrade request carried the token
+/// cookie, then counts every data (text/binary) frame received until the
+/// client closes — the control-websocket probe must send none.
+///
+/// `result_large_err`: the handshake callback's signature is fixed by
+/// `tokio_tungstenite::accept_hdr_async`'s `Callback` trait (its `Err` is a
+/// full `http::Response`); this is test-only stub code, not a library
+/// return type we control.
+#[allow(clippy::result_large_err)]
+pub async fn start_ws_stub() -> WsStub {
+    use futures_util::StreamExt;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+    let (acceptor, pin_hex) = tls_acceptor_and_pin();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let saw_cookie = Arc::new(AtomicBool::new(false));
+    let data_frames = Arc::new(AtomicUsize::new(0));
+    let (sc, df) = (saw_cookie.clone(), data_frames.clone());
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let tls = acceptor.accept(tcp).await.unwrap();
+        let cb = |req: &Request, resp: Response| {
+            let ok = req
+                .headers()
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("token=0.987654"));
+            sc.store(ok, Ordering::SeqCst);
+            Ok(resp)
+        };
+        let mut ws = tokio_tungstenite::accept_hdr_async(tls, cb).await.unwrap();
+        while let Some(Ok(msg)) = ws.next().await {
+            if msg.is_binary() || msg.is_text() {
+                df.fetch_add(1, Ordering::SeqCst);
+            }
+            if msg.is_close() {
+                break;
+            }
+        }
+    });
+    WsStub {
+        port,
+        pin_hex,
+        saw_cookie,
+        data_frames,
+    }
+}
