@@ -15,6 +15,7 @@
     clippy::as_conversions
 )]
 
+pub mod flv;
 pub mod login;
 pub use login::{LoginError, Token, parse_login_token};
 
