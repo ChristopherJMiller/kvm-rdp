@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "kvm-probe"
 path = "src/main.rs"
 
+[[test]]
+name = "stubs"
+path = "tests/stubs/main.rs"
+
 [dependencies]
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
@@ -22,9 +26,18 @@ serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 rustls-pki-types = "1"
 x509-parser = "0.16"
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+kvm-proto = { path = "../kvm-proto" }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }  # default features would pull in ring (§4.2)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+bytes = { workspace = true }
+tempfile = "3"
 
 [lints.clippy]
 indexing_slicing = "deny"

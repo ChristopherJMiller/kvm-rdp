@@ -70,7 +70,10 @@ impl ServerCertVerifier for SpkiPinVerifier {
         if self.spki_matches(&spki) {
             Ok(ServerCertVerified::assertion())
         } else {
-            Err(TlsError::General("kvm_cert_mismatch".into()))
+            Err(TlsError::General(format!(
+                "kvm_cert_mismatch: observed spki_sha256={}",
+                crate::fingerprint::spki_sha256_hex(&spki)
+            )))
         }
     }
 
