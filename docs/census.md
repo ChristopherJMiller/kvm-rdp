@@ -6,10 +6,10 @@
 
 | | |
 |---|---|
-| Date | 2026-10-06 (Leg A, session 1) |
+| Date | 2026-10-06 (Leg A, sessions 1 and 2) |
 | Device | Angeet/Yeeso ES3 ("ONE KVM"), self-signed cert `C=CN, O=OneKVM, CN=OneKVM` |
 | Firmware | no `Server` header and no version string on `/`; read it from the KVM UI's about page — *pending* |
-| Source | Mac Studio over HDMI; Mac at its **lock screen** for session 1 (display kept awake by a Shift keep-alive) |
+| Source | Mac Studio over HDMI. Session 1: the Mac's **lock screen** (display kept awake by a Shift keep-alive). Session 2: unlocked; a full-screen test-pattern page (black / white / grey ramp / ms clock, a `data:` URL in Edge) and a pure-red page, driven through the KVM's own HID websocket by a throwaway helper (not in the repo) |
 | Presets covered | the KVM's current preset only (1920×1080, 30 fps). 60 fps and "auto" are *pending* (need the KVM UI) |
 | Tool | `kvm-probe` at `plan-a` `b7cc2b9`, release build |
 
@@ -37,7 +37,8 @@ Every value below says how it was obtained. *pending* = not yet measured.
 | NAL types in coded tags | only 1 and 5 — no AUD, no SEI, no in-band SPS/PPS | JSONL `nal_types` |
 | **tag == AU?** | **Yes**: `multi_picture_tags` 0, `continuation_tags` 0, `non_vcl_picture_tags` 0 (≈ 2 700 tags over three captures) | `summarize` |
 | Frame sizes (static screen) | IDR up to 264 KB; P 208 B – 91 KB | JSONL `size` |
-| Static vs typing cadence | static: one tag every 33 ms (no frame skipping on a static screen). Typing/moving: *pending* (needs the unlocked Mac) | JSONL `recv_ms` deltas |
+| Static vs typing cadence | the same: one tag every 33 ms whether the screen is static (lock screen) or moving (ms clock); the KVM never skips frames on a static screen | JSONL `recv_ms` / `timestamp_ms` deltas |
+| Frame sizes (moving clock) | IDR ≤ 24.5 KB; P 3.3–17.4 KB (~2 Mbit/s) | JSONL `size` |
 | **FLV-reconnect → first IDR, 20 trials** | https p50 **183 ms**, p95 **300 ms**; http p50 **97 ms**, p95 **129 ms** (20/20 ok each) | `first-idr --trials 20` |
 | First tag on connect | always an IDR; the GOP restarts at the connection | JSONL |
 | **Burst on connect** | **0 frames** (no GOP-cache replay; 26–29 tags in the first second) | JSONL burst query (Part 6 step 4) |
@@ -63,17 +64,19 @@ Every value below says how it was obtained. *pending* = not yet measured.
 | rustls negotiates? | **Yes** (fingerprint, capture, first-idr, ws-open all over https) | kvm-probe |
 | FLV open → first IDR | https p50 183 / p95 300 ms; http p50 97 / p95 129 ms | `first-idr` |
 | Inter-tag jitter (30 s static) | https p50 33, p95 38, p99 83, max 136 ms; http p50 33, p95 36, p99 49, max 55 ms | JSONL `recv_ms` deltas |
+| Inter-tag jitter (30 s moving) | https p50 33, p95 36, p99 40, max 82 ms; http p50 33, p95 39, p99 50, max 59 ms — no consistent TLS penalty | JSONL `recv_ms` deltas |
 | Control websocket open | https 42 ms; http 32 ms | `ws-open` |
 
 ## Leg A — colour (decoded Y only)
 
 | Pattern | Y min | Y max | How |
 |---|---|---|---|
-| Black | *pending* | *pending* | `sample-range` |
-| White | *pending* | *pending* | `sample-range` |
-| Grey ramp (0–15, 236–255) | *pending* | *pending* | `sample-range` |
+| Black | 16 | 16 | `sample-range` |
+| White | 233 | 236 | `sample-range` |
+| Grey ramp (0–15, 64/128/192, 236–255) | 15 | 235 | `sample-range` |
+| Pure red `rgb(255,0,0)` (400×400 crop) | Y 63, U 110, V 239 (flat) | | `signalstats` on one decoded frame, in the sandbox |
 
-Verdict: *pending*. The VUI already claims **full range, BT.601** (primaries 5, matrix 5); the decoded Y range confirms or refutes it.
+Verdict: the pixels are **limited range (16–235) and BT.709** — red's Y of 63 matches BT.709 (BT.601 would be ≈ 81; U is off pure red's 102, probably macOS colour management on the Mac's output). The SPS's VUI is **wrong on both counts**: it claims full range (`video_full_range_flag` 1) and BT.601 (primaries 5, matrix 5). A decoder that honours the VUI shows washed-out, slightly mis-tinted colour (an ffmpeg PNG export of "black" came out dark grey); one that assumes BT.709 limited — what RDP AVC420 specifies — shows it correctly.
 
 ## Leg A — crash behaviour
 
@@ -96,11 +99,12 @@ Moved to Plan C's L4 hardware checks (it needs HID input, which `kvm-probe` neve
 
 ## Derived decisions (handoff to Task 9.1) — provisional until Legs B/C
 
-- **§3.2 scheme:** https stays the default (rustls negotiates; one pin for all ports). TLS costs ~90 ms on FLV open and a heavier jitter tail (p99 83 vs 49 ms); re-measure jitter on a moving screen before deciding whether that counts as "measurable latency".
+- **§3.2 scheme:** **https** (rustls negotiates; one pin for all ports). TLS costs ~90 ms on each FLV/websocket open and nothing measurable in steady state (moving-screen jitter is the same or better than http), so it is not the "measurable latency" that would justify http.
 - **§6.1 pinned values:** Baseline 66, level as **rewritten** (below), 1920×1080 (120×68 MBs, crop 8), POC 0, 1 ref frame, CAVLC, tag = AU.
 - **§6.2 admission:** `CompositionTime == 0` must become "constant per stream" (the KVM sends a constant 16 ms).
 - **§6.5 `idr_policy`:** `reconnect` passes (N ≈ 0.3 s). Better: since any new FLV connection forces an IDR from the shared encoder, the bridge can **request an IDR by opening and closing a short side FLV connection**, keeping its main stream. Propose this as the primary IDR mechanism; keep `reconnect` as the fallback.
-- **§6.8 `sps_rewrite`: required.** `level_idc` 31 → **40** (1080p30 needs MaxFS 8192, MaxMBPS 244 800 ≤ 245 760); 60 fps would need 4.2. The level byte sits before any Exp-Golomb field, so the rewrite is a one-byte patch with no emulation-prevention change. Consider also setting `constraint_set1_flag` (constrained Baseline: 1 slice group, no ASO observed) if Leg B shows Windows App needs it. Colour (full range, BT.601) cannot be fixed by a rewrite. Leg B's colour A/B decides whether it matters.
+- **§6.8 `sps_rewrite`: required.** `level_idc` 31 → **40** (1080p30 needs MaxFS 8192, MaxMBPS 244 800 ≤ 245 760); 60 fps would need 4.2. The level byte sits before any Exp-Golomb field, so the rewrite is a one-byte patch with no emulation-prevention change. Consider also setting `constraint_set1_flag` (constrained Baseline: 1 slice group, no ASO observed) if Leg B shows Windows App needs it. **Also correct the VUI:** `video_full_range_flag` 0 and colour description 1/1/1 (BT.709) — or drop `colour_description_present_flag` — because the pixels are limited-range BT.709 and the VUI says otherwise. Those fields sit after Exp-Golomb fields, so this is a bit-level SPS re-serialisation (re-apply emulation prevention), not a byte patch — a Plan B parser/writer task. Leg B's colour A/B shows whether Windows App honours the VUI at all.
+- **§7 input (Plan C):** HID keyboard frames drive macOS as specified (US layout, `cmd` = GUI bit 0x08). The §3.3 session-start sequence's zero-button absolute report at (0, 0) **parks the pointer in the top-left corner on every websocket (re)open**, which reveals the menu bar over full-screen apps — send the last known pointer position instead. An 842-character URL sent at one report per 20 ms took ~60–90 s to land in Edge's address bar (the omnibox's per-keystroke work is mixed in); measure the KVM's own HID rate in Plan C before fixing the §8 paste rate.
 - **§5 sessions:** never call logout while another client (the vendor UI as break-glass, the census tool) may be using the device: logout is global. Teardown should close the websocket and the FLV, and let the token lapse.
 - **§6.9 ErrorInfo / `flv_idle_timeout`:** *pending*.
 - **§7.4 `key_repeat_timeout` / `modifier_idle_timeout`:** *pending* (Leg B key matrix).
@@ -120,6 +124,9 @@ tag_is_au = true
 composition_time_ms = 16
 idr_on_new_connection = true  # shared encoder: every new FLV forces an IDR for all viewers
 no_signal_card = "all-intra, same SPS"
+pixel_range = "limited"       # measured: black 16, white 233-236
+pixel_matrix = "bt709"        # measured: red Y 63
+vui_claims = "full range, bt601 (primaries 5, matrix 5)"  # wrong; see Leg A colour
 sps_hex = "6742001f965403c0112f2cdc1418140800"
 pps_hex = "68ce31120000"
 ```
