@@ -638,11 +638,16 @@ mod tests {
         assert!(!matches!(outcome, SampleOutcome::ScalerInserted));
     }
 
+    /// The host captures dir as the CLI anchors it (`main.rs`'s
+    /// `CAPTURES_DIR`): build-tree-relative, never an owner's home path
+    /// hard-coded into a public repository (final review m10).
+    const TEST_CAPTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../captures");
+
     #[test]
     fn argv_is_exact_and_has_no_scaler() {
         let argv = build_ffmpeg_sandbox_argv(
             Path::new("/nix/store/abc-ffmpeg/bin/ffmpeg"),
-            Path::new("/home/chris/Repos/kvm-rdp/captures"),
+            Path::new(TEST_CAPTURES_DIR),
             "ramp-1080p60.flv",
             "ramp-1080p60.y",
         );
@@ -665,7 +670,7 @@ mod tests {
                 "/nix",
                 "/nix",
                 "--bind",
-                "/home/chris/Repos/kvm-rdp/captures",
+                TEST_CAPTURES_DIR,
                 "/cap",
                 "--chdir",
                 "/cap",
