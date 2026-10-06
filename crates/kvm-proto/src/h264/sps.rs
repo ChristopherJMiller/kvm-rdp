@@ -135,6 +135,97 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsSummary, SpsParseError> {
     SpsSummary::from_sps(&sps).map_err(SpsParseError::Summary)
 }
 
+/// The §6.1 admission limits. Defaults are the spec ceilings; the census may
+/// tighten `max_num_ref_frames` or (if the KVM uses them) relax the scaling
+/// matrix / HRD requirements with pinned values.
+#[derive(Debug, Clone)]
+pub struct SpsLimits {
+    pub allowed_profiles: &'static [u8],
+    pub max_level_idc: u8,
+    pub max_width: u32,
+    pub max_height: u32,
+    pub max_num_ref_frames: u32,
+    pub require_no_scaling_matrix: bool,
+    pub require_no_hrd: bool,
+}
+
+impl Default for SpsLimits {
+    fn default() -> Self {
+        Self {
+            allowed_profiles: &[66, 77, 100],
+            max_level_idc: 51, // level 5.1
+            max_width: 4096,
+            max_height: 2304,
+            max_num_ref_frames: 16,
+            require_no_scaling_matrix: true,
+            require_no_hrd: true,
+        }
+    }
+}
+
+/// A specific §6.1 SPS limit that was exceeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpsLimitViolation {
+    Profile(u8),
+    ChromaNot420(u8),
+    BitDepthNot8 { luma_minus8: u8, chroma_minus8: u8 },
+    NotFrameMbsOnly,
+    Level(u8),
+    WidthTooLarge(u32),
+    HeightTooLarge(u32),
+    WidthNotEven(u32),
+    HeightNotEven(u32),
+    TooManyRefFrames(u32),
+    ScalingMatrixPresent,
+    HrdPresent,
+}
+
+/// Check an SPS summary against the §6.1 admission limits. The first failing
+/// rule wins, in spec order.
+pub fn check_sps_limits(s: &SpsSummary, limits: &SpsLimits) -> Result<(), SpsLimitViolation> {
+    if !limits.allowed_profiles.contains(&s.profile_idc) {
+        return Err(SpsLimitViolation::Profile(s.profile_idc));
+    }
+    if s.chroma_format_idc != 1 {
+        return Err(SpsLimitViolation::ChromaNot420(s.chroma_format_idc));
+    }
+    if s.bit_depth_luma_minus8 != 0 || s.bit_depth_chroma_minus8 != 0 {
+        return Err(SpsLimitViolation::BitDepthNot8 {
+            luma_minus8: s.bit_depth_luma_minus8,
+            chroma_minus8: s.bit_depth_chroma_minus8,
+        });
+    }
+    if !s.frame_mbs_only_flag {
+        return Err(SpsLimitViolation::NotFrameMbsOnly);
+    }
+    if s.level_idc > limits.max_level_idc {
+        return Err(SpsLimitViolation::Level(s.level_idc));
+    }
+    if s.width > limits.max_width {
+        return Err(SpsLimitViolation::WidthTooLarge(s.width));
+    }
+    if s.height > limits.max_height {
+        return Err(SpsLimitViolation::HeightTooLarge(s.height));
+    }
+    // Bitwise `& 1` avoids clippy::arithmetic_side_effects on `%`.
+    if s.width & 1 == 1 {
+        return Err(SpsLimitViolation::WidthNotEven(s.width));
+    }
+    if s.height & 1 == 1 {
+        return Err(SpsLimitViolation::HeightNotEven(s.height));
+    }
+    if s.num_ref_frames > limits.max_num_ref_frames {
+        return Err(SpsLimitViolation::TooManyRefFrames(s.num_ref_frames));
+    }
+    if limits.require_no_scaling_matrix && s.seq_scaling_matrix_present {
+        return Err(SpsLimitViolation::ScalingMatrixPresent);
+    }
+    if limits.require_no_hrd && (s.nal_hrd_present || s.vcl_hrd_present) {
+        return Err(SpsLimitViolation::HrdPresent);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -190,5 +281,132 @@ mod tests {
     #[test]
     fn parse_sps_rejects_empty() {
         assert!(matches!(parse_sps(&[]), Err(SpsParseError::BadNalHeader)));
+    }
+
+    // R5: `pub(super)` so Task 9's `classify_tests` module (a sibling under
+    // `sps.rs`) can reach it via `super::tests::ok_summary`.
+    pub(super) fn ok_summary() -> SpsSummary {
+        SpsSummary {
+            profile_idc: 77,
+            level_idc: 42,
+            chroma_format_idc: 1,
+            bit_depth_luma_minus8: 0,
+            bit_depth_chroma_minus8: 0,
+            pic_order_cnt_type: 2,
+            width: 1920,
+            height: 1080,
+            num_ref_frames: 1,
+            frame_mbs_only_flag: true,
+            seq_scaling_matrix_present: false,
+            nal_hrd_present: false,
+            vcl_hrd_present: false,
+            video_full_range_flag: None,
+            colour_primaries: None,
+            matrix_coefficients: None,
+            max_num_reorder_frames: None,
+            max_dec_frame_buffering: None,
+            log2_max_frame_num: 4,
+            sps_id: 0,
+            frame_cropping: true,
+        }
+    }
+
+    #[test]
+    fn within_limits_ok() {
+        assert_eq!(
+            check_sps_limits(&ok_summary(), &SpsLimits::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn each_rule_has_its_own_violation() {
+        let lim = SpsLimits::default();
+        let mut s = ok_summary();
+        s.profile_idc = 244;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::Profile(244))
+        );
+
+        let mut s = ok_summary();
+        s.chroma_format_idc = 2;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::ChromaNot420(2))
+        );
+
+        let mut s = ok_summary();
+        s.bit_depth_luma_minus8 = 2;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::BitDepthNot8 {
+                luma_minus8: 2,
+                chroma_minus8: 0
+            })
+        );
+
+        let mut s = ok_summary();
+        s.frame_mbs_only_flag = false;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::NotFrameMbsOnly)
+        );
+
+        let mut s = ok_summary();
+        s.level_idc = 52;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::Level(52))
+        );
+
+        let mut s = ok_summary();
+        s.width = 4112;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::WidthTooLarge(4112))
+        );
+
+        let mut s = ok_summary();
+        s.height = 2320;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::HeightTooLarge(2320))
+        );
+
+        let mut s = ok_summary();
+        s.width = 1921;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::WidthNotEven(1921))
+        );
+
+        let mut s = ok_summary();
+        s.height = 1081;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::HeightNotEven(1081))
+        );
+
+        let mut s = ok_summary();
+        s.num_ref_frames = 17;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::TooManyRefFrames(17))
+        );
+
+        let mut s = ok_summary();
+        s.seq_scaling_matrix_present = true;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::ScalingMatrixPresent)
+        );
+
+        let mut s = ok_summary();
+        s.vcl_hrd_present = true;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::HrdPresent)
+        );
     }
 }

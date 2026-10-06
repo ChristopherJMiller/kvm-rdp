@@ -8,6 +8,7 @@ mod nal;
 pub use nal::{NalHeader, NalHeaderError};
 pub use nal::{is_aud, is_idr, is_parameter_set, is_vcl, nal_type_allowed};
 mod sps;
+pub use sps::{SpsLimitViolation, SpsLimits, check_sps_limits};
 pub use sps::{SpsParseError, SpsSummary, SpsSummaryError, parse_sps};
 
 #[cfg(test)]
