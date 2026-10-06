@@ -85,6 +85,49 @@ fn read_param_sets(
     Ok(out)
 }
 
+/// Split length-prefixed NALs out of an AVC NALU tag body (zero-copy).
+/// `start` is past the 5-byte FLV AVC header; `length_size` is 1, 2 or 4.
+pub(crate) fn parse_nalus(
+    body: &Bytes,
+    start: usize,
+    length_size: u8,
+) -> Result<Vec<Nal>, FlvError> {
+    let mut nals = Vec::new();
+    let mut at = start;
+    let ls = usize::from(length_size);
+    loop {
+        if body.len().saturating_sub(at) == 0 {
+            break;
+        }
+        let len_end = at.checked_add(ls).ok_or(FlvError::MalformedVideoTag)?;
+        let len_bytes = body
+            .as_ref()
+            .get(at..len_end)
+            .ok_or(FlvError::MalformedVideoTag)?;
+        let nal_len = read_len(len_bytes);
+        let nal_end = len_end
+            .checked_add(nal_len)
+            .ok_or(FlvError::MalformedVideoTag)?;
+        if nal_len == 0 || body.as_ref().get(len_end..nal_end).is_none() {
+            return Err(FlvError::MalformedVideoTag); // 0 < n ≤ remaining (§6.2)
+        }
+        nals.push(Nal {
+            bytes: body.slice(len_end..nal_end),
+        });
+        at = nal_end;
+    }
+    Ok(nals)
+}
+
+/// Big-endian NAL length of 1–4 bytes.
+fn read_len(bytes: &[u8]) -> usize {
+    let mut v: usize = 0;
+    for b in bytes {
+        v = v.wrapping_shl(8).wrapping_add(usize::from(*b));
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -141,5 +184,39 @@ mod tests {
             0x17, 0, 0, 0, 0, 0x01, 0x42, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67,
         ]);
         assert_eq!(parse_avc_config(&short, 5), Err(FlvError::BadConfigRecord));
+    }
+
+    #[test]
+    fn splits_four_byte_length_nal() {
+        let body = Bytes::from_static(&[
+            0x17, 0x01, 0, 0, 0, 0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x80, 0x10,
+        ]);
+        let nals = parse_nalus(&body, 5, 4).unwrap();
+        assert_eq!(nals.len(), 1);
+        assert_eq!(nals[0].bytes, Bytes::from_static(&[0x65, 0x88, 0x80, 0x10]));
+        assert_eq!(nals[0].unit_type(), Some(5));
+    }
+
+    #[test]
+    fn splits_two_one_byte_length_nals() {
+        let body = Bytes::from_static(&[
+            0x27, 0x01, 0, 0, 0, 0x02, 0x67, 0x88, 0x03, 0x68, 0xCE, 0x3C,
+        ]);
+        let nals = parse_nalus(&body, 5, 1).unwrap();
+        assert_eq!(nals.len(), 2);
+        assert_eq!(nals[0].bytes, Bytes::from_static(&[0x67, 0x88]));
+        assert_eq!(nals[1].bytes, Bytes::from_static(&[0x68, 0xCE, 0x3C]));
+    }
+
+    #[test]
+    fn rejects_overrun_and_zero_length() {
+        let overrun =
+            Bytes::from_static(&[0x17, 0x01, 0, 0, 0, 0x00, 0x00, 0x00, 0x09, 0x65, 0x88]);
+        assert_eq!(
+            parse_nalus(&overrun, 5, 4),
+            Err(FlvError::MalformedVideoTag)
+        );
+        let zero = Bytes::from_static(&[0x17, 0x01, 0, 0, 0, 0x00, 0x00, 0x00, 0x00]);
+        assert_eq!(parse_nalus(&zero, 5, 4), Err(FlvError::MalformedVideoTag));
     }
 }
