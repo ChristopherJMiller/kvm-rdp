@@ -14,6 +14,24 @@ impl From<std::io::Error> for CaptureError {
     }
 }
 
+/// Lets callers that return `std::io::Result` use `?` directly on a
+/// `CaptureDir` method (e.g. `resolve`) without a manual `map_err`.
+impl From<CaptureError> for std::io::Error {
+    fn from(e: CaptureError) -> Self {
+        match e {
+            CaptureError::Io(io_err) => io_err,
+            CaptureError::Unsafe(name) => std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unsafe capture name: {name}"),
+            ),
+            CaptureError::NotADirectory(path) => std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("not a directory: {}", path.display()),
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct CaptureDir {
     root: PathBuf,

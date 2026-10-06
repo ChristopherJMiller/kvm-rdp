@@ -453,6 +453,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kvm-proto",
+ "libc",
  "rcgen",
  "rustls",
  "rustls-pki-types",
