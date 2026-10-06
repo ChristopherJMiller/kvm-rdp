@@ -1,19 +1,28 @@
 //! Census summary (§12 Leg A): roll a capture's `TagRecord`s into IDR/P
-//! counts, the codec/FourCC set, the size range, GOP length, and how many
-//! tags hold more than one picture start (tag ≠ access unit).
+//! counts, the codec/FourCC set, the size range, GOP length, and the three
+//! counts that decide whether one FLV tag is one access unit.
 //!
 //! I6/M6: `idr`, `p_slices`, `gop_len`, `min_size` and `max_size` are all
-//! counted over *coded AVC video pictures only* — a video tag
+//! counted over *coded AVC video picture tags only* — a video tag
 //! (`tag_type == 9`) carrying an actual AVC NALU packet
 //! (`codec_id == Some(7) && avc_packet_type == Some(1)`), never a
 //! sequence-header/end-of-sequence tag, an audio or script tag, or an
 //! Enhanced-RTMP/HEVC tag (which never sets `codec_id == Some(7)`).
 //! Interleaved audio no longer inflates `gop_len`, and an HEVC
 //! keyframe-flagged tag can never register as an AVC IDR. `idr` is "this
-//! picture's NALs include type 5"; `p_slices` is "this picture has a VCL
-//! NAL (1–5) but no type 5". `bad_header_nals` counts the framing-violation
-//! sentinel (`u8::MAX`, §12 I2/record.rs) across *all* tags, not just
-//! picture tags — the census must surface it wherever it occurs.
+//! tag's NALs include type 5"; `p_slices` is "this tag has a VCL NAL (1–5)
+//! but no type 5" — per tag, so they equal per-picture counts only when
+//! tag = AU. `bad_header_nals` counts the framing-violation sentinel
+//! (`u8::MAX`, §12 I2/record.rs) across *all* tags, not just picture tags —
+//! the census must surface it wherever it occurs.
+//!
+//! **Tag = AU** (final review I2) holds only when all three of
+//! `multi_picture_tags`, `continuation_tags` and `non_vcl_picture_tags` are
+//! 0. A *slice NAL* is a VCL NAL (types 1–5), paired with its parallel
+//! `first_mb` entry; a slice with `first_mb == Some(0)` starts a picture.
+//! `gop_len` is counted in pictures, not tags: the picture index advances
+//! once per picture start, so a picture split across tags, an AUD/SEI-only
+//! tag or a two-picture tag cannot stretch or shrink it.
 
 use crate::record::TagRecord;
 
@@ -27,12 +36,21 @@ pub struct TagSummary {
     pub min_size: usize,
     pub max_size: usize,
     pub gop_len: Option<usize>,
-    /// Tags holding more than one `first_mb_in_slice == 0` (more than one picture): tag ≠ AU.
+    /// AVC NALU tags holding more than one picture start (> 1 slice NAL
+    /// with `first_mb_in_slice == 0`): tag ≠ AU.
     pub multi_picture_tags: usize,
     /// Sentinel (`u8::MAX`) NAL-header entries across all tags: framing
     /// violations the census must surface (§12 I2), additive beyond the
     /// plan's original `TagSummary` (B13 review I6/M6).
     pub bad_header_nals: usize,
+    /// AVC NALU tags whose first slice NAL does not start a picture
+    /// (`first_mb != Some(0)`: the rest of a picture begun in an earlier
+    /// tag, or a slice header that failed to parse): tag ≠ AU. Additive
+    /// (final review I2).
+    pub continuation_tags: usize,
+    /// AVC NALU tags with no slice NAL at all (AUD, SEI or in-band SPS/PPS
+    /// sent in a tag of their own): tag ≠ AU. Additive (final review I2).
+    pub non_vcl_picture_tags: usize,
 }
 
 /// A video tag carrying an actual coded AVC picture (NALU packet type 1) —
@@ -42,14 +60,22 @@ fn is_coded_avc_picture(r: &TagRecord) -> bool {
     r.tag_type == 9 && r.codec_id == Some(7) && r.avc_packet_type == Some(1)
 }
 
+/// A VCL NAL: a coded slice (1, 5) or slice data partition (2–4). Only
+/// types 1 and 5 get a `first_mb` (`capture::push_nal`); a partition — not
+/// in §6.2's allowlist anyway — reads as "not a picture start".
+fn is_slice(nal_type: u8) -> bool {
+    (1..=5).contains(&nal_type)
+}
+
 pub fn summarize(records: &[TagRecord]) -> TagSummary {
     let mut s = TagSummary {
         min_size: usize::MAX,
         ..TagSummary::default()
     };
-    // Position among coded-picture tags only (not `records`' own index),
-    // so an interleaved audio/script/sequence-header tag can never stretch
-    // `gop_len` (I6).
+    // Picture index (not `records`' own index, nor a tag count): it
+    // advances once per picture start, so interleaved audio/script/
+    // sequence-header tags (I6), continuation and non-VCL tags (I2) can
+    // never stretch `gop_len`. Only the first two IDR positions are needed.
     let mut idr_positions: Vec<usize> = Vec::new();
     let mut picture_index: usize = 0;
     for r in records {
@@ -70,9 +96,6 @@ pub fn summarize(records: &[TagRecord]) -> TagSummary {
         s.bad_header_nals = s
             .bad_header_nals
             .saturating_add(r.nal_types.iter().filter(|&&t| t == u8::MAX).count());
-        if r.first_mb.iter().filter(|m| **m == Some(0)).count() > 1 {
-            s.multi_picture_tags = s.multi_picture_tags.saturating_add(1);
-        }
 
         if !is_coded_avc_picture(r) {
             continue;
@@ -80,14 +103,40 @@ pub fn summarize(records: &[TagRecord]) -> TagSummary {
         s.min_size = s.min_size.min(r.size);
         s.max_size = s.max_size.max(r.size);
         let has_idr = r.nal_types.contains(&5);
-        let has_vcl = r.nal_types.iter().any(|&t| (1..=5).contains(&t));
+        let has_vcl = r.nal_types.iter().any(|&t| is_slice(t));
         if has_idr {
             s.idr = s.idr.saturating_add(1);
-            idr_positions.push(picture_index);
         } else if has_vcl {
             s.p_slices = s.p_slices.saturating_add(1);
         }
-        picture_index = picture_index.saturating_add(1);
+
+        // Walk the slice NALs with their parallel `first_mb` entry. A
+        // missing entry (only possible in a hand-edited or tampered JSONL;
+        // `record_for` keeps the vectors parallel) reads as `None`.
+        let mut first_slice_starts_picture: Option<bool> = None;
+        let mut picture_starts: usize = 0;
+        for (i, &t) in r.nal_types.iter().enumerate() {
+            if !is_slice(t) {
+                continue;
+            }
+            let starts_picture = r.first_mb.get(i).copied().flatten() == Some(0);
+            first_slice_starts_picture.get_or_insert(starts_picture);
+            if starts_picture {
+                picture_starts = picture_starts.saturating_add(1);
+                if t == 5 && idr_positions.len() < 2 {
+                    idr_positions.push(picture_index);
+                }
+                picture_index = picture_index.saturating_add(1);
+            }
+        }
+        match first_slice_starts_picture {
+            None => s.non_vcl_picture_tags = s.non_vcl_picture_tags.saturating_add(1),
+            Some(false) => s.continuation_tags = s.continuation_tags.saturating_add(1),
+            Some(true) => {}
+        }
+        if picture_starts > 1 {
+            s.multi_picture_tags = s.multi_picture_tags.saturating_add(1);
+        }
     }
     if s.min_size == usize::MAX {
         s.min_size = 0;
@@ -169,7 +218,8 @@ mod tests {
 
     #[test]
     fn multi_picture_tags_still_detected_via_first_mb() {
-        let recs = vec![picture(vec![1], vec![Some(0), Some(0)], 900)];
+        // Two slice NALs, each with its own parallel `first_mb` entry.
+        let recs = vec![picture(vec![1, 1], vec![Some(0), Some(0)], 900)];
         let s = summarize(&recs);
         assert_eq!(s.multi_picture_tags, 1);
     }
@@ -207,10 +257,113 @@ mod tests {
     /// still correctly counted as an IDR.
     #[test]
     fn bad_header_nals_counts_sentinel_255_across_all_tags() {
-        let recs = vec![picture(vec![255, 5], vec![Some(0)], 1000), audio_tag()];
+        // `first_mb` is parallel to `nal_types`, as `record_for` writes it.
+        let recs = vec![
+            picture(vec![255, 5], vec![None, Some(0)], 1000),
+            audio_tag(),
+        ];
         let s = summarize(&recs);
         assert_eq!(s.bad_header_nals, 1);
         assert_eq!(s.idr, 1);
+    }
+
+    /// The three "tag ≠ AU" counts, in one tuple for the tests below:
+    /// (multi_picture_tags, continuation_tags, non_vcl_picture_tags).
+    fn not_au_counts(s: &TagSummary) -> (usize, usize, usize) {
+        (
+            s.multi_picture_tags,
+            s.continuation_tags,
+            s.non_vcl_picture_tags,
+        )
+    }
+
+    /// I2 (final review): a picture split across tags — each picture's
+    /// second slice arrives in its own tag with first_mb != 0. Every such
+    /// tag is a continuation, and gop_len is counted in pictures (IDR, P,
+    /// IDR = 2), not tags (which would give 1: the two IDR halves are
+    /// adjacent tags).
+    #[test]
+    fn a_picture_split_across_two_tags_counts_continuations() {
+        let recs = vec![
+            picture(vec![9, 5], vec![None, Some(0)], 3000),
+            picture(vec![5], vec![Some(120)], 3000),
+            picture(vec![9, 1], vec![None, Some(0)], 400),
+            picture(vec![1], vec![Some(120)], 400),
+            picture(vec![9, 5], vec![None, Some(0)], 3000),
+            picture(vec![5], vec![Some(120)], 3000),
+        ];
+        let s = summarize(&recs);
+        assert_eq!(not_au_counts(&s), (0, 3, 0));
+        assert_eq!(s.gop_len, Some(2));
+    }
+
+    /// I2: a slice whose header prefix failed to parse (`first_mb` None)
+    /// cannot prove it starts a picture, so as a tag's first slice it is
+    /// counted as a continuation — the conservative "tag ≠ AU" direction.
+    #[test]
+    fn an_unparsed_first_slice_counts_as_a_continuation() {
+        let s = summarize(&[picture(vec![1], vec![None], 400)]);
+        assert_eq!(not_au_counts(&s), (0, 1, 0));
+    }
+
+    /// I2 + B13 re-review minor: an AVC NALU tag with no slice at all (an
+    /// AUD- or SEI-only tag, or in-band SPS/PPS in a tag of their own) is a
+    /// non-VCL picture tag, and must not stretch gop_len (IDR, P, IDR = 2,
+    /// not 5).
+    #[test]
+    fn aud_or_sei_only_tags_count_as_non_vcl_picture_tags() {
+        let recs = vec![
+            picture(vec![9, 5], vec![None, Some(0)], 3000),
+            picture(vec![9], vec![None], 6),
+            picture(vec![6], vec![None], 20),
+            picture(vec![9, 1], vec![None, Some(0)], 400),
+            picture(vec![7, 8], vec![None, None], 30),
+            picture(vec![9, 5], vec![None, Some(0)], 3000),
+        ];
+        let s = summarize(&recs);
+        assert_eq!(not_au_counts(&s), (0, 0, 3));
+        assert_eq!(s.gop_len, Some(2));
+    }
+
+    /// I2: two pictures in one tag (two slices with first_mb == 0) is a
+    /// multi-picture tag, and both pictures count toward gop_len (IDR, P+P,
+    /// IDR = 3).
+    #[test]
+    fn two_pictures_in_one_tag_count_as_a_multi_picture_tag() {
+        let recs = vec![
+            picture(vec![5], vec![Some(0)], 3000),
+            picture(vec![1, 1], vec![Some(0), Some(0)], 800),
+            picture(vec![5], vec![Some(0)], 3000),
+        ];
+        let s = summarize(&recs);
+        assert_eq!(not_au_counts(&s), (1, 0, 0));
+        assert_eq!(s.gop_len, Some(3));
+    }
+
+    /// I2: a clean stream — one picture per AVC NALU tag, including a
+    /// multi-slice picture whose slices all sit in its own tag, in-band
+    /// SPS/PPS/AUD/SEI alongside a slice, plus sequence-header and audio
+    /// tags — has all three "tag ≠ AU" counts at 0.
+    #[test]
+    fn a_clean_one_picture_per_tag_stream_has_all_three_counts_zero() {
+        let mut seq = picture(vec![7, 8], vec![None, None], 40);
+        seq.avc_packet_type = Some(0);
+        let recs = vec![
+            seq,
+            picture(
+                vec![9, 7, 8, 6, 5, 5],
+                vec![None, None, None, None, Some(0), Some(60)],
+                5000,
+            ),
+            audio_tag(),
+            picture(vec![9, 1], vec![None, Some(0)], 900),
+            picture(vec![9, 1, 1], vec![None, Some(0), Some(60)], 950),
+            audio_tag(),
+            picture(vec![9, 5], vec![None, Some(0)], 4800),
+        ];
+        let s = summarize(&recs);
+        assert_eq!(not_au_counts(&s), (0, 0, 0));
+        assert_eq!((s.idr, s.p_slices, s.gop_len), (2, 2, Some(3)));
     }
 
     #[test]

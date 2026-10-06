@@ -59,6 +59,71 @@ async fn whole_fixture_is_saved_and_every_tag_recorded() {
     assert!(lines.iter().all(|l| l["recv_ms"].is_u64()));
 }
 
+/// Capture the committed ffmpeg-muxed fixture through `run`, read its
+/// JSONL back as `TagRecord`s exactly as `kvm-probe summarize` does, and
+/// return the records with the fixture's manifest.
+async fn fixture_records() -> (Vec<kvm_probe::record::TagRecord>, serde_json::Value) {
+    let stub = support::start_flv_stub().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = CaptureDir::create(&tmp.path().join("captures")).unwrap();
+    let mut jsonl = Vec::new();
+    run(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "0.987654",
+        &dir,
+        "s.flv",
+        &mut jsonl,
+        StopAt::default(),
+    )
+    .await
+    .unwrap();
+    let records = String::from_utf8(jsonl)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let manifest = serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/360p30_main_full.flv.manifest.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    (records, manifest)
+}
+
+/// I2 (final review), against real data: the x264 fixture is one picture
+/// per FLV tag (`slices_per_au: 1`, `aud=1`), so summarize must report
+/// tag = AU (all three counts 0) and the manifest's IDR count, frame count
+/// and GOP (`key_frames`, `frames`, `keyint`) in pictures.
+#[tokio::test]
+async fn fixture_summary_is_tag_equals_au_with_the_manifest_gop() {
+    let (records, m) = fixture_records().await;
+    let s = kvm_probe::report::summarize(&records);
+    assert_eq!(
+        (
+            s.multi_picture_tags,
+            s.continuation_tags,
+            s.non_vcl_picture_tags
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(
+        u64::try_from(s.idr).unwrap(),
+        m["key_frames"].as_u64().unwrap()
+    );
+    assert_eq!(
+        u64::try_from(s.idr + s.p_slices).unwrap(),
+        m["frames"].as_u64().unwrap()
+    );
+    assert_eq!(
+        s.gop_len.map(|g| u64::try_from(g).unwrap()),
+        m["keyint"].as_u64()
+    );
+}
+
 #[tokio::test]
 async fn byte_cap_mid_tag_stops_cleanly() {
     let stub = support::start_flv_stub().await;
