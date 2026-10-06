@@ -12,13 +12,42 @@ mod cfg {
     pub const REGION_QP: u8 = 22; // spec §6.3 video.region_qp
 }
 
+mod display;
+mod gfx;
+mod replay;
+mod ship;
 mod tls;
 
-mod replay;
+use std::net::SocketAddr;
+use std::time::Duration;
 
-mod gfx;
+use ironrdp_server::{
+    ConnectionHandler, ConnectionInfo, Credentials, PostConnectionAction, RdpServer, ServerError,
+};
 
-mod ship;
+struct LogHandler;
+impl ConnectionHandler for LogHandler {
+    fn on_accept(&mut self, peer: std::net::SocketAddr) -> bool {
+        tracing::info!(%peer, "LEGB_CONN on_accept");
+        true
+    }
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        tracing::info!(
+            keyboard_layout = info.keyboard_layout,
+            keyboard_type = ?info.keyboard_type,
+            "LEGB_CONN on_connection_info"
+        );
+    }
+    fn on_disconnected(
+        &mut self,
+        peer: std::net::SocketAddr,
+        duration: Duration,
+        error: Option<&ServerError>,
+    ) -> PostConnectionAction {
+        tracing::warn!(%peer, ?duration, error = ?error.map(|e| e.to_string()), "LEGB_CONN on_disconnected");
+        PostConnectionAction::Continue
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -40,6 +69,76 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    tracing::info!("legb-winapp spike starting (placeholder main — wired up in later tasks)");
+    let fixture = std::env::var(cfg::FIXTURE_ENV)
+        .map_err(|_| anyhow::anyhow!("set {} to a committed Annex-B fixture", cfg::FIXTURE_ENV))?;
+    let aus = replay::load_fixture(std::path::Path::new(&fixture))?;
+    tracing::info!(fixture = %fixture, aus = aus.len(), "LEGB loaded fixture");
+
+    // Dimensions: 1920x1080 default; override with LEGB_W/LEGB_H for a resize fixture.
+    let w: u16 = std::env::var("LEGB_W")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1920);
+    let h: u16 = std::env::var("LEGB_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1080);
+
+    let tls = tls::self_signed("kvm-bridge.spike")?;
+    let gfx = gfx::Gfx::new(cfg::HARD_CAP);
+
+    let addr: SocketAddr = cfg::RDP_LISTEN.parse()?;
+    let mut server = RdpServer::builder()
+        .with_addr(addr)
+        .with_hybrid(tls.acceptor, tls.spki_pub_key)
+        .with_input_handler(display::SpikeInput)
+        .with_display_handler(display::SpikeDisplay { w, h })
+        .with_gfx_factory(Some(Box::new(gfx.clone())))
+        .with_connection_policy(ironrdp_server::ConnectionPolicy::Preempt)
+        .with_connection_handler(Some(Box::new(LogHandler)))
+        .build();
+
+    server.set_credentials(Some(Credentials {
+        username: cfg::NLA_USERNAME.to_owned(),
+        password: cfg::NLA_PASSWORD.to_owned(),
+        domain: None,
+    }));
+    server.enable_autodetect(); // RTT probes available if the client negotiates the channel
+
+    let rtt_handle = server.autodetect_rtt_handle();
+
+    // stdin command reader -> ship task.
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ship::ShipCmd>(8);
+    tokio::spawn(async move {
+        use tokio::io::AsyncBufReadExt as _;
+        let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let cmd = match line.trim() {
+                "resize" => Some(ship::ShipCmd::Resize(1280, 720)),
+                "strand" => Some(ship::ShipCmd::Strand),
+                "resume" => Some(ship::ShipCmd::Resume),
+                other => {
+                    tracing::warn!(%other, "unknown command (resize|strand|resume)");
+                    None
+                }
+            };
+            if let Some(c) = cmd {
+                let _ = cmd_tx.send(c).await;
+            }
+        }
+    });
+
+    tokio::spawn(ship::run_ship(
+        gfx,
+        aus,
+        w,
+        h,
+        cfg::HARD_CAP,
+        rtt_handle,
+        cmd_rx,
+    ));
+
+    tracing::info!(%addr, "LEGB listening (Hybrid/NLA, Preempt, autodetect on)");
+    server.run().await?;
     Ok(())
 }

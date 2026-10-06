@@ -1683,6 +1683,7 @@ name = "legb-winapp"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bytes",
  "ironrdp-dvc",
  "ironrdp-egfx",
