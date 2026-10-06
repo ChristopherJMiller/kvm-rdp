@@ -10,7 +10,7 @@
 | Device | Angeet/Yeeso ES3 ("ONE KVM"), self-signed cert `C=CN, O=OneKVM, CN=OneKVM` |
 | Firmware | no `Server` header and no version string on `/`; read it from the KVM UI's about page — *pending* |
 | Source | Mac Studio over HDMI. Session 1: the Mac's **lock screen** (display kept awake by a Shift keep-alive). Session 2: unlocked; a full-screen test-pattern page (black / white / grey ramp / ms clock, a `data:` URL in Edge) and a pure-red page, driven through the KVM's own HID websocket by a throwaway helper (not in the repo) |
-| Presets covered | the KVM's current preset only (1920×1080, 30 fps). 60 fps and "auto" are *pending* (need the KVM UI) |
+| Presets covered | 1920×1080 at 30 fps only. 60 fps and "auto" deliberately not measured: the bridge pins the KVM to 1080p30 (see Derived decisions) |
 | Tool | `kvm-probe` at `plan-a` `b7cc2b9`, release build |
 
 Every value below says how it was obtained. *pending* = not yet measured.
@@ -43,7 +43,7 @@ Every value below says how it was obtained. *pending* = not yet measured.
 | First tag on connect | always an IDR; the GOP restarts at the connection | JSONL |
 | **Burst on connect** | **0 frames** (no GOP-cache replay; 26–29 tags in the first second) | JSONL burst query (Part 6 step 4) |
 | **Second connection triggers an IDR?** | **Yes, for every viewer.** b connected at +12.0 s; a got an extra IDR at +12.2 s (3 frames after its regular one) and a's GOP cadence restarted there. One shared encoder: any new FLV connection forces an IDR into all streams | a/b capture JSONL |
-| Resolution-change signalling | *pending* (needs a preset or Mac resolution change). Signal loss does **not** change the SPS: the NO SIGNAL card uses the same SPS bytes at 1920×1080 | JSONL `param_sets_hex` |
+| Resolution-change signalling | Not measured in detail. One observation (n = 1, tentative): while presets were being switched in the KVM UI, a live FLV delivered 8 tags and then ended — a preset change appears to **close live FLV connections** rather than signal in-band. Signal loss does **not** change the SPS: the NO SIGNAL card uses the same SPS bytes at 1920×1080 | 10 s capture during preset switching; JSONL `param_sets_hex` |
 
 ## Leg A — sessions (not in the §12 list; found here and load-bearing for §5)
 
@@ -108,7 +108,7 @@ Moved to Plan C's L4 hardware checks (it needs HID input, which `kvm-probe` neve
 - **§5 sessions:** never call logout while another client (the vendor UI as break-glass, the census tool) may be using the device: logout is global. Teardown should close the websocket and the FLV, and let the token lapse.
 - **§6.9 ErrorInfo / `flv_idle_timeout`:** *pending*.
 - **§7.4 `key_repeat_timeout` / `modifier_idle_timeout`:** *pending* (Leg B key matrix).
-- **`video.default_size`:** 1920×1080 (the only preset measured).
+- **`video.default_size`:** 1920×1080, and the KVM preset is **pinned to 1920×1080 at 30 fps** (not "auto", not 60 fps): 60 fps would need level 4.2 and double the bitrate for no gain on a remote desktop, and "auto" invites resolution changes. A preset or Mac resolution change is a rare, operator-driven event; the bridge handles it on its existing paths either way — a closed FLV takes the reconnect path, and a new sequence header or in-band SPS goes through `classify_sps_change` (Incompatible → resize).
 
 ## Artifacts
 
