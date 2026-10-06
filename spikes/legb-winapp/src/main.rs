@@ -12,6 +12,8 @@ mod cfg {
     pub const REGION_QP: u8 = 22; // spec §6.3 video.region_qp
 }
 
+mod tls;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // One crypto provider, aws-lc-rs, installed idempotently (spec §4.2).
