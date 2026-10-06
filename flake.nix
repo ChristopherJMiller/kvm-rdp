@@ -45,6 +45,7 @@
           pkgs.ffmpeg-full
           pkgs.jq
           pkgs.bubblewrap
+          pkgs.openssl # census step 2: `openssl s_client -brief` per TLS port
         ];
 
         KVM_RDP_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
