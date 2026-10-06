@@ -27,6 +27,21 @@ pub async fn first_idr_latency(
     token: &str,
     timeout: Duration,
 ) -> Result<Duration, KvmError> {
+    first_idr_latency_capped(target, pin, token, timeout, MAX_BYTES).await
+}
+
+/// Same as `first_idr_latency`, but with an explicit byte cap instead of
+/// the crate's `MAX_BYTES` constant (B12 review, fix round 1, I1): a test
+/// seam so the byte-cap boundedness can be exercised without actually
+/// streaming 64 MiB. `pub` so the integration-test binary can reach it;
+/// `first_idr_latency` is the crate's one real entry point for callers.
+pub async fn first_idr_latency_capped(
+    target: &KvmTarget,
+    pin: Option<&str>,
+    token: &str,
+    timeout: Duration,
+    max_bytes: u64,
+) -> Result<Duration, KvmError> {
     let started = Instant::now();
     let now = TokioInstant::now();
     let deadline = now.checked_add(timeout).unwrap_or(now);
@@ -54,9 +69,9 @@ pub async fn first_idr_latency(
             continue;
         };
         total_bytes = total_bytes.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
-        if total_bytes > MAX_BYTES {
+        if total_bytes > max_bytes {
             return Err(KvmError::Http(format!(
-                "av.flv exceeded the {MAX_BYTES}-byte cap before an IDR"
+                "av.flv exceeded the {max_bytes}-byte cap before an IDR"
             )));
         }
         demux.push(chunk);
