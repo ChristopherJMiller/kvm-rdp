@@ -208,6 +208,23 @@ impl SpsCfg {
     }
 }
 
+/// Build a wire slice NAL carrying only the three leading header fields
+/// (first_mb_in_slice, slice_type, pic_parameter_set_id) + trailing bits.
+/// `header_byte` e.g. 0x41 (type 1, non-IDR) or 0x65 (type 5, IDR).
+pub fn build_slice_nal(
+    header_byte: u8,
+    first_mb_in_slice: u32,
+    slice_type: u32,
+    pps_id: u32,
+) -> Vec<u8> {
+    let mut w = BitWriter::new();
+    w.put_ue(first_mb_in_slice);
+    w.put_ue(slice_type);
+    w.put_ue(pps_id);
+    w.rbsp_trailing_bits();
+    wrap_nal(header_byte, &w.into_rbsp())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

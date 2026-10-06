@@ -10,6 +10,10 @@ pub use nal::{is_aud, is_idr, is_parameter_set, is_vcl, nal_type_allowed};
 mod sps;
 pub use sps::{SpsLimitViolation, SpsLimits, check_sps_limits};
 pub use sps::{SpsParseError, SpsSummary, SpsSummaryError, parse_sps};
+mod slice;
+pub use slice::{
+    SliceHeaderPrefix, SliceParseError, parse_slice_header_prefix, slice_type_allowed,
+};
 
 #[cfg(test)]
 pub(crate) mod test_support;
