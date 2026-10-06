@@ -92,8 +92,31 @@ the client runs on another host):
 `env -u LD_LIBRARY_PATH xvfb-run -a xfreerdp /v:127.0.0.1:13389 /u:kvm
 /p:legb-spike-pw /sec:nla /gfx:AVC420 /cert:ignore /log-level:INFO`.
 
+### Results — 2026-10-06, FreeRDP 3.31.1 on rowlett (Xvfb 1920×1080), loopback `127.0.0.1:23389`
+
+(`13389` is also taken on rowlett, by a microvm listener; runs set `LEGB_LISTEN=127.0.0.1:23389`.)
+
+| Gate / observation | Result | Evidence |
+|---|---|---|
+| NLA with the rcgen **ECDSA** cert | **Pass** — `/sec:nla` completes; no RSA cert needed | `LEGB_CONN on_accept` → `on_connection_info`; clean disconnects |
+| Confirmed capability set has AVC420 | **Pass** — FreeRDP advertises 2 sets: `V8` (`02000000`, SMALL_CACHE) and `V8_1` (`12000000`, SMALL_CACHE \| AVC420_ENABLED); server confirms `V8_1`, `confirmed_has_avc=true` | `LEGB_CAP advertise entry` ×2, `LEGB_READY` |
+| First-frame ack p95 ≤ 1 s | **Pass** — 10 fresh connections: min 77, p50 84, **p95 97**, max 97 ms (IronRDP's own `latency_us`, send → FrameAcknowledge) | `ironrdp_egfx::server` "EGFX FrameAcknowledge received" |
+| Steady-state ack latency (1080p30, 895 frames) | p50 11.4, p95 26.6, p99 36.2, max 82.4 ms; ≤ 2 frames in flight | same, 30 s run |
+| Picture returns after a server resize (real path) | **Pass** — `DisplayUpdate::Resize` → reactivation (`updates_calls` 1→2) → Setup → 720p IDR: **picture_return_ms = 34** | `LEGB_DISPLAY`, `LEGB_RESIZE label=resize` |
+| `resize-channel` (channel-only Setup, same 1080p stream on a 1280×720 surface) | **Broken** — logs a 7 ms "return" but FreeRDP rejects every later frame (`areRectsValid: Rectangle 0 {0x0-1280x720} outside of bounding frame 0x0`). The real resize path is required (spec §6.4 already says so) | client log |
+| Picture returns after a client re-advertise | **N/A** — FreeRDP never re-advertised (`re_advertise=false` throughout) | `LEGB_READY` |
+| Ack suspension | **Never** — `queue_depth` 0 on all 895 acks; `suspended=false` | `LEGB_ACK` |
+| Auto-detect | **Answered** — RTT 0–4 ms on loopback | `LEGB_AUTODETECT autodetect_answered=true` |
+| QoE | **Never fired** (FreeRDP sends no QoE frame acks by default) | no `LEGB_QOE` |
+| Stranding (stdin `strand`) | **Pass** — the last frame stays fully displayed while stranded (screens 3 s apart are byte-identical; no blank, no partial frame); resume continues | `LEGB_SHIP: STRAND` / `RESUME`, screenshots |
+| ErrorInfo 0x7 | FreeRDP logs `ERRINFO_SERVER_DENIED_CONNECTION` and exits; no auto-reconnect | client log, `LEGB_ERRORINFO` |
+| **ES3-shaped stream** (Baseline, 1080p30, **level_idc 31** mislabelled, VUI full range + BT.601) | **Decodes** — 445 acks over 15 s, picture correct; identical with `level_idc` 40. FreeRDP does not care about the level | local x264 fixtures `captures/es3like_l31/l40.h264` (R23, not committed) |
+| **Colour: does the client honour the VUI?** | **No (FreeRDP).** Limited-range pixels (Y 16 / 235) render as RGB **16,16,16 / 235,235,235** whether the VUI says full or limited — FreeRDP applies a fixed full-range conversion to AVC420, as MS-RDPEGFX specifies. Same result for `1080p30_main_limited` vs `…_limited_flagfull` | screenshots, pixel reads |
+
+**Consequence for passthrough (colour):** the KVM's pixels are limited-range, so a client that follows MS-RDPEGFX's fixed full-range AVC420 conversion shows them **mildly washed out** (black → grey 16, white → 235; ~14 % contrast loss), and rewriting the VUI cannot change that for such a client. Whether Windows App honours the VUI is now the top item on Chris's acceptance list; if it does not, options are (a) accept the mild wash-out, (b) find a KVM setting that makes its encoder emit full-range YUV, or (c) re-encode — rejected by the design (§14).
+
 Capture (one row per observation; raw log line id in brackets):
-- [ ] NLA completes with the rcgen **ECDSA** cert. If NLA fails, mint an RSA
+- [x] NLA completes with the rcgen **ECDSA** cert. If NLA fails, mint an RSA
       cert (`openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out
       cert.pem -subj /CN=kvm-bridge.spike -days 2`, load via
       `ironrdp_server::TlsIdentityCtx::init_from_paths` for the pub key) and
