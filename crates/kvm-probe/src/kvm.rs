@@ -208,3 +208,132 @@ async fn login_inner(
         .map_err(|e| KvmError::Login(format!("{e:?}")))?;
     Ok(token.into_string())
 }
+
+/// Bound for the whole logout exchange (final review m1; §3.2 "teardown
+/// calls logout, best effort, bounded"): connect, handshake, request and
+/// response head.
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Log out of the KVM session `token` belongs to: `GET` the path of
+/// `request::logout_url` (`/cgi-bin/login.lua?logout`) on the web port,
+/// with the token cookie (§3.1, §3.2), bounded by `LOGOUT_TIMEOUT`. Any 2xx
+/// or 3xx answer counts as logged out; anything else is an error naming
+/// only the status code — the response body (device text) is never read
+/// into it. Callers treat a failure as best effort: report it, carry on.
+pub async fn logout(target: &KvmTarget, pin: Option<&str>, token: &str) -> Result<(), KvmError> {
+    match tokio::time::timeout(LOGOUT_TIMEOUT, logout_inner(target, pin, token)).await {
+        Ok(result) => result,
+        Err(_) => Err(KvmError::Http(format!(
+            "logout timed out after {LOGOUT_TIMEOUT:?}"
+        ))),
+    }
+}
+
+async fn logout_inner(target: &KvmTarget, pin: Option<&str>, token: &str) -> Result<(), KvmError> {
+    // The request target is the origin-form path of the one logout URL
+    // builder (`request::logout_url`), as `login` sends its own path.
+    let url: hyper::Uri = request::logout_url(target)
+        .parse()
+        .map_err(|e| KvmError::Http(format!("logout url: {e}")))?;
+    let path = url
+        .path_and_query()
+        .map(|p| p.as_str().to_string())
+        .ok_or_else(|| KvmError::Http("logout url has no path".into()))?;
+    let io = connect_to(target, target.login_port, pin).await?;
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
+        .await
+        .map_err(|e| KvmError::Http(e.to_string()))?;
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+    let req = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header("Host", &target.host)
+        .header("Cookie", request::token_cookie_header(token))
+        .body(http_body_util::Empty::<hyper::body::Bytes>::new())
+        .map_err(|e| KvmError::Http(e.to_string()))?;
+    let resp = sender
+        .send_request(req)
+        .await
+        .map_err(|e| KvmError::Http(e.to_string()))?;
+    let status = resp.status();
+    if status.is_success() || status.is_redirection() {
+        Ok(())
+    } else {
+        Err(KvmError::Http(format!(
+            "logout http status {}",
+            status.as_u16()
+        )))
+    }
+}
+
+/// What a logged-in session produced: the work's output, and how its
+/// logout went (final review m1).
+#[derive(Debug)]
+pub struct Session<T> {
+    pub output: T,
+    pub logout: Result<(), KvmError>,
+}
+
+/// Log in, run `work` with the token, then log out with it — always, even
+/// when the work itself failed (final review m1): every kvm-probe run that
+/// logs in releases its KVM session, so a census of many runs (20
+/// first-IDR trials each) never piles up live sessions against the
+/// device's session cap. A failed login is the error (there is no token,
+/// so nothing to log out); a failed logout is reported in
+/// `Session::logout`, never turned into the session's error.
+pub async fn with_session<T>(
+    target: &KvmTarget,
+    pin: Option<&str>,
+    password: &str,
+    now_unix: i64,
+    timezone: &str,
+    work: impl AsyncFnOnce(&str) -> T,
+) -> Result<Session<T>, KvmError> {
+    let token = login(target, pin, password, now_unix, timezone).await?;
+    let output = work(&token).await;
+    let logout = logout(target, pin, &token).await;
+    Ok(Session { output, logout })
+}
+
+/// §9.2's bound on device-influenced text reaching the terminal.
+const MAX_ERROR_TEXT: usize = 200;
+
+/// Render an error for the operator's terminal (final review m1/m7): its
+/// `Debug` form, which escapes control characters, cut to at most
+/// `MAX_ERROR_TEXT` bytes (on a char boundary, marked with `…`).
+pub fn bounded_debug(e: &impl std::fmt::Debug) -> String {
+    let text = format!("{e:?}");
+    if text.len() <= MAX_ERROR_TEXT {
+        return text;
+    }
+    let mut end = MAX_ERROR_TEXT;
+    while end > 0 && !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let mut out = text.get(..end).unwrap_or_default().to_string();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// m1/m7: an error shown to the operator is escaped (no raw control
+    /// bytes) and bounded at 200 bytes plus the `…` marker, even when it
+    /// is long and multi-byte at the cut.
+    #[test]
+    fn bounded_debug_escapes_and_bounds() {
+        let long = format!("\u{1b}]0;title\u{7}{}", "é".repeat(300));
+        let out = bounded_debug(&KvmError::Http(long));
+        assert!(out.len() <= MAX_ERROR_TEXT.saturating_add('…'.len_utf8()));
+        assert!(out.ends_with('…'), "{out}");
+        assert!(!out.chars().any(char::is_control), "{out:?}");
+        assert!(out.starts_with("Http(\"\\u{1b}]0;title\\u{7}"), "{out}");
+
+        let short = bounded_debug(&KvmError::Http("logout http status 500".into()));
+        assert_eq!(short, "Http(\"logout http status 500\")");
+    }
+}

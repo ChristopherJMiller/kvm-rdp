@@ -1,7 +1,7 @@
 //! Loopback TLS stubs for the kvm-probe integration tests (Tasks 5.8–5.10).
 //! No real KVM is reachable from tests, so every test drives one of these
 //! instead.
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -9,6 +9,23 @@ use tokio_rustls::TlsAcceptor;
 pub struct Stub {
     pub port: u16,
     pub pin_hex: String,
+    /// Every request head this stub received (request line + headers, lossy
+    /// UTF-8), in arrival order — so a test can see e.g. that a logout was
+    /// sent, and with which cookie.
+    pub requests: Arc<Mutex<Vec<String>>>,
+}
+
+/// Read one request head (up to the blank line, or 4 KiB, or EOF).
+async fn read_head<S: tokio::io::AsyncRead + Unpin>(s: &mut S) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    while buf.len() < 4096 && !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        match s.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// A self-signed loopback TLS identity and the SHA-256(SPKI) hex pin of it.
@@ -26,32 +43,41 @@ pub fn tls_acceptor_and_pin() -> (TlsAcceptor, String) {
 }
 
 /// Serve `response` verbatim (status line, headers, body) to every TLS
-/// connection after reading the request, then close.
+/// connection after reading (and recording) the request head, then close.
+/// The head is recorded before the response is written, so once a client
+/// has its response the request is already in `Stub::requests`.
 pub async fn start_http_stub(response: Vec<u8>) -> Stub {
     let (acceptor, pin_hex) = tls_acceptor_and_pin();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let response = Arc::new(response);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
     tokio::spawn(async move {
         loop {
             let (tcp, _) = match listener.accept().await {
                 Ok(v) => v,
                 Err(_) => break,
             };
-            let (acceptor, response) = (acceptor.clone(), response.clone());
+            let (acceptor, response, recorded) =
+                (acceptor.clone(), response.clone(), recorded.clone());
             tokio::spawn(async move {
                 let mut tls = match acceptor.accept(tcp).await {
                     Ok(v) => v,
                     Err(_) => return,
                 };
-                let mut buf = [0u8; 4096];
-                let _ = tls.read(&mut buf).await; // consume the request head
+                let head = read_head(&mut tls).await;
+                recorded.lock().unwrap().push(head);
                 let _ = tls.write_all(&response).await;
                 let _ = tls.shutdown().await;
             });
         }
     });
-    Stub { port, pin_hex }
+    Stub {
+        port,
+        pin_hex,
+        requests,
+    }
 }
 
 pub fn http_response(status: &str, content_type: &str, body: &[u8]) -> Vec<u8> {

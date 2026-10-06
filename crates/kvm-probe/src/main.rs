@@ -43,15 +43,42 @@ fn target(conn: &Conn) -> KvmTarget {
     }
 }
 
-async fn token(conn: &Conn) -> Result<String, String> {
-    let pw = secret::read_password_file(&conn.password_file)?;
+/// The KVM password, from `--password-file` only (§9.2), read once per run.
+fn password(conn: &Conn) -> Result<String, String> {
+    secret::read_password_file(&conn.password_file)
+}
+
+/// Log in on the web port, run `work` with the token, then log out with
+/// it — always, even if the work failed (final review m1,
+/// `kvm::with_session`). A failed login is this function's error; a
+/// failed logout is best effort: printed (escaped and bounded, never the
+/// token or device text beyond that) and otherwise ignored.
+async fn session<T>(
+    conn: &Conn,
+    password: &str,
+    work: impl AsyncFnOnce(&str) -> T,
+) -> Result<T, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|e| e.to_string())?;
     let now = i64::try_from(now.as_secs()).map_err(|e| e.to_string())?;
-    kvm::login(&target(conn), conn.pin_for(Port::Web), &pw, now, "UTC")
-        .await
-        .map_err(|e| format!("{e:?}"))
+    let s = kvm::with_session(
+        &target(conn),
+        conn.pin_for(Port::Web),
+        password,
+        now,
+        "UTC",
+        work,
+    )
+    .await
+    .map_err(|e| format!("{e:?}"))?;
+    if let Err(e) = &s.logout {
+        eprintln!(
+            "kvm-probe: logout failed (best effort, ignored): {}",
+            kvm::bounded_debug(e)
+        );
+    }
+    Ok(s.output)
 }
 
 fn captures_dir() -> Result<CaptureDir, String> {
@@ -104,51 +131,65 @@ async fn run(cli: Cli) -> Result<(), String> {
             seconds,
             max_mb,
         } => {
-            let tok = token(&conn).await?;
-            let dir = captures_dir()?;
-            let jsonl_file = create_output_file(&dir, &format!("{name}.jsonl"))?;
-            let mut jsonl = std::io::BufWriter::new(jsonl_file);
-            let stop = capture::StopAt {
-                max_bytes: max_mb.saturating_mul(1024 * 1024),
-                max_duration: Duration::from_secs(seconds),
-            };
-            let result = capture::run(
-                &target(&conn),
-                conn.pin_for(Port::Video),
-                &tok,
-                &dir,
-                &name,
-                &mut jsonl,
-                stop,
+            let pw = password(&conn)?;
+            let t = target(&conn);
+            let s = session(
+                &conn,
+                &pw,
+                async |tok: &str| -> Result<capture::Stats, String> {
+                    let dir = captures_dir()?;
+                    let jsonl_file = create_output_file(&dir, &format!("{name}.jsonl"))?;
+                    let mut jsonl = std::io::BufWriter::new(jsonl_file);
+                    let stop = capture::StopAt {
+                        max_bytes: max_mb.saturating_mul(1024 * 1024),
+                        max_duration: Duration::from_secs(seconds),
+                    };
+                    let result = capture::run(
+                        &t,
+                        conn.pin_for(Port::Video),
+                        tok,
+                        &dir,
+                        &name,
+                        &mut jsonl,
+                        stop,
+                    )
+                    .await
+                    .map_err(|e| format!("{e:?}"));
+                    // m6: write out and fsync the JSONL on every path, success
+                    // or not, and report a failure — never leave it to the
+                    // `BufWriter`'s drop, which swallows the error.
+                    let finished = finish_jsonl(jsonl);
+                    match (result, finished) {
+                        (Ok(s), Ok(())) => Ok(s),
+                        (Err(e), Ok(())) | (Ok(_), Err(e)) => Err(e),
+                        (Err(e), Err(f)) => Err(format!("{e}; and {f}")),
+                    }
+                },
             )
-            .await
-            .map_err(|e| format!("{e:?}"));
-            // m6: write out and fsync the JSONL on every path, success or
-            // not, and report a failure — never leave it to the
-            // `BufWriter`'s drop, which swallows the error.
-            let finished = finish_jsonl(jsonl);
-            let s = match (result, finished) {
-                (Ok(s), Ok(())) => s,
-                (Err(e), Ok(())) | (Ok(_), Err(e)) => return Err(e),
-                (Err(e), Err(f)) => return Err(format!("{e}; and {f}")),
-            };
+            .await??;
             println!(
                 "tags={} bytes={} parse_errors={} first_error={:?}",
                 s.tags, s.bytes, s.parse_errors, s.first_error
             );
         }
         Cmd::FirstIdr { conn, trials } => {
-            let tok = token(&conn).await?;
+            let pw = password(&conn)?;
             let t = target(&conn);
             let mut samples = Vec::new();
             for _ in 0..trials {
-                let d = trial::first_idr_latency(
-                    &t,
-                    conn.pin_for(Port::Video),
-                    &tok,
-                    Duration::from_secs(10),
-                )
-                .await
+                // m1: each trial is its own session — log in, time the FLV
+                // open → first IDR (login excluded), log out — so 20
+                // trials never hold 20 live KVM sessions.
+                let d = session(&conn, &pw, async |tok: &str| {
+                    trial::first_idr_latency(
+                        &t,
+                        conn.pin_for(Port::Video),
+                        tok,
+                        Duration::from_secs(10),
+                    )
+                    .await
+                })
+                .await?
                 .map_err(|e| format!("{e:?}"))?;
                 println!("trial: {} ms", d.as_millis());
                 samples.push(d);
@@ -161,11 +202,13 @@ async fn run(cli: Cli) -> Result<(), String> {
             );
         }
         Cmd::WsOpen { conn } => {
-            let tok = token(&conn).await?;
-            let d =
-                wsprobe::open_control_websocket(&target(&conn), conn.pin_for(Port::Control), &tok)
-                    .await
-                    .map_err(|e| format!("{e:?}"))?;
+            let pw = password(&conn)?;
+            let t = target(&conn);
+            let d = session(&conn, &pw, async |tok: &str| {
+                wsprobe::open_control_websocket(&t, conn.pin_for(Port::Control), tok).await
+            })
+            .await?
+            .map_err(|e| format!("{e:?}"))?;
             println!("websocket upgrade: {} ms", d.as_millis());
         }
         Cmd::SampleRange {

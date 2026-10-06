@@ -201,3 +201,166 @@ async fn rejected_password_body_is_a_clean_login_error() {
         Err(kvm_probe::kvm::KvmError::Login(_))
     ));
 }
+
+/// m1 (final review): logout is `GET /cgi-bin/login.lua?logout` (the
+/// path of `request::logout_url`) on the web port, carrying the token
+/// cookie (§3.2: the cookie goes on every request, logout included).
+#[tokio::test]
+async fn logout_sends_get_logout_with_the_token_cookie() {
+    let stub = support::start_http_stub(support::http_response(
+        "200 OK",
+        "application/json",
+        br#"{"result":0}"#,
+    ))
+    .await;
+    kvm_probe::kvm::logout(&target(stub.port), Some(&stub.pin_hex), "0.987654")
+        .await
+        .unwrap();
+    let reqs = stub.requests.lock().unwrap();
+    let [head] = reqs.as_slice() else {
+        panic!("expected exactly one request: {reqs:?}");
+    };
+    assert!(
+        head.starts_with("GET /cgi-bin/login.lua?logout HTTP/1.1\r\n"),
+        "{head}"
+    );
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("\r\ncookie: token=0.987654\r\n"),
+        "{head}"
+    );
+}
+
+/// m1: a logged-in session logs out after its work — login, the work
+/// with the token, then the logout carrying that token's cookie — so the
+/// census's many runs never pile up live KVM sessions.
+#[tokio::test]
+async fn with_session_logs_out_after_the_work_with_the_token_cookie() {
+    let stub = support::start_login_stub().await;
+    let s = kvm_probe::kvm::with_session(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "pw",
+        1_759_680_000,
+        "UTC",
+        async |token: &str| token.to_string(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.output, "0.987654");
+    assert!(s.logout.is_ok(), "{:?}", s.logout);
+    let reqs = stub.requests.lock().unwrap();
+    let [login, logout] = reqs.as_slice() else {
+        panic!("expected login then logout: {reqs:?}");
+    };
+    assert!(
+        login.starts_with("POST /cgi-bin/login.lua HTTP/1.1\r\n"),
+        "{login}"
+    );
+    assert!(
+        logout.starts_with("GET /cgi-bin/login.lua?logout HTTP/1.1\r\n"),
+        "{logout}"
+    );
+    assert!(
+        logout
+            .to_ascii_lowercase()
+            .contains("\r\ncookie: token=0.987654\r\n"),
+        "{logout}"
+    );
+}
+
+/// m1: the logout happens even when the work fails (a failed first-IDR
+/// trial still releases its session).
+#[tokio::test]
+async fn with_session_logs_out_even_when_the_work_fails() {
+    let stub = support::start_login_stub().await;
+    let s = kvm_probe::kvm::with_session(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "pw",
+        1_759_680_000,
+        "UTC",
+        async |_token: &str| -> Result<(), &str> { Err("trial failed") },
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.output, Err("trial failed"));
+    let reqs = stub.requests.lock().unwrap();
+    assert_eq!(reqs.len(), 2, "{reqs:?}");
+    assert!(
+        reqs[1].starts_with("GET /cgi-bin/login.lua?logout "),
+        "{reqs:?}"
+    );
+}
+
+/// m1: no token, no logout — a failed login is the session's error and
+/// nothing else is sent.
+#[tokio::test]
+async fn with_session_sends_no_logout_when_login_fails() {
+    let stub = support::start_http_stub(support::http_response(
+        "200 OK",
+        "application/json",
+        br#"{"result":403}"#,
+    ))
+    .await;
+    let r = kvm_probe::kvm::with_session(
+        &target(stub.port),
+        Some(&stub.pin_hex),
+        "pw",
+        1_759_680_000,
+        "UTC",
+        async |_token: &str| (),
+    )
+    .await;
+    assert!(
+        matches!(r, Err(kvm_probe::kvm::KvmError::Login(_))),
+        "{r:?}"
+    );
+    assert_eq!(stub.requests.lock().unwrap().len(), 1);
+}
+
+/// m1: logout is best effort but bounded — a peer that never answers it
+/// gets a clean timeout error, never a hang (paused time: no real wait).
+#[tokio::test(start_paused = true)]
+async fn logout_is_bounded_against_a_silent_peer() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _held = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+    let t = KvmTarget {
+        scheme: Scheme::Http,
+        host: "127.0.0.1".into(),
+        login_port: port,
+        video_port: 1,
+        control_port: 1,
+    };
+    match kvm_probe::kvm::logout(&t, None, "0.987654").await {
+        Err(kvm_probe::kvm::KvmError::Http(msg)) => {
+            assert!(msg.to_ascii_lowercase().contains("time"), "{msg}");
+        }
+        other => panic!("expected a logout timeout, got {other:?}"),
+    }
+}
+
+/// m1: a refused logout is an error naming only the status code — never
+/// the device's body, which is hostile text.
+#[tokio::test]
+async fn refused_logout_names_the_status_but_never_the_body() {
+    let stub = support::start_http_stub(support::http_response(
+        "500 Internal Server Error",
+        "text/html",
+        b"\x1b]0;pwned\x07 device text",
+    ))
+    .await;
+    let err = kvm_probe::kvm::logout(&target(stub.port), Some(&stub.pin_hex), "0.987654")
+        .await
+        .unwrap_err();
+    let text = format!("{err:?}");
+    assert!(text.contains("500"), "{text}");
+    assert!(
+        !text.contains("pwned") && !text.contains("device text"),
+        "{text}"
+    );
+}
