@@ -2,6 +2,9 @@
 //! change classification, slice-header prefix. Parsers face attacker input
 //! (spec §2, §6.1, §6.2); the crate-root deny lints apply here too.
 
+mod annexb;
+pub use annexb::{AvccError, avcc_to_annex_b};
+
 #[cfg(test)]
 mod tests {
     #[test]
