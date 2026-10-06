@@ -15,6 +15,9 @@
     clippy::as_conversions
 )]
 
+pub mod login;
+pub use login::{LoginError, Token, parse_login_token};
+
 /// Crate name; the first link/smoke anchor until the parsers land.
 #[must_use]
 pub const fn name() -> &'static str {
