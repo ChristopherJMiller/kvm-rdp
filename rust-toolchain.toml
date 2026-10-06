@@ -1,0 +1,7 @@
+# Pins the toolchain for rustup and CI. In the nix devshell (flake.nix) the
+# toolchain is supplied by rust-overlay and this file is advisory; the two
+# are kept at the same version on purpose (spec §4.2).
+[toolchain]
+channel = "1.94.1"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "minimal"
