@@ -4,7 +4,17 @@
 //! QoE, re-advertises and whether auto-detect is negotiated. NOT production code.
 
 mod cfg {
-    pub const RDP_LISTEN: &str = "0.0.0.0:3389";
+    // Fix round 1 (I1): loopback-only by default, not `0.0.0.0:3389`. This
+    // host's own xrdp already owns `:3389` (the B16 implementer's own smoke
+    // test hit that collision and worked around it with a manual temporary
+    // edit — see B16-report.md), and `0.0.0.0` would bind every LAN
+    // interface for a spike whose NLA password is published in plaintext in
+    // this very repo (main.rs, README.md, docs/census.md) — no reason for
+    // that exposure when nothing about this spike needs to be reached from
+    // off-host. Override with `LEGB_LISTEN` (see `main`) to reach it from
+    // another machine, e.g. for the controller's FreeRDP pass.
+    pub const LISTEN_ENV: &str = "LEGB_LISTEN";
+    pub const DEFAULT_LISTEN: &str = "127.0.0.1:13389";
     pub const NLA_USERNAME: &str = "kvm"; // must equal rdpgw's pre-filled username (Leg C)
     pub const NLA_PASSWORD: &str = "legb-spike-pw"; // throwaway; NLA needs it recoverable
     pub const FIXTURE_ENV: &str = "LEGB_FIXTURE"; // path to a committed Annex-B .h264 stream
@@ -22,8 +32,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use ironrdp_server::{
-    ConnectionHandler, ConnectionInfo, Credentials, PostConnectionAction, RdpServer, ServerError,
+    ConnectionHandler, ConnectionInfo, Credentials, ErrorInfo, PostConnectionAction, RdpServer,
+    ServerError,
 };
+use num_traits::FromPrimitive as _;
 
 struct LogHandler;
 impl ConnectionHandler for LogHandler {
@@ -88,7 +100,13 @@ async fn main() -> anyhow::Result<()> {
     let gfx = gfx::Gfx::new(cfg::HARD_CAP);
     let ctl = display::DisplayCtl::new(w, h);
 
-    let addr: SocketAddr = cfg::RDP_LISTEN.parse()?;
+    let listen = std::env::var(cfg::LISTEN_ENV).unwrap_or_else(|_| cfg::DEFAULT_LISTEN.to_owned());
+    let addr: SocketAddr = listen.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "{}={listen:?} is not a valid socket address: {e}",
+            cfg::LISTEN_ENV
+        )
+    })?;
     let mut server = RdpServer::builder()
         .with_addr(addr)
         .with_hybrid(tls.acceptor, tls.spki_pub_key)
@@ -107,6 +125,9 @@ async fn main() -> anyhow::Result<()> {
     server.enable_autodetect(); // RTT probes available if the client negotiates the channel
 
     let rtt_handle = server.autodetect_rtt_handle();
+    // Fix round 1 (b): wire the ErrorInfo/auto-reconnect census item — the
+    // checklist named it (docs/census.md) but nothing called it until now.
+    let errorinfo_handle = server.error_info_disconnect_handle();
 
     // Target size for both resize paths. `resize` (the real path) pairs this
     // with LEGB_FIXTURE_RESIZE below; `resize-channel` (the old, channel-only
@@ -130,13 +151,48 @@ async fn main() -> anyhow::Result<()> {
         use tokio::io::AsyncBufReadExt as _;
         let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let cmd = match line.trim() {
+            let line = line.trim();
+            // Fix round 1 (b): `errorinfo <hex>` sends a ServerSetErrorInfo
+            // PDU with that code then disconnects — exercises the census
+            // item that previously named `error_info_disconnect_handle()`
+            // with no stdin command actually calling it. Handled here,
+            // directly on the handle, rather than through `ShipCmd`: it
+            // doesn't touch the ship loop's state at all.
+            if let Some(hex) = line.strip_prefix("errorinfo ") {
+                let code = u32::from_str_radix(hex.trim().trim_start_matches("0x"), 16);
+                match code {
+                    Ok(code) => match ErrorInfo::from_u32(code) {
+                        Some(err) => {
+                            tracing::warn!(
+                                code = format!("0x{code:x}"),
+                                error = ?err,
+                                "LEGB_ERRORINFO sending ServerSetErrorInfo, then disconnecting"
+                            );
+                            if let Err(e) = errorinfo_handle.disconnect(err) {
+                                tracing::error!(error = %e, "LEGB_ERRORINFO disconnect send failed (no active connection?)");
+                            }
+                        }
+                        None => tracing::warn!(
+                            code = format!("0x{code:x}"),
+                            "LEGB_ERRORINFO unrecognized ErrorInfo code (not in MS-RDPBCGR's tables)"
+                        ),
+                    },
+                    Err(e) => {
+                        tracing::warn!(%hex, error = %e, "LEGB_ERRORINFO bad hex code (want e.g. `errorinfo 5` or `errorinfo 0x5`)")
+                    }
+                }
+                continue;
+            }
+            let cmd = match line {
                 "resize" => Some(ship::ShipCmd::Resize),
                 "resize-channel" => Some(ship::ShipCmd::ResizeChannel(resize_w, resize_h)),
                 "strand" => Some(ship::ShipCmd::Strand),
                 "resume" => Some(ship::ShipCmd::Resume),
                 other => {
-                    tracing::warn!(%other, "unknown command (resize|resize-channel|strand|resume)");
+                    tracing::warn!(
+                        %other,
+                        "unknown command (resize|resize-channel|strand|resume|errorinfo <hex>)"
+                    );
                     None
                 }
             };

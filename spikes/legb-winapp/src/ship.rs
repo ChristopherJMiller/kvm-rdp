@@ -107,6 +107,7 @@ pub async fn run_ship(
                 }
                 ShipCmd::ResizeChannel(nw, nh) => {
                     // Old path, kept for comparison: channel-level re-Setup, same stream.
+                    let t0 = Instant::now();
                     w = nw;
                     h = nh;
                     tracing::warn!(
@@ -117,6 +118,11 @@ pub async fn run_ship(
                     if let Err(e) = setup(&gfx, &handle, &sender, w, h, hard_cap) {
                         tracing::error!(error = %e, "LEGB_SHIP: re-setup failed");
                     }
+                    // Fix round 1 (a): same direct picture-return-time log as
+                    // the real `Resize` path, anchored on this branch's own
+                    // "emitted" instant. The next frame shipped (same stream,
+                    // new size) is whichever one the watch captures.
+                    gfx.arm_resize_watch("resize-channel", t0);
                 }
                 ShipCmd::Resize => {
                     let Some((next, nw, nh)) = resize_to.take() else {
@@ -155,6 +161,11 @@ pub async fn run_ship(
                         ms = t0.elapsed().as_millis(),
                         "LEGB_SHIP: new-size stream starts at IDR"
                     );
+                    // Fix round 1 (a): arm the picture-return-time watch now
+                    // — the very next frame shipped is the new-size stream's
+                    // first IDR, and its ack is what closes the measurement
+                    // (`t0` is this branch's "RESIZE emitted" instant).
+                    gfx.arm_resize_watch("resize", t0);
                     // No explicit pacing resync here: the end-of-loop step
                     // below (shared with every other source of lateness —
                     // a stall, STRAND/RESUME) detects that the schedule has
@@ -282,7 +293,7 @@ fn ship_one(
     h: u16,
     epoch: &Instant,
 ) -> anyhow::Result<()> {
-    let (dvc, chan, sid) = {
+    let (dvc, chan, sid, sent) = {
         let mut server = handle.lock().expect("gfx handle");
         let sid = match gfx.snapshot().and_then(|(_, _, s)| s) {
             Some(s) => s,
@@ -299,9 +310,16 @@ fn ship_one(
         let chan = server
             .channel_id()
             .ok_or_else(|| anyhow::anyhow!("no EGFX channel id"))?;
-        (server.drain_output(), chan, sid)
+        (server.drain_output(), chan, sid, sent)
     };
     let _ = sid;
+    // Outside the `handle` lock (fix round 1 (a)): tell the resize-ack
+    // watch, if armed, which frame_id to wait for. `note_shipped_frame`
+    // only ever locks `gfx`'s own `ctx` mutex, never `handle` — no nesting
+    // with the block above.
+    if let Some(id) = sent {
+        gfx.note_shipped_frame(id);
+    }
     if dvc.is_empty() {
         return Ok(());
     }

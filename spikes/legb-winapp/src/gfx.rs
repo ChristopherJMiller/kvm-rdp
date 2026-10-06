@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ironrdp_egfx::pdu::{
     CapabilitiesAdvertisePdu, CapabilitiesV8Flags, CapabilitiesV10Flags, CapabilitiesV81Flags,
@@ -16,6 +17,22 @@ pub struct SpikeCtx {
     pub avc420: bool,
     pub ready_count: u32,
     pub surface_id: Option<u16>,
+    pub resize_watch: Option<ResizeWatch>,
+}
+
+/// Fix round 1 (b): tracks one in-flight "picture return" measurement so
+/// `on_frame_ack` can log `LEGB_RESIZE picture_return_ms` directly, instead
+/// of leaving the census to correlate three separate log lines by hand.
+/// Armed by `Gfx::arm_resize_watch` right after a resize (`resize` or
+/// `resize-channel`) has re-run Setup; `frame_id` is filled in by
+/// `Gfx::note_shipped_frame` on the first frame shipped afterward (whichever
+/// stream that frame comes from — the switched one for `resize`, the same
+/// one for `resize-channel`); `on_frame_ack` clears the watch once that
+/// frame's ack arrives.
+pub struct ResizeWatch {
+    pub label: &'static str,
+    pub t0: Instant,
+    pub frame_id: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -51,6 +68,35 @@ impl Gfx {
             c.surface_id = Some(id);
         }
     }
+
+    /// Arm a picture-return-time watch: `on_frame_ack` will log
+    /// `LEGB_RESIZE picture_return_ms` once the first frame shipped after
+    /// this call is acknowledged. `label` distinguishes `"resize"` (the
+    /// real path) from `"resize-channel"` (the old, channel-only path) in
+    /// the log line.
+    pub fn arm_resize_watch(&self, label: &'static str, t0: Instant) {
+        if let Some(c) = self.ctx.lock().expect("ctx mutex").as_mut() {
+            c.resize_watch = Some(ResizeWatch {
+                label,
+                t0,
+                frame_id: None,
+            });
+        }
+    }
+
+    /// Called for every frame actually shipped. If a resize watch is armed
+    /// and hasn't captured a frame yet, this is — by construction, since the
+    /// caller arms the watch immediately before the next frame goes out —
+    /// the one to wait for the ack of.
+    pub fn note_shipped_frame(&self, frame_id: u32) {
+        if let Some(c) = self.ctx.lock().expect("ctx mutex").as_mut() {
+            if let Some(w) = c.resize_watch.as_mut() {
+                if w.frame_id.is_none() {
+                    w.frame_id = Some(frame_id);
+                }
+            }
+        }
+    }
 }
 
 impl ServerEventSender for Gfx {
@@ -81,6 +127,7 @@ impl GfxServerFactory for Gfx {
             avc420: false,
             ready_count: 0,
             surface_id: None,
+            resize_watch: None,
         });
         tracing::info!("EGFX: fresh GraphicsPipelineServer for new connection");
         Some((GfxDvcBridge::new(handle.clone()), handle))
@@ -163,6 +210,29 @@ impl GraphicsPipelineHandler for SpikeHandler {
             total_frames_decoded,
             "LEGB_ACK on_frame_ack"
         );
+
+        // Fix round 1 (a): if this ack matches the frame a resize watch is
+        // waiting on, log the picture-return time as one line instead of
+        // leaving the census to correlate "RESIZE emitted" / "new-size
+        // stream starts at IDR" / "shipped IDR" / this ack by hand. Only
+        // touches `ctx` (never `handle`), same as `on_ready` above — safe
+        // under the same precondition (this callback runs under IronRDP's
+        // own `handle` lock; C1).
+        if let Some(c) = self.ctx.lock().expect("ctx mutex").as_mut() {
+            let fire = c
+                .resize_watch
+                .as_ref()
+                .is_some_and(|w| w.frame_id == Some(frame_id));
+            if fire {
+                let w = c.resize_watch.take().expect("checked Some above");
+                tracing::warn!(
+                    label = w.label,
+                    frame_id,
+                    picture_return_ms = w.t0.elapsed().as_millis(),
+                    "LEGB_RESIZE picture_return_ms"
+                );
+            }
+        }
     }
 
     fn on_qoe_metrics(&mut self, metrics: QoeMetrics) {
@@ -421,6 +491,7 @@ mod tests {
             avc420: false,
             ready_count: 0,
             surface_id: None,
+            resize_watch: None,
         })));
         let mut handler = SpikeHandler { ctx, hard_cap: 5 };
 

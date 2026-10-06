@@ -11,6 +11,11 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 async-trait = "0.1"
+# `ErrorInfo::from_u32` (fix round 1 (b), stdin `errorinfo <hex>`) is a
+# num_traits::FromPrimitive trait method; already resolved transitively via
+# ironrdp-pdu (Cargo.lock has it at 0.2.19) — promoted to a direct dep so the
+# trait is in scope in main.rs.
+num-traits = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-std", "io-util"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }

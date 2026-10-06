@@ -86,9 +86,11 @@ Moved to Plan C's L4 hardware checks (it needs HID input, which `kvm-probe` neve
 
 Run: `legb-winapp` with a committed fixture; FreeRDP 3.31.1 on rowlett (R22 —
 Windows App is hard to test from here; every Windows-App run step in this
-batch becomes a FreeRDP run instead:
-`env -u LD_LIBRARY_PATH xvfb-run -a xfreerdp /v:127.0.0.1:<port> /u:kvm
-/p:legb-spike-pw /sec:nla /gfx:AVC420 /cert:ignore /log-level:INFO`).
+batch becomes a FreeRDP run instead). The server listens on `127.0.0.1:13389`
+by default (fix round 1, I1 — loopback-only; override with `LEGB_LISTEN` if
+the client runs on another host):
+`env -u LD_LIBRARY_PATH xvfb-run -a xfreerdp /v:127.0.0.1:13389 /u:kvm
+/p:legb-spike-pw /sec:nla /gfx:AVC420 /cert:ignore /log-level:INFO`.
 
 Capture (one row per observation; raw log line id in brackets):
 - [ ] NLA completes with the rcgen **ECDSA** cert. If NLA fails, mint an RSA
@@ -96,14 +98,19 @@ Capture (one row per observation; raw log line id in brackets):
       cert.pem -subj /CN=kvm-bridge.spike -days 2`, load via
       `ironrdp_server::TlsIdentityCtx::init_from_paths` for the pub key) and
       retry. RECORD which key type FreeRDP requires. [LEGB_CONN/handshake]
-- [ ] Confirmed capability set contains AVC420 (`confirmed_has_avc=true`,
-      `server_supports_avc420=true`). RECORD the exact confirmed version. [LEGB_READY]
+- [ ] Confirmed capability set contains AVC420 (`confirmed_has_avc=true`;
+      fix round 1, I2 — this is the one real field `on_ready` logs for this
+      gate, `gfx.rs`'s `LEGB_READY` line; there is no `server_supports_avc420`
+      field anywhere in the code, despite an earlier draft of this checklist
+      citing one). RECORD the exact confirmed version from the same line's
+      `confirmed` field (the full negotiated `CapabilitySet`, e.g. `V8_1`).
+      [LEGB_READY]
 - [ ] Full advertised ladder (every `LEGB_CAP advertise entry`: version + hex +
       parsed). Commit as the capability fixture for the L1 golden (§11.2).
 - [ ] First-frame ack p95 over ≥20 reconnects (time first `LEGB_SHIP shipped IDR`
       → its matching `LEGB_ACK`). This sets `video.first_ack_grace`. GATE ≤ 1 s.
 - [ ] Picture returns within N (§6.5, ≤ 3 s) after a server-initiated resize
-      (Task 6b; stdin `resize` with `LEGB_FIXTURE_RESIZE=$PWD/fixtures/large/720p30_main_full.h264`): picture-return time = first ack after "new-size stream starts at IDR" − "RESIZE emitted". Also record `resize-channel` (channel-only swap, stdin `resize-channel`): does it blink?
+      (Task 6b; stdin `resize` with `LEGB_FIXTURE_RESIZE=$PWD/fixtures/large/720p30_main_full.h264`): fix round 1 (a) — read `picture_return_ms` straight off the `LEGB_RESIZE picture_return_ms` line (`label="resize"`) rather than correlating "RESIZE emitted" / "new-size stream starts at IDR" / "shipped IDR" / `LEGB_ACK` by hand. Also record `resize-channel` (channel-only swap, stdin `resize-channel`; same line, `label="resize-channel"`): does it blink?
 - [ ] Picture returns within N after a client re-advertise (`re_advertise=true`
       in LEGB_READY): same measurement.
 - [ ] Does FreeRDP SUSPEND acks? (`LEGB_ACK suspended=true`,
@@ -123,8 +130,13 @@ them as pass/fail):
       delay + repeat interval (sets §7.4 `key_repeat_timeout`; feeds §7.1 Mac
       remap decision). Commit as the remap-table fixture.
 - [ ] Each ErrorInfo dialog + auto-reconnect behaviour: trigger 0x1, 0x5, 0x7,
-      0x9 via `error_info_disconnect_handle().disconnect(...)`. Revise §6.9 if
-      0x19 SERVER_SHUTDOWN suits `shutdown` better.
+      0x9 via stdin `errorinfo <hex>` (fix round 1, b — now wired to
+      `error_info_disconnect_handle().disconnect(...)`; logs
+      `LEGB_ERRORINFO` with the code sent). The *dialog* itself stays
+      deferred (FreeRDP has no UI to screenshot), but FreeRDP's own
+      disconnect-and-log behaviour for each code is observable now and worth
+      spot-checking in this same run. Revise §6.9 if 0x19 SERVER_SHUTDOWN
+      suits `shutdown` better.
 - [ ] Colour A/B: run twice — `LEGB_FIXTURE=$PWD/fixtures/large/1080p30_main_limited.h264`, then `…/1080p30_main_limited_flagfull.h264` (identical slices, only the VUI range flag differs);
       eyeball black level in Windows App; record whether the two differ (does it honour the VUI?). **Add for this device:** does Windows App decode the KVM's Baseline / level-3.1-labelled 1080p stream as is, and with `level_idc` rewritten to 40?
 

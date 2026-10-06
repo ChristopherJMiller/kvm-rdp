@@ -1690,6 +1690,7 @@ dependencies = [
  "ironrdp-pdu",
  "ironrdp-server",
  "ironrdp-svc",
+ "num-traits",
  "picky-krb",
  "rcgen",
  "rustls",
