@@ -55,3 +55,42 @@ jobs:
             exit "$rc"
           fi
           echo "ring: not in the dependency graph"
+      - name: kvm-proto/fuzzing stays out of the workspace graph (Plan B D8)
+        run: |
+          # kvm_proto::fuzzing panics by design; only fuzz/ (its own
+          # workspace) may enable the feature. --all-features above compiles
+          # it for clippy and the seed tests; this checks no crate asks for it.
+          if cargo tree --workspace -e features -i kvm-proto | grep -q 'feature "fuzzing"'; then
+            echo "::error::a workspace crate enables kvm-proto's fuzzing feature (Plan B D8)"
+            exit 1
+          fi
+
+  fuzz:
+    # Bounded fuzzing of kvm-proto (spec §11.2, §13 — CI only): every target
+    # for 5 s, RSS-capped by scripts/fuzz.sh. Longer runs are the nightly
+    # workflow's.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-01
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Seeds, on stable (rust-toolchain.toml)
+        run: scripts/fuzz.sh seeds
+      - name: Fuzz every target for 5 s
+        env:
+          FUZZ_CARGO: cargo +nightly-2026-10-01
+        run: scripts/fuzz.sh run 5
+      - name: Keep any crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

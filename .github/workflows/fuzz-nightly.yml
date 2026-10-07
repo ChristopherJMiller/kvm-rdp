@@ -1,0 +1,40 @@
+name: Fuzz (nightly)
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    # Nine targets × 300 s (45 min) plus the ASan build and the seeds.
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-10-01
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version 0.13.2
+      - name: Seeds, on stable (rust-toolchain.toml)
+        run: scripts/fuzz.sh seeds
+      - name: Fuzz every target for 300 s
+        env:
+          FUZZ_CARGO: cargo +nightly-2026-10-01
+        run: scripts/fuzz.sh run 300
+      - name: Keep any crash
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
