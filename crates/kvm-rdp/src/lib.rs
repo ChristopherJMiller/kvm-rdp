@@ -15,6 +15,7 @@
 
 pub mod admin;
 pub mod config;
+pub mod kvm;
 pub mod logging;
 pub mod metrics;
 pub mod msg;
