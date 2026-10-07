@@ -317,7 +317,9 @@ impl KvmSim {
         self.shared.stats()
     }
     /// Wait until `pred` holds over the event log; `Err` carries the log at
-    /// the timeout.
+    /// the timeout. `pred` runs with no lock held, so it may call this sim
+    /// (`|_| sim.stats().frames_sent > n`); it is re-run after every event
+    /// and every counter change (PB14 m6).
     pub async fn wait_for(
         &self,
         timeout: Duration,

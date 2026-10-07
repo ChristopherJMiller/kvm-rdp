@@ -181,11 +181,16 @@ impl Shared {
 
     pub(crate) fn frame_dropped(&self) {
         self.lock().stats.frames_dropped += 1;
+        // A `wait_for` predicate may be watching the counters.
+        self.changed.notify_waiters();
     }
 
     pub(crate) fn write_blocked(&self, d: Duration) {
-        let mut g = self.lock();
-        g.stats.max_flv_write_block = g.stats.max_flv_write_block.max(d);
+        {
+            let mut g = self.lock();
+            g.stats.max_flv_write_block = g.stats.max_flv_write_block.max(d);
+        }
+        self.changed.notify_waiters();
     }
 
     pub(crate) fn events(&self) -> Vec<SimEvent> {
@@ -255,26 +260,68 @@ impl Shared {
         self.lock().ws.retain(|tx| tx.send(cmd).is_ok());
     }
 
-    /// Wait until `pred` holds over the event log, or `timeout`. `pred` runs
-    /// on the log under the lock, so a wake-up copies nothing; the log is
-    /// cloned once, for the result.
+    /// Wait until `pred` holds over the event log, or `timeout`; either way
+    /// the result carries the log as `pred` last saw it, brought up to date.
+    ///
+    /// `pred` runs on a snapshot with the lock released, so it may call the
+    /// sim itself — `|_| sim.stats().frames_sent > n` is the natural L2
+    /// pattern (PB14 m6: it used to run under this non-reentrant lock, and
+    /// re-locking it blocked the thread where `timeout` could not reach it).
+    /// The snapshot grows by copying only the events recorded since the
+    /// last check. `pred` is re-run after every recorded event and every
+    /// counter change (`frame_dropped`, `write_blocked`).
     pub(crate) async fn wait_for(
         &self,
         timeout: Duration,
         pred: impl Fn(&[SimEvent]) -> bool,
     ) -> Result<Vec<SimEvent>, Vec<SimEvent>> {
         let deadline = tokio::time::Instant::now() + timeout;
+        let mut seen: Vec<SimEvent> = Vec::new();
         loop {
+            // Created before the check: a change made after it still wakes
+            // this waiter (`notify_waiters` reaches every `Notified` that
+            // exists, polled or not).
             let notified = self.changed.notified();
-            {
-                let g = self.lock();
-                if pred(&g.events) {
-                    return Ok(g.events.clone());
-                }
+            self.catch_up(&mut seen);
+            if pred(&seen) {
+                return Ok(seen);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return Err(self.lock().events.clone());
+                self.catch_up(&mut seen);
+                return Err(seen);
             }
         }
+    }
+
+    /// Append the events recorded since `seen` was last brought up to date.
+    fn catch_up(&self, seen: &mut Vec<SimEvent>) {
+        let g = self.lock();
+        if let Some(new) = g.events.get(seen.len()..) {
+            seen.extend_from_slice(new);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// PB14 m6: a predicate on the counters is re-run when a counter changes
+    /// with no event recorded (a viewer's dropped frame), not only at the
+    /// next event or the timeout.
+    #[tokio::test]
+    async fn a_counter_change_alone_wakes_a_waiter() {
+        let shared = Arc::new(Shared::default());
+        let s = shared.clone();
+        let waiter = tokio::spawn(async move {
+            s.wait_for(Duration::from_secs(5), |_| s.stats().frames_dropped > 0)
+                .await
+                .is_ok()
+        });
+        tokio::task::yield_now().await; // the waiter checks once and sleeps
+        shared.frame_dropped();
+        let woke = tokio::time::timeout(Duration::from_secs(1), waiter).await;
+        assert!(matches!(woke, Ok(Ok(true))), "{woke:?}");
     }
 }
