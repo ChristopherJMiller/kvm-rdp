@@ -113,8 +113,10 @@ item the census did not measure is marked *open*.
 - Leg A confirmed `https`: rustls negotiates TLS 1.3
   (`TLS_AES_256_GCM_SHA384`) on all three ports; TLS costs ~90 ms on each
   connection open (FLV open → first IDR p50 183 vs 97 ms over `http`) and
-  nothing measurable in steady state (inter-tag jitter on a moving screen is
-  the same or better). Scheme `http` (80 / 8880 / 8888) stays a config option
+  nothing measurable in steady state on a moving screen (inter-tag jitter is
+  the same or better) — the static capture's tail is worse (p99 83 vs 49 ms,
+  max 136 vs 55 ms, n = 1 capture each; `census.md`, Leg A — transport), but
+  the decision is unaffected. Scheme `http` (80 / 8880 / 8888) stays a config option
   for diagnosis on the isolated segment only; neither of the conditions that
   would have justified it (rustls cannot negotiate, measurable TLS latency)
   holds. TLS here buys confidentiality against the LAN, not trust in the
@@ -207,7 +209,7 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
 - **Upstream prerequisites for Plan C.** Plan A writes four IronRDP patches
   (each roughly 30–50 lines plus a test) on branch `kvm-rdp-egfx-patches`,
   off `38b074e`, of the owner's public fork
-  (`github.com/ChristopherJMiller/IronRDP`, cloned at `~/Repos/IronRDP`).
+  (`github.com/ChristopherJMiller/IronRDP`).
   The upstream PR is deferred until the owner says to open it:
   1. **Ack suspension survives resets.** (a) `FrameTracker::clear()` keeps
      `ack_suspended` — used by `resize_with_monitors`, i.e. every Setup;
@@ -780,7 +782,7 @@ Leg A's results (`census.md`, Leg A — stream and colour) and Leg B's
 | Level below the coded size. **Found**: 1920×1080 labelled `level_idc` 31, but 8160 MBs > level 3.1's MaxFS 3600 | h264-reader — so `kvm-proto`'s `parse_sps` — refuses the SPS as sent (`FieldValueTooLarge { pic_size_in_map_units: 8160 }`); a strict client decoder may too. FreeRDP does not care: an ES3-shaped x264 stream decodes the same at level 31 and 40 (Leg B) | Rewrite (a), below — required for `kvm-proto`'s own checks whatever the client does. Whether Windows App decodes the stream as labelled is an acceptance item (§12) |
 | Limited-range or BT.601 samples. **Found**: the pixels are limited-range BT.709 (decoded Y: black 16, white 233–236; pure red Y 63, where BT.601 would give ≈ 81), but the VUI claims full range (`video_full_range_flag` 1) and BT.601 (primaries 5, matrix 5) | MS-RDPEGFX fixes AVC420 to full-range BT.709. A client that applies that fixed conversion ignores the VUI and shows limited-range pixels **mildly washed out**: black → 16, white → 235 (~14 % contrast loss). **FreeRDP does exactly this**: Y 16 / 235 render as RGB 16,16,16 / 235,235,235 whether the VUI says full or limited (Leg B). A decoder that honours the VUI as sent shows washed-out, slightly mis-tinted colour | Measured on **decoded** samples, not flags. Rewrite (b), below, makes the VUI true — right for a client that honours it, but it cannot change a client that applies the fixed conversion. **Known limitation**, below |
 | POC type 0 without `bitstream_restriction`. **Found** | Client decoders may hold frames | Rewrite (c), below, **always** — decided in Plan A's Task 9.1 instead of a POC-0 presentation-hold experiment: the SPS is re-serialised for (b) anyway, and the structure is valid for Baseline. Safe because §6.1 already refuses B-slices and non-increasing POC. Leg B's stranding test passed on FreeRDP, but with x264 fixtures, not a POC-0 stream; whether Windows App holds frames on the rewritten stream is an acceptance item (§12) |
-| Encoder stops sending on a static screen. **Not found**: one tag every 33 ms whether the screen is static or moving | Some clients hold the last ~2 frames, so the last keystroke never appears | Cannot strand a keystroke on the ES3 at 30 fps. Leg B's barcode stranding test passed on FreeRDP: while stranded, the last frame stays fully displayed (screens 3 s apart byte-identical; no blank, no partial frame). `flv_idle_timeout` (10 s) sits far above the 33 ms cadence |
+| Encoder stops sending on a static screen. **Not found**: one tag every 33 ms whether the screen is static or moving | Some clients hold the last ~2 frames, so the last keystroke never appears | Cannot strand a keystroke on the ES3 at 30 fps. Leg B's barcode stranding test on FreeRDP showed a stable picture while stranded (screens 3 s apart byte-identical; no blank, no partial frame) — not confirmed as the last frame shipped, and run on x264 streams with POC type 2 and `bitstream_restriction`, which cannot fail the presentation-hold gate a real POC-0, no-restriction stream could; that check moves to Plan C's L2 with Plan B's ES3-shaped POC-type-0 fixture (§11.5, Task 6.1). `flv_idle_timeout` (10 s) sits far above the 33 ms cadence |
 
 **Known limitation: mild wash-out on fixed-conversion clients.** The ES3's
 pixels are limited-range, and a client that follows MS-RDPEGFX's fixed
@@ -1533,8 +1535,9 @@ Milestone 1 hardens these parsers rather than writing them.
 `docs/census.md`) and the verdict is **go for passthrough** (Milestone 0
 verdict, below). Leg A ran against the ES3 in two sessions. **Legs B and C
 ran with FreeRDP 3.31.1 standing in for Windows App**, which could not
-easily be tested yet: stock IronRDP HEAD `38b074e` replaying committed
-fixtures, direct (Leg B) and through rdpgw `16cdaaf` (Leg C). Every
+easily be tested yet: stock IronRDP HEAD `38b074e` replaying fixtures
+(gitignored, generated by `gen-fixtures.sh large`), direct (Leg B) and
+through rdpgw `16cdaaf` (Leg C). Every
 Windows App run step below became a FreeRDP run; what only Windows App can
 answer is the owner acceptance checklist (below). Recorded deviations from
 the lists below:
@@ -1550,17 +1553,29 @@ the lists below:
 - Leg B: it also replayed an ES3-shaped local x264 stream (Baseline,
   1080p30, `level_idc` 31, VUI full range and BT.601, and the same at level
   40), generated into `captures/` and not committed. The barcode stranding
-  test replayed x264 fixtures, not a POC-0 stream; the POC-0
-  presentation-hold check was replaced by always adding
-  `bitstream_restriction` (§6.8), and the POC-type-0 fixture moved to Plan B
-  (§11.5). FreeRDP's capability bytes are recorded in `census.md`, not as a
-  separate fixture file; Windows App's capability and key-matrix fixtures
-  wait for the acceptance run.
+  test and the ES3-shaped decode both ran on x264 encodes (POC type 2,
+  `bitstream_restriction` present), not a POC-type-0 stream like the real
+  ES3 — a stable picture while stranded on these streams is not proof that
+  the presentation-hold gate a POC-0, no-restriction stream could fail
+  would also pass; that check moves to Plan C's L2 with Plan B's
+  ES3-shaped POC-type-0 fixture (Plan B Task 6.1, §11.5). The POC-0
+  presentation-hold experiment itself was replaced by always adding
+  `bitstream_restriction` (§6.8). The first-frame ack p95 gate was measured
+  over 10 fresh connections, not the ≥ 20 the brief and checklist ask for;
+  the recorded p95 is the maximum of 10, not a true 95th percentile. The
+  colour A/B result is recorded as an observation, not scored as a
+  pass/fail gate — the verdict table marks it "Recorded, not a gate" (rev 5
+  §6.8 had already planned to ship with documented contrast loss). Only the
+  `/gfx:AVC420` two-set capability pair's bytes are recorded in
+  `census.md`; the 11-set ladder (no `/gfx`, Leg C) is named but not
+  committed with its bytes as a separate fixture file (Plan C captures them
+  from the flake's FreeRDP, §11.2). Windows App's capability and key-matrix
+  fixtures wait for the acceptance run.
 - Leg C: everything ran on loopback, so the stand-in proxy's source address
   (127.0.0.2) played the trusted proxy and 127.0.0.1 "another LAN host";
   every certificate was a throwaway self-signed one (`/cert:ignore`).
 - The IronRDP patches are written on the owner's fork, branch
-  `kvm-rdp-egfx-patches` (cloned at `~/Repos/IronRDP`); the upstream PR is
+  `kvm-rdp-egfx-patches`; the upstream PR is
   deferred until the owner says so, and Plan C git-pins the fork (§4.2).
 
 Left open: the firmware version (no `Server` header; it is read from the
@@ -1598,7 +1613,8 @@ checklist at the end of this section):
     /nix --bind $CAPDIR /cap …`). During captures the Mac shows only test
     patterns or the lock screen.
 - **Leg B — Windows App spike, direct** (stock IronRDP HEAD, throwaway code,
-  replaying committed fixtures; run with FreeRDP 3.31.1, Status above). Logs and commits every capability set and the
+  replaying fixtures, not all committed — see Status above; run with
+  FreeRDP 3.31.1). Logs and commits every capability set and the
   confirmed one (with FreeRDP's), ack latency and every `queue_depth` (does
   Windows App suspend acks; does it re-send a suspend ack after its own
   re-advertise or after a server resize?), whether it negotiates the
@@ -1647,8 +1663,8 @@ before `census.md` is committed):
 | E | M5 + M6: L3, CI, image, perf pass |
 
 The companion `luma-homeops` spec is written once Milestone 0 passes. It has
-(verdict below), so the companion spec can be written; it takes §9.4,
-including Leg C's rdpgw findings, as input.
+passed (verdict below), so the companion spec can be written now; it takes
+§9.4, including Leg C's rdpgw findings, as input.
 
 ### Milestone 0 verdict
 
@@ -1667,7 +1683,7 @@ below. If Windows App rejects something FreeRDP accepted, the bridge adapts
 | Picture within N after a server resize | **Pass**: 34 ms direct, 37 ms through rdpgw, on the real resize path (§6.4) | Leg B, Leg C |
 | Picture within N after a re-advertise | **N/A**: FreeRDP never re-advertised — acceptance item 8 | Leg B, Leg C |
 | Colour A/B | **Recorded, not a gate**: FreeRDP ignores the VUI; mild wash-out on limited-range pixels (§6.8 known limitation) — acceptance item 1 | Leg B |
-| Barcode stranding | **Pass**: the last frame stays fully displayed while stranded | Leg B |
+| Barcode stranding | **Pass, non-diagnostic for POC-0**: a stable picture while stranded (no blank, no partial frame), not confirmed as the last frame shipped; run on x264 streams (POC type 2, `bitstream_restriction` present), which cannot fail the presentation-hold gate a real POC-0, no-restriction stream could — that check moves to Plan C's L2 with Plan B's ES3-shaped fixture (Task 6.1) | Leg B |
 | N ≤ 3 s for the chosen policy | **Pass**: FLV open → first IDR p95 300 ms over https; N = 1.8 s for `side` (§6.5) | Leg A, Census gates |
 | Max burst ≤ hard cap and ≤ channel capacity | **Pass**: burst on connect 0 frames; hard cap 60 frames (§6.6) | Leg A, Census gates |
 | Leg C: the gateway-token `.rdp` connects | **Pass** over the websocket transport; legacy HTTP and RPC fail at `16cdaaf` (§9.4) — acceptance item 2 | Leg C |
@@ -1678,10 +1694,12 @@ below. If Windows App rejects something FreeRDP accepted, the bridge adapts
 ### Owner acceptance checklist (Windows App)
 
 Every Milestone 0 item that only Windows App can answer, run by the owner
-with Windows App on macOS, direct and through rdpgw — against the Leg B/C
-spikes (`spikes/legb-winapp`, `spikes/legc-rdpgw`) or, once it exists, the
-bridge. Each result goes into `census.md`, and the values marked
-*acceptance* in §4.4 are retuned from it. In priority order:
+with Windows App on macOS, direct and through rdpgw — against the
+**finished bridge** (Plans C–E), with the real KVM, or `kvm-sim` for a dry
+run. The Leg B/C spikes (`spikes/legb-winapp`, `spikes/legc-rdpgw`) are
+throwaway and are not re-run for this; they stay only as historical
+evidence (§12, Status). Each result goes into `census.md`, and the values
+marked *acceptance* in §4.4 are retuned from it. In priority order:
 
 1. **VUI and colour.** Does Windows App honour the VUI? Replay
    `fixtures/large/1080p30_main_limited.h264` and its `…_flagfull` twin
@@ -1722,6 +1740,21 @@ bridge. Each result goes into `census.md`, and the values marked
    return within N (§6.5) after it? Record every capability set it
    advertises, direct and through rdpgw, as the L1/L2 fixture (§11.2,
    §11.3).
+9. **NLA against the shipped certificate.** §9.1 ships an RSA certificate
+   for NLA; the Leg B/C spikes used rcgen ECDSA instead (FreeRDP completed
+   NLA against it, `census.md` Leg B). Confirm Windows App completes NLA
+   against RSA, and record which username/domain form it sends — `kvm`,
+   `DOMAIN\kvm` or `.\kvm` — direct and through rdpgw (FreeRDP sent
+   `ROWLETT\kvm` through the gateway, `kvm` direct; §9.1's compare is built
+   on that). The result decides whether §9.1's RSA requirement stands, or
+   whether ECDSA is enough.
+10. **Picture return after a server-initiated resize, on Windows App.**
+    Time from `DisplayUpdate::Resize` to the first ack of the new-size IDR,
+    on the real resize path (§6.4) — the only one used, since the
+    channel-only swap blinks on Windows App and is broken outright on
+    FreeRDP. Leg B/C measured this on FreeRDP (34 ms direct, 37 ms through
+    rdpgw); Windows App's own deactivation/reactivation handling on this
+    path is untested. **Gate N ≤ 3 s** (§6.5).
 
 ## 13. Development resource budget
 

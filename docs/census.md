@@ -31,6 +31,7 @@ Every value below says how it was obtained. *pending* = not yet measured.
 | bitstream_restriction | absent (no `max_num_reorder_frames` / `max_dec_frame_buffering`; Baseline has no reordering anyway) | `trace_headers` |
 | Scaling matrices | not present (Baseline) | `trace_headers` |
 | HRD | `nal_hrd` 0, `vcl_hrd` 0 | `trace_headers` |
+| Trailing zero bytes | Both the SPS and PPS end in a trailing `00` byte (`sps_hex` …`08 00`, `pps_hex` …`12 00 00`, Artifacts below) — H.264 7.4.1 says a NAL's last byte is never 00 | SPS/PPS hex (Artifacts) |
 | GOP length | **60 frames (2 s)** on HDMI input. The KVM's own NO SIGNAL card is all-intra (every frame IDR, 13 365 B each) | `summarize` `gop_len`; JSONL IDR indices |
 | Frame rate / timestamps | 30 fps: FLV timestamp steps 33/34 ms | JSONL `timestamp_ms` deltas |
 | CompositionTime | **constant 16 ms** on every coded frame (0 on the sequence header) | JSONL `composition_time` |
@@ -58,7 +59,7 @@ Every value below says how it was obtained. *pending* = not yet measured.
 
 | Field | Value | How |
 |---|---|---|
-| Service ports (vendor UI) | web 80/443, video 8880/8881, control 8888/8889, WebRTC 1988 | vendor UI; TCP connect to the six documented ports (all open) |
+| Service ports (vendor UI) | web 80/443, video 8880/8881, control 8888/8889, WebRTC 1988 | vendor UI; TCP connect to the seven documented ports (all open) |
 | TLS ports | 443, 8881, 8889 — **one certificate** for all three; SPKI SHA-256 `f94841875ec7fa56220d48ffadaa5c0f2d84ffbbd1beeb060245ded1419b614f` (one `--pin` covers all ports) | `fingerprint --port` ×3 |
 | TLS version / cipher | TLSv1.3, `TLS_AES_256_GCM_SHA384` on all three | `openssl s_client -brief` |
 | rustls negotiates? | **Yes** (fingerprint, capture, first-idr, ws-open all over https) | kvm-probe |
@@ -84,7 +85,8 @@ Moved to Plan C's L4 hardware checks (it needs HID input, which `kvm-probe` neve
 
 ## Leg B — FreeRDP 3.31.1 (direct), stock IronRDP HEAD 38b074e
 
-Run: `legb-winapp` with a committed fixture; FreeRDP 3.31.1 on rowlett (R22 —
+Run: `legb-winapp` with a generated, gitignored fixture (not committed);
+FreeRDP 3.31.1 on rowlett (R22 —
 Windows App is hard to test from here; every Windows-App run step in this
 batch becomes a FreeRDP run instead). The server listens on `127.0.0.1:13389`
 by default (fix round 1, I1 — loopback-only; override with `LEGB_LISTEN` if
@@ -108,9 +110,9 @@ the client runs on another host):
 | Ack suspension | **Never** — `queue_depth` 0 on all 895 acks; `suspended=false` | `LEGB_ACK` |
 | Auto-detect | **Answered** — RTT 0–4 ms on loopback | `LEGB_AUTODETECT autodetect_answered=true` |
 | QoE | **Never fired** (FreeRDP sends no QoE frame acks by default) | no `LEGB_QOE` |
-| Stranding (stdin `strand`) | **Pass** — the last frame stays fully displayed while stranded (screens 3 s apart are byte-identical; no blank, no partial frame); resume continues | `LEGB_SHIP: STRAND` / `RESUME`, screenshots |
+| Stranding (stdin `strand`) | **Pass, non-diagnostic for POC-0** — a stable picture while stranded (screens 3 s apart are byte-identical; no blank, no partial frame), not proven to be the last frame shipped (the spike never logs the last-shipped frame index); resume continues. Run on x264 streams with POC type 2 and `bitstream_restriction`, which cannot fail the presentation-hold gate the real ES3 stream (POC type 0, no restriction) could — the real-shape check moves to Plan C's L2 with Plan B's ES3-shaped POC-type-0 fixture (Plan B Task 6.1); the bridge's `sps_rewrite` adds `bitstream_restriction` anyway (§6.8) | `LEGB_SHIP: STRAND` / `RESUME`, screenshots |
 | ErrorInfo 0x7 | FreeRDP logs `ERRINFO_SERVER_DENIED_CONNECTION` and exits; no auto-reconnect | client log, `LEGB_ERRORINFO` |
-| **ES3-shaped stream** (Baseline, 1080p30, **level_idc 31** mislabelled, VUI full range + BT.601) | **Decodes** — 445 acks over 15 s, picture correct; identical with `level_idc` 40. FreeRDP does not care about the level | local x264 fixtures `captures/es3like_l31/l40.h264` (R23, not committed) |
+| **ES3-shaped stream** (Baseline, 1080p30, **level_idc 31** mislabelled, VUI full range + BT.601) | **Decodes** — 445 acks over 15 s, picture correct; identical with `level_idc` 40. FreeRDP does not care about the level. These are x264 encodes (POC type 2, `bitstream_restriction` present), not POC-type-0 like the real ES3 — they match the ES3 on level and VUI but cannot exercise the presentation-hold gate a POC-0, no-restriction stream could; that check moves to Plan C's L2 with Plan B's ES3-shaped POC-type-0 fixture (Plan B Task 6.1) | local x264 fixtures `captures/es3like_l31/l40.h264` (R23, not committed) |
 | **Colour: does the client honour the VUI?** | **No (FreeRDP).** Limited-range pixels (Y 16 / 235) render as RGB **16,16,16 / 235,235,235** whether the VUI says full or limited — FreeRDP applies a fixed full-range conversion to AVC420, as MS-RDPEGFX specifies. Same result for `1080p30_main_limited` vs `…_limited_flagfull` | screenshots, pixel reads |
 
 **Consequence for passthrough (colour):** the KVM's pixels are limited-range, so a client that follows MS-RDPEGFX's fixed full-range AVC420 conversion shows them **mildly washed out** (black → grey 16, white → 235; ~14 % contrast loss), and rewriting the VUI cannot change that for such a client. Whether Windows App honours the VUI is now the top item on Chris's acceptance list; if it does not, options are (a) accept the mild wash-out, (b) find a KVM setting that makes its encoder emit full-range YUV, or (c) re-encode — rejected by the design (§14).
@@ -121,33 +123,61 @@ Capture (one row per observation; raw log line id in brackets):
       cert.pem -subj /CN=kvm-bridge.spike -days 2`, load via
       `ironrdp_server::TlsIdentityCtx::init_from_paths` for the pub key) and
       retry. RECORD which key type FreeRDP requires. [LEGB_CONN/handshake]
-- [ ] Confirmed capability set contains AVC420 (`confirmed_has_avc=true`;
+- [x] Confirmed capability set contains AVC420 (`confirmed_has_avc=true`;
       fix round 1, I2 — this is the one real field `on_ready` logs for this
       gate, `gfx.rs`'s `LEGB_READY` line; there is no `server_supports_avc420`
       field anywhere in the code, despite an earlier draft of this checklist
       citing one). RECORD the exact confirmed version from the same line's
       `confirmed` field (the full negotiated `CapabilitySet`, e.g. `V8_1`).
-      [LEGB_READY]
+      [LEGB_READY] — **Pass**, `V8_1` (Results, above)
 - [ ] Full advertised ladder (every `LEGB_CAP advertise entry`: version + hex +
       parsed). Commit as the capability fixture for the L1 golden (§11.2).
-- [ ] First-frame ack p95 over ≥20 reconnects (time first `LEGB_SHIP shipped IDR`
+      Done for the `/gfx:AVC420` two-set pair (hex above); the 11-set
+      no-`/gfx` ladder is confirmed byte-identical to a direct run through
+      the gateway (Leg C) but not yet committed with its own bytes as a
+      separate fixture file — left open for Plan C (§11.2).
+- [x] First-frame ack p95 over ≥20 reconnects (time first `LEGB_SHIP shipped IDR`
       → its matching `LEGB_ACK`). This sets `video.first_ack_grace`. GATE ≤ 1 s.
-- [ ] Picture returns within N (§6.5, ≤ 3 s) after a server-initiated resize
-      (Task 6b; stdin `resize` with `LEGB_FIXTURE_RESIZE=$PWD/fixtures/large/720p30_main_full.h264`): fix round 1 (a) — read `picture_return_ms` straight off the `LEGB_RESIZE picture_return_ms` line (`label="resize"`) rather than correlating "RESIZE emitted" / "new-size stream starts at IDR" / "shipped IDR" / `LEGB_ACK` by hand. Also record `resize-channel` (channel-only swap, stdin `resize-channel`; same line, `label="resize-channel"`): does it blink?
-- [ ] Picture returns within N after a client re-advertise (`re_advertise=true`
-      in LEGB_READY): same measurement.
-- [ ] Does FreeRDP SUSPEND acks? (`LEGB_ACK suspended=true`,
+      — **Pass**, p95 97 ms, but measured over 10 connections, not ≥ 20
+      (Results, above); p95 of 10 is the maximum observed.
+- [x] Picture returns within N (§6.5, ≤ 3 s) after a server-initiated resize
+      (Task 6b; stdin `resize` with `LEGB_FIXTURE_RESIZE=$PWD/fixtures/large/720p30_main_full.h264`): fix round 1 (a) — read `picture_return_ms` straight off the `LEGB_RESIZE picture_return_ms` line (`label="resize"`) rather than correlating "RESIZE emitted" / "new-size stream starts at IDR" / "shipped IDR" / `LEGB_ACK` by hand. Also record `resize-channel` (channel-only swap, stdin `resize-channel`; same line, `label="resize-channel"`): does it blink? — **Pass**, `picture_return_ms` 34 on the real path; `resize-channel` is broken on FreeRDP (Results, above)
+- [x] Picture returns within N after a client re-advertise (`re_advertise=true`
+      in LEGB_READY): same measurement. — **N/A**, FreeRDP never re-advertised
+      (Results, above)
+- [x] Does FreeRDP SUSPEND acks? (`LEGB_ACK suspended=true`,
       queue_depth=0xFFFFFFFF). Does it re-send a suspend ack AFTER its own
       re-advertise and AFTER a server resize? (Decides §4.2 patch-1 fallback.)
-- [ ] Auto-detect: does `LEGB_AUTODETECT autodetect_answered` ever become true?
-      (Decides the standing-delay gate, §6.6.)
-- [ ] QoE: does `LEGB_QOE` ever fire? Record `time_diff_dr_us`.
-- [ ] Barcode stranding (stdin `strand`): does the last frame appear without
+      — **Never**, `queue_depth` 0 throughout (Results, above)
+- [x] Auto-detect: does `LEGB_AUTODETECT autodetect_answered` ever become true?
+      (Decides the standing-delay gate, §6.6.) — **Yes**, RTT 0–4 ms on
+      loopback (Results, above)
+- [x] QoE: does `LEGB_QOE` ever fire? Record `time_diff_dr_us`. — **Never**
+      fired (Results, above)
+- [x] Barcode stranding (stdin `strand`): does the last frame appear without
       further input? Sets §6.8's idle-encoder decision + `flv_idle_timeout`.
+      — **Pass, non-diagnostic for POC-0** (Results, above)
 
 Deferred — Chris's acceptance (Windows-App-only; FreeRDP has no UI for these,
 so they wait for a real Windows App run before Plan A's spec revision reads
-them as pass/fail):
+them as pass/fail). This runs against the **finished bridge** (Plans C–E)
+with the real KVM, or `kvm-sim` for a dry run — not against the Plan A
+spikes (`spikes/legb-winapp`, `spikes/legc-rdpgw`), which are throwaway and
+stay only as historical evidence:
+- [ ] NLA against the bridge's shipped certificate type: §9.1 ships an RSA
+      certificate (the Leg B/C spikes used rcgen ECDSA instead, and FreeRDP
+      completed NLA against it with no RSA fallback needed, above). Confirm
+      Windows App completes NLA against RSA, and record which
+      username/domain form it sends — `kvm`, `DOMAIN\kvm` or `.\kvm` —
+      direct and through rdpgw (FreeRDP sent `ROWLETT\kvm` through the
+      gateway, `kvm` direct; census.md Leg C). The result decides whether
+      §9.1's RSA requirement stands, or whether ECDSA is enough.
+- [ ] Picture return after a server-initiated resize, on Windows App
+      itself: time from `DisplayUpdate::Resize` to the first ack of the
+      new-size IDR. FreeRDP measured 34 ms direct / 37 ms through rdpgw on
+      the real resize path (above); Windows App is known to blink on the
+      channel-only path, so its deactivation/reactivation handling on the
+      real path is the open risk. **Gate N ≤ 3 s** (spec §6.5).
 - [ ] Key matrix: every physical key/chord → the `LEGB_INPUT keyboard` scancode
       + extended flag + Cmd-rewrite behaviour. ≥ 20 typematic samples: initial
       delay + repeat interval (sets §7.4 `key_repeat_timeout`; feeds §7.1 Mac
@@ -304,17 +334,17 @@ trust-on-first-use).
 | Max burst length ≤ hard cap and ≤ KVM→pump channel capacity | **Pass** — burst on connect is 0 frames |
 | N ≤ 3 s for the chosen policy (`reconnect`: reconnect → first IDR p95 ≤ 1.5 s) | **Pass** — p95 300 ms (https), 129 ms (http) |
 
-## Derived decisions (handoff to Task 9.1) — provisional until Legs B/C
+## Derived decisions (handoff to Task 9.1 — complete, spec rev 6)
 
-- **§3.2 scheme:** **https** (rustls negotiates; one pin for all ports). TLS costs ~90 ms on each FLV/websocket open and nothing measurable in steady state (moving-screen jitter is the same or better than http), so it is not the "measurable latency" that would justify http.
+- **§3.2 scheme:** **https** (rustls negotiates; one pin for all ports). TLS costs ~90 ms on each FLV/websocket open and nothing measurable in steady state on a moving screen (jitter is the same or better than http) — the static capture's tail is worse (p99 83 vs 49 ms, max 136 vs 55 ms, n = 1 capture each, Leg A — transport above), but that doesn't change the decision — so https is not the "measurable latency" that would justify http.
 - **§6.1 pinned values:** Baseline 66, level as **rewritten** (below), 1920×1080 (120×68 MBs, crop 8), POC 0, 1 ref frame, CAVLC, tag = AU.
 - **§6.2 admission:** `CompositionTime == 0` must become "constant per stream" (the KVM sends a constant 16 ms).
 - **§6.5 `idr_policy`:** `reconnect` passes (N ≈ 0.3 s). Better: since any new FLV connection forces an IDR from the shared encoder, the bridge can **request an IDR by opening and closing a short side FLV connection**, keeping its main stream. Propose this as the primary IDR mechanism; keep `reconnect` as the fallback.
 - **§6.8 `sps_rewrite`: required.** `level_idc` 31 → **40** (1080p30 needs MaxFS 8192, MaxMBPS 244 800 ≤ 245 760); 60 fps would need 4.2. The level byte sits before any Exp-Golomb field, so the rewrite is a one-byte patch with no emulation-prevention change. Consider also setting `constraint_set1_flag` (constrained Baseline: 1 slice group, no ASO observed) if Leg B shows Windows App needs it. **Also correct the VUI:** `video_full_range_flag` 0 and colour description 1/1/1 (BT.709) — or drop `colour_description_present_flag` — because the pixels are limited-range BT.709 and the VUI says otherwise. Those fields sit after Exp-Golomb fields, so this is a bit-level SPS re-serialisation (re-apply emulation prevention), not a byte patch — a Plan B parser/writer task. Leg B's colour A/B shows whether Windows App honours the VUI at all.
 - **§7 input (Plan C):** HID keyboard frames drive macOS as specified (US layout, `cmd` = GUI bit 0x08). The §3.3 session-start sequence's zero-button absolute report at (0, 0) **parks the pointer in the top-left corner on every websocket (re)open**, which reveals the menu bar over full-screen apps — send the last known pointer position instead. An 842-character URL sent at one report per 20 ms took ~60–90 s to land in Edge's address bar (the omnibox's per-keystroke work is mixed in); measure the KVM's own HID rate in Plan C before fixing the §8 paste rate.
 - **§5 sessions:** never call logout while another client (the vendor UI as break-glass, the census tool) may be using the device: logout is global. Teardown should close the websocket and the FLV, and let the token lapse.
-- **§6.9 ErrorInfo / `flv_idle_timeout`:** *pending*.
-- **§7.4 `key_repeat_timeout` / `modifier_idle_timeout`:** *pending* (Leg B key matrix).
+- **§6.9 ErrorInfo / `flv_idle_timeout`:** `flv_idle_timeout` set to 10 s (far above the 33 ms cadence). The ErrorInfo table stands as written and is confirmed for 0x7 on FreeRDP only, direct and through rdpgw; Windows App's dialog/auto-reconnect behaviour for 0x1/0x5/0x7/0x9, and whether `0x19` suits `shutdown` better, is Chris's acceptance item 5.
+- **§7.4 `key_repeat_timeout` / `modifier_idle_timeout`:** `key_repeat_timeout` takes the safe default 10 s and `modifier_idle_timeout` is confirmed at 30 s; the typematic capture that would retune `key_repeat_timeout` from a real value is *pending* Chris's acceptance (Leg B key matrix, above).
 - **`video.default_size`:** 1920×1080, and the KVM preset is **pinned to 1920×1080 at 30 fps** (not "auto", not 60 fps): 60 fps would need level 4.2 and double the bitrate for no gain on a remote desktop, and "auto" invites resolution changes. A preset or Mac resolution change is a rare, operator-driven event; the bridge handles it on its existing paths either way — a closed FLV takes the reconnect path, and a new sequence header or in-band SPS goes through `classify_sps_change` (a new size classifies as `Resize`, which takes the §6.4 resize path).
 
 ## Artifacts
@@ -334,8 +364,15 @@ no_signal_card = "all-intra, same SPS"
 pixel_range = "limited"       # measured: black 16, white 233-236
 pixel_matrix = "bt709"        # measured: red Y 63
 vui_claims = "full range, bt601 (primaries 5, matrix 5)"  # wrong; see Leg A colour
+# sps_hex/pps_hex are L0 rewriter goldens (spec §11.5), not kvm-sim stream
+# parameters — they don't match any fixture's slices.
 sps_hex = "6742001f965403c0112f2cdc1418140800"
 pps_hex = "68ce31120000"
 ```
 
-Capability fixture and key-matrix fixture: *pending* (Leg B). `captures/` is gitignored, 0700, and wiped after every session.
+Capability fixture: the `/gfx:AVC420` two-set pair's bytes are in this file
+(Leg B/C, above); the 11-set no-`/gfx` ladder is named but its bytes are not
+committed as a separate L1 golden fixture — left for Plan C (spec §11.2).
+Key-matrix fixture: *pending* — waits on Windows App (Deferred — Chris's
+acceptance, Leg B, above). `captures/` is gitignored, 0700, and wiped after
+every session.
