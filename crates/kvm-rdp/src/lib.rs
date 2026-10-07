@@ -15,6 +15,7 @@
 
 pub mod config;
 pub mod logging;
+pub mod metrics;
 
 #[cfg(test)]
 mod pin_goldens;
