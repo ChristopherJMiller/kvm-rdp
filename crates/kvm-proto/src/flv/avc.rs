@@ -1,4 +1,4 @@
-use crate::flv::header::FlvError;
+use crate::flv::header::{FlvError, FlvLimits};
 use crate::flv::reader::Cur;
 use bytes::Bytes;
 
@@ -29,8 +29,8 @@ impl Nal {
 }
 
 /// Parsed `AVCDecoderConfigurationRecord` (ISO 14496-15). SPS/PPS are
-/// zero-copy slices of the tag body (§6.2). Count/size caps (1–4 SPS,
-/// 1–16 PPS, ≤ 1 KiB each) are Plan B hardening.
+/// zero-copy slices of the tag body (§6.2), 1–4 SPS and 1–16 PPS of
+/// 1..=1024 bytes each (`FlvLimits`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvcConfig {
     pub length_size_minus_one: u8,
@@ -42,7 +42,11 @@ pub struct AvcConfig {
 
 /// Parse the config record starting at `start` (past the 5-byte FLV AVC
 /// header). `body` is the whole tag body so slices share its allocation.
-pub(crate) fn parse_avc_config(body: &Bytes, start: usize) -> Result<AvcConfig, FlvError> {
+pub(crate) fn parse_avc_config(
+    body: &Bytes,
+    start: usize,
+    limits: &FlvLimits,
+) -> Result<AvcConfig, FlvError> {
     let region = body
         .as_ref()
         .get(start..)
@@ -58,10 +62,16 @@ pub(crate) fn parse_avc_config(body: &Bytes, start: usize) -> Result<AvcConfig, 
     if length_size_minus_one == 2 {
         return Err(FlvError::BadLengthSize);
     }
-    let num_sps = c.u8().ok_or(FlvError::BadConfigRecord)? & 0x1F;
-    let sps = read_param_sets(body, &mut c, start, num_sps)?;
-    let num_pps = c.u8().ok_or(FlvError::BadConfigRecord)?;
-    let pps = read_param_sets(body, &mut c, start, num_pps)?;
+    let num_sps = usize::from(c.u8().ok_or(FlvError::BadConfigRecord)? & 0x1F);
+    if num_sps == 0 || num_sps > limits.max_sps {
+        return Err(FlvError::ParamSetCount);
+    }
+    let sps = read_param_sets(body, &mut c, start, num_sps, limits)?;
+    let num_pps = usize::from(c.u8().ok_or(FlvError::BadConfigRecord)?);
+    if num_pps == 0 || num_pps > limits.max_pps {
+        return Err(FlvError::ParamSetCount);
+    }
+    let pps = read_param_sets(body, &mut c, start, num_pps, limits)?;
     Ok(AvcConfig {
         length_size_minus_one,
         profile_idc,
@@ -75,11 +85,15 @@ fn read_param_sets(
     body: &Bytes,
     c: &mut Cur<'_>,
     start: usize,
-    count: u8,
+    count: usize,
+    limits: &FlvLimits,
 ) -> Result<Vec<Bytes>, FlvError> {
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(count);
     for _ in 0..count {
         let len = usize::from(c.u16().ok_or(FlvError::BadConfigRecord)?);
+        if len == 0 || len > limits.max_param_set_len {
+            return Err(FlvError::ParamSetSize);
+        }
         let at = start
             .checked_add(c.pos())
             .ok_or(FlvError::BadConfigRecord)?;
@@ -95,10 +109,13 @@ fn read_param_sets(
 
 /// Split length-prefixed NALs out of an AVC NALU tag body (zero-copy).
 /// `start` is past the 5-byte FLV AVC header; `length_size` is 1, 2 or 4.
+/// The NAL count is capped before each NAL is collected (§6.2: 128 per AU),
+/// so a 4 MiB tag of 1-byte NALs cannot amplify into a huge `Vec`.
 pub(crate) fn parse_nalus(
     body: &Bytes,
     start: usize,
     length_size: u8,
+    limits: &FlvLimits,
 ) -> Result<Vec<Nal>, FlvError> {
     let mut nals = Vec::new();
     let mut at = start;
@@ -118,6 +135,9 @@ pub(crate) fn parse_nalus(
             .ok_or(FlvError::MalformedVideoTag)?;
         if nal_len == 0 || body.as_ref().get(len_end..nal_end).is_none() {
             return Err(FlvError::MalformedVideoTag); // 0 < n ≤ remaining (§6.2)
+        }
+        if nals.len() >= limits.max_nals_per_tag {
+            return Err(FlvError::TooManyNals);
         }
         nals.push(Nal {
             bytes: body.slice(len_end..nal_end),
@@ -174,6 +194,7 @@ const IS_EX_HEADER: u8 = 0x80;
 pub(crate) fn parse_video_body(
     body: &Bytes,
     length_size: Option<u8>,
+    limits: &FlvLimits,
 ) -> Result<VideoBody, FlvError> {
     let mut c = Cur::new(body.as_ref());
     let b0 = c.u8().ok_or(FlvError::MalformedVideoTag)?;
@@ -213,13 +234,14 @@ pub(crate) fn parse_video_body(
         0 => Ok(VideoBody::SequenceHeader(parse_avc_config(
             body,
             AVC_HEADER_LEN,
+            limits,
         )?)),
         1 => {
             let ls = length_size.ok_or(FlvError::NalBeforeSequenceHeader)?;
             Ok(VideoBody::Nalus {
                 frame_type,
                 composition_time,
-                nals: parse_nalus(body, AVC_HEADER_LEN, ls)?,
+                nals: parse_nalus(body, AVC_HEADER_LEN, ls, limits)?,
             })
         }
         2 => Ok(VideoBody::EndOfSequence),
@@ -273,7 +295,7 @@ mod tests {
             0x01, 0x42, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67, 0x42, 0x00, 0x1E, 0x88, 0x01,
             0x00, 0x04, 0x68, 0xCE, 0x3C, 0x80,
         ]);
-        let cfg = parse_avc_config(&body, 5).unwrap();
+        let cfg = parse_avc_config(&body, 5, &FlvLimits::default()).unwrap();
         assert_eq!(cfg.length_size_minus_one, 3);
         assert_eq!((cfg.profile_idc, cfg.level_idc), (0x42, 0x1E));
         assert_eq!(
@@ -287,12 +309,18 @@ mod tests {
     fn rejects_bad_length_size_and_truncation() {
         // lengthSizeMinusOne = 2 (0xFE & 0x03)
         let bad_ls = Bytes::from_static(&[0x17, 0, 0, 0, 0, 0x01, 0x42, 0x00, 0x1E, 0xFE, 0xE0]);
-        assert_eq!(parse_avc_config(&bad_ls, 5), Err(FlvError::BadLengthSize));
+        assert_eq!(
+            parse_avc_config(&bad_ls, 5, &FlvLimits::default()),
+            Err(FlvError::BadLengthSize)
+        );
         // SPS length 0x0005 but only 1 byte present
         let short = Bytes::from_static(&[
             0x17, 0, 0, 0, 0, 0x01, 0x42, 0x00, 0x1E, 0xFF, 0xE1, 0x00, 0x05, 0x67,
         ]);
-        assert_eq!(parse_avc_config(&short, 5), Err(FlvError::BadConfigRecord));
+        assert_eq!(
+            parse_avc_config(&short, 5, &FlvLimits::default()),
+            Err(FlvError::BadConfigRecord)
+        );
     }
 
     #[test]
@@ -300,7 +328,7 @@ mod tests {
         let body = Bytes::from_static(&[
             0x17, 0x01, 0, 0, 0, 0x00, 0x00, 0x00, 0x04, 0x65, 0x88, 0x80, 0x10,
         ]);
-        let nals = parse_nalus(&body, 5, 4).unwrap();
+        let nals = parse_nalus(&body, 5, 4, &FlvLimits::default()).unwrap();
         assert_eq!(nals.len(), 1);
         assert_eq!(nals[0].bytes, Bytes::from_static(&[0x65, 0x88, 0x80, 0x10]));
         assert_eq!(nals[0].unit_type(), Some(5));
@@ -311,7 +339,7 @@ mod tests {
         let body = Bytes::from_static(&[
             0x27, 0x01, 0, 0, 0, 0x02, 0x67, 0x88, 0x03, 0x68, 0xCE, 0x3C,
         ]);
-        let nals = parse_nalus(&body, 5, 1).unwrap();
+        let nals = parse_nalus(&body, 5, 1, &FlvLimits::default()).unwrap();
         assert_eq!(nals.len(), 2);
         assert_eq!(nals[0].bytes, Bytes::from_static(&[0x67, 0x88]));
         assert_eq!(nals[1].bytes, Bytes::from_static(&[0x68, 0xCE, 0x3C]));
@@ -322,10 +350,103 @@ mod tests {
         let overrun =
             Bytes::from_static(&[0x17, 0x01, 0, 0, 0, 0x00, 0x00, 0x00, 0x09, 0x65, 0x88]);
         assert_eq!(
-            parse_nalus(&overrun, 5, 4),
+            parse_nalus(&overrun, 5, 4, &FlvLimits::default()),
             Err(FlvError::MalformedVideoTag)
         );
         let zero = Bytes::from_static(&[0x17, 0x01, 0, 0, 0, 0x00, 0x00, 0x00, 0x00]);
-        assert_eq!(parse_nalus(&zero, 5, 4), Err(FlvError::MalformedVideoTag));
+        assert_eq!(
+            parse_nalus(&zero, 5, 4, &FlvLimits::default()),
+            Err(FlvError::MalformedVideoTag)
+        );
+    }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::arithmetic_side_effects,
+        clippy::as_conversions
+    )]
+    use super::*;
+
+    /// A config record body with `n_sps` SPSs of `sps_len` bytes and `n_pps`
+    /// 2-byte PPSs, after the 5-byte FLV AVC header.
+    fn record(n_sps: u8, sps_len: usize, n_pps: u8) -> Bytes {
+        let mut b = vec![0x17, 0, 0, 0, 0, 1, 0x42, 0, 0x1F, 0xFF, 0xE0 | n_sps];
+        for _ in 0..n_sps {
+            b.extend_from_slice(&(sps_len as u16).to_be_bytes());
+            b.push(0x67);
+            b.extend(std::iter::repeat_n(0x42, sps_len.saturating_sub(1)));
+        }
+        b.push(n_pps);
+        for _ in 0..n_pps {
+            b.extend_from_slice(&[0, 2, 0x68, 0xCE]);
+        }
+        Bytes::from(b)
+    }
+
+    #[test]
+    fn config_record_counts_and_sizes_are_capped() {
+        let lim = FlvLimits::default();
+        assert!(parse_avc_config(&record(1, 16, 1), 5, &lim).is_ok());
+        assert!(parse_avc_config(&record(4, 1024, 16), 5, &lim).is_ok());
+        assert_eq!(
+            parse_avc_config(&record(0, 16, 1), 5, &lim),
+            Err(FlvError::ParamSetCount)
+        );
+        assert_eq!(
+            parse_avc_config(&record(5, 16, 1), 5, &lim),
+            Err(FlvError::ParamSetCount)
+        );
+        assert_eq!(
+            parse_avc_config(&record(1, 16, 0), 5, &lim),
+            Err(FlvError::ParamSetCount)
+        );
+        assert_eq!(
+            parse_avc_config(&record(1, 16, 17), 5, &lim),
+            Err(FlvError::ParamSetCount)
+        );
+        assert_eq!(
+            parse_avc_config(&record(1, 1025, 1), 5, &lim),
+            Err(FlvError::ParamSetSize)
+        );
+        assert_eq!(
+            parse_avc_config(&record(1, 0, 1), 5, &lim),
+            Err(FlvError::ParamSetSize)
+        );
+        // configurationVersion must be 1.
+        let mut v2 = record(1, 16, 1).to_vec();
+        v2[5] = 2;
+        assert_eq!(
+            parse_avc_config(&Bytes::from(v2), 5, &lim),
+            Err(FlvError::BadConfigRecord)
+        );
+    }
+
+    #[test]
+    fn at_most_128_nals_per_tag() {
+        let lim = FlvLimits::default();
+        let tag = |n: usize| {
+            let mut b = vec![0x27, 1, 0, 0, 0];
+            for _ in 0..n {
+                b.extend_from_slice(&[1, 0x09]);
+            }
+            Bytes::from(b)
+        };
+        assert_eq!(parse_nalus(&tag(128), 5, 1, &lim).unwrap().len(), 128);
+        assert_eq!(
+            parse_nalus(&tag(129), 5, 1, &lim),
+            Err(FlvError::TooManyNals)
+        );
+    }
+
+    #[test]
+    fn a_video_tag_with_an_empty_body_is_malformed() {
+        assert_eq!(
+            parse_video_body(&Bytes::new(), Some(4), &FlvLimits::default()),
+            Err(FlvError::MalformedVideoTag)
+        );
     }
 }

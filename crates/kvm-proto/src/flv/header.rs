@@ -4,22 +4,35 @@ pub(crate) const HEADER_LEN: usize = 9;
 pub(crate) const TAG_HEADER_LEN: usize = 11;
 pub(crate) const PREV_TAG_SIZE_LEN: usize = 4;
 
-/// Per-stream framing limits. `max_tag_size` is §6.2's 4 MiB tag cap; the
-/// remaining size-limit hardening is Plan B.
+/// Per-stream framing limits (§6.2). Every one is checked before the data it
+/// bounds is buffered or collected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FlvLimits {
+    /// `DataSize` cap: 4 MiB.
     pub max_tag_size: u32,
+    /// NALs in one NALU tag (one access unit): 128.
+    pub max_nals_per_tag: usize,
+    /// SPSs in one `AVCDecoderConfigurationRecord`: 1..=4.
+    pub max_sps: usize,
+    /// PPSs in one `AVCDecoderConfigurationRecord`: 1..=16.
+    pub max_pps: usize,
+    /// Bytes in one SPS or PPS: 1 KiB.
+    pub max_param_set_len: usize,
 }
 impl Default for FlvLimits {
     fn default() -> Self {
         Self {
             max_tag_size: 4_194_304,
+            max_nals_per_tag: 128,
+            max_sps: 4,
+            max_pps: 16,
+            max_param_set_len: 1024,
         }
     }
 }
 
-/// A framing violation (§6.9, `parse_errors{kind}`). The M0 subset surfaces
-/// only the kinds reachable from demux; §6.1 admission kinds are Plan B.
+/// A framing violation found by the demuxer (§6.9: transient, an FLV
+/// reconnect; `parse_errors{kind}`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FlvError {
     BadHeader,
@@ -31,6 +44,34 @@ pub enum FlvError {
     BadLengthSize,
     NalBeforeSequenceHeader,
     MalformedVideoTag,
+    /// More than `FlvLimits::max_nals_per_tag` NALs in one tag.
+    TooManyNals,
+    /// A config record with 0 or more than `max_sps` SPSs, or 0 or more than
+    /// `max_pps` PPSs.
+    ParamSetCount,
+    /// An SPS or PPS longer than `max_param_set_len`, or empty.
+    ParamSetSize,
+}
+
+impl FlvError {
+    /// The `parse_errors{kind}` label.
+    #[must_use]
+    pub fn kind(self) -> &'static str {
+        match self {
+            FlvError::BadHeader => "bad_header",
+            FlvError::BadPrevTagSize => "bad_prev_tag_size",
+            FlvError::EncryptedTag => "encrypted_tag",
+            FlvError::BadStreamId => "bad_stream_id",
+            FlvError::OversizeTag => "oversize_tag",
+            FlvError::BadConfigRecord => "bad_config_record",
+            FlvError::BadLengthSize => "bad_length_size",
+            FlvError::NalBeforeSequenceHeader => "nal_before_sequence_header",
+            FlvError::MalformedVideoTag => "malformed_video_tag",
+            FlvError::TooManyNals => "too_many_nals",
+            FlvError::ParamSetCount => "param_set_count",
+            FlvError::ParamSetSize => "param_set_size",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,6 +180,33 @@ mod tests {
         assert_eq!(t.data_size, 25);
         assert_eq!(t.timestamp, 0x21);
         assert_eq!(t.stream_id, 0);
+    }
+
+    #[test]
+    fn every_error_kind_is_a_distinct_snake_case_label() {
+        let all = [
+            FlvError::BadHeader,
+            FlvError::BadPrevTagSize,
+            FlvError::EncryptedTag,
+            FlvError::BadStreamId,
+            FlvError::OversizeTag,
+            FlvError::BadConfigRecord,
+            FlvError::BadLengthSize,
+            FlvError::NalBeforeSequenceHeader,
+            FlvError::MalformedVideoTag,
+            FlvError::TooManyNals,
+            FlvError::ParamSetCount,
+            FlvError::ParamSetSize,
+        ];
+        let mut kinds: Vec<&str> = all.iter().map(|e| e.kind()).collect();
+        assert!(
+            kinds
+                .iter()
+                .all(|k| k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'))
+        );
+        kinds.sort_unstable();
+        kinds.dedup();
+        assert_eq!(kinds.len(), all.len());
     }
 
     #[test]

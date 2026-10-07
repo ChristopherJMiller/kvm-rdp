@@ -137,7 +137,7 @@ impl FlvDemuxer {
             8 => TagBody::Audio,
             18 => TagBody::ScriptData,
             9 => {
-                let vb = parse_video_body(&raw.body, self.length_size)?;
+                let vb = parse_video_body(&raw.body, self.length_size, &self.limits)?;
                 if let VideoBody::SequenceHeader(ref cfg) = vb {
                     self.length_size = Some(cfg.length_size_minus_one.wrapping_add(1));
                 }
