@@ -23,12 +23,17 @@ enum State {
     Tag,
 }
 
-/// Incremental FLV demuxer over an internal `BytesMut`.
+/// Incremental FLV demuxer over an internal `BytesMut`. After a framing
+/// error in the tag stream itself (header, `PrevTagSize`, `DataSize`,
+/// `StreamID`, encryption) the stream is misaligned, so the demuxer is
+/// poisoned: `push` discards input and `next_tag` repeats the error. A
+/// body-level error (one tag's video body) leaves the stream aligned.
 pub struct FlvDemuxer {
     buf: BytesMut,
     state: State,
     limits: FlvLimits,
     pub(crate) length_size: Option<u8>,
+    poisoned: Option<FlvError>,
 }
 
 impl FlvDemuxer {
@@ -38,16 +43,38 @@ impl FlvDemuxer {
             state: State::Start,
             limits,
             length_size: None,
+            poisoned: None,
         }
     }
 
     /// Append received bytes. One copy into the reassembly buffer; NAL/SPS
     /// slices taken from a tag body are shared without further copying.
+    /// A poisoned demuxer discards them.
     pub fn push(&mut self, data: &[u8]) {
-        self.buf.extend_from_slice(data);
+        if self.poisoned.is_none() {
+            self.buf.extend_from_slice(data);
+        }
+    }
+
+    /// Bytes buffered and not yet returned as tags.
+    #[must_use]
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
     }
 
     pub(crate) fn next_raw_tag(&mut self) -> Result<Option<RawTag>, FlvError> {
+        if let Some(e) = self.poisoned {
+            return Err(e);
+        }
+        let r = self.next_raw_tag_inner();
+        if let Err(e) = r {
+            self.poisoned = Some(e);
+            self.buf = BytesMut::new();
+        }
+        r
+    }
+
+    fn next_raw_tag_inner(&mut self) -> Result<Option<RawTag>, FlvError> {
         loop {
             match self.state {
                 State::Start => {
@@ -323,5 +350,75 @@ mod tests {
             }
             other => panic!("expected Enhanced, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::*;
+
+    const HEADER: [u8; 13] = [b'F', b'L', b'V', 1, 1, 0, 0, 0, 9, 0, 0, 0, 0];
+
+    /// §11.2 pre-buffer test: `DataSize = 0xFFFFFF` is refused as soon as the
+    /// 11th header byte arrives, before a single body byte is buffered;
+    /// nothing is reserved for the announced body on the way, and nothing is
+    /// kept — not even capacity — afterwards.
+    #[test]
+    fn oversize_data_size_is_refused_after_eleven_header_bytes() {
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&HEADER);
+        let tag_header = [0x09, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 0, 0, 0];
+        for b in &tag_header[..10] {
+            d.push(&[*b]);
+            assert_eq!(d.next_tag(), Ok(None));
+            // Nothing is reserved for the body the header announces.
+            assert!(d.buf.capacity() < 1024, "{}", d.buf.capacity());
+        }
+        d.push(&tag_header[10..]);
+        assert_eq!(d.next_tag(), Err(FlvError::OversizeTag));
+        assert_eq!(d.buffered_len(), 0);
+        assert_eq!(d.buf.capacity(), 0, "the buffer itself is released");
+    }
+
+    #[test]
+    fn a_framing_error_poisons_the_demuxer() {
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&HEADER);
+        d.push(&[0x29, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xAA, 0, 0, 0, 12]); // encrypted
+        assert_eq!(d.next_tag(), Err(FlvError::EncryptedTag));
+        d.push(&[0x09; 64]);
+        assert_eq!(d.buffered_len(), 0, "a poisoned demuxer buffers nothing");
+        assert_eq!(d.next_tag(), Err(FlvError::EncryptedTag));
+    }
+
+    #[test]
+    fn a_body_error_leaves_the_stream_aligned() {
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&HEADER);
+        // A video tag whose body is one byte (no AVC header), then an audio tag.
+        d.push(&[0x09, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0x17, 0, 0, 0, 12]);
+        d.push(&[0x08, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xAF, 0, 0, 0, 12]);
+        assert_eq!(d.next_tag(), Err(FlvError::MalformedVideoTag));
+        assert!(matches!(
+            d.next_tag().unwrap().unwrap().body,
+            TagBody::Audio
+        ));
+    }
+
+    #[test]
+    fn data_offset_below_nine_is_refused_and_above_nine_skips_padding() {
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&[b'F', b'L', b'V', 1, 1, 0, 0, 0, 8, 0, 0, 0, 0]);
+        assert_eq!(d.next_tag(), Err(FlvError::BadHeader));
+        let mut d = FlvDemuxer::new(FlvLimits::default());
+        d.push(&[
+            b'F', b'L', b'V', 1, 1, 0, 0, 0, 12, 0xEE, 0xEE, 0xEE, 0, 0, 0, 0,
+        ]);
+        d.push(&[0x08, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0xAF, 0, 0, 0, 12]);
+        assert!(matches!(
+            d.next_tag().unwrap().unwrap().body,
+            TagBody::Audio
+        ));
     }
 }
