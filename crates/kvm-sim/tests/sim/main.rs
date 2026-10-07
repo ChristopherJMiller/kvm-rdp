@@ -5,3 +5,4 @@ mod faults;
 mod flv;
 mod login;
 mod source;
+mod websocket;

@@ -10,11 +10,10 @@ mod encoder;
 mod flv;
 mod http;
 mod source;
-// The websocket (Task 8.6) is the last user of `state`.
-#[allow(dead_code)]
 mod state;
 mod tls;
 mod web;
+mod ws;
 
 pub use source::{Frame, Source, SourceError, fixtures_dir};
 pub use state::{Policy, PortKind, SimEvent, SimStats};
@@ -196,25 +195,25 @@ struct ConnCtx {
     profile: Profile,
 }
 
-/// One accepted connection: TLS, then its port's service. The websocket is
-/// Task 8.6's; until then the control port answers 404.
+/// One accepted connection: TLS, then its port's service.
 async fn serve_connection(kind: PortKind, tcp: TcpStream, conn: u64, ctx: Arc<ConnCtx>) {
     let Ok(Ok(mut tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, ctx.acceptor.accept(tcp)).await
     else {
         return;
     };
+    if kind == PortKind::Control {
+        ws::serve(tls, conn, ctx.shared.clone()).await;
+        return;
+    }
     let Ok(Some(req)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, http::read_request(&mut tls)).await
     else {
         return;
     };
     match kind {
         PortKind::Web => web::serve(tls, req, &ctx.shared, &ctx.password).await,
-        PortKind::Video => {
+        _ => {
             let (shared, enc) = (ctx.shared.clone(), ctx.enc.clone());
             flv::serve(tls, req, conn, shared, enc, ctx.profile).await;
-        }
-        PortKind::Control => {
-            let _ = http::respond(&mut tls, 404, "text/plain", b"not yet").await;
         }
     }
 }
