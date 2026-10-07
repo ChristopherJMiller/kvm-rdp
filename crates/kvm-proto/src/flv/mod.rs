@@ -13,6 +13,7 @@ mod avc;
 mod burst;
 mod demux;
 mod header;
+pub mod mux;
 mod reader;
 
 pub use avc::{AvcConfig, FrameType, Nal, VideoBody};
