@@ -15,6 +15,7 @@ mod slice;
 pub use slice::{
     SliceHeaderPrefix, SliceParseError, parse_slice_header_prefix, slice_type_allowed,
 };
+pub mod sps_syntax;
 
 #[cfg(test)]
 pub(crate) mod test_support;
