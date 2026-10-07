@@ -38,9 +38,9 @@ use std::time::Instant;
 pub struct AccessUnit {
     pub flv_timestamp_ms: u32,
     pub idr: bool,
-    /// Ran more than `burst_threshold` ahead of real time, measured from
-    /// this FLV connection's first *coded* tag, not its sequence header
-    /// (D11; fix round 1, P10/m5).
+    /// Ran more than `burst_threshold` ahead of real time: its delivery
+    /// delay is that much below the median of the last second on this FLV
+    /// connection (§6.2, rev 6.2 — the sliding baseline that replaced D11).
     pub burst: bool,
     /// The AUD, when the source sent one: exactly two bytes, its
     /// `primary_pic_type` covering the picture (§6.2).
@@ -143,7 +143,7 @@ impl VideoAdmission {
 
     /// A new FLV connection (any origin) delivers the tags from now on: its
     /// first parameter sets are `Initial`, its first coded tag sets the
-    /// `CompositionTime` and becomes the burst baseline (D11), and POC order
+    /// `CompositionTime`, the burst baseline starts afresh, and POC order
     /// starts afresh. The pins persist (§6.1).
     ///
     /// Callers must call this exactly once per FLV connection, before its

@@ -537,19 +537,22 @@ fn an_oversized_slice_header_list_is_stream_incompatible() {
 #[test]
 fn bursts_are_marked_against_real_time() {
     // All tags "arrive" at t0 while their timestamps run 33 ms apart: the
-    // fifth AU is 132 ms ahead of the first, past §6.2's 100 ms: a burst.
+    // seventh AU's delay is 132 ms below the median of the six before it,
+    // past §6.2's 100 ms (rev 6.2): a burst. The sixth is 99 ms below.
     let r = run(&[
         (16, vec![idr()]),
         (16, vec![p(1)]),
         (16, vec![p(2)]),
         (16, vec![p(3)]),
         (16, vec![p(4)]),
+        (16, vec![p(5)]),
+        (16, vec![p(6)]),
     ]);
     let bursts: Vec<bool> = r[1..]
         .iter()
         .map(|a| a.as_ref().unwrap().au.as_ref().unwrap().burst)
         .collect();
-    assert_eq!(bursts, [false, false, false, false, true]);
+    assert_eq!(bursts, [false, false, false, false, false, false, true]);
 }
 
 /// A sequence-header tag carrying `sps` and the default PPS.

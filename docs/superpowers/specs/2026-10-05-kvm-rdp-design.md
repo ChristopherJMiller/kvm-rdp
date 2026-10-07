@@ -8,11 +8,15 @@
 | Client | Microsoft Windows App on macOS, through an rdpgw RD Gateway on 443 |
 | Companion spec | Deployment, gateway, edge gating and KVM isolation live in `luma-homeops` (separate spec, written after Milestone 0). §9.4 lists what this spec requires of it |
 
+**Rev 6.2 — Plan C (in progress, 2026-10-07).** Burst marking uses a
+sliding median baseline (§6.2; Plan B's final review I3). Plan C's last
+task completes this revision.
+
 **Rev 6.1 — Plan B (2026-10-06).** Records what building Milestones 1 and 2
 settled: POC type 1 is refused (§6.1); trailing zero bytes are trimmed from
 every NAL before the §6.2 checks, at most one AUD per tag comes before any
 slice, unknown FLV tag types are framing violations, burst marking is
-measured from the first coded tag, and the 4 SPS / 16 PPS limits also bound
+measured from the first coded tag (superseded in rev 6.2), and the 4 SPS / 16 PPS limits also bound
 each tag's in-band sets (§6.2); one active SPS and a sequence header that
 replaces every PPS, with a PPS-only change classed `other` and
 byte-identical repeats raising nothing (§6.1); the level rewrite applies
@@ -604,10 +608,19 @@ resync scanning.
   a tag that is not exactly one picture (a second picture start, or a first
   slice with `first_mb_in_slice ≠ 0`) is a framing violation (§6.9).
 - **Bursts**: an AU whose FLV timestamp runs more than 100 ms ahead of its
-  receive time (measured since the FLV connection's first coded tag, rev
-  6.1) is marked
-  `burst` — a GOP-caching source replaying on connect. The ES3 sends none
-  (burst on connect 0 frames, `census.md`); the marking stays as a defence.
+  receive time is marked `burst` — a GOP-caching source replaying on
+  connect. "Ahead" is measured against a sliding baseline (rev 6.2): the
+  AU's delivery delay (receive time − FLV timestamp) is more than 100 ms
+  below the **median** delay of the AUs received in the last 1 s on that
+  FLV connection (at most 256 of them). A replay is marked from about its
+  seventh AU on, and live AUs after it stop being marked within 1 s; a late
+  first tag, and one late tag mid-stream — the census's worst https gap is
+  136 ms — are outvoted by the on-time AUs around them and mark nothing.
+  (Rev 6.1's baseline, fixed at the connection's first coded tag, marked
+  every later AU after one late tag — Plan B's final review measured 300
+  of 300 — which disabled the soft gate; a sliding *maximum* would do the
+  same for a second after every late tag.) The ES3 sends none (burst on
+  connect 0 frames, `census.md`); the marking stays as a defence.
 - Parser modules deny `clippy::{indexing_slicing, unwrap_used, expect_used,
   panic, arithmetic_side_effects, as_conversions}`. The one exception is
   `kvm_proto::fuzzing` (rev 6.1): the fuzz targets' bodies, whose panics are
