@@ -15,6 +15,8 @@
 
 pub mod bits;
 pub mod flv;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod fuzzing;
 pub mod h264;
 pub mod hid;
 pub mod login;

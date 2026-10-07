@@ -11,6 +11,12 @@ autotests = false
 [lib]
 doctest = false
 
+[features]
+# Fuzz-target bodies with output invariants (`kvm_proto::fuzzing`), for
+# `fuzz/` only: the module panics by design (Plan B deviation D8), and CI
+# fails if any workspace crate enables this feature.
+fuzzing = []
+
 [dependencies]
 bytes = { workspace = true }
 h264-reader = { workspace = true }
@@ -23,3 +29,7 @@ proptest = { workspace = true }
 [[test]]
 name = "fixtures"
 path = "tests/fixtures.rs"
+
+[[example]]
+name = "fuzz_seeds"
+required-features = ["fuzzing"]
