@@ -33,6 +33,13 @@
           exec ${pkgs.coreutils}/bin/nice -n 19 "$real" "$@"
         fi
       '';
+
+      # §13: one shared target dir for every worktree of this repo.
+      sharedTarget = ''
+        if [ -z "''${CARGO_TARGET_DIR:-}" ] && common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null); then
+          export CARGO_TARGET_DIR="$(dirname "$common")/target"
+        fi
+      '';
     in
     {
       devShells.${system}.default = pkgs.mkShell {
@@ -51,6 +58,7 @@
         KVM_RDP_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
 
         shellHook = ''
+          ${sharedTarget}
           echo "kvm-rdp devshell: $(${rustToolchain}/bin/rustc --version)"
         '';
       };

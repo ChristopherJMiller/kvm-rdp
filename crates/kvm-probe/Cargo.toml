@@ -10,10 +10,12 @@ autotests = false
 [lib]
 name = "kvm_probe"
 path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "kvm-probe"
 path = "src/main.rs"
+test = false
 
 [[test]]
 name = "stubs"

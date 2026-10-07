@@ -5,8 +5,8 @@ jobs = 4
 [env]
 RUST_TEST_THREADS = "4"
 
-# CARGO_TARGET_DIR: keep ONE shared target dir across all git worktrees
-# (spec §13) — never one per worktree. The devshell/operator exports an
-# absolute CARGO_TARGET_DIR at the shared tree; it is intentionally NOT
-# hard-coded here (the path is machine-specific). CI overrides build
-# parallelism with the CARGO_BUILD_JOBS env var.
+# CARGO_TARGET_DIR: ONE shared target dir across all git worktrees (spec
+# §13). The devshell's shellHook exports `<main checkout>/target` (from
+# `git rev-parse --git-common-dir`) unless CARGO_TARGET_DIR is already set;
+# it is not hard-coded here because the path is machine-specific. CI
+# overrides build parallelism with the CARGO_BUILD_JOBS env var.

@@ -14,8 +14,15 @@ use core::str;
 
 /// A validated session token of the form `0.<digits>` (the vendor matches
 /// `/token=0\.\d+/`), sent back as `Cookie: token=<token>` and `?token=`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// A secret (§9.2): its `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Token(String);
+
+impl core::fmt::Debug for Token {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Token(<redacted>)")
+    }
+}
 
 impl Token {
     pub fn as_str(&self) -> &str {
@@ -142,5 +149,20 @@ mod tests {
             Err(LoginError::ResultNotOk)
         );
         assert_eq!(parse_login_token(&[0xFFu8, 0xFE]), Err(LoginError::NotUtf8));
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn debug_never_shows_the_token() {
+        let t = parse_login_token(br#"{"result":0,"token":"0.987654321"}"#).unwrap();
+        let shown = format!("{t:?} {:?}", Ok::<_, LoginError>(t.clone()));
+        assert!(!shown.contains("987654321"), "{shown}");
+        assert_eq!(format!("{t:?}"), "Token(<redacted>)");
+        assert_eq!(t.as_str(), "0.987654321");
     }
 }
