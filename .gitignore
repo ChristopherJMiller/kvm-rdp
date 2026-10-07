@@ -50,3 +50,5 @@ spikes/legc-rdpgw/**/*.rdp
 /fuzz/artifacts/
 /fuzz/corpus/
 /fuzz/target/
+# `cargo fuzz coverage` writes here; nothing in the plan runs it (fix round 1, m5)
+/fuzz/coverage/

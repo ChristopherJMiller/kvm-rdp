@@ -59,9 +59,23 @@ jobs:
         run: |
           # kvm_proto::fuzzing panics by design; only fuzz/ (its own
           # workspace) may enable the feature. --all-features above compiles
-          # it for clippy and the seed tests; this checks no crate asks for it.
-          if cargo tree --workspace -e features -i kvm-proto | grep -q 'feature "fuzzing"'; then
+          # it for clippy and the seed tests; this checks no crate asks for
+          # it, on any platform (--target all catches a target-specific
+          # dependency a host-only tree misses), and fails outright if
+          # `cargo tree` itself errors rather than failing open (fix round 1,
+          # m1/m2).
+          set +e
+          tree=$(cargo tree --workspace --target all -e features -i kvm-proto 2>"$RUNNER_TEMP/fuzzing.err")
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::cargo tree failed while checking for kvm-proto's fuzzing feature (Plan B D8):"
+            cat "$RUNNER_TEMP/fuzzing.err"
+            exit "$rc"
+          fi
+          if echo "$tree" | grep -q 'feature "fuzzing"'; then
             echo "::error::a workspace crate enables kvm-proto's fuzzing feature (Plan B D8)"
+            echo "$tree"
             exit 1
           fi
 

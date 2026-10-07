@@ -70,7 +70,7 @@
         };
 
         # `nix develop .#fuzz`: nightly + cargo-fuzz, same §13 wrapper. Only to
-        # reproduce a CI fuzz crash (`cargo fuzz run --fuzz-dir fuzz --target-dir "$CARGO_TARGET_DIR/fuzz-build" -a T ARTIFACT`, the flags CI uses):
+        # reproduce a CI fuzz crash (`cargo fuzz run --fuzz-dir fuzz --target-dir "$CARGO_TARGET_DIR/fuzz-build" -a T ARTIFACT -- -timeout=10`, the flags CI uses — `-timeout` defaults to 1200 s, so a timeout artifact needs it to replay as a timeout rather than a 20-minute hang, fix round 1 m4):
         # fuzzing itself runs in CI only (spec §13).
         fuzz = pkgs.mkShell {
           packages = [

@@ -12,6 +12,11 @@
 # (rustup); `nix develop .#fuzz` provides both to reproduce a CI crash.
 # `seeds` builds a kvm-proto example with the stable toolchain — rustup's
 # rust-toolchain.toml in CI, the default devshell locally — never nightly.
+# `run` refuses (exit 2, touching nothing) unless SECONDS, FUZZ_RSS_MB,
+# FUZZ_MAX_LEN and FUZZ_CORPUS_MB are positive integers and every named
+# TARGET is one of `all` below — a typo must not fuzz unbounded (libFuzzer
+# treats `-max_total_time=0`, which is what a non-numeric SECONDS parses to,
+# as no limit) or `rm -rf` an unintended path (fix round 1, I1).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 target_dir=${CARGO_TARGET_DIR:-$PWD/target}
@@ -29,11 +34,41 @@ seeds() {
   nice -n 19 cargo run -q -p kvm-proto --features fuzzing --example fuzz_seeds -- "$seeds_dir"
 }
 
+# $1: the name to report (SECONDS, FUZZ_RSS_MB, ...). $2: the value. A bare
+# positive integer, no leading zero, no sign — "0", "-5", "5s", "login" and
+# "" are all refused (fix round 1, I1).
+positive_int() {
+  case "$2" in
+    ''|0*|*[!0-9]*)
+      echo "fuzz: $1 must be a positive integer, got '$2'" >&2
+      exit 2
+      ;;
+  esac
+}
+
 run() {
   local secs=${1:-60}
   shift || true
   local targets=("$@")
   [ ${#targets[@]} -gt 0 ] || targets=("${all[@]}")
+
+  # Validate everything before touching the filesystem: a bad argument must
+  # refuse cleanly, not fuzz with no time/RSS cap or rm -rf an unintended
+  # path through an unknown target name (fix round 1, I1).
+  positive_int SECONDS "$secs"
+  positive_int FUZZ_RSS_MB "$rss_mb"
+  positive_int FUZZ_MAX_LEN "$max_len"
+  positive_int FUZZ_CORPUS_MB "$corpus_mb"
+  for t in "${targets[@]}"; do
+    case " ${all[*]} " in
+      *" $t "*) ;;
+      *)
+        echo "fuzz: unknown target '$t' (${all[*]})" >&2
+        exit 2
+        ;;
+    esac
+  done
+
   if [ ! -d "$seeds_dir" ]; then
     echo "fuzz: no seeds; run scripts/fuzz.sh seeds first (stable toolchain)" >&2
     exit 1
@@ -48,12 +83,19 @@ run() {
       exit 1
     fi
     echo "fuzz: $t for ${secs}s (rss ${rss_mb} MB, max_len $max_len)"
+    # A crash (cargo-fuzz exits non-zero) must still drop the fresh corpus
+    # (unless kept) before the failure propagates — the crash artifact
+    # itself lives under fuzz/artifacts, never touched here (fix round 1,
+    # m3).
+    local rc=0
     nice -n 19 "${fuzz_cargo[@]}" fuzz run --fuzz-dir fuzz --target-dir "$build_dir" -a "$t" \
       "$corpus_dir/$t" "$seeds_dir/$t" -- \
       -max_total_time="$secs" -rss_limit_mb="$rss_mb" -malloc_limit_mb="$rss_mb" \
-      -max_len="$max_len" -timeout=10 -print_final_stats=1
-    # A fresh corpus is scratch: drop it so later targets and the disk don't carry it.
+      -max_len="$max_len" -timeout=10 -print_final_stats=1 || rc=$?
+    # A fresh corpus is scratch: drop it so later targets and the disk don't
+    # carry it — on success or on a crash alike.
     [ "${FUZZ_KEEP_CORPUS:-0}" = 1 ] || rm -rf "${corpus_dir:?}/$t"
+    [ "$rc" -eq 0 ] || exit "$rc"
   done
 }
 
