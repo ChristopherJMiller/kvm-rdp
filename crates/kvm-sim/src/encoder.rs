@@ -317,6 +317,23 @@ mod tests {
         out
     }
 
+    /// Drain `rx` until it closes, asserting every item until then is a
+    /// `Frame`. Bounded by a 5 s timeout (fix round 2) so a regression that
+    /// leaves a stalled viewer connected fails the test quickly instead of
+    /// hanging it.
+    async fn drain_to_close(rx: &mut mpsc::Receiver<Item>) -> usize {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut frames = 0;
+            while let Some(item) = rx.recv().await {
+                assert!(matches!(item, Item::Frame(_)));
+                frames += 1;
+            }
+            frames
+        })
+        .await
+        .expect("viewer was not disconnected within 5s")
+    }
+
     #[tokio::test]
     async fn a_new_viewer_forces_an_idr_into_every_open_stream() {
         let (enc, _) = es3();
@@ -453,11 +470,7 @@ mod tests {
         // b, full, is dropped instead of losing the fault: its 512 queued
         // frames still drain, then its stream ends (`recv` returns `None`),
         // and the fault it never saw is not counted as a dropped frame.
-        let mut frames = 0;
-        while let Some(item) = b.rx.recv().await {
-            assert!(matches!(item, Item::Frame(_)));
-            frames += 1;
-        }
+        let frames = drain_to_close(&mut b.rx).await;
         assert_eq!(frames, 512);
         assert_eq!(shared.stats().frames_dropped, 0);
         // Other viewers are unaffected: a is still subscribed and working.
@@ -478,11 +491,7 @@ mod tests {
         enc.switch(other, ResizeSignal::SequenceHeader);
         enc.sync().await;
         assert!(matches!(a.rx.try_recv(), Ok(Item::Params { .. })));
-        let mut frames = 0;
-        while let Some(item) = b.rx.recv().await {
-            assert!(matches!(item, Item::Frame(_)));
-            frames += 1;
-        }
+        let frames = drain_to_close(&mut b.rx).await;
         assert_eq!(frames, 512);
         assert_eq!(shared.stats().frames_dropped, 0);
     }
