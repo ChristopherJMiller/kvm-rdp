@@ -22,7 +22,7 @@ use crate::flv::mux::{
     write_tag,
 };
 use crate::flv::{FlvDemuxer, FlvLimits, TagBody, VideoBody};
-use crate::h264::rewrite::{RewriteConfig, RewriteError, rewrite_sps};
+use crate::h264::rewrite::{RewriteConfig, RewriteError, RewriteFields, rewrite_sps};
 use crate::h264::sanitize::{NalVerdict, check_nal};
 use crate::h264::sps_syntax::{BitstreamRestriction, ColourDescription, SpsSyntax};
 use crate::h264::{SpsPins, avcc_to_annex_b, split_annex_b};
@@ -75,14 +75,54 @@ pub fn admission(data: &[u8]) {
     let mut pins: Option<SpsPins> = None;
     let mut out = Vec::new();
     let now = Instant::now();
+    // Preflight controller addition (M06): §6.1 says `CompositionTime` is
+    // constant per stream on coded tags. Peek at it, independently of
+    // `admit`, before the call consumes the tag — a tag whose CT differs
+    // from the first one this connection saw must be refused
+    // (`stream_incompatible`), never admitted.
+    let mut first_ct: Option<i32> = None;
     while let Ok(Some(tag)) = d.next_tag() {
-        let Ok(admitted) = a.admit(tag, now) else {
+        let ct_this_tag = match &tag.body {
+            TagBody::Video(VideoBody::Nalus {
+                composition_time, ..
+            }) => Some(*composition_time),
+            _ => None,
+        };
+        let ct_mismatch = match (first_ct, ct_this_tag) {
+            (Some(first), Some(ct)) => first != ct,
+            _ => false,
+        };
+        let admitted = a.admit(tag, now);
+        if ct_mismatch {
+            assert!(
+                admitted.is_err(),
+                "a CompositionTime change was admitted instead of refused"
+            );
+            return;
+        }
+        let Ok(admitted) = admitted else {
             return;
         };
+        if let Some(ct) = ct_this_tag {
+            first_ct.get_or_insert(ct);
+        }
         if let Some(change) = admitted.params {
             let p = change.params;
-            // The emitted SPS is exactly the admitted (rewritten) one.
-            assert_eq!(SpsSyntax::parse(&p.sps).unwrap().to_nal(), p.sps.as_ref());
+            // §11.2: the emitted SPS is the rewritten one — a fixed point
+            // of the rewriter (preflight I1: canonical form alone cannot
+            // distinguish a rewritten SPS from an admitted-but-unrewritten
+            // one, so M15 survived).
+            let again = rewrite_sps(&p.sps, &RewriteConfig::ES3).unwrap();
+            assert_eq!(
+                again.nal.as_slice(),
+                p.sps.as_ref(),
+                "emitted SPS is not the rewritten one"
+            );
+            assert_eq!(
+                again.changed,
+                RewriteFields::default(),
+                "emitted SPS still needs a rewrite"
+            );
             let now_pins = SpsPins::of(&p.summary);
             assert_eq!(
                 *pins.get_or_insert(now_pins),
@@ -136,6 +176,12 @@ pub fn avcc(data: &[u8]) {
             while !r.is_empty() {
                 let (len, tail) = r.split_at(ls);
                 let n = len.iter().fold(0usize, |v, b| v << 8 | *b as usize);
+                // Preflight controller addition (M23): §6.2 requires
+                // `0 < n` — no NAL of declared length 0 may ever reach a
+                // §6.3 AU. `avcc_to_annex_b` returning `Ok` must mean every
+                // length it read was positive; this independent
+                // re-derivation of the same bytes must agree.
+                assert!(n > 0, "accepted a zero-length NAL (§6.2: 0 < n)");
                 nals.push(&tail[..n]);
                 r = &tail[n..];
             }
@@ -196,8 +242,16 @@ pub fn sps_rewrite(data: &[u8]) {
     // RB3 amendment: a level raise on a 66/77/88 SPS clears
     // constraint_set3_flag unconditionally (the bit is reserved once
     // level_idc != 11), not only when the input itself was level 1b.
-    // `r.changed.level` is exactly the rewriter's own condition for this.
-    if matches!(input.profile_idc, 66 | 77 | 88) && r.changed.level {
+    // Preflight I1/m5: key this off an independently observed raise
+    // (input vs output `level_idc`) rather than trusting the rewriter's
+    // own `r.changed.level` report — a rewriter that mis-reports
+    // `changed.level` while clearing cs3 without an actual raise must not
+    // be excused by believing its own flag (M18b2). This numeric
+    // comparison does not special-case a level-1b -> 1.1 raise that keeps
+    // `level_idc`'s number at 11 (none of this target's seeds reach that
+    // case); see the fix-round report for the known limitation.
+    let level_raised = out.level_idc != input.level_idc;
+    if matches!(input.profile_idc, 66 | 77 | 88) && level_raised {
         expect.constraint_flags &= !0x10;
     }
     let ev = expect.vui.get_or_insert_with(Default::default);
@@ -323,6 +377,11 @@ pub fn sanitize(data: &[u8]) {
     let nal = bytes::Bytes::copy_from_slice(data);
     if let Ok(NalVerdict::Keep(h, kept)) = check_nal(&nal) {
         assert!(!kept.is_empty());
+        // Preflight I2: "input with only trailing zeros trimmed" held
+        // trivially when nothing was trimmed (M03 survived) — a kept NAL
+        // must not itself end in a zero byte (H.264 7.4.1: a conforming
+        // NAL never does).
+        assert_ne!(kept.last(), Some(&0), "trailing zero kept");
         assert!(
             matches!(h.nal_unit_type, 1 | 5 | 7 | 8 | 9),
             "type {}",
@@ -433,17 +492,34 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
     let main = read("360p30_main_full.h264");
     let slices = read("360p30_main_slices.h264");
     let mut out = Vec::new();
-    let flv = |data: &[u8], aus: usize, ls: u8, ct: i32, keep: fn(u8) -> bool| {
+    // `pad`: the ES3 pads its own parameter sets with trailing zero bytes
+    // (census.md's `sps_hex`/`pps_hex`: SPS + one `00`, PPS + two `00 00`).
+    // Padding only `es3.flv`'s sequence header exercises Review Focus #1
+    // (the ES3's own padded sets are trimmed, admitted, and never mistaken
+    // for a start code) through an admission seed — preflight I2: no
+    // admission seed previously carried a padded config record.
+    let flv = |data: &[u8], aus: usize, ls: u8, ct: i32, keep: fn(u8) -> bool, pad: bool| {
         let nals: Vec<&[u8]> = split_annex_b(data).collect();
         let sps = *nals.iter().find(|n| n[0] & 0x1F == 7).unwrap();
         let pps = *nals.iter().find(|n| n[0] & 0x1F == 8).unwrap();
+        let (sps_zeros, pps_zeros) = if pad { (1, 2) } else { (0, 0) };
+        let sps_padded: Vec<u8> = sps
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(0u8, sps_zeros))
+            .collect();
+        let pps_padded: Vec<u8> = pps
+            .iter()
+            .copied()
+            .chain(std::iter::repeat_n(0u8, pps_zeros))
+            .collect();
         let mut f = Vec::new();
         write_flv_header(&mut f, false, true);
         write_tag(
             &mut f,
             TAG_VIDEO,
             0,
-            &avc_sequence_header_body(&[sps], &[pps], ls).unwrap(),
+            &avc_sequence_header_body(&[&sps_padded], &[&pps_padded], ls).unwrap(),
         )
         .unwrap();
         for (i, au) in access_units(data).into_iter().take(aus).enumerate() {
@@ -455,8 +531,8 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
         f
     };
     let flvs = [
-        ("es3.flv", flv(&es3, 8, 4, 16, |t| matches!(t, 1 | 5))),
-        ("slices.flv", flv(&slices, 4, 1, 0, |t| t != 6)),
+        ("es3.flv", flv(&es3, 8, 4, 16, |t| matches!(t, 1 | 5), true)),
+        ("slices.flv", flv(&slices, 4, 1, 0, |t| t != 6, false)),
         (
             "ffmpeg_head.flv",
             read("360p30_main_full.flv")[..32 * 1024].to_vec(),
@@ -466,6 +542,38 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
         // flv_demux's first byte picks the chunk size: 0x10 = 257 bytes.
         out.push(("flv_demux", name.to_owned(), [&[0x10][..], &bytes].concat()));
         out.push(("admission", name.to_owned(), bytes));
+    }
+    // Preflight controller addition (M06): a 3-tag input whose second
+    // coded tag changes `CompositionTime` from the first. Real admission
+    // must refuse the second tag (`Incompatible::CompositionTime`), not
+    // admit it — the invariant added to `admission` above depends on a
+    // seed that actually varies CT across tags to prove it can fail.
+    {
+        let nals: Vec<&[u8]> = split_annex_b(&es3).collect();
+        let sps = *nals.iter().find(|n| n[0] & 0x1F == 7).unwrap();
+        let pps = *nals.iter().find(|n| n[0] & 0x1F == 8).unwrap();
+        let mut f = Vec::new();
+        write_flv_header(&mut f, false, true);
+        write_tag(
+            &mut f,
+            TAG_VIDEO,
+            0,
+            &avc_sequence_header_body(&[sps], &[pps], 4).unwrap(),
+        )
+        .unwrap();
+        let es3_aus = access_units(&es3);
+        for (i, ct) in [16, 0].into_iter().enumerate() {
+            let Some(au) = es3_aus.get(i) else { continue };
+            let vcl: Vec<&[u8]> = au
+                .iter()
+                .copied()
+                .filter(|n| matches!(n[0] & 0x1F, 1 | 5))
+                .collect();
+            let mut b = Vec::new();
+            avc_nalu_body(&mut b, i == 0, ct, &vcl, 4).unwrap();
+            write_tag(&mut f, TAG_VIDEO, i as u32 * 33, &b).unwrap();
+        }
+        out.push(("admission", "ct_change.flv".to_owned(), f));
     }
     // An in-band parameter-set flood at §6.2's per-tag cap (4 SPS, 16 PPS)
     // ahead of the ES3-like IDR; the fuzzer grows it past the cap (D10).
@@ -507,6 +615,11 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
         "es3_idr".to_owned(),
         [&[2u8][..], &first_au].concat(),
     ));
+    // Preflight controller addition (M23): a declared length of 0 is a
+    // framing violation (§6.2 `0 < n`); `avcc_to_annex_b` must refuse it,
+    // never silently accept it as an empty NAL. No other seed here
+    // contains one, so the n > 0 re-derivation check above could not fail.
+    out.push(("avcc", "zero_length_nal".to_owned(), vec![2u8, 0, 0, 0, 0]));
     for (name, sps) in [
         ("es3_census", ES3_SPS.to_vec()),
         ("es3like", ES3_LIKE_PARAMS.0.to_vec()),
