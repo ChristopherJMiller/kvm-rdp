@@ -1,0 +1,33 @@
+[package]
+name = "kvm-sim"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+autotests = false
+
+[lib]
+doctest = false
+
+[dependencies]
+kvm-proto = { path = "../kvm-proto" }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+httparse = "1.10"
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "time", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs"] }
+
+[dev-dependencies]
+kvm-probe = { path = "../kvm-probe" }
+tempfile = "3"
+
+[[test]]
+name = "sim"
+path = "tests/sim/main.rs"

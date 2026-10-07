@@ -600,6 +600,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kvm-sim"
+version = "0.0.0"
+dependencies = [
+ "bytes",
+ "futures-util",
+ "httparse",
+ "kvm-probe",
+ "kvm-proto",
+ "rcgen",
+ "rustls",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
