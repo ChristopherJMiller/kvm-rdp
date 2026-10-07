@@ -38,6 +38,26 @@ fn multi_slice_access_units_stay_whole() {
     assert_eq!(s.gop_starts, [0, 30, 60]);
 }
 
+/// m2 fix round 1: H.264 §7.4.1.2.3's access-unit split must not depend on
+/// an AUD marking every boundary — kvm-bench's on-demand `from_annex_b`
+/// streams may have none. Rebuild the multi-slice fixture with every AUD
+/// removed and confirm the split is unchanged.
+#[test]
+fn access_units_split_correctly_without_auds() {
+    let data = std::fs::read(kvm_sim::fixtures_dir().join("360p30_main_slices.h264")).unwrap();
+    let mut stripped = Vec::new();
+    for nal in kvm_proto::h264::split_annex_b(&data) {
+        if nal.first().copied().unwrap_or(0) & 0x1F == 9 {
+            continue;
+        }
+        stripped.extend_from_slice(&[0, 0, 0, 1]);
+        stripped.extend_from_slice(nal);
+    }
+    let s = Source::from_annex_b("360p30_main_slices_no_aud", &stripped).unwrap();
+    assert_eq!(s.frames.len(), 90);
+    assert_eq!(s.gop_starts, [0, 30, 60]);
+}
+
 #[test]
 fn a_stream_must_start_with_an_idr() {
     let data = std::fs::read(kvm_sim::fixtures_dir().join("360p30_main_full.h264")).unwrap();

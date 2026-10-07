@@ -92,6 +92,9 @@ struct Encoder {
     force_idr: bool,
     signal: bool,
     no_signal_k: usize,
+    /// The source index of the most recently emitted IDR, so a forced or
+    /// NO SIGNAL IDR never repeats it back to back (`avoid_idr_repeat`).
+    last_idr_source: Option<usize>,
     gop_cache: Vec<Arc<OutFrame>>,
     viewers: Vec<mpsc::Sender<Item>>,
 }
@@ -129,12 +132,30 @@ impl Encoder {
             .collect()
     }
 
+    /// If `idx` (a GOP start) would repeat the most recently emitted IDR
+    /// and the source has more than one GOP, use the next one instead:
+    /// two consecutive IDR access units must not share `idr_pic_id`
+    /// (H.264 §7.4.3), and repeating a GOP start means repeating its
+    /// encoded IDU byte for byte. A single-GOP source
+    /// (`gop_starts.len() == 1`) has no other IDR to show and keeps
+    /// repeating — a documented limit, not fixed here.
+    fn avoid_idr_repeat(&self, idx: usize) -> usize {
+        if self.source.gop_starts.len() > 1 && Some(idx) == self.last_idr_source {
+            self.source.next_gop_start(idx)
+        } else {
+            idx
+        }
+    }
+
     fn tick(&mut self) {
         let frames_len = self.source.frames.len().max(1);
         let index = if self.signal {
             let at_idr = self.source.frames.get(self.pos).is_some_and(|f| f.idr);
-            if self.force_idr && !at_idr {
-                self.pos = self.source.next_gop_start(self.pos);
+            if self.force_idr {
+                if !at_idr {
+                    self.pos = self.source.next_gop_start(self.pos);
+                }
+                self.pos = self.avoid_idr_repeat(self.pos);
             }
             self.force_idr = false;
             let i = self.pos;
@@ -142,12 +163,12 @@ impl Encoder {
             i
         } else {
             let starts = &self.source.gop_starts;
-            let i = starts
+            let candidate = starts
                 .get(self.no_signal_k % starts.len().max(1))
                 .copied()
                 .unwrap_or(0);
             self.no_signal_k += 1;
-            i
+            self.avoid_idr_repeat(candidate)
         };
         let Some(frame) = self.source.frames.get(index) else {
             return;
@@ -161,19 +182,30 @@ impl Encoder {
         self.seq += 1;
         if out.idr {
             self.gop_cache.clear();
+            self.last_idr_source = Some(out.source_index);
         }
         self.gop_cache.push(out.clone());
         self.broadcast(&Item::Frame(out));
     }
 
+    /// Queue `item` for every viewer. A viewer whose 512-slot queue is
+    /// full loses only a `Frame` — a merely slow viewer skips a frame, as
+    /// a real server would. A full queue on a `Fault` or `Params` instead
+    /// disconnects that viewer (I1): a stalled connection that misses a
+    /// close or a new sequence header must not silently keep streaming
+    /// under stale parameters once it resumes, so kvm-sim ends its stream
+    /// the way a real server drops a client it can no longer keep up with.
     fn broadcast(&mut self, item: &Item) {
         let shared = &self.shared;
         self.viewers.retain(|tx| match tx.try_send(item.clone()) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                shared.frame_dropped();
-                true
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => match item {
+                Item::Frame(_) => {
+                    shared.frame_dropped();
+                    true
+                }
+                Item::Fault(_) | Item::Params { .. } => false,
+            },
             Err(mpsc::error::TrySendError::Closed(_)) => false,
         });
     }
@@ -229,6 +261,7 @@ pub(crate) fn spawn(
         force_idr: false,
         signal: true,
         no_signal_k: 0,
+        last_idr_source: None,
         gop_cache: Vec::new(),
         viewers: Vec::new(),
     };
@@ -400,6 +433,88 @@ mod tests {
                 "params true SequenceHeader",
                 "frame 1 idr true"
             ]
+        );
+    }
+
+    /// I1 fix round 1: a full queue must disconnect on a control item, not
+    /// silently drop it and count it as a dropped frame.
+    #[tokio::test]
+    async fn a_full_viewer_is_disconnected_by_a_fault_instead_of_losing_it() {
+        let (enc, shared) = es3();
+        let mut a = enc.subscribe().await.unwrap();
+        let mut b = enc.subscribe().await.unwrap();
+        enc.advance(512);
+        // a drains normally; b never does, so its queue is now full.
+        assert_eq!(drain(&enc, &mut a).await.len(), 512);
+        enc.inject(Fault::Close);
+        enc.sync().await;
+        // a, not full, gets the fault like any other item.
+        assert!(matches!(a.rx.try_recv(), Ok(Item::Fault(Fault::Close))));
+        // b, full, is dropped instead of losing the fault: its 512 queued
+        // frames still drain, then its stream ends (`recv` returns `None`),
+        // and the fault it never saw is not counted as a dropped frame.
+        let mut frames = 0;
+        while let Some(item) = b.rx.recv().await {
+            assert!(matches!(item, Item::Frame(_)));
+            frames += 1;
+        }
+        assert_eq!(frames, 512);
+        assert_eq!(shared.stats().frames_dropped, 0);
+        // Other viewers are unaffected: a is still subscribed and working.
+        enc.advance(1);
+        assert_eq!(drain(&enc, &mut a).await.len(), 1);
+    }
+
+    /// I1 fix round 1: the same disconnect-not-drop rule for a `Params`
+    /// item (a source switch), not just a `Fault`.
+    #[tokio::test]
+    async fn a_full_viewer_is_disconnected_by_a_source_switch_instead_of_losing_it() {
+        let (enc, shared) = es3();
+        let mut a = enc.subscribe().await.unwrap();
+        let mut b = enc.subscribe().await.unwrap();
+        enc.advance(512);
+        assert_eq!(drain(&enc, &mut a).await.len(), 512);
+        let other = Source::fixture("480p30_main_full.h264").unwrap();
+        enc.switch(other, ResizeSignal::SequenceHeader);
+        enc.sync().await;
+        assert!(matches!(a.rx.try_recv(), Ok(Item::Params { .. })));
+        let mut frames = 0;
+        while let Some(item) = b.rx.recv().await {
+            assert!(matches!(item, Item::Frame(_)));
+            frames += 1;
+        }
+        assert_eq!(frames, 512);
+        assert_eq!(shared.stats().frames_dropped, 0);
+    }
+
+    /// m1 fix round 1: H.264 §7.4.3 forbids two consecutive IDR access
+    /// units with the same `idr_pic_id`; kvm-sim reuses the source frame's
+    /// own `idr_pic_id`, so two consecutive IDRs must come from different
+    /// source frames. The NO SIGNAL → return transition is where the old
+    /// code repeated one (census: the alternating card is fine on its own,
+    /// but a forced-return IDR could land back on the GOP start the NO
+    /// SIGNAL card had just shown).
+    #[tokio::test]
+    async fn consecutive_idrs_never_repeat_the_same_source_frame() {
+        let (enc, _) = es3();
+        let mut a = enc.subscribe().await.unwrap();
+        enc.advance(5);
+        enc.signal(false);
+        enc.advance(4);
+        enc.signal(true);
+        enc.advance(2);
+        enc.sync().await;
+        let mut idr_sources = Vec::new();
+        while let Ok(item) = a.rx.try_recv() {
+            if let Item::Frame(f) = item
+                && f.idr
+            {
+                idr_sources.push(f.source_index);
+            }
+        }
+        assert!(
+            idr_sources.windows(2).all(|w| w[0] != w[1]),
+            "two consecutive IDRs reused the same source frame (same idr_pic_id): {idr_sources:?}"
         );
     }
 }
