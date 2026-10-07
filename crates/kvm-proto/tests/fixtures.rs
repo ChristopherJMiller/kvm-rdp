@@ -1,4 +1,6 @@
 //! Oracle: ffmpeg's view of each committed fixture (its manifest) vs kvm-proto.
+#[path = "admission.rs"]
+mod admission;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
