@@ -36,6 +36,12 @@ impl Token {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LoginError {
     NotUtf8,
+    /// No `"result"` field was found at all — an empty body, non-JSON
+    /// junk, or a well-formed object missing the field. Distinct from
+    /// [`LoginError::ResultNotOk`] (a present, non-zero `result`): this is
+    /// the device not answering sensibly, not a rejected login (PC5 fix
+    /// round 1, I1).
+    NoResult,
     ResultNotOk,
     NoToken,
     BadTokenFormat,
@@ -45,8 +51,10 @@ pub enum LoginError {
 /// `"result":0` plus a `"token"` string matching `0.<digits>`.
 pub fn parse_login_token(body: &[u8]) -> Result<Token, LoginError> {
     let text = str::from_utf8(body).map_err(|_| LoginError::NotUtf8)?;
-    if !result_is_zero(text) {
-        return Err(LoginError::ResultNotOk);
+    match result_is_zero(text) {
+        None => return Err(LoginError::NoResult),
+        Some(false) => return Err(LoginError::ResultNotOk),
+        Some(true) => {}
     }
     let raw = json_string_value(text, "token").ok_or(LoginError::NoToken)?;
     if is_valid_token(raw) {
@@ -79,33 +87,23 @@ fn json_string_value<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     inner.get(..end)
 }
 
-/// True when a numeric `"result"` value is exactly `0` (a string result is
-/// a failure message and is rejected).
-fn result_is_zero(text: &str) -> bool {
+/// `None`: no `"result"` key/value could be found at all (not JSON, empty
+/// body, or the field itself is missing) — the device did not answer
+/// sensibly. `Some(true)`: present and exactly `0`. `Some(false)`: present
+/// and anything else (a string reason, a nonzero code) — a rejected login.
+fn result_is_zero(text: &str) -> Option<bool> {
     let needle = "\"result\"";
-    let Some(key_at) = text.find(needle) else {
-        return false;
-    };
-    let Some(after_key) = key_at.checked_add(needle.len()) else {
-        return false;
-    };
-    let Some(tail) = text.get(after_key..) else {
-        return false;
-    };
-    let Some(colon) = tail.find(':') else {
-        return false;
-    };
-    let Some(after_colon) = colon.checked_add(1) else {
-        return false;
-    };
-    let Some(vtail) = tail.get(after_colon..).map(str::trim_start) else {
-        return false;
-    };
+    let key_at = text.find(needle)?;
+    let after_key = key_at.checked_add(needle.len())?;
+    let tail = text.get(after_key..)?;
+    let colon = tail.find(':')?;
+    let after_colon = colon.checked_add(1)?;
+    let vtail = tail.get(after_colon..)?.trim_start();
     let num: String = vtail
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '-' || *c == '+')
         .collect();
-    num == "0"
+    Some(num == "0")
 }
 
 #[cfg(test)]
@@ -149,6 +147,20 @@ mod tests {
             Err(LoginError::ResultNotOk)
         );
         assert_eq!(parse_login_token(&[0xFFu8, 0xFE]), Err(LoginError::NotUtf8));
+    }
+
+    /// PC5 fix round 1, I1: a CGI hiccup (empty body, `{}`, a busy page) is
+    /// not a rejected login — it has no `"result"` field at all, so it must
+    /// be distinguishable from a present, non-zero `result` (§7 table: Auth
+    /// is "login rejected", not "didn't answer sensibly").
+    #[test]
+    fn rejects_when_no_result_field_is_present() {
+        assert_eq!(parse_login_token(b""), Err(LoginError::NoResult));
+        assert_eq!(parse_login_token(b"{}"), Err(LoginError::NoResult));
+        assert_eq!(
+            parse_login_token(b"<html>busy</html>"),
+            Err(LoginError::NoResult)
+        );
     }
 }
 
