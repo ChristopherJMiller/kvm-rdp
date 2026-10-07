@@ -18,7 +18,8 @@ replaces every PPS, with a PPS-only change classed `other` and
 byte-identical repeats raising nothing (§6.1); the level rewrite applies
 H.264 A.3.1's frame-size rules in full, and with level ≤ 5.1 admits at most
 32 768 MBs per frame at 30 fps (§6.8 (a)); a `level_idc` outside Table A-1,
-or above level 5.1, is `stream_incompatible` rather than guessed at, level
+or naming level 6, 6.1 or 6.2, is `stream_incompatible` rather than guessed
+at (level 5.2 is ranked, then refused by §6.1's limits), level
 1b ranks strictly between level 1 and level 1.1, and `constraint_set3_flag`
 clears on every level raise of a profile 66/77/88 SPS (§6.8); the
 fuzz-oracle module is the one `kvm-proto` module outside the parser lint
@@ -243,7 +244,11 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   equivalent of the old patch 3 below. Upstream's version runs the discard
   inside `run_connection`/`run_connection_with` themselves, so it covers both
   entry points and also drops an embedder's `ServerEvent`s queued *before*
-  the call, not only ones left over from an earlier connection. Patch 3 is
+  the call, not only ones left over from an earlier connection — except the
+  lifecycle events it keeps by allowlist (`discard_stale_session_events`,
+  upstream `server.rs` ~:2229–2240): `Quit`, `GetLocalAddr`,
+  `SetCredentials` and `SetAutoReconnectCookie` survive the discard, so a
+  `Quit` queued before the call is still seen (§5.2). Patch 3 is
   dropped; the fork, renamed `kvm-rdp-egfx-patches-v2`, now carries three
   patches. The upstream PR for what remains is deferred until the owner says
   to open it:
@@ -470,7 +475,11 @@ Windows App run retunes (§12):
 
 On SIGTERM or SIGINT: stop accepting; release-all and wait for the websocket
 flush (≤ 500 ms); disconnect the client with cause `shutdown`; close FLV and
-websocket (no logout, §5.1); exit within 5 s. Release builds use
+websocket (no logout, §5.1); exit within 5 s. A `ServerEvent::Quit` sent
+while a client is connected ends only that connection — IronRDP's
+connection loop returns `Disconnect` and `run` goes back to accepting — so
+stopping the server takes a second `Quit` after that connection has
+drained (rev 6.1). Release builds use
 `panic = "abort"`. A crash cannot release keys: what the Mac does when the
 websocket TCP connection dies with a key held moved from Leg A to Plan C's L4
 hardware checks (§12), and the answer goes in §9.3.
@@ -899,9 +908,14 @@ Plan B builds the rewriter, with the POC-type-0 fixture (§11.5, §12).
   lowered to level 1; on every level raise of a profile 66/77/88 SPS,
   `constraint_set3_flag` (0x10) is cleared, even when the input was not
   itself 1b (rev 6.1) — a stray flag below a non-1b level is reserved and
-  must not survive the raise. A `level_idc` outside Table A-1, or above
-  level 5.1, is refused (`RewriteError::UnknownLevel`) rather than guessed
-  at. `level_idc` is the
+  must not survive the raise. A `level_idc` outside Table A-1, or naming
+  level 6, 6.1 or 6.2 (real Table A-1 entries the rewriter does not rank,
+  since §6.1 refuses above 5.1 regardless), is refused
+  (`RewriteError::UnknownLevel`) rather than guessed at. Level 5.2 is
+  ranked like any other: a stream that needs it is rewritten, then refused
+  one layer later by §6.1's admission check
+  (`SpsIncompatibleReason::OutsideLimits(SpsLimitViolation::Level(52))`).
+  `level_idc` is the
   SPS's third payload byte, before any Exp-Golomb field, so on its own this is
   a one-byte patch with no emulation-prevention change.
 - (b) `"vui"`: `video_full_range_flag` 0 and colour description **1/1/1**
@@ -919,11 +933,11 @@ Plan B builds the rewriter, with the POC-type-0 fixture (§11.5, §12).
   re-serialisation as (b), so it costs nothing extra.
 
 An SPS the rewriter cannot read (it reads only what §6.1 admits), whose
-`level_idc` names no level in Table A-1 (`RewriteError::UnknownLevel`, rev
-6.1), or whose output h264-reader does not parse back to the input's fields
-apart from the rewritten ones, is `stream_incompatible` (§6.9). There is no
-pass-through: without the rewrite the ES3's stream cannot be admitted at
-all.
+`level_idc` names no level in Table A-1, or level 6, 6.1 or 6.2
+(`RewriteError::UnknownLevel`, rev 6.1), or whose output h264-reader does
+not parse back to the input's fields apart from the rewritten ones, is
+`stream_incompatible` (§6.9). There is no pass-through: without the
+rewrite the ES3's stream cannot be admitted at all.
 
 ### 6.9 Upstream failure taxonomy and disconnects
 
@@ -1350,7 +1364,7 @@ frame (`alloc-stats` builds).
 | Tier | Where | What |
 |---|---|---|
 | L0 unit | `kvm-proto` | Goldens (HID encoders, scancode table, AVCC→Annex-B, SPS fields); SPS rewriter goldens: the ES3's SPS (`census.md` `sps_hex`) → `level_idc` 40, VUI full-range 0, colour 1/1/1 and `bitstream_restriction` added (`max_num_reorder_frames` 0, `max_dec_frame_buffering` 1), emulation prevention re-applied, and the output accepted by h264-reader; a level that already admits the size is never lowered; an SPS already labelled BT.709 limited, at an adequate level and carrying `bitstream_restriction` is byte-identical; a re-serialisation that produces `00 00 0[0-3]` gains an emulation-prevention byte; with `"restriction"`, `bitstream_restriction` already present is kept; an unreadable SPS → `stream_incompatible`; `CompositionTime` constant (16) is admitted and a change refused; FLV mux→demux round-trip property tests; parse of a committed ffmpeg-muxed FLV; burst marking; mouse scaling at the edges; **one hostile vector per §6.1/§6.2 rule, each asserting its specific error kind**; SPS-change classification per §6.1's table; a pre-buffer test (`DataSize = 0xFFFFFF` rejected after ≤ 11 bytes, nothing reserved); sans-IO cores with injected clock (release epoch and released-by-bridge rule, both key timers including two keys held with repeats of the second only → no release, backoff, paste pacing and text handling, debounce) |
-| L0 fuzz | `fuzz/` | FLV demux, AVCC, sanitiser, SPS/PPS/slice checks, SPS rewriter, login response; a differential mux→demux target. Output invariants in every target: emitted NAL types ∈ {1,5,7,8,9}; no emitted NAL contains `00 00 0[0-2]`; re-splitting the Annex-B yields exactly the emitted NALs; any emitted SPS is byte-identical to the last admitted (after rewrite) SPS and its pinned fields equal the first SPS's; any emitted AUD is two bytes; every admitted slice header re-parses, from the whole NAL and with no bound, to lists within §6.1's ceilings (rev 6.1, final review). Rewriter: the output re-parses with every field equal to the input except `level_idc` (never lower than the input's), the VUI's video-signal-type and colour-description fields, and, with `"restriction"`, `max_num_reorder_frames`, `max_dec_frame_buffering` and `bitstream_restriction_flag`. 5 s per target per PR, longer nightly. CI-only |
+| L0 fuzz | `fuzz/` | FLV demux, AVCC, sanitiser, SPS/PPS/slice checks, SPS rewriter, login response; a differential mux→demux target. Output invariants in every target: emitted NAL types ∈ {1,5,7,8,9}; no emitted NAL contains `00 00 0[0-2]`; re-splitting the Annex-B yields exactly the emitted NALs; any emitted SPS is byte-identical to the last admitted (after rewrite) SPS and its pinned fields equal the first SPS's; any emitted AUD is two bytes; every admitted slice header re-parses, from the whole NAL and with no bound, to lists within §6.1's ceilings (rev 6.1, final review). Rewriter: the output re-parses with every field equal to the input except `level_idc` (never lower than the input's), the VUI's video-signal-type and colour-description fields, with `"restriction"`, `max_num_reorder_frames`, `max_dec_frame_buffering` and `bitstream_restriction_flag`, and, on any level raise of a profile 66/77/88 SPS, `constraint_set3_flag` (`constraint_flags & 0x10`), which the rewriter clears (§6.8 (a); rev 6.1, Plan B D12). 5 s per target per PR, longer nightly. CI-only |
 | L1 sans-IO | `kvm-rdp` | `Pump::step` and `GraphicsPipelineServer` ↔ `GraphicsPipelineClient` in memory (cases below). IronRDP goldens: `encode_avc420_bitmap_stream(full_frame(640,360,22))` bytes and the ResetGraphics monitor bytes — required on every pin bump |
 | L2 full stack | `kvm-rdp` (one test binary) | Bridge + kvm-sim + in-process IronRDP client over loopback (§11.3) |
 | L3 interop | CI, `#[ignore]` test | FreeRDP 3 from the flake (§11.4) |
