@@ -13,5 +13,7 @@
     clippy::as_conversions
 )]
 
+pub mod config;
+
 #[cfg(test)]
 mod pin_goldens;
