@@ -91,8 +91,9 @@ pub struct Policy {
     pub reject_logins: bool,
     /// Answer `av.flv` with this HTTP status instead of a stream.
     pub flv_status: Option<u16>,
-    /// A second concurrent `av.flv` gets 503 (side connections refused).
-    pub refuse_concurrent_flv: bool,
+    /// The next N `av.flv` opens made while another FLV is open get 503
+    /// (side connections refused); each refusal decrements it.
+    pub refuse_concurrent_flv: u32,
     /// Answer the websocket upgrade with this HTTP status.
     pub ws_status: Option<u16>,
     /// Stop reading websockets (the bridge's writes back up).

@@ -6,11 +6,11 @@
 //! the bridge's L2/L3 tests and kvm-bench can assert on it. It replays
 //! committed fixtures only, never KVM captures.
 
-// av.flv (Tasks 8.4, 8.5) and the websocket (Task 8.6) are the remaining
-// users of `encoder`, `http`'s av.flv helpers and `state`.
+// av.flv's faults (Task 8.5) read `encoder::Item::Fault`; the websocket
+// (Task 8.6) is the last user of `state`.
 #[allow(dead_code)]
 mod encoder;
-#[allow(dead_code)]
+mod flv;
 mod http;
 mod source;
 #[allow(dead_code)]
@@ -194,11 +194,13 @@ struct ConnCtx {
     shared: Arc<Shared>,
     acceptor: TlsAcceptor,
     password: String,
+    enc: EncoderHandle,
+    profile: Profile,
 }
 
-/// One accepted connection: TLS, then its port's service. `av.flv` is Task
-/// 8.4's and the websocket Task 8.6's; until then both ports answer 404.
-async fn serve_connection(kind: PortKind, tcp: TcpStream, _conn: u64, ctx: Arc<ConnCtx>) {
+/// One accepted connection: TLS, then its port's service. The websocket is
+/// Task 8.6's; until then the control port answers 404.
+async fn serve_connection(kind: PortKind, tcp: TcpStream, conn: u64, ctx: Arc<ConnCtx>) {
     let Ok(Ok(mut tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, ctx.acceptor.accept(tcp)).await
     else {
         return;
@@ -209,7 +211,11 @@ async fn serve_connection(kind: PortKind, tcp: TcpStream, _conn: u64, ctx: Arc<C
     };
     match kind {
         PortKind::Web => web::serve(tls, req, &ctx.shared, &ctx.password).await,
-        PortKind::Video | PortKind::Control => {
+        PortKind::Video => {
+            let (shared, enc) = (ctx.shared.clone(), ctx.enc.clone());
+            flv::serve(tls, req, conn, shared, enc, ctx.profile).await;
+        }
+        PortKind::Control => {
             let _ = http::respond(&mut tls, 404, "text/plain", b"not yet").await;
         }
     }
@@ -242,6 +248,8 @@ impl KvmSim {
             shared: shared.clone(),
             acceptor: id.acceptor,
             password: cfg.password.clone(),
+            enc: enc.clone(),
+            profile: cfg.profile,
         });
         let next_conn = Arc::new(AtomicU64::new(1));
         for (listener, kind) in [
