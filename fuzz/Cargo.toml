@@ -1,0 +1,88 @@
+# Fuzz targets for kvm-proto (spec §4.1, §11.2): a separate cargo workspace
+# on a pinned nightly (rust-toolchain.toml here), fuzzed only by
+# scripts/fuzz.sh in CI (§13) — never by `cargo test`, never on a dev host.
+# Each target is a one-liner over kvm_proto::fuzzing, which holds the bodies
+# and their output invariants (and is exercised on stable by kvm-proto's own
+# tests).
+[package]
+name = "kvm-proto-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4.13"
+kvm-proto = { path = "../crates/kvm-proto", features = ["fuzzing"] }
+
+[profile.release]
+debug = "line-tables-only"
+
+[[bin]]
+name = "flv_demux"
+path = "fuzz_targets/flv_demux.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "admission"
+path = "fuzz_targets/admission.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "avcc"
+path = "fuzz_targets/avcc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sps_rewrite"
+path = "fuzz_targets/sps_rewrite.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pps"
+path = "fuzz_targets/pps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sanitize"
+path = "fuzz_targets/sanitize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "slice"
+path = "fuzz_targets/slice.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "login"
+path = "fuzz_targets/login.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mux_demux"
+path = "fuzz_targets/mux_demux.rs"
+test = false
+doc = false
+bench = false

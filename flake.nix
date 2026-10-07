@@ -21,10 +21,15 @@
         extensions = [ "rust-src" ];
       };
 
+      # fuzz/ only (spec §4.1): libFuzzer + AddressSanitizer need nightly.
+      # Pinned to a date present in flake.lock's rust-overlay, and the same
+      # date as fuzz/rust-toolchain.toml.
+      fuzzToolchain = pkgs.rust-bin.nightly."2026-10-01".minimal;
+
       # §13 cargo wrapper: cap CPU/IO/memory and nice the whole build.
       # Falls back to plain `nice` when there is no user systemd (e.g. CI).
-      cargoWrapper = pkgs.writeShellScriptBin "cargo" ''
-        real=${rustToolchain}/bin/cargo
+      cargoWrapper = toolchain: pkgs.writeShellScriptBin "cargo" ''
+        real=${toolchain}/bin/cargo
         if ${pkgs.systemd}/bin/systemctl --user show-environment >/dev/null 2>&1; then
           exec ${pkgs.systemd}/bin/systemd-run --user --scope -q \
             -p CPUWeight=20 -p IOWeight=20 -p MemoryMax=8G \
@@ -42,25 +47,42 @@
       '';
     in
     {
-      devShells.${system}.default = pkgs.mkShell {
-        # cargoWrapper first so its `cargo` shadows the toolchain's on PATH.
-        packages = [
-          cargoWrapper
-          rustToolchain
-          pkgs.cmake
-          pkgs.pkg-config
-          pkgs.ffmpeg-full
-          pkgs.jq
-          pkgs.bubblewrap
-          pkgs.openssl # census step 2: `openssl s_client -brief` per TLS port
-        ];
+      devShells.${system} = {
+        default = pkgs.mkShell {
+          # cargoWrapper first so its `cargo` shadows the toolchain's on PATH.
+          packages = [
+            (cargoWrapper rustToolchain)
+            rustToolchain
+            pkgs.cmake
+            pkgs.pkg-config
+            pkgs.ffmpeg-full
+            pkgs.jq
+            pkgs.bubblewrap
+            pkgs.openssl # census step 2: `openssl s_client -brief` per TLS port
+          ];
 
-        KVM_RDP_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
+          KVM_RDP_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";
 
-        shellHook = ''
-          ${sharedTarget}
-          echo "kvm-rdp devshell: $(${rustToolchain}/bin/rustc --version)"
-        '';
+          shellHook = ''
+            ${sharedTarget}
+            echo "kvm-rdp devshell: $(${rustToolchain}/bin/rustc --version)"
+          '';
+        };
+
+        # `nix develop .#fuzz`: nightly + cargo-fuzz, same §13 wrapper. Only to
+        # reproduce a CI fuzz crash (`cargo fuzz run --fuzz-dir fuzz --target-dir "$CARGO_TARGET_DIR/fuzz-build" -a T ARTIFACT`, the flags CI uses):
+        # fuzzing itself runs in CI only (spec §13).
+        fuzz = pkgs.mkShell {
+          packages = [
+            (cargoWrapper fuzzToolchain)
+            fuzzToolchain
+            pkgs.cargo-fuzz
+          ];
+          shellHook = ''
+            ${sharedTarget}
+            echo "kvm-rdp fuzz shell: $(${fuzzToolchain}/bin/rustc --version)"
+          '';
+        };
       };
     };
 }

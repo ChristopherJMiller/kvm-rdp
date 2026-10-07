@@ -1,0 +1,5 @@
+# fuzz/ only: libFuzzer + AddressSanitizer need nightly (spec §4.1). The same
+# date as flake.nix's `fuzzToolchain` and CI's fuzz job.
+[toolchain]
+channel = "nightly-2026-10-01"
+profile = "minimal"

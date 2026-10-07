@@ -44,3 +44,9 @@ spikes/legc-rdpgw/gomod/
 # generated .rdp files carry a live PAA gateway token
 spikes/legc-rdpgw/**/*.rdp
 /legc.rdp
+
+# fuzzing (scripts/fuzz.sh): crash artifacts stay local until triaged; the
+# corpus and seeds live under the shared target dir, never in the repo
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
