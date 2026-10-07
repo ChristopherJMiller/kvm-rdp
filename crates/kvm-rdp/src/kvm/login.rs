@@ -12,7 +12,8 @@ use kvm_proto::{LoginError, Token, parse_login_token};
 use serde::Serialize;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// A login response body larger than this is refused unread (§9.2).
+/// A login response body is read only up to this many bytes; the first
+/// byte past it ends the read and refuses the login (§9.2, M2).
 pub const MAX_LOGIN_BODY: usize = 64 * 1024;
 /// hyper's read buffer for a KVM response head (login and FLV): a hostile
 /// header is refused once this much is buffered — hyper's default is
@@ -91,7 +92,10 @@ async fn login_inner(
     let bytes = read_capped(resp.into_body(), MAX_LOGIN_BODY).await?;
     parse_login_token(&bytes).map_err(|e| match e {
         LoginError::ResultNotOk => KvmError::Auth,
-        _ => KvmError::Protocol("login body"),
+        LoginError::NoResult
+        | LoginError::NotUtf8
+        | LoginError::NoToken
+        | LoginError::BadTokenFormat => KvmError::Protocol("login body"),
     })
 }
 
@@ -196,6 +200,16 @@ mod tests {
         EndlessBody,
         HugeHeader,
         Silent,
+        /// PC5 fix round 1, I1: `200` with an empty body — no `"result"`
+        /// field at all, so this must not be classified as a rejected
+        /// login.
+        EmptyOk,
+        /// PC5 fix round 1, I1: `200` with a non-JSON HTML body (a "busy"
+        /// page, say) — same as `EmptyOk`, no `"result"` field.
+        Html,
+        /// PC5 fix round 1, I2: an arbitrary HTTP status with an empty
+        /// body.
+        Status(u16),
     }
 
     /// A plain-HTTP KVM (scheme `http`, §3.2's diagnosis option) that
@@ -225,6 +239,26 @@ mod tests {
                             let _ = s.write_all(&h).await;
                         }
                         Hostile::Silent => tokio::time::sleep(Duration::from_secs(30)).await,
+                        Hostile::EmptyOk => {
+                            let _ = s
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+                                )
+                                .await;
+                        }
+                        Hostile::Html => {
+                            let body: &[u8] = b"<html>busy</html>";
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = s.write_all(head.as_bytes()).await;
+                            let _ = s.write_all(body).await;
+                        }
+                        Hostile::Status(code) => {
+                            let head = format!("HTTP/1.1 {code} X\r\nContent-Length: 0\r\n\r\n");
+                            let _ = s.write_all(head.as_bytes()).await;
+                        }
                     }
                 });
             }
@@ -241,12 +275,25 @@ mod tests {
     /// `login_timeout` and carries no device text; the 64 KiB header is
     /// refused at `MAX_RESPONSE_HEAD` (16 KiB; hyper's ~408 KiB default
     /// would accept it), the endless body at `MAX_LOGIN_BODY` (64 KiB).
+    ///
+    /// PC5 fix round 1: `EmptyOk`/`Html` (I1) are a CGI hiccup, not a
+    /// rejected login — a present `"result"` is required for `Auth`, so
+    /// both come back `Protocol("login body")`, class Transient, and are
+    /// retried rather than ending the session fatally. `Status` (I2) pins
+    /// the 401/403 → `Auth` arm (and a non-auth status's `Http` mapping) —
+    /// deleting that arm now fails this test (see the report's "prove it
+    /// bites" note).
     #[tokio::test]
     async fn hostile_login_responses_are_bounded() {
         for (mode, want) in [
             (Hostile::EndlessBody, KvmError::Protocol("body too large")),
             (Hostile::HugeHeader, KvmError::Protocol("response")),
             (Hostile::Silent, KvmError::Timeout("login")),
+            (Hostile::EmptyOk, KvmError::Protocol("login body")),
+            (Hostile::Html, KvmError::Protocol("login body")),
+            (Hostile::Status(401), KvmError::Auth),
+            (Hostile::Status(403), KvmError::Auth),
+            (Hostile::Status(503), KvmError::Http(503)),
         ] {
             let ep = hostile(mode).await;
             let t = Instant::now();
