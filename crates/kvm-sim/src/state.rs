@@ -261,7 +261,8 @@ impl Shared {
     }
 
     /// Wait until `pred` holds over the event log, or `timeout`; either way
-    /// the result carries the log as `pred` last saw it, brought up to date.
+    /// the result carries the log brought up to date after `pred` last ran —
+    /// on `Ok`, at least every event `pred` could have observed (N1).
     ///
     /// `pred` runs on a snapshot with the lock released, so it may call the
     /// sim itself — `|_| sim.stats().frames_sent > n` is the natural L2
@@ -284,6 +285,9 @@ impl Shared {
             let notified = self.changed.notified();
             self.catch_up(&mut seen);
             if pred(&seen) {
+                // The predicate may have read counters bumped by events
+                // recorded after the snapshot (N1): return them too.
+                self.catch_up(&mut seen);
                 return Ok(seen);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
@@ -323,5 +327,25 @@ mod tests {
         shared.frame_dropped();
         let woke = tokio::time::timeout(Duration::from_secs(1), waiter).await;
         assert!(matches!(woke, Ok(Ok(true))), "{woke:?}");
+    }
+
+    /// N1 (Plan B final review): an event recorded after `wait_for`'s
+    /// snapshot but before its predicate reads the counters is in the
+    /// returned log. The predicate records it itself, which forces the race.
+    #[tokio::test]
+    async fn wait_for_returns_at_least_what_its_predicate_saw() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let shared = Arc::new(Shared::default());
+        let s = shared.clone();
+        let recorded = AtomicBool::new(false);
+        let log = shared
+            .wait_for(Duration::from_secs(5), |_| {
+                if !recorded.swap(true, Ordering::SeqCst) {
+                    s.record(SimEvent::FlvOpen { conn: 7 });
+                }
+                s.stats().flv_open == 1
+            })
+            .await;
+        assert_eq!(log, Ok(vec![SimEvent::FlvOpen { conn: 7 }]));
     }
 }

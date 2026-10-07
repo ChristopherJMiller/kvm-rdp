@@ -131,8 +131,9 @@ pub enum Fault {
 }
 
 /// How kvm-sim stamps FLV tags (final review I2). Admission marks an AU
-/// `burst` when its stamp runs more than 100 ms ahead of its receive time,
-/// both measured from the connection's first coded tag (§6.2), and §6.5/§6.6
+/// `burst` when its stamp runs more than 100 ms further ahead of its receive
+/// time than the median delivery of the last second on that connection
+/// (§6.2, rev 6.2), and §6.5/§6.6
 /// treat burst AUs differently — exempt from the soft gate, chunked by
 /// `burst_chunk`, counted against the hard cap — so the stamps decide which
 /// path a test exercises.
@@ -142,7 +143,8 @@ pub enum Timestamps {
     /// cadence. Under [`Pacing::RealTime`] that tracks the wall clock. Under
     /// [`Pacing::Manual`] it does not: [`KvmSim::advance`] writes its frames
     /// back to back while their stamps step 33 ms apart, so nearly every AU
-    /// is a burst (the final review saw 282 of 290) — the source-burst path.
+    /// is a burst (all but the first six of a batch, rev 6.2) — the
+    /// source-burst path.
     #[default]
     FrameCount,
     /// Milliseconds since this FLV connection opened, read from the wall
@@ -369,10 +371,10 @@ impl KvmSim {
     }
     /// `Pacing::Manual`: encode `frames` frames now; every open FLV writes
     /// them back to back. Under the default [`Timestamps::FrameCount`] their
-    /// stamps still step 33 ms apart, so every AU more than 100 ms (three
-    /// frames) ahead of the wall clock since the connection's first coded
-    /// tag arrives as a `burst` — with back-to-back calls, every AU from the
-    /// fifth on. [`Timestamps::WallClock`] stamps them as live instead.
+    /// stamps still step 33 ms apart, so within one batch every AU more than
+    /// 100 ms further ahead than the median of the batch before it arrives
+    /// as a `burst` — every AU from the seventh on. [`Timestamps::WallClock`]
+    /// stamps them as live instead.
     pub fn advance(&self, frames: u32) {
         self.enc.advance(frames);
     }

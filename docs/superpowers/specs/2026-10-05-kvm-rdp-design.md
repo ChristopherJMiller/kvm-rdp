@@ -9,8 +9,10 @@
 | Companion spec | Deployment, gateway, edge gating and KVM isolation live in `luma-homeops` (separate spec, written after Milestone 0). §9.4 lists what this spec requires of it |
 
 **Rev 6.2 — Plan C (in progress, 2026-10-07).** Burst marking uses a
-sliding median baseline (§6.2; Plan B's final review I3). Plan C's last
-task completes this revision.
+sliding median baseline (§6.2; Plan B's final review I3); kvm-sim's
+`wait_for` returns every event its predicate could have seen, and §11.5's
+source-burst wording is fixed (N1, N2). Plan C's last task completes this
+revision.
 
 **Rev 6.1 — Plan B (2026-10-06).** Records what building Milestones 1 and 2
 settled: POC type 1 is refused (§6.1); trailing zero bytes are trimmed from
@@ -1607,8 +1609,9 @@ questions belong to L5.
   the soft gate. `Timestamps::WallClock` stamps each tag with the time
   since its FLV connection opened instead, so no AU is a burst: a
   manual-paced L2 case of the live path (soft gate, stall, flow causes)
-  uses it, and a source-burst case keeps the default or
-  `burst_on_connect`.
+  uses it, and a source-burst case keeps the default `FrameCount` (with
+  `burst_on_connect` for a replay on connect) — under `WallClock` a replay
+  is stamped live (rev 6.2).
 - `KvmSim::wait_for` runs its predicate with no lock held, so the
   predicate may read the sim (`sim.stats()`), and re-runs it after every
   event and counter change (rev 6.1, final review).

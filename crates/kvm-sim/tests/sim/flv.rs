@@ -579,9 +579,10 @@ async fn manual_pacing_bursts_with_frame_count_stamps_and_never_with_wall_clock_
             Timestamps::FrameCount => {
                 let cadence: Vec<u32> = (0..FRAMES).map(|k| k * 1000 / 30).collect();
                 assert_eq!(stamped, cadence);
-                // AU k is 33·k ms ahead of the first; past 100 ms of real
-                // time it is a burst. Every AU from the 11th on is, unless
-                // reading ten tags took over 233 ms (the review: 282/290).
+                // AU k's delay is 33·k ms below the first's, less the read
+                // time; more than 100 ms below the median of those before
+                // it is a burst (§6.2, rev 6.2) — every AU from the seventh
+                // on when the tags are read back to back (24 of 30).
                 assert!(bursts >= 20, "{bursts} of {FRAMES} bursts");
             }
             Timestamps::WallClock => {
