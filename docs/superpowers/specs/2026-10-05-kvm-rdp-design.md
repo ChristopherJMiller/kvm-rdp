@@ -30,6 +30,10 @@ limited-range BT.709 pixels under the ES3's mislabels (§11.5); and the
 IronRDP fork pin moves to `kvm-rdp-egfx-patches-v2`, rebased onto upstream
 `2c08bda7` (§4.2).
 
+**Rev 6.1 — Plan B's final review (2026-10-07).** Slice-header lists are
+bounded as they are read, from the NAL's first 4 KiB, and the AUD is
+checked like a slice header (§6.1, §6.2, §9.3).
+
 **Rev 6 — census-filled (2026-10-06).** Fills every census-dependent value
 from `docs/census.md` — Leg A, Leg B (direct) and Leg C (through rdpgw
 `16cdaaf`) — and records the Milestone 0 verdict: **go for passthrough**
@@ -500,7 +504,16 @@ SPS as sent fails them.
   `pic_scaling_matrix_present_flag == 0` (the ES3 has none, `census.md`).
 - **Slice headers**: `slice_type ∈ {0, 2, 5, 7}` (P and I only); `pps_id` refers
   to a validated PPS; `first_mb_in_slice < PicSizeInMbs`; POC strictly
-  increasing in decode order within a GOP.
+  increasing in decode order within a GOP. Lists are bounded (rev 6.1,
+  final review): at most 16 active references
+  (`num_ref_idx_lX_active_minus1` ≤ 15, frames only), at most
+  `num_ref_idx_lX_active_minus1 + 1` `ref_pic_list_modification` entries
+  per list (H.264 7.4.3.1) and at most 66 memory-management operations
+  (ffmpeg's `MAX_MMCO_COUNT`) — refused as each list is read, so a hostile
+  header never costs memory in proportion to its length. The header is
+  read from the NAL's first 4 KiB only: the longest conforming header §6.1
+  can admit is about 1 KiB on the wire, so one that does not fit is
+  unparsable.
 
 **The ES3's stream** (`census.md`, Leg A — stream; 1920×1080 at 30 fps, the
 only preset measured). These are the values kvm-sim's ES3 profile, the
@@ -565,6 +578,11 @@ resync scanning.
   never ends in `00`, and the ES3 appends them to its SPS and PPS
   (`census.md` `sps_hex`, `pps_hex`).
 - At most one AUD per tag, before any slice (rev 6.1); §6.3 sends it first.
+  It reaches the client verbatim, so it is checked like a slice header (rev
+  6.1, final review): exactly `access_unit_delimiter_rbsp` — two bytes once
+  trimmed, `primary_pic_type` then the stop bit — with a `primary_pic_type`
+  whose Table 7-5 set holds every slice type in the tag (7.4.2.4); anything
+  else is `stream_incompatible`.
 - Limits: tag 4 MiB, 128 NALs per AU, 4 SPS, 16 PPS — the SPS/PPS limits
   bound a config record and, separately, each NALU tag's in-band sets: a
   fifth SPS or seventeenth PPS in one tag is a framing violation, refused
@@ -912,7 +930,7 @@ all.
 | Transient (websocket) | websocket close or oversize message; a write exceeding `hid_write_timeout` | Reconnect with `kvm.backoff`; the session-start sequence; no NeedIdr |
 | Auth | login rejected; HTTP 401/403 or `result: 403` on FLV/WS — e.g. after any session's logout, which is global (§3.2). Side FLVs are excluded (§6.5) | Re-login once (the only time the bridge logs in again within a session, §5.1). A second consecutive failure, with no successful re-login in between, is fatal: `kvm_auth_failed` |
 | Certificate | SPKI mismatch | Fatal immediately, no login sent: `kvm_cert_mismatch` |
-| Stream-incompatible | HEVC; B-frames (including a `CompositionTime` change); outside §6.1 limits; a pinned field changes; a slice/PPS check fails; an SPS the rewriter cannot read or verify (§6.8) | Fatal immediately: `stream_incompatible` |
+| Stream-incompatible | HEVC; B-frames (including a `CompositionTime` change); outside §6.1 limits; a pinned field changes; a slice, PPS or AUD check fails; an SPS the rewriter cannot read or verify (§6.8) | Fatal immediately: `stream_incompatible` |
 | Framing violation | bad header, encrypted tag, `StreamID ≠ 0`, bad `PrevTagSize`, oversize tag, start code in a NAL, NAL limits, NALU before any sequence header, a tag that is not one picture (§6.2) | Transient (FLV reconnect, `parse_errors{kind}`); three within 60 s is fatal: `stream_corrupt` |
 | Deadline | No successful login within `upstream_deadline` of `on_connection_info`; or no FLV tag within `upstream_deadline` of the first FLV open, or since the FLV connection was lost, despite reconnecting | Fatal: `kvm_unreachable` |
 
@@ -1138,7 +1156,7 @@ pasted text are never logged (§4.5). Secrets come only from files (§4.4).
 | Threat | Mitigation | Residual |
 |---|---|---|
 | Hostile FLV/H.264 attacks the bridge | Hardened, fuzzed parsers in `kvm-proto` with output invariants; no C decoder in the bridge; size limits checked before buffering | Bugs in `h264-reader` |
-| Hostile video attacks the **laptop's decoder** | NAL allowlist; start-code check; SPS, PPS and slice headers limit-checked | **Slice data cannot be sanitised without decoding.** A compromised KVM could target the laptop's hardware decoder. Accepted for v1; the answer is containment |
+| Hostile video attacks the **laptop's decoder** | NAL allowlist; start-code check; SPS, PPS, AUD and slice headers limit-checked, slice-header lists bounded as they are read (§6.1) | **Slice data cannot be sanitised without decoding.** A compromised KVM could target the laptop's hardware decoder. Accepted for v1; the answer is containment |
 | Compromised KVM records input | — | Every keystroke and paste through the bridge — including passwords typed into the Mac — is visible to a compromised KVM. Accepted explicitly. Don't paste secrets through the bridge |
 | Compromised KVM injects keystrokes on its own | Factory reset (or reflash, if a vendor image exists) before first use and after isolation lands; power the KVM or its USB link off when not in use; alert on the router's NO-WAN drop rule (forward rule 120, `NO-WAN-v4`) and on KVM-originated LAN flows (companion spec) | Isolation limits who can reach the KVM, not what it does |
 | Anyone who can reach the KVM types into the Mac (port 8888 is the CVE port) | WAN egress blocked; isolation (§9.4) | Until isolation lands, the LAN, the tailnet, and every galaxy pod and hostNetwork process can reach :8888/:8889 |
@@ -1329,7 +1347,7 @@ frame (`alloc-stats` builds).
 | Tier | Where | What |
 |---|---|---|
 | L0 unit | `kvm-proto` | Goldens (HID encoders, scancode table, AVCC→Annex-B, SPS fields); SPS rewriter goldens: the ES3's SPS (`census.md` `sps_hex`) → `level_idc` 40, VUI full-range 0, colour 1/1/1 and `bitstream_restriction` added (`max_num_reorder_frames` 0, `max_dec_frame_buffering` 1), emulation prevention re-applied, and the output accepted by h264-reader; a level that already admits the size is never lowered; an SPS already labelled BT.709 limited, at an adequate level and carrying `bitstream_restriction` is byte-identical; a re-serialisation that produces `00 00 0[0-3]` gains an emulation-prevention byte; with `"restriction"`, `bitstream_restriction` already present is kept; an unreadable SPS → `stream_incompatible`; `CompositionTime` constant (16) is admitted and a change refused; FLV mux→demux round-trip property tests; parse of a committed ffmpeg-muxed FLV; burst marking; mouse scaling at the edges; **one hostile vector per §6.1/§6.2 rule, each asserting its specific error kind**; SPS-change classification per §6.1's table; a pre-buffer test (`DataSize = 0xFFFFFF` rejected after ≤ 11 bytes, nothing reserved); sans-IO cores with injected clock (release epoch and released-by-bridge rule, both key timers including two keys held with repeats of the second only → no release, backoff, paste pacing and text handling, debounce) |
-| L0 fuzz | `fuzz/` | FLV demux, AVCC, sanitiser, SPS/PPS/slice checks, SPS rewriter, login response; a differential mux→demux target. Output invariants in every target: emitted NAL types ∈ {1,5,7,8,9}; no emitted NAL contains `00 00 0[0-2]`; re-splitting the Annex-B yields exactly the emitted NALs; any emitted SPS is byte-identical to the last admitted (after rewrite) SPS and its pinned fields equal the first SPS's. Rewriter: the output re-parses with every field equal to the input except `level_idc` (never lower than the input's), the VUI's video-signal-type and colour-description fields, and, with `"restriction"`, `max_num_reorder_frames`, `max_dec_frame_buffering` and `bitstream_restriction_flag`. 5 s per target per PR, longer nightly. CI-only |
+| L0 fuzz | `fuzz/` | FLV demux, AVCC, sanitiser, SPS/PPS/slice checks, SPS rewriter, login response; a differential mux→demux target. Output invariants in every target: emitted NAL types ∈ {1,5,7,8,9}; no emitted NAL contains `00 00 0[0-2]`; re-splitting the Annex-B yields exactly the emitted NALs; any emitted SPS is byte-identical to the last admitted (after rewrite) SPS and its pinned fields equal the first SPS's; any emitted AUD is two bytes; every admitted slice header re-parses, from the whole NAL and with no bound, to lists within §6.1's ceilings (rev 6.1, final review). Rewriter: the output re-parses with every field equal to the input except `level_idc` (never lower than the input's), the VUI's video-signal-type and colour-description fields, and, with `"restriction"`, `max_num_reorder_frames`, `max_dec_frame_buffering` and `bitstream_restriction_flag`. 5 s per target per PR, longer nightly. CI-only |
 | L1 sans-IO | `kvm-rdp` | `Pump::step` and `GraphicsPipelineServer` ↔ `GraphicsPipelineClient` in memory (cases below). IronRDP goldens: `encode_avc420_bitmap_stream(full_frame(640,360,22))` bytes and the ResetGraphics monitor bytes — required on every pin bump |
 | L2 full stack | `kvm-rdp` (one test binary) | Bridge + kvm-sim + in-process IronRDP client over loopback (§11.3) |
 | L3 interop | CI, `#[ignore]` test | FreeRDP 3 from the flake (§11.4) |

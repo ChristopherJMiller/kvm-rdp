@@ -10,7 +10,7 @@
 
 use crate::flv::FlvError;
 use crate::h264::SpsIncompatibleReason;
-use crate::h264::picture::SliceRefusal;
+use crate::h264::picture::{AudRefusal, SliceRefusal};
 use crate::h264::pps::PpsRefusal;
 use crate::h264::rewrite::RewriteError;
 use crate::h264::sanitize::NalRefusal;
@@ -48,6 +48,8 @@ pub enum Incompatible {
     Sps(SpsIncompatibleReason),
     Pps(PpsRefusal),
     Slice(SliceRefusal),
+    /// The access unit delimiter is malformed or does not fit the picture.
+    Aud(AudRefusal),
 }
 
 /// Why a tag was refused, by §6.9 class.
@@ -90,6 +92,7 @@ impl AdmissionError {
                 Incompatible::Sps(_) => "sps",
                 Incompatible::Pps(_) => "pps",
                 Incompatible::Slice(_) => "slice",
+                Incompatible::Aud(_) => "aud",
             },
         }
     }
@@ -143,6 +146,7 @@ mod tests {
             )),
             incompatible(Incompatible::Pps(PpsRefusal::SliceGroups)),
             incompatible(Incompatible::Slice(SliceRefusal::SliceType(1))),
+            incompatible(Incompatible::Aud(AudRefusal::Malformed)),
         ];
         let mut kinds: Vec<&str> = all.iter().map(AdmissionError::kind).collect();
         kinds.sort_unstable();

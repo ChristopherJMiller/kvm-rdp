@@ -1,5 +1,6 @@
 //! §6.1 slice-header checks and the decode-order POC rule, on top of
-//! h264-reader's slice-header parser with the admitted SPS and PPSs.
+//! h264-reader's slice-header parser with the admitted SPS and PPSs; and
+//! §6.2's access unit delimiter, checked against the picture's slices.
 #![deny(
     clippy::indexing_slicing,
     clippy::unwrap_used,
@@ -11,17 +12,21 @@
 
 use crate::h264::{parse_slice_header_prefix, slice_type_allowed};
 use h264_reader::Context;
+use h264_reader::nal::pps::PicParameterSet;
 use h264_reader::nal::slice::{
-    DecRefPicMarking, MemoryManagementControlOperation, PicOrderCountLsb, SliceHeader,
+    DecRefPicMarking, MemoryManagementControlOperation, ModificationOfPicNums, NumRefIdxActive,
+    PicOrderCountLsb, RefPicListModifications, SliceHeader,
 };
 use h264_reader::nal::sps::{PicOrderCntType, SeqParameterSet};
 use h264_reader::nal::{Nal as _, RefNal};
+use h264_reader::rbsp::{BitRead, BitReaderError, Integer, Primitive};
 
 /// Why a slice was refused (`stream_incompatible`, §6.9).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SliceRefusal {
     /// h264-reader could not parse the header (its error, as text) — this
-    /// includes a `pic_parameter_set_id` with no admitted PPS.
+    /// includes a `pic_parameter_set_id` with no admitted PPS, and a header
+    /// that does not fit in [`SLICE_HEADER_BOUND`] bytes.
     Unparsable(String),
     /// `slice_type` not in `{0, 2, 5, 7}`: B, SP or SI (§6.1 admits P and I).
     SliceType(u32),
@@ -31,12 +36,90 @@ pub enum SliceRefusal {
     PocNotIncreasing { previous: i64, current: i64 },
     /// POC type 1 is refused by the SPS limits; never reaches here.
     PocType1,
+    /// A list or count in the header past what H.264 allows (§6.1, §9.3;
+    /// final review I1).
+    HeaderLimits(HeaderLimit),
+}
+
+/// Bytes of a slice NAL its header is parsed from (§6.1; final review I1).
+/// The rest is slice data, which nothing here reads.
+///
+/// The longest *conforming* header §6.1 can admit — 36 864 MBs (4096×2304),
+/// an 8-bit 4:2:0 frame, one slice group, P or I, with every field at the
+/// widest value its semantics allow and every list at its ceiling (16
+/// modifications, a 16-reference weight table with chroma, 66 three-field
+/// MMCOs) — is 5 604 bits, 701 bytes of RBSP. Emulation prevention adds at
+/// most one byte per two, so with the NAL header byte that is at most
+/// 1 053 bytes on the wire (and 1 473 bytes even with field coding's 32
+/// references, which §6.1 does not admit). 4 KiB covers it nearly four
+/// times over; x264's and the ES3's headers are under 20 bytes. A header
+/// that does not fit is non-conforming and refused as `Unparsable`.
+pub const SLICE_HEADER_BOUND: usize = 4096;
+
+/// A slice-header list or count past what H.264 allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderLimit {
+    /// `num_ref_idx_lX_active_minus1` above 15: a frame slice has at most
+    /// 16 active references (7.4.3), and §6.1 admits frames only.
+    NumRefIdx(u32),
+    /// More entries in `ref_pic_list_modification` list `list` (0 or 1)
+    /// than `max`: `num_ref_idx_lX_active_minus1 + 1` (7.4.3.1), or 16 —
+    /// the most any admitted slice can have — when the list is cut off
+    /// while it is still being read.
+    RefPicListModifications { list: u8, max: u32 },
+    /// More than 66 `memory_management_control_operation`s (ffmpeg's
+    /// `MAX_MMCO_COUNT`).
+    Mmco,
+}
+
+/// Most active references, hence most modifications per list, in a frame
+/// slice (7.4.3: `num_ref_idx_lX_active_minus1` ≤ 15).
+const MAX_REFS: u32 = 16;
+/// Most memory-management operations in one header (ffmpeg's
+/// `MAX_MMCO_COUNT`).
+const MAX_MMCO: u32 = 66;
+
+/// Why an access unit delimiter was refused (`stream_incompatible`, §6.9;
+/// PB10 m2, folded into final review I1). The AUD reaches the client's
+/// decoder (§6.3), so it is checked like a slice header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudRefusal {
+    /// Not exactly `access_unit_delimiter_rbsp` (7.3.2.4): the NAL header,
+    /// then one byte of `primary_pic_type`, the stop bit and four zero bits.
+    Malformed,
+    /// This `primary_pic_type`'s Table 7-5 set does not hold every slice
+    /// type in the picture (7.4.2.4).
+    PrimaryPicType(u8),
+}
+
+/// The `primary_pic_type` of an AUD that is exactly
+/// `access_unit_delimiter_rbsp`. `aud` is a §6.2-trimmed NAL: the stop bit
+/// keeps its payload byte non-zero, so a well-formed AUD is two bytes.
+pub fn aud_primary_pic_type(aud: &[u8]) -> Result<u8, AudRefusal> {
+    match aud {
+        [_, payload] if payload & 0x1F == 0x10 => Ok(payload.wrapping_shr(5)),
+        _ => Err(AudRefusal::Malformed),
+    }
+}
+
+/// True when `primary_pic_type`'s Table 7-5 set holds every slice type of
+/// a picture that has I slices (`intra`) and/or P slices (`predicted`) —
+/// the only types §6.1 admits.
+#[must_use]
+pub fn primary_pic_type_covers(primary_pic_type: u8, intra: bool, predicted: bool) -> bool {
+    // Table 7-5: 0 I · 1 I, P · 2 I, P, B · 3 SI · 4 SI, SP · 5 I, SI ·
+    // 6 I, SI, P, SP · 7 every type.
+    let has_i = matches!(primary_pic_type, 0 | 1 | 2 | 5 | 6 | 7);
+    let has_p = matches!(primary_pic_type, 1 | 2 | 6 | 7);
+    (!intra || has_i) && (!predicted || has_p)
 }
 
 /// The slice-header fields that identify a picture (7.4.1.2.4) and its POC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SliceInfo {
     pub first_mb_in_slice: u32,
+    /// 0 or 5 (P), 2 or 7 (I): the types §6.1 admits.
+    pub slice_type: u32,
     pub idr: bool,
     pub nal_ref_idc: u8,
     pub pps_id: u8,
@@ -63,9 +146,174 @@ impl SliceInfo {
     }
 }
 
-/// Parse and check one slice NAL (type 1 or 5) against `ctx`.
+/// h264-reader reads both of a slice header's lists until their
+/// terminators, with no count bound (`RefPicListModifications::read_list`,
+/// `DecRefPicMarking::read`), so a hostile header makes it allocate in
+/// proportion to the NAL (final review I1: 87 MB for a 3.3 MB slice). This
+/// reader refuses the entry past each ceiling as it is read, so h264-reader
+/// never holds more than `MAX_REFS` modifications or `MAX_MMCO` operations.
+/// It knows the entries by the syntax-element names h264-reader 0.9 passes;
+/// the tests that refuse an unterminated list and a 67th MMCO pin them.
+struct Budget<R> {
+    inner: R,
+    /// `ref_pic_list_modification_flag`s read so far: the current list + 1.
+    lists: u8,
+    entries: u32,
+    mmco: u32,
+    exceeded: Option<HeaderLimit>,
+}
+
+impl<R: BitRead> Budget<R> {
+    fn new(inner: R) -> Self {
+        Budget {
+            inner,
+            lists: 0,
+            entries: 0,
+            mmco: 0,
+            exceeded: None,
+        }
+    }
+
+    /// Record `limit`; the error stops h264-reader, and `parse_slice`
+    /// reports `limit` instead of it.
+    fn exceed(&mut self, limit: HeaderLimit, name: &'static str) -> BitReaderError {
+        self.exceeded = Some(limit);
+        BitReaderError::ExpGolombTooLarge(name)
+    }
+}
+
+impl<R: BitRead> BitRead for Budget<R> {
+    fn read_ue(&mut self, name: &'static str) -> Result<u32, BitReaderError> {
+        let value = self.inner.read_ue(name)?;
+        match name {
+            // 3 ends the list.
+            "modification_of_pic_nums_idc" if value != 3 => {
+                self.entries = self.entries.saturating_add(1);
+                if self.entries > MAX_REFS {
+                    let limit = HeaderLimit::RefPicListModifications {
+                        list: self.lists.saturating_sub(1),
+                        max: MAX_REFS,
+                    };
+                    return Err(self.exceed(limit, name));
+                }
+            }
+            // 0 ends the list.
+            "memory_management_control_operation" if value != 0 => {
+                self.mmco = self.mmco.saturating_add(1);
+                if self.mmco > MAX_MMCO {
+                    return Err(self.exceed(HeaderLimit::Mmco, name));
+                }
+            }
+            _ => {}
+        }
+        Ok(value)
+    }
+
+    fn read_bit(&mut self, name: &'static str) -> Result<bool, BitReaderError> {
+        let bit = self.inner.read_bit(name)?;
+        if name == "ref_pic_list_modification_flag" {
+            self.lists = self.lists.saturating_add(1);
+            self.entries = 0;
+        }
+        Ok(bit)
+    }
+
+    fn read_se(&mut self, name: &'static str) -> Result<i32, BitReaderError> {
+        self.inner.read_se(name)
+    }
+
+    fn read<const BITS: u32, I: Integer>(
+        &mut self,
+        name: &'static str,
+    ) -> Result<I, BitReaderError> {
+        self.inner.read::<BITS, I>(name)
+    }
+
+    fn read_var<I: Integer>(
+        &mut self,
+        bit_count: u32,
+        name: &'static str,
+    ) -> Result<I, BitReaderError> {
+        self.inner.read_var(bit_count, name)
+    }
+
+    fn read_to<V: Primitive>(&mut self, name: &'static str) -> Result<V, BitReaderError> {
+        self.inner.read_to(name)
+    }
+
+    fn skip(&mut self, bit_count: u32, name: &'static str) -> Result<(), BitReaderError> {
+        self.inner.skip(bit_count, name)
+    }
+
+    fn byte_aligned(&self) -> bool {
+        self.inner.byte_aligned()
+    }
+
+    fn has_more_rbsp_data(&mut self, name: &'static str) -> Result<bool, BitReaderError> {
+        self.inner.has_more_rbsp_data(name)
+    }
+
+    fn finish_rbsp(self) -> Result<(), BitReaderError> {
+        self.inner.finish_rbsp()
+    }
+
+    fn finish_sei_payload(self) -> Result<(), BitReaderError> {
+        self.inner.finish_sei_payload()
+    }
+}
+
+/// §6.1's slice-header counts that need the parsed header: the active
+/// reference counts, and each modification list against its own count.
+fn check_header_limits(sh: &SliceHeader, pps: &PicParameterSet) -> Result<(), SliceRefusal> {
+    let (l0, l1) = match &sh.num_ref_idx_active {
+        None => (
+            pps.num_ref_idx_l0_default_active_minus1,
+            pps.num_ref_idx_l1_default_active_minus1,
+        ),
+        Some(NumRefIdxActive::P {
+            num_ref_idx_l0_active_minus1,
+        }) => (
+            *num_ref_idx_l0_active_minus1,
+            pps.num_ref_idx_l1_default_active_minus1,
+        ),
+        Some(NumRefIdxActive::B {
+            num_ref_idx_l0_active_minus1,
+            num_ref_idx_l1_active_minus1,
+        }) => (*num_ref_idx_l0_active_minus1, *num_ref_idx_l1_active_minus1),
+    };
+    if let Some(&n) = [l0, l1].iter().find(|&&n| n >= MAX_REFS) {
+        return Err(SliceRefusal::HeaderLimits(HeaderLimit::NumRefIdx(n)));
+    }
+    let none: &[ModificationOfPicNums] = &[];
+    let (mods_l0, mods_l1) = match &sh.ref_pic_list_modification {
+        Some(RefPicListModifications::P {
+            ref_pic_list_modification_l0,
+        }) => (ref_pic_list_modification_l0.as_slice(), none),
+        Some(RefPicListModifications::B {
+            ref_pic_list_modification_l0,
+            ref_pic_list_modification_l1,
+        }) => (
+            ref_pic_list_modification_l0.as_slice(),
+            ref_pic_list_modification_l1.as_slice(),
+        ),
+        Some(RefPicListModifications::I) | None => (none, none),
+    };
+    for (list, mods, minus1) in [(0, mods_l0, l0), (1, mods_l1, l1)] {
+        let max = minus1.saturating_add(1);
+        if u32::try_from(mods.len()).map_or(true, |n| n > max) {
+            return Err(SliceRefusal::HeaderLimits(
+                HeaderLimit::RefPicListModifications { list, max },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parse and check one slice NAL (type 1 or 5) against `ctx`. Only its
+/// first [`SLICE_HEADER_BOUND`] bytes are read.
 pub fn parse_slice(ctx: &Context, nal: &[u8]) -> Result<SliceInfo, SliceRefusal> {
     let unparsable = |e: &dyn core::fmt::Debug| SliceRefusal::Unparsable(format!("{e:?}"));
+    let nal = nal.get(..SLICE_HEADER_BOUND).unwrap_or(nal);
     // The slice type is checked from the context-free prefix first, so a B
     // slice is refused as such whatever follows it.
     let prefix = parse_slice_header_prefix(nal).map_err(|e| unparsable(&e))?;
@@ -74,9 +322,13 @@ pub fn parse_slice(ctx: &Context, nal: &[u8]) -> Result<SliceInfo, SliceRefusal>
     }
     let refnal = RefNal::new(nal, &[], true);
     let header = refnal.header().map_err(|e| unparsable(&e))?;
-    let mut bits = refnal.rbsp_bits();
-    let (sh, sps, pps) =
-        SliceHeader::from_bits(ctx, &mut bits, header, None).map_err(|e| unparsable(&e))?;
+    let mut bits = Budget::new(refnal.rbsp_bits());
+    let parsed = SliceHeader::from_bits(ctx, &mut bits, header, None);
+    if let Some(limit) = bits.exceeded {
+        return Err(SliceRefusal::HeaderLimits(limit));
+    }
+    let (sh, sps, pps) = parsed.map_err(|e| unparsable(&e))?;
+    check_header_limits(&sh, pps)?;
     let pic_size_in_mbs = sps
         .pic_width_in_mbs()
         .saturating_mul(sps.pic_height_in_map_units());
@@ -102,6 +354,7 @@ pub fn parse_slice(ctx: &Context, nal: &[u8]) -> Result<SliceInfo, SliceRefusal>
     );
     Ok(SliceInfo {
         first_mb_in_slice: sh.first_mb_in_slice,
+        slice_type: prefix.slice_type,
         idr: sh.idr_pic_id.is_some(),
         nal_ref_idc: header.nal_ref_idc(),
         pps_id: pps.pic_parameter_set_id.id(),
@@ -327,6 +580,142 @@ mod tests {
                 first_mb: 8160,
                 pic_size_in_mbs: 8160
             })
+        );
+    }
+
+    /// A P slice with `n` `ref_pic_list_modification_l0` entries (idc 0,
+    /// `abs_diff_pic_num_minus1` 0) against `ctx`'s PPS (one active
+    /// reference by default).
+    fn mods(n: usize) -> SliceCfg {
+        SliceCfg {
+            ref_list_mods: vec![(0, 0); n],
+            ..SliceCfg::p(1)
+        }
+    }
+
+    fn limit(l: HeaderLimit) -> Result<SliceInfo, SliceRefusal> {
+        Err(SliceRefusal::HeaderLimits(l))
+    }
+
+    /// Final review I1: H.264 7.4.3.1 allows at most
+    /// `num_ref_idx_l0_active_minus1 + 1` modifications per list.
+    #[test]
+    fn modifications_are_bounded_by_the_active_reference_count() {
+        let (ctx, _) = ctx(2);
+        assert!(parse_slice(&ctx, &mods(1).build()).is_ok());
+        assert_eq!(
+            parse_slice(&ctx, &mods(2).build()),
+            limit(HeaderLimit::RefPicListModifications { list: 0, max: 1 })
+        );
+        let four = SliceCfg {
+            num_ref_idx_override: Some(3),
+            ..mods(4)
+        };
+        assert!(parse_slice(&ctx, &four.build()).is_ok());
+        let five = SliceCfg {
+            num_ref_idx_override: Some(3),
+            ..mods(5)
+        };
+        assert_eq!(
+            parse_slice(&ctx, &five.build()),
+            limit(HeaderLimit::RefPicListModifications { list: 0, max: 4 })
+        );
+    }
+
+    /// 7.4.3: `num_ref_idx_l0_active_minus1` is at most 15 in a frame slice,
+    /// and §6.1 admits frames only — so no list ever needs more than 16
+    /// modifications.
+    #[test]
+    fn a_frame_slice_has_at_most_16_active_references() {
+        let (ctx, _) = ctx(2);
+        let sixteen = SliceCfg {
+            num_ref_idx_override: Some(15),
+            ..mods(16)
+        };
+        assert!(parse_slice(&ctx, &sixteen.build()).is_ok());
+        let seventeen = SliceCfg {
+            num_ref_idx_override: Some(16),
+            ..SliceCfg::p(1)
+        };
+        assert_eq!(
+            parse_slice(&ctx, &seventeen.build()),
+            limit(HeaderLimit::NumRefIdx(16))
+        );
+    }
+
+    /// At most 66 memory-management operations, ffmpeg's `MAX_MMCO_COUNT`.
+    #[test]
+    fn mmco_operations_are_bounded_at_66() {
+        let (ctx, _) = ctx(2);
+        let ops = |n: usize| SliceCfg {
+            mmco1: vec![0; n],
+            ..SliceCfg::p(1)
+        };
+        assert!(parse_slice(&ctx, &ops(66).build()).is_ok());
+        assert_eq!(
+            parse_slice(&ctx, &ops(67).build()),
+            limit(HeaderLimit::Mmco)
+        );
+    }
+
+    /// A list is cut off at its ceiling while it is being read, not parsed
+    /// to its end: these 100 entries never terminate, and an unbudgeted
+    /// parse reads on through the slice data into an invalid
+    /// `modification_of_pic_nums_idc` (`Unparsable`) instead. The input is
+    /// under 64 bytes.
+    #[test]
+    fn an_unterminated_list_is_refused_at_the_ceiling_while_it_is_read() {
+        let (ctx, _) = ctx(2);
+        let nal = SliceCfg {
+            terminate_lists: false,
+            ..mods(100)
+        }
+        .build();
+        assert!(nal.len() < 64, "{}", nal.len());
+        assert_eq!(
+            parse_slice(&ctx, &nal),
+            limit(HeaderLimit::RefPicListModifications { list: 0, max: 16 })
+        );
+    }
+
+    /// The header is read from a bounded prefix of the NAL; a slice whose
+    /// data runs far past that prefix still parses.
+    #[test]
+    fn a_slice_far_longer_than_the_header_bound_still_parses() {
+        let (ctx, _) = ctx(2);
+        let nal = SliceCfg {
+            slice_data: vec![0xA5; 64 * 1024],
+            ..mods(1)
+        }
+        .build();
+        assert!(nal.len() > 16 * SLICE_HEADER_BOUND);
+        assert_eq!(parse_slice(&ctx, &nal), Ok(slice(&ctx, &mods(1))));
+    }
+
+    /// Only the first `SLICE_HEADER_BOUND` bytes are read. After the header,
+    /// a one bit and a run of zero bits look like `rbsp_trailing_bits` until
+    /// the 0xA5 after them: within the bound that byte is "more RBSP data"
+    /// and the header parses; past it, the header seems to overrun the RBSP.
+    #[test]
+    fn only_the_first_4_kib_of_a_slice_are_read() {
+        let (ctx, _) = ctx(2);
+        let with_zeros = |zeros: usize| {
+            SliceCfg {
+                slice_data: [vec![0x80], vec![0; zeros], vec![0xA5]].concat(),
+                ..SliceCfg::p(1)
+            }
+            .build()
+        };
+        let inside = with_zeros(2000);
+        assert!(inside.len() < SLICE_HEADER_BOUND, "{}", inside.len());
+        assert!(parse_slice(&ctx, &inside).is_ok());
+        let past = with_zeros(4000);
+        // Its one bits after the 0x80 are all in its last three bytes.
+        assert!(past.len() > SLICE_HEADER_BOUND + 3, "{}", past.len());
+        let r = parse_slice(&ctx, &past);
+        assert!(
+            matches!(&r, Err(SliceRefusal::Unparsable(e)) if e.contains("overran")),
+            "{r:?}"
         );
     }
 

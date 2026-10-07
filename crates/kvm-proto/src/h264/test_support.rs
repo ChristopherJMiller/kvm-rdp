@@ -291,6 +291,21 @@ pub struct SliceCfg {
     /// `(pic_order_cnt_lsb, bits)` for POC type 0.
     pub poc_lsb: Option<(u32, u32)>,
     pub mmco5: bool,
+    /// P slices: `num_ref_idx_active_override_flag` 1 with this
+    /// `num_ref_idx_l0_active_minus1`.
+    pub num_ref_idx_override: Option<u32>,
+    /// P slices: `ref_pic_list_modification_l0` entries as
+    /// `(modification_of_pic_nums_idc, value)`; empty → flag 0.
+    pub ref_list_mods: Vec<(u32, u32)>,
+    /// Non-IDR reference slices: MMCO 1 operations, one per
+    /// `difference_of_pic_nums_minus1` here (adaptive marking when
+    /// non-empty; `mmco5` adds an MMCO 5 after them).
+    pub mmco1: Vec<u32>,
+    /// End the modification list and the MMCO list with their terminators
+    /// (false: lists that are never terminated).
+    pub terminate_lists: bool,
+    /// The stand-in slice data.
+    pub slice_data: Vec<u8>,
 }
 
 impl SliceCfg {
@@ -305,6 +320,11 @@ impl SliceCfg {
             idr_pic_id: 0,
             poc_lsb: None,
             mmco5: false,
+            num_ref_idx_override: None,
+            ref_list_mods: Vec::new(),
+            mmco1: Vec::new(),
+            terminate_lists: true,
+            slice_data: vec![0xA5],
         }
     }
     pub fn p(frame_num: u32) -> Self {
@@ -334,8 +354,25 @@ impl SliceCfg {
             w.put_bit(true); // direct_spatial_mv_pred_flag
         }
         if is_p || is_b {
-            w.put_bit(false); // num_ref_idx_active_override_flag
-            w.put_bit(false); // ref_pic_list_modification_flag_l0
+            match self.num_ref_idx_override {
+                Some(n) => {
+                    w.put_bit(true); // num_ref_idx_active_override_flag
+                    w.put_ue(n);
+                    if is_b {
+                        w.put_ue(n);
+                    }
+                }
+                None => w.put_bit(false),
+            }
+            // ref_pic_list_modification_flag_l0, then its entries
+            w.put_bit(!self.ref_list_mods.is_empty());
+            for &(idc, value) in &self.ref_list_mods {
+                w.put_ue(idc);
+                w.put_ue(value);
+            }
+            if !self.ref_list_mods.is_empty() && self.terminate_lists {
+                w.put_ue(3);
+            }
             if is_b {
                 w.put_bit(false); // ref_pic_list_modification_flag_l1
             }
@@ -344,17 +381,27 @@ impl SliceCfg {
             if idr {
                 w.put_bit(false); // no_output_of_prior_pics_flag
                 w.put_bit(false); // long_term_reference_flag
-            } else if self.mmco5 {
+            } else if self.mmco5 || !self.mmco1.is_empty() {
                 w.put_bit(true); // adaptive_ref_pic_marking_mode_flag
-                w.put_ue(5);
-                w.put_ue(0);
+                for &d in &self.mmco1 {
+                    w.put_ue(1);
+                    w.put_ue(d);
+                }
+                if self.mmco5 {
+                    w.put_ue(5);
+                }
+                if self.terminate_lists {
+                    w.put_ue(0);
+                }
             } else {
                 w.put_bit(false);
             }
         }
         w.put_se(0); // slice_qp_delta
         w.put_ue(1); // disable_deblocking_filter_idc
-        w.put_bits(0xA5, 8); // stand-in slice data
+        for &b in &self.slice_data {
+            w.put_bits(u32::from(b), 8);
+        }
         w.rbsp_trailing_bits();
         wrap_nal(self.header_byte, &w.into_rbsp())
     }

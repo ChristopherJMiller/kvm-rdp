@@ -142,6 +142,10 @@ pub fn admission(data: &[u8]) {
                 expected.extend(p.pps.iter().map(|b| b.as_ref()));
             }
             expected.extend(au.vcl.iter().map(|n| n.bytes.as_ref()));
+            // PB10 m2: an emitted AUD is exactly `access_unit_delimiter_rbsp`.
+            if let Some(aud) = &au.aud {
+                assert!(aud.len() == 2 && aud[1] & 0x1F == 0x10, "AUD {aud:02x?}");
+            }
             let resplit: Vec<&[u8]> = split_annex_b(&out).collect();
             assert_eq!(resplit, expected, "Annex-B re-split differs");
             for nal in resplit {
@@ -311,7 +315,8 @@ pub const MAIN_360P_PARAMS: (&[u8], &[u8]) = (
 /// the first byte picks the context, the rest is a run of slice NALs
 /// separated as Annex B. Every POC the tracker admits exceeds the last one
 /// it admitted in that GOP (§6.1), which an IDR starts — as does the picture
-/// after an MMCO 5.
+/// after an MMCO 5. Every admitted header's lists are bounded (final review
+/// I1; `admitted_header_lists_are_bounded`).
 pub fn slice(data: &[u8]) {
     let Some((&sel, rest)) = data.split_first() else {
         return;
@@ -321,6 +326,7 @@ pub fn slice(data: &[u8]) {
     let mut last: Option<i64> = None;
     for nal in split_annex_b(rest) {
         if let Ok(info) = crate::h264::picture::parse_slice(&c.ctx, nal) {
+            admitted_header_lists_are_bounded(&c.ctx, nal, &info);
             if info.idr {
                 last = None;
             }
@@ -349,6 +355,116 @@ pub fn slice(data: &[u8]) {
             }
         }
     }
+}
+
+/// Final review I1: a slice header `parse_slice` admitted has bounded lists.
+/// An independent parse — h264-reader alone, over the whole NAL rather than
+/// the bounded prefix, with no budget — must read the same header, with at
+/// most 16 active references, at most `num_ref_idx_l0_active_minus1 + 1`
+/// modifications and at most 66 MMCOs.
+fn admitted_header_lists_are_bounded(
+    ctx: &h264_reader::Context,
+    nal: &[u8],
+    info: &crate::h264::picture::SliceInfo,
+) {
+    use h264_reader::nal::slice::{
+        DecRefPicMarking, NumRefIdxActive, RefPicListModifications, SliceHeader,
+    };
+    use h264_reader::nal::{Nal as _, RefNal};
+    let refnal = RefNal::new(nal, &[], true);
+    let (sh, _, pps) =
+        SliceHeader::from_bits(ctx, &mut refnal.rbsp_bits(), refnal.header().unwrap(), None)
+            .expect("admitted from the prefix, unparsable whole");
+    assert_eq!(
+        (sh.first_mb_in_slice, sh.frame_num, sh.idr_pic_id),
+        (info.first_mb_in_slice, info.frame_num, info.idr_pic_id)
+    );
+    let active = match sh.num_ref_idx_active {
+        Some(NumRefIdxActive::P {
+            num_ref_idx_l0_active_minus1,
+        }) => num_ref_idx_l0_active_minus1,
+        Some(NumRefIdxActive::B { .. }) => panic!("a B slice was admitted"),
+        None => pps.num_ref_idx_l0_default_active_minus1,
+    };
+    assert!(active <= 15, "num_ref_idx_l0_active_minus1 {active}");
+    match &sh.ref_pic_list_modification {
+        Some(RefPicListModifications::P {
+            ref_pic_list_modification_l0: mods,
+        }) => assert!(
+            mods.len() as u32 <= active + 1,
+            "{} modifications for {} references",
+            mods.len(),
+            active + 1
+        ),
+        Some(RefPicListModifications::B { .. }) => panic!("a B slice was admitted"),
+        Some(RefPicListModifications::I) | None => {}
+    }
+    if let Some(DecRefPicMarking::Adaptive(ops)) = &sh.dec_ref_pic_marking {
+        assert!(ops.len() <= 66, "{} MMCOs", ops.len());
+    }
+}
+
+/// A P slice against `c` (frame 1, POC lsb 2 when POC type 0) whose header
+/// carries `mods` modifications and `mmcos` MMCO 1 operations: a `slice`
+/// seed at §6.1's ceilings for the fuzzer to push past them.
+fn p_slice_with_lists(c: &Ctx, mods: usize, mmcos: usize) -> Vec<u8> {
+    use crate::bits::{BitWriter, escape_rbsp_into};
+    use h264_reader::nal::sps::PicOrderCntType;
+    let pps = c
+        .ctx
+        .pps_by_id(h264_reader::nal::pps::PicParamSetId::from_u32(0).unwrap())
+        .unwrap();
+    assert!(
+        !pps.bottom_field_pic_order_in_frame_present_flag && !pps.redundant_pic_cnt_present_flag
+    );
+    let mut w = BitWriter::new();
+    w.write_ue(0); // first_mb_in_slice
+    w.write_ue(5); // slice_type: P (all)
+    w.write_ue(0); // pic_parameter_set_id
+    w.write_bits(1, u32::from(c.sps.log2_max_frame_num())); // frame_num
+    if let PicOrderCntType::TypeZero {
+        log2_max_pic_order_cnt_lsb_minus4: n,
+    } = c.sps.pic_order_cnt
+    {
+        w.write_bits(2, u32::from(n) + 4); // pic_order_cnt_lsb
+    }
+    // One active reference, whatever the PPS's default.
+    w.write_flag(true); // num_ref_idx_active_override_flag
+    w.write_ue(0); // num_ref_idx_l0_active_minus1
+    w.write_flag(mods > 0); // ref_pic_list_modification_flag_l0
+    if mods > 0 {
+        for _ in 0..mods {
+            w.write_ue(0); // modification_of_pic_nums_idc: subtract
+            w.write_ue(0); // abs_diff_pic_num_minus1
+        }
+        w.write_ue(3);
+    }
+    if pps.weighted_pred_flag {
+        // pred_weight_table for 4:2:0 and one reference: both denominators
+        // 0, no explicit luma or chroma weights.
+        w.write_ue(0);
+        w.write_ue(0);
+        w.write_flag(false);
+        w.write_flag(false);
+    }
+    w.write_flag(true); // adaptive_ref_pic_marking_mode_flag
+    for _ in 0..mmcos {
+        w.write_ue(1); // short-term picture unused for reference
+        w.write_ue(0); // difference_of_pic_nums_minus1
+    }
+    w.write_ue(0);
+    if pps.entropy_coding_mode_flag {
+        w.write_ue(0); // cabac_init_idc
+    }
+    w.write_se(0); // slice_qp_delta
+    if pps.deblocking_filter_control_present_flag {
+        w.write_ue(1); // disable_deblocking_filter_idc
+    }
+    w.write_u8(0xA5); // stand-in slice data
+    w.write_trailing_bits();
+    let mut nal = vec![0x41]; // nal_ref_idc 2, non-IDR slice
+    escape_rbsp_into(&w.into_rbsp(), &mut nal);
+    nal
 }
 
 /// PPS admission against an admitted context (the first byte picks it): an
@@ -636,6 +752,20 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
             .flat_map(|n| [&[0u8, 0, 0, 1][..], n].concat())
             .collect();
         out.push(("slice", name.to_owned(), [&[sel][..], &aus].concat()));
+        // Final review I1: a P slice at §6.1's ceilings — one modification
+        // for its one active reference, and 66 MMCOs — after the IDR, for
+        // the fuzzer to push past them.
+        let idr = access_units(data)[0]
+            .iter()
+            .copied()
+            .find(|n| n[0] & 0x1F == 5)
+            .unwrap();
+        let p = p_slice_with_lists(&contexts()[usize::from(sel)], 1, 66);
+        out.push((
+            "slice",
+            format!("{name}_lists_at_ceiling"),
+            [&[sel][..], &[0, 0, 0, 1], idr, &[0, 0, 0, 1], &p].concat(),
+        ));
     }
     out.push((
         "login",
@@ -728,6 +858,44 @@ mod tests {
             aus += usize::from(a.admit(tag, Instant::now()).unwrap().au.is_some());
         }
         assert_eq!(aus, 8);
+    }
+
+    /// The `lists_at_ceiling` seeds sit exactly at §6.1's ceilings: admitted
+    /// as built, refused one entry past either (final review I1).
+    #[test]
+    fn the_ceiling_seeds_are_admitted_and_one_more_entry_is_not() {
+        use crate::h264::picture::{HeaderLimit, SliceRefusal, parse_slice};
+        for c in contexts() {
+            assert!(parse_slice(&c.ctx, &p_slice_with_lists(c, 1, 66)).is_ok());
+            assert_eq!(
+                parse_slice(&c.ctx, &p_slice_with_lists(c, 2, 66)),
+                Err(SliceRefusal::HeaderLimits(
+                    HeaderLimit::RefPicListModifications { list: 0, max: 1 }
+                ))
+            );
+            assert_eq!(
+                parse_slice(&c.ctx, &p_slice_with_lists(c, 1, 67)),
+                Err(SliceRefusal::HeaderLimits(HeaderLimit::Mmco))
+            );
+        }
+    }
+
+    /// The bounded-lists invariant is not vacuous: handed a header past
+    /// either ceiling as if it had been admitted, it fails.
+    #[test]
+    fn the_bounded_lists_invariant_fails_on_an_unbounded_header() {
+        let c = &contexts()[1];
+        let info =
+            crate::h264::picture::parse_slice(&c.ctx, &p_slice_with_lists(c, 1, 66)).unwrap();
+        for (mods, mmcos, needle) in [(2, 0, "modifications for"), (1, 67, "67 MMCOs")] {
+            let nal = p_slice_with_lists(c, mods, mmcos);
+            let caught = std::panic::catch_unwind(|| {
+                admitted_header_lists_are_bounded(&c.ctx, &nal, &info);
+            });
+            let msg = caught.expect_err(needle);
+            let msg = msg.downcast_ref::<String>().unwrap();
+            assert!(msg.contains(needle), "{msg}");
+        }
     }
 
     /// Both `ES3_LIKE_PARAMS` and `MAIN_360P_PARAMS` are copies of fixture

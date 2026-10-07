@@ -21,7 +21,9 @@ pub use params::{ParamClass, ParamSets, ParamsChange};
 pub use violations::{ViolationVerdict, ViolationWindow};
 
 use crate::flv::{AvcConfig, BurstMarker, FlvError, FlvLimits, FlvTag, Nal, TagBody, VideoBody};
-use crate::h264::picture::{PocTracker, SliceInfo, parse_slice};
+use crate::h264::picture::{
+    AudRefusal, PocTracker, SliceInfo, aud_primary_pic_type, parse_slice, primary_pic_type_covers,
+};
 use crate::h264::rewrite::RewriteConfig;
 use crate::h264::sanitize::{NalVerdict, check_nal};
 use crate::h264::{SpsLimits, frame_id};
@@ -40,7 +42,8 @@ pub struct AccessUnit {
     /// this FLV connection's first *coded* tag, not its sequence header
     /// (D11; fix round 1, P10/m5).
     pub burst: bool,
-    /// The AUD, when the source sent one.
+    /// The AUD, when the source sent one: exactly two bytes, its
+    /// `primary_pic_type` covering the picture (§6.2).
     pub aud: Option<Bytes>,
     /// The allowlisted VCL NALs (types 1 and 5), trimmed, in order.
     pub vcl: Vec<Nal>,
@@ -279,7 +282,11 @@ impl VideoAdmission {
                         if seen_vcl || aud.is_some() {
                             return Err(framing(Framing::NotOnePicture));
                         }
-                        aud = Some(bytes);
+                        // It reaches the client's decoder verbatim (§6.3),
+                        // so its payload is checked too (PB10 m2).
+                        let ppt = aud_primary_pic_type(&bytes)
+                            .map_err(|e| incompatible(Incompatible::Aud(e)))?;
+                        aud = Some((bytes, ppt));
                         None
                     }
                     _ => {
@@ -295,7 +302,16 @@ impl VideoAdmission {
             Some(b) => self.params.change(class, b),
             None => None,
         };
-        let first = self.check_picture(&nals)?;
+        let picture = self.check_picture(&nals)?;
+        // 7.4.2.4: the AUD's Table 7-5 set holds every slice type here.
+        if let Some((_, ppt)) = &aud
+            && !primary_pic_type_covers(*ppt, picture.intra, picture.predicted)
+        {
+            return Err(incompatible(Incompatible::Aud(AudRefusal::PrimaryPicType(
+                *ppt,
+            ))));
+        }
+        let first = picture.first;
         let sps = self
             .params
             .active_sps()
@@ -309,7 +325,7 @@ impl VideoAdmission {
                 flv_timestamp_ms: timestamp,
                 idr: first.idr,
                 burst: self.burst.mark(timestamp, now),
-                aud,
+                aud: aud.map(|(bytes, _)| bytes),
                 vcl: nals,
             }),
             end_of_sequence: false,
@@ -318,9 +334,10 @@ impl VideoAdmission {
     }
 
     /// §6.1's slice checks and §6.2's one-picture rule; returns the first
-    /// slice's fields.
-    fn check_picture(&self, vcl: &[Nal]) -> Result<SliceInfo, AdmissionError> {
+    /// slice's fields and the slice types the picture holds.
+    fn check_picture(&self, vcl: &[Nal]) -> Result<Picture, AdmissionError> {
         let mut first: Option<SliceInfo> = None;
+        let (mut intra, mut predicted) = (false, false);
         for n in vcl {
             let s = parse_slice(self.params.ctx(), &n.bytes)
                 .map_err(|e| incompatible(Incompatible::Slice(e)))?;
@@ -329,9 +346,25 @@ impl VideoAdmission {
                 Some(f) if s.first_mb_in_slice != 0 && f.same_picture(&s) => {}
                 _ => return Err(framing(Framing::NotOnePicture)),
             }
+            intra |= matches!(s.slice_type, 2 | 7);
+            predicted |= matches!(s.slice_type, 0 | 5);
         }
-        first.ok_or(framing(Framing::NotOnePicture))
+        let first = first.ok_or(framing(Framing::NotOnePicture))?;
+        Ok(Picture {
+            first,
+            intra,
+            predicted,
+        })
     }
+}
+
+/// One tag's picture, as `check_picture` found it.
+struct Picture {
+    first: SliceInfo,
+    /// It has an I slice.
+    intra: bool,
+    /// It has a P slice.
+    predicted: bool,
 }
 
 /// A config-record entry: §6.2's per-NAL checks, and its own header must say

@@ -11,7 +11,7 @@ use crate::flv::mux::{
     TAG_VIDEO, avc_nalu_body, avc_sequence_header_body, write_flv_header, write_tag,
 };
 use crate::flv::{FlvDemuxer, FlvError, FlvLimits, FrameType};
-use crate::h264::picture::SliceRefusal;
+use crate::h264::picture::{AudRefusal, HeaderLimit, SliceRefusal};
 use crate::h264::sanitize::NalRefusal;
 use crate::h264::test_support::{PpsCfg, SliceCfg, SpsCfg};
 use crate::h264::{NalHeader, PinnedField, SpsIncompatibleReason};
@@ -467,6 +467,71 @@ fn annex_b_output_matches_section_6_3_and_frame_id_hashes_the_vcl() {
     assert_eq!(out, want, "no parameter sets before a P frame");
     assert_eq!(p_au.frame_id(), crate::h264::frame_id([p(1).as_slice()]));
     assert_eq!(NalHeader::from_nal(&params.sps).unwrap().nal_unit_type, 7);
+}
+
+/// PB10 m2, folded into final review I1: an AUD is forwarded to the
+/// client's decoder, so it must be exactly `access_unit_delimiter_rbsp` —
+/// `primary_pic_type`, then the stop bit — and its Table 7-5 set must hold
+/// every slice type in the picture (7.4.2.4). Anything else is refused,
+/// never forwarded verbatim.
+#[test]
+fn an_aud_is_two_bytes_whose_primary_pic_type_covers_the_picture() {
+    // x264's own (every committed fixture): 0x10 (I) before an IDR, 0x30
+    // (I, P) before a P picture. 0xF0 (every type) and 0x50 (I, SI) / 0xD0
+    // (I, SI, P, SP) fit too.
+    for (before_idr, before_p) in [(0x10, 0x30), (0xF0, 0xF0), (0x50, 0xD0)] {
+        let r = run(&[
+            (16, vec![vec![0x09, before_idr], idr()]),
+            (16, vec![vec![0x09, before_p], p(1)]),
+        ]);
+        assert!(
+            r.iter().all(Result::is_ok),
+            "{before_idr:#x}/{before_p:#x}: {r:?}"
+        );
+    }
+    let aud = |r| Err(incompatible(Incompatible::Aud(r)));
+    let before_p = |nal: Vec<u8>| last(&run(&[(16, vec![idr()]), (16, vec![nal, p(1)])])).clone();
+    // One byte (also what `09 00` trims to), a byte too many, and 1000
+    // bytes too many (PB10's probe was 100 KB).
+    assert_eq!(before_p(vec![0x09]), aud(AudRefusal::Malformed));
+    assert_eq!(before_p(vec![0x09, 0x30, 0x80]), aud(AudRefusal::Malformed));
+    let long = [vec![0x09, 0x30], vec![0xAA; 1000]].concat();
+    assert_eq!(before_p(long), aud(AudRefusal::Malformed));
+    // `001 1 1000` and `001 0 0001`: no stop bit followed by zero bits.
+    assert_eq!(before_p(vec![0x09, 0x38]), aud(AudRefusal::Malformed));
+    assert_eq!(before_p(vec![0x09, 0x21]), aud(AudRefusal::Malformed));
+    // 0 (I only) and 5 (I, SI) cannot announce a P picture.
+    assert_eq!(
+        before_p(vec![0x09, 0x10]),
+        aud(AudRefusal::PrimaryPicType(0))
+    );
+    assert_eq!(
+        before_p(vec![0x09, 0xB0]),
+        aud(AudRefusal::PrimaryPicType(5))
+    );
+    // 3 (SI) and 4 (SI, SP) cannot announce an I picture.
+    for ppt in [3u8, 4] {
+        let r = run(&[(16, vec![vec![0x09, (ppt << 5) | 0x10], idr()])]);
+        assert_eq!(last(&r), &aud(AudRefusal::PrimaryPicType(ppt)));
+    }
+}
+
+/// Final review I1, end to end: a P slice whose modification list is
+/// longer than its one active reference allows is refused as
+/// `stream_incompatible`, not admitted and forwarded.
+#[test]
+fn an_oversized_slice_header_list_is_stream_incompatible() {
+    let mut mods = SliceCfg::p(1);
+    mods.ref_list_mods = vec![(0, 0); 2];
+    let r = run(&[(16, vec![idr()]), (16, vec![mods.build()])]);
+    let e = last(&r).clone().unwrap_err();
+    assert_eq!(
+        e,
+        incompatible(Incompatible::Slice(SliceRefusal::HeaderLimits(
+            HeaderLimit::RefPicListModifications { list: 0, max: 1 }
+        )))
+    );
+    assert_eq!(e.kind(), "slice");
 }
 
 #[test]
