@@ -135,9 +135,14 @@ pub fn parse_sps(nal: &[u8]) -> Result<SpsSummary, SpsParseError> {
     SpsSummary::from_sps(&sps).map_err(SpsParseError::Summary)
 }
 
-/// The §6.1 admission limits. Defaults are the spec ceilings; the census may
-/// tighten `max_num_ref_frames` or (if the KVM uses them) relax the scaling
-/// matrix / HRD requirements with pinned values.
+/// §6.1: `num_ref_frames` is never admitted above 16, whatever the limit says.
+pub const NUM_REF_FRAMES_CEILING: u32 = 16;
+
+/// The §6.1 admission limits. Defaults are the spec values: the census
+/// pinned `max_num_ref_frames` to 1 (`census.md`, Leg A — stream); a test
+/// replaying fixtures with more reference frames may raise it, but never
+/// past `NUM_REF_FRAMES_CEILING`. The ES3 uses neither scaling matrices nor
+/// HRD, so both stay refusals (booleans, no pinned values).
 #[derive(Debug, Clone)]
 pub struct SpsLimits {
     pub allowed_profiles: &'static [u8],
@@ -156,7 +161,7 @@ impl Default for SpsLimits {
             max_level_idc: 51, // level 5.1
             max_width: 4096,
             max_height: 2304,
-            max_num_ref_frames: 16,
+            max_num_ref_frames: 1,
             require_no_scaling_matrix: true,
             require_no_hrd: true,
         }
@@ -168,8 +173,14 @@ impl Default for SpsLimits {
 pub enum SpsLimitViolation {
     Profile(u8),
     ChromaNot420(u8),
-    BitDepthNot8 { luma_minus8: u8, chroma_minus8: u8 },
+    BitDepthNot8 {
+        luma_minus8: u8,
+        chroma_minus8: u8,
+    },
     NotFrameMbsOnly,
+    /// POC type 1: the decode-order POC rule (§6.1) is computed for types 0
+    /// and 2 only, and no source in scope uses type 1.
+    PocType1,
     Level(u8),
     WidthTooLarge(u32),
     HeightTooLarge(u32),
@@ -198,6 +209,9 @@ pub fn check_sps_limits(s: &SpsSummary, limits: &SpsLimits) -> Result<(), SpsLim
     if !s.frame_mbs_only_flag {
         return Err(SpsLimitViolation::NotFrameMbsOnly);
     }
+    if s.pic_order_cnt_type == 1 {
+        return Err(SpsLimitViolation::PocType1);
+    }
     if s.level_idc > limits.max_level_idc {
         return Err(SpsLimitViolation::Level(s.level_idc));
     }
@@ -214,7 +228,7 @@ pub fn check_sps_limits(s: &SpsSummary, limits: &SpsLimits) -> Result<(), SpsLim
     if s.height & 1 == 1 {
         return Err(SpsLimitViolation::HeightNotEven(s.height));
     }
-    if s.num_ref_frames > limits.max_num_ref_frames {
+    if s.num_ref_frames > limits.max_num_ref_frames.min(NUM_REF_FRAMES_CEILING) {
         return Err(SpsLimitViolation::TooManyRefFrames(s.num_ref_frames));
     }
     if limits.require_no_scaling_matrix && s.seq_scaling_matrix_present {
@@ -262,6 +276,11 @@ pub enum SpsChange {
 /// against `previous`; because any earlier out-of-pin SPS would already have
 /// been `Incompatible` and ended the session, that equals comparing to the
 /// session's first SPS.
+///
+/// This is kvm-proto's one §6.1 classifier: admission (`video::ParamState`)
+/// calls it for every SPS that differs from the active one, after D4's rule
+/// that a byte-identical rewritten SPS raises nothing — so, called directly
+/// (kvm-probe's census), identical summaries are `Other`.
 pub fn classify_sps_change(
     previous: Option<&SpsSummary>,
     new: &SpsSummary,
@@ -273,32 +292,57 @@ pub fn classify_sps_change(
     let Some(prev) = previous else {
         return SpsChange::Initial;
     };
-    if prev.profile_idc != new.profile_idc {
-        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
-            PinnedField::ProfileIdc,
-        ));
-    }
-    if prev.chroma_format_idc != new.chroma_format_idc {
-        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
-            PinnedField::ChromaFormat,
-        ));
-    }
-    if prev.bit_depth_luma_minus8 != new.bit_depth_luma_minus8
-        || prev.bit_depth_chroma_minus8 != new.bit_depth_chroma_minus8
-    {
-        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
-            PinnedField::BitDepth,
-        ));
-    }
-    if prev.pic_order_cnt_type != new.pic_order_cnt_type {
-        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(
-            PinnedField::PicOrderCntType,
-        ));
+    if let Err(f) = SpsPins::of(prev).check(new) {
+        return SpsChange::Incompatible(SpsIncompatibleReason::PinnedFieldChanged(f));
     }
     if prev.width != new.width || prev.height != new.height || prev.level_idc != new.level_idc {
         return SpsChange::Resize;
     }
     SpsChange::Other
+}
+
+/// The §6.1 pinned fields: fixed by a KVM session's first SPS, persisting
+/// across FLV reconnects, reset at `Start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpsPins {
+    pub profile_idc: u8,
+    pub chroma_format_idc: u8,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub pic_order_cnt_type: u8,
+}
+
+impl SpsPins {
+    #[must_use]
+    pub fn of(s: &SpsSummary) -> SpsPins {
+        SpsPins {
+            profile_idc: s.profile_idc,
+            chroma_format_idc: s.chroma_format_idc,
+            bit_depth_luma_minus8: s.bit_depth_luma_minus8,
+            bit_depth_chroma_minus8: s.bit_depth_chroma_minus8,
+            pic_order_cnt_type: s.pic_order_cnt_type,
+        }
+    }
+
+    /// The first pinned field `s` changes, in spec order.
+    pub fn check(&self, s: &SpsSummary) -> Result<(), PinnedField> {
+        let now = SpsPins::of(s);
+        if now.profile_idc != self.profile_idc {
+            return Err(PinnedField::ProfileIdc);
+        }
+        if now.chroma_format_idc != self.chroma_format_idc {
+            return Err(PinnedField::ChromaFormat);
+        }
+        if now.bit_depth_luma_minus8 != self.bit_depth_luma_minus8
+            || now.bit_depth_chroma_minus8 != self.bit_depth_chroma_minus8
+        {
+            return Err(PinnedField::BitDepth);
+        }
+        if now.pic_order_cnt_type != self.pic_order_cnt_type {
+            return Err(PinnedField::PicOrderCntType);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -396,15 +440,31 @@ mod tests {
 
     #[test]
     fn exact_ceiling_values_pass() {
-        // Fix round 1: pin the ceilings themselves, not just values beyond
-        // them — width=4096, height=2304, level_idc=51, num_ref_frames=16
-        // are each the exact §6.1 limit and must still be admitted.
+        // Pin the ceilings themselves, not just values beyond them —
+        // width=4096, height=2304, level_idc=51 are each the exact §6.1
+        // limit; num_ref_frames is 1 by default (the census value) and a
+        // raised limit stops at 16.
         let mut s = ok_summary();
         s.width = 4096;
         s.height = 2304;
         s.level_idc = 51;
-        s.num_ref_frames = 16;
         assert_eq!(check_sps_limits(&s, &SpsLimits::default()), Ok(()));
+        s.num_ref_frames = 2;
+        assert_eq!(
+            check_sps_limits(&s, &SpsLimits::default()),
+            Err(SpsLimitViolation::TooManyRefFrames(2))
+        );
+        let raised = SpsLimits {
+            max_num_ref_frames: 99,
+            ..SpsLimits::default()
+        };
+        s.num_ref_frames = 16;
+        assert_eq!(check_sps_limits(&s, &raised), Ok(()));
+        s.num_ref_frames = 17;
+        assert_eq!(
+            check_sps_limits(&s, &raised),
+            Err(SpsLimitViolation::TooManyRefFrames(17))
+        );
     }
 
     #[test]
@@ -597,7 +657,10 @@ mod classify_tests {
 
     #[test]
     fn num_ref_frames_change_only_is_other() {
-        let lim = SpsLimits::default();
+        let lim = SpsLimits {
+            max_num_ref_frames: 16,
+            ..SpsLimits::default()
+        };
         let prev = ok_summary();
         let mut new = ok_summary();
         new.num_ref_frames = 3; // still <= 16; not a pinned field, not dims/level
@@ -614,6 +677,41 @@ mod classify_tests {
         assert_eq!(
             classify_sps_change(Some(&prev), &ok_summary(), &lim),
             SpsChange::Other
+        );
+    }
+}
+
+#[cfg(test)]
+mod pins_tests {
+    use super::tests::ok_summary;
+    use super::*;
+
+    #[test]
+    fn several_pinned_fields_report_the_first_in_spec_order() {
+        let pins = SpsPins::of(&ok_summary());
+        let mut s = ok_summary();
+        s.pic_order_cnt_type = 0;
+        s.bit_depth_luma_minus8 = 2;
+        s.chroma_format_idc = 2;
+        s.profile_idc = 100;
+        assert_eq!(pins.check(&s), Err(PinnedField::ProfileIdc));
+        s.profile_idc = 77;
+        assert_eq!(pins.check(&s), Err(PinnedField::ChromaFormat));
+        s.chroma_format_idc = 1;
+        assert_eq!(pins.check(&s), Err(PinnedField::BitDepth));
+        s.bit_depth_luma_minus8 = 0;
+        assert_eq!(pins.check(&s), Err(PinnedField::PicOrderCntType));
+        s.pic_order_cnt_type = 2;
+        assert_eq!(pins.check(&s), Ok(()));
+    }
+
+    #[test]
+    fn poc_type_1_is_refused() {
+        let mut s = ok_summary();
+        s.pic_order_cnt_type = 1;
+        assert_eq!(
+            check_sps_limits(&s, &SpsLimits::default()),
+            Err(SpsLimitViolation::PocType1)
         );
     }
 }

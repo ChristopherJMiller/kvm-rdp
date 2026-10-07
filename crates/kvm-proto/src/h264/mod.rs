@@ -5,11 +5,12 @@
 mod annexb;
 pub use annexb::{AnnexBNals, AvccError, avcc_to_annex_b, frame_id, split_annex_b};
 mod nal;
-pub use nal::{NalHeader, NalHeaderError};
-pub use nal::{is_aud, is_idr, is_parameter_set, is_vcl, nal_type_allowed};
+pub use nal::{
+    NalHeader, NalHeaderError, is_aud, is_idr, is_parameter_set, is_vcl, nal_type_allowed,
+};
 mod sps;
-pub use sps::{PinnedField, SpsChange, SpsIncompatibleReason, classify_sps_change};
-pub use sps::{SpsLimitViolation, SpsLimits, check_sps_limits};
+pub use sps::{NUM_REF_FRAMES_CEILING, SpsLimitViolation, SpsLimits, check_sps_limits};
+pub use sps::{PinnedField, SpsChange, SpsIncompatibleReason, SpsPins, classify_sps_change};
 pub use sps::{SpsParseError, SpsSummary, SpsSummaryError, parse_sps};
 mod slice;
 pub use slice::{
