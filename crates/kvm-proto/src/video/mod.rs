@@ -36,7 +36,9 @@ use std::time::Instant;
 pub struct AccessUnit {
     pub flv_timestamp_ms: u32,
     pub idr: bool,
-    /// Ran more than `burst_threshold` ahead of real time on this FLV (§6.2).
+    /// Ran more than `burst_threshold` ahead of real time, measured from
+    /// this FLV connection's first *coded* tag, not its sequence header
+    /// (D11; fix round 1, P10/m5).
     pub burst: bool,
     /// The AUD, when the source sent one.
     pub aud: Option<Bytes>,
@@ -138,8 +140,16 @@ impl VideoAdmission {
 
     /// A new FLV connection (any origin) delivers the tags from now on: its
     /// first parameter sets are `Initial`, its first coded tag sets the
-    /// `CompositionTime`, and burst marking and POC order start afresh. The
-    /// pins persist (§6.1).
+    /// `CompositionTime` and becomes the burst baseline (D11), and POC order
+    /// starts afresh. The pins persist (§6.1).
+    ///
+    /// Callers must call this exactly once per FLV connection, before its
+    /// first tag. `VideoAdmission` does not itself refuse a coded tag that
+    /// arrives without a preceding sequence header on this connection (that
+    /// protection is `FlvDemuxer::NalBeforeSequenceHeader`, which only holds
+    /// with a fresh `FlvDemuxer` per connection, fix round 1, m3) — it would
+    /// simply admit against whatever sets the previous connection left
+    /// behind.
     pub fn flv_opened(&mut self) {
         self.params.flv_opened();
         self.composition_time = None;
@@ -147,7 +157,12 @@ impl VideoAdmission {
         self.burst.reset();
     }
 
-    /// Admit one demuxed tag received at `now`.
+    /// Admit one demuxed tag received at `now`. On `Err`, the caller must
+    /// reopen the FLV (`flv_opened`) before admitting another tag: any
+    /// in-band parameter sets the failing tag adopted before the refusal
+    /// stay adopted, with no `ParamsChange` delivered for them, until the
+    /// next sequence header — which is `Initial` again after a reopen
+    /// (fix round 1, m6).
     pub fn admit(&mut self, tag: FlvTag, now: Instant) -> Result<Admitted, AdmissionError> {
         match tag.body {
             TagBody::Audio | TagBody::ScriptData => Ok(Admitted::default()),
@@ -195,6 +210,19 @@ impl VideoAdmission {
         })
     }
 
+    /// Classify and apply every NAL in one coded tag, then check the
+    /// surviving VCL NALs as one picture.
+    ///
+    /// Deviation (fix round 1, m1): H.264 7.4.1.2.3 makes an SPS/PPS after
+    /// a tag's first slice the start of the *next* access unit, not part of
+    /// this one. This tag-at-a-time admission does not split a tag at a
+    /// mid-tag parameter set: it adopts it immediately and validates every
+    /// slice in the tag — including slices before it — against whatever is
+    /// active once the whole tag is scanned. No unchecked bytes leak (every
+    /// VCL NAL that reaches the AU was parsed against the sets active when
+    /// `check_picture` ran), but a source that changes parameters mid-tag
+    /// sees them applied to the wrong half of the tag. No observed source
+    /// in scope does this (the ES3 and x264 send sets before any slice).
     fn coded(
         &mut self,
         timestamp: u32,

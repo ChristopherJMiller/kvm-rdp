@@ -124,6 +124,11 @@ fn each_admission_rule_has_its_own_refusal() {
     far.first_mb = 120 * 68;
     let mut other_pps = SliceCfg::p(1);
     other_pps.pps_id = 3;
+    // A continuation slice (`first_mb != 0`) whose other picture-identity
+    // fields (frame_num, idr) do not match the tag's first slice: it must
+    // not be accepted as that picture's continuation (fix round 1, I1/M08).
+    let mut continuation_other_picture = SliceCfg::p(1);
+    continuation_other_picture.first_mb = 5;
     let (mut nonref1, mut nonref2) = (SliceCfg::p(1), SliceCfg::p(1));
     nonref1.header_byte = 0x01;
     nonref2.header_byte = 0x01;
@@ -160,6 +165,25 @@ fn each_admission_rule_has_its_own_refusal() {
         (
             "first slice not at MB 0",
             vec![(16, vec![idr()]), (16, vec![cont.build()])],
+            framing(Framing::NotOnePicture),
+        ),
+        (
+            // Two slices with identical picture-identity headers, both at
+            // MB 0: neither can be the other's continuation (first_mb == 0
+            // for both), so the second starts an unwanted second picture.
+            // Without the `first_mb_in_slice != 0` half of the check, this
+            // passes (fix round 1, I1/M07).
+            "two same-header pictures in one tag",
+            vec![(16, vec![idr()]), (16, vec![p(1), p(1)])],
+            framing(Framing::NotOnePicture),
+        ),
+        (
+            // `first_mb != 0` alone does not make a slice a continuation of
+            // the tag's first picture: its other picture-identity fields
+            // must also match. Without the `same_picture` half of the
+            // check, this passes (fix round 1, I1/M08).
+            "a continuation slice belongs to a different picture",
+            vec![(16, vec![idr(), continuation_other_picture.build()])],
             framing(Framing::NotOnePicture),
         ),
         (
@@ -225,6 +249,35 @@ fn each_admission_rule_has_its_own_refusal() {
     for (name, tags, want) in cases {
         assert_eq!(last(&run(&tags)), &Err(want), "{name}");
     }
+}
+
+/// The positive side of the one-picture rule (fix round 1, I1): H.264
+/// permits arbitrary slice order (ASO) — later slices of a picture need
+/// not run in MB order, only match the first slice's picture-identity
+/// fields (`same_picture`) — and `write_annex_b` emits them in source order,
+/// not sorted by `first_mb`.
+#[test]
+fn slices_in_arbitrary_order_are_one_access_unit() {
+    let mbs = [0_u32, 2000, 1000, 4000];
+    let nals: Vec<Vec<u8>> = mbs
+        .iter()
+        .map(|&m| {
+            SliceCfg {
+                first_mb: m,
+                ..SliceCfg::idr()
+            }
+            .build()
+        })
+        .collect();
+    let r = run(&[(16, nals.clone())]);
+    let au = r[1].as_ref().unwrap().au.as_ref().unwrap();
+    assert!(au.idr);
+    // fix round 1, m4: the AU's own FLV timestamp, not a placeholder (this
+    // is `run`'s first coded tag: timestamp `(0 + 1) * 33`).
+    assert_eq!(au.flv_timestamp_ms, 33);
+    let got: Vec<&[u8]> = au.vcl.iter().map(|n| n.bytes.as_ref()).collect();
+    let want: Vec<&[u8]> = nals.iter().map(Vec::as_slice).collect();
+    assert_eq!(got, want, "write_annex_b must preserve source order");
 }
 
 #[test]
@@ -315,6 +368,44 @@ fn config_record_entries_must_be_what_they_claim() {
         ),
         Err(framing(Framing::ConfigNalType(8)))
     );
+}
+
+/// Fix round 1, I2: a new in-band PPS id is adopted (not just byte-identical
+/// repeats, which PB9/4.6's other tests cover), raising `SpsChanged{other}`
+/// (D4 — a PPS alone changing is `Other`), and every cached PPS — not only
+/// the first — is written before the next IDR (§6.3).
+#[test]
+fn an_in_band_pps_is_adopted_and_every_cached_pps_precedes_an_idr() {
+    let new_pps = PpsCfg {
+        pps_id: 1,
+        ..PpsCfg::default()
+    }
+    .build();
+    let r = run(&[(16, vec![new_pps, idr()])]);
+    let a = r[1].as_ref().unwrap();
+    let change = a.params.as_ref().unwrap();
+    assert_eq!(
+        change.class,
+        ParamClass::Other,
+        "a PPS-only change is Other (D4)"
+    );
+    assert_eq!(
+        change.params.pps.len(),
+        2,
+        "the cache now holds both PPS ids"
+    );
+    let au = a.au.as_ref().unwrap();
+    let mut out = Vec::new();
+    au.write_annex_b(&change.params, &mut out);
+    let mut want = vec![0, 0, 0, 1];
+    want.extend_from_slice(&change.params.sps);
+    for p in &change.params.pps {
+        want.extend_from_slice(&[0, 0, 0, 1]);
+        want.extend_from_slice(p);
+    }
+    want.extend_from_slice(&[0, 0, 0, 1]);
+    want.extend_from_slice(&idr());
+    assert_eq!(out, want, "every cached PPS, in id order, before the IDR");
 }
 
 #[test]

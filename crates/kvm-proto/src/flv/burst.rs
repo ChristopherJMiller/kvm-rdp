@@ -3,7 +3,10 @@ use std::time::Instant;
 
 /// Marks access units that arrive faster than real time — a GOP-caching
 /// source replaying on connect (§6.2). State is per FLV connection; `reset`
-/// re-baselines from the next connection's first tag.
+/// re-baselines from the next connection's first call to `mark` — the
+/// caller (`video::VideoAdmission::coded`) calls `mark` only for coded
+/// tags, so in practice that is the connection's first *coded* tag, not any
+/// sequence header ahead of it (D11; fix round 1, P10/m5).
 pub struct BurstMarker {
     baseline: Option<(u32, Instant)>,
     threshold: Duration,
@@ -22,8 +25,9 @@ impl BurstMarker {
     }
 
     /// Record a tag's FLV timestamp (ms) and receive time; returns whether
-    /// it is a burst. The first tag of a connection sets the baseline and is
-    /// never a burst.
+    /// it is a burst. The first call after construction or `reset` sets the
+    /// baseline and is never a burst (D11: the caller drives this from the
+    /// connection's first *coded* tag, not its sequence header).
     pub fn mark(&mut self, flv_ts_ms: u32, now: Instant) -> bool {
         match self.baseline {
             None => {
