@@ -51,7 +51,7 @@ fn nal_type(n: &[u8]) -> u8 {
 #[test]
 fn committed_bytes_match_their_manifests() {
     let ms = manifests();
-    assert_eq!(ms.len(), 10, "expected 10 committed fixtures");
+    assert_eq!(ms.len(), 11, "expected 11 committed fixtures");
     for m in &ms {
         let name = m["name"].as_str().unwrap();
         let bytes = read(name);
@@ -80,7 +80,23 @@ fn kvm_proto_sps_parser_agrees_with_ffmpeg() {
             .into_iter()
             .find(|n| nal_type(n) == 7)
             .unwrap_or_else(|| panic!("{name}: no SPS"));
+        if m.get("ffmpeg_level_vui_sps_hex").is_some() {
+            continue; // the ES3-like fixture: es3like_fixture_is_refused_as_sent_and_rewritten_like_ffmpeg
+        }
         let s = kvm_proto::h264::parse_sps(sps).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        // gen-fixtures asks x264 for BT.709 on every encode; a literal check
+        // catches a dropped colorprim/colormatrix param the manifest would
+        // simply repeat.
+        assert_eq!(
+            s.colour_primaries,
+            Some(1),
+            "{name} colour_primaries literal"
+        );
+        assert_eq!(
+            s.matrix_coefficients,
+            Some(1),
+            "{name} matrix_coefficients literal"
+        );
         assert_eq!(
             u64::from(s.width),
             m["width"].as_u64().unwrap(),
@@ -186,5 +202,69 @@ fn slice_fixture_stays_within_the_per_au_nal_limit() {
     assert!(
         max <= 128,
         "slice fixture exceeds §6.2's 128 NALs/AU: {max}"
+    );
+}
+
+#[test]
+fn es3like_fixture_is_refused_as_sent_and_rewritten_like_ffmpeg() {
+    use kvm_proto::h264::rewrite::{RewriteConfig, rewrite_sps};
+    let m = manifests()
+        .into_iter()
+        .find(|m| m["name"] == "360p30_es3like_poc0.h264")
+        .unwrap();
+    // The manifest is ffmpeg's view of the stream as generated: ES3-shaped.
+    assert_eq!(
+        (
+            m["profile_idc"].as_u64(),
+            m["level_idc"].as_u64(),
+            m["pic_order_cnt_type"].as_u64()
+        ),
+        (Some(66), Some(21), Some(0))
+    );
+    assert_eq!(m["bitstream_restriction_flag"].as_u64(), Some(0));
+    assert_eq!(
+        (
+            m["colour_primaries"].as_u64(),
+            m["matrix_coefficients"].as_u64()
+        ),
+        (Some(5), Some(5))
+    );
+    assert_eq!(
+        (m["keyint"].as_u64(), m["key_frames"].as_u64()),
+        (Some(60), Some(2))
+    );
+    let bytes = read("360p30_es3like_poc0.h264");
+    let sps = nals(&bytes).into_iter().find(|n| nal_type(n) == 7).unwrap();
+    // Like the ES3's own SPS, h264-reader refuses it as sent (§6.8).
+    assert!(kvm_proto::h264::parse_sps(sps).is_err());
+    // kvm-proto's level + VUI rewrite is byte-identical to ffmpeg's
+    // h264_metadata doing the same (an independent serialiser).
+    let lv = rewrite_sps(
+        sps,
+        &RewriteConfig {
+            restriction: false,
+            ..RewriteConfig::ES3
+        },
+    )
+    .unwrap();
+    let hex: String = lv.nal.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(hex, m["ffmpeg_level_vui_sps_hex"].as_str().unwrap());
+    // The full rewrite: level 30 for 640×368 at 30 fps, BT.709 limited,
+    // bitstream_restriction 0 / 1 added (gen-fixtures checks the same with
+    // trace_headers and an unchanged decode).
+    let full = rewrite_sps(sps, &RewriteConfig::ES3).unwrap();
+    let s = &full.summary;
+    assert_eq!(
+        (s.width, s.height, s.level_idc, s.pic_order_cnt_type),
+        (640, 360, 30, 0)
+    );
+    assert_eq!(s.video_full_range_flag, Some(false));
+    assert_eq!(
+        (s.colour_primaries, s.matrix_coefficients),
+        (Some(1), Some(1))
+    );
+    assert_eq!(
+        (s.max_num_reorder_frames, s.max_dec_frame_buffering),
+        (Some(0), Some(1))
     );
 }

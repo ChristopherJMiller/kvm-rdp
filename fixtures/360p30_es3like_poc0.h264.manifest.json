@@ -1,0 +1,19 @@
+{
+  "name": "360p30_es3like_poc0.h264",
+  "sha256": "131ea43747b288b8c1aede036645ac525c629c31100439b84c4b4128f731e091",
+  "bytes": 318186,
+  "width": 640,
+  "height": 360,
+  "profile_idc": 66,
+  "level_idc": 21,
+  "pic_order_cnt_type": 0,
+  "video_full_range_flag": 1,
+  "bitstream_restriction_flag": 0,
+  "colour_primaries": 5,
+  "matrix_coefficients": 5,
+  "frames": 120,
+  "key_frames": 2,
+  "keyint": 60,
+  "slices_per_au": 1,
+  "ffmpeg_level_vui_sps_hex": "6742001ee901405ff2e02d40404050000003001000000303c840"
+}

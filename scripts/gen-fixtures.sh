@@ -3,6 +3,7 @@
 # ffmpeg/x264 (flake.lock): encoder -threads 1, sliced-threads=0, fixed GOP,
 # scenecut=0. Never fed from the real KVM.
 #   scripts/gen-fixtures.sh            fixtures/*.h264|.flv + *.manifest.json (committed)
+#   scripts/gen-fixtures.sh es3like    only fixtures/360p30_es3like_poc0.h264 (+ manifest)
 #   scripts/gen-fixtures.sh large      fixtures/large/*.h264 (gitignored; spikes, benches)
 #   scripts/gen-fixtures.sh clean      rm -rf fixtures/large
 set -euo pipefail
@@ -10,6 +11,9 @@ cd "$(dirname "$0")/.."
 MODE=${1:-committed}
 FF=(nice -n 19 ffmpeg -hide_banner -nostdin -loglevel error -y)
 FP=(nice -n 19 ffprobe -v error)
+# Decode-only runs (md5, trace_headers): §13 caps ffmpeg at 4 threads. Encodes
+# keep their own `-threads 1` (determinism), so FF itself is unchanged.
+DEC=("${FF[@]}" -threads 4)
 
 # 16-bit frame-counter barcode across the top: block k is white when bit k of
 # the frame number n is set. $1/$2 = block width/height.
@@ -32,15 +36,11 @@ enc() {
     -b:v "$br" -maxrate "$br" -bufsize "$br" -f h264 "$out"
 }
 
-# Count in-band SPS (nal_unit_type 7) NALs by scanning for Annex-B start codes
-# directly. NOT implemented via ffmpeg's trace_headers bsf: empirically, its
-# logging (via the auto-inserted extract_extradata bsf plus the internal h264
-# parser) does not scale 1:1 with the real NAL count — a stream with exactly
-# one real in-band SPS logged either 1 or 2 "nal_unit_type: 7" trace lines
-# depending on what else was in the stream, and a stream with 3 real SPS
-# logged 4 — so it cannot be trusted as a count. A byte-level scan for the
-# start-code + SPS header byte (forbidden_zero_bit=0, nal_unit_type=7, any of
-# the 4 possible nal_ref_idc values: 0x07/0x27/0x47/0x67) is exact.
+# Whether a stream has an in-band SPS (nal_unit_type 7): a byte-level scan for
+# a 3-byte start code followed by an SPS header byte (any of the 4 nal_ref_idc
+# values: 0x07/0x27/0x47/0x67). Only presence (0 vs not 0) is used; a 4-byte
+# start code ends in the same 3 bytes. Not ffmpeg's trace_headers, whose
+# extradata handling logs SPS lines that do not match the real NAL count.
 sps_count() {
   grep -c -aP '\x00\x00\x01[\x07\x27\x47\x67]' "$1" 2>/dev/null || true
 }
@@ -95,7 +95,8 @@ committed() {
   # encoder params (same size/profile/level/keyint/range, differing only in
   # repeat-headers), prepended once ahead of the repeat-headers=0 payload.
   if [ "$(sps_count "$d/360p30_main_norepeat.h264")" -eq 0 ]; then
-    local sps_pps=$(mktemp)
+    local sps_pps
+    sps_pps=$(mktemp)
     "${FF[@]}" -i "$d/360p30_main_full.h264" -frames:v 1 -c copy \
       -bsf:v "filter_units=pass_types=7-8" -f h264 "$sps_pps"
     cat "$sps_pps" "$d/360p30_main_norepeat.h264" > "${d}/360p30_main_norepeat.h264.tmp"
@@ -128,6 +129,86 @@ committed() {
   manifest $d/480p30_main_full.h264 30
   manifest $d/360p30_main_full.flv 30
   manifest $d/slate_1080p.h264 1
+  es3like
+}
+
+es3_fixture() { cargo run -q -p kvm-proto --example es3_fixture -- "$@"; }
+
+# check_sps_trace HEX FIELD=VALUE...: ffmpeg's trace_headers, an independent
+# reader, must see every listed field of the Annex-B SPS HEX at its value.
+check_sps_trace() {
+  local hex=$1 f trace kv got
+  shift
+  f=$(mktemp)
+  printf '%b' "$(printf '00000001%s' "$hex" | sed 's/../\\x&/g')" > "$f"
+  trace=$("${DEC[@]}" -loglevel trace -f h264 -i "$f" -c copy -bsf:v trace_headers -f null - 2>&1 || true)
+  rm -f "$f"
+  for kv in "$@"; do
+    got=$(tv "$trace" "${kv%%=*}")
+    if [ "$got" != "${kv#*=}" ]; then
+      echo "gen-fixtures: SPS $hex: ${kv%%=*} is $got, want ${kv#*=}" >&2
+      return 1
+    fi
+  done
+}
+
+# The ES3-shaped POC-type-0 fixture (spec §11.5; Plan B deviation D6): an x264
+# Baseline POC-type-2 encode of limited-range BT.709 pixels (what Leg A
+# measured on the ES3's) with the ES3's GOP (keyint 60, ref 1), turned by
+# kvm-proto's es3_fixture example into POC type 0 (pic_order_cnt_lsb =
+# 2 × frame_num) carrying the ES3's mislabels — so the §6.8 VUI rewrite makes
+# its VUI true, as it does the ES3's. Checked four ways: trace_headers reads
+# the L0 goldens of kvm-proto Task 2.4 (census.md's sps_hex rewritten) with
+# the fields that task claims; the decode is unchanged; kvm-proto's full §6.8
+# rewrite of the fixture reads back in trace_headers as level 30,
+# limited-range BT.709 and bitstream_restriction 0/1, with the decode still
+# unchanged; and ffmpeg's own h264_metadata level+VUI rewrite of its SPS is
+# recorded in the manifest, which kvm-proto's tests compare byte for byte
+# with the bridge's.
+es3like() {
+  local d=fixtures work md5_src trace kv got hex
+  check_sps_trace 67420028965403c0112f2cd40404041b41008540 level_idc=40 \
+    video_full_range_flag=0 colour_primaries=1 transfer_characteristics=1 \
+    matrix_coefficients=1 bitstream_restriction_flag=1 max_num_reorder_frames=0 \
+    max_dec_frame_buffering=1 pic_order_cnt_type=0
+  check_sps_trace 67420028965403c0112f2cd404040408 level_idc=40 video_full_range_flag=0 \
+    colour_primaries=1 transfer_characteristics=1 matrix_coefficients=1 \
+    bitstream_restriction_flag=0
+  work=$(mktemp -d)
+  enc "$work/src.h264" 640x360 120 baseline 3.0 tv 60 600k 1 40 32 ":ref=1"
+  es3_fixture es3ify "$work/src.h264" $d/360p30_es3like_poc0.h264
+  md5_src=$("${DEC[@]}" -i "$work/src.h264" -fps_mode passthrough -f md5 -)
+  if [ "$("${DEC[@]}" -i $d/360p30_es3like_poc0.h264 -fps_mode passthrough -f md5 -)" != "$md5_src" ]; then
+    echo "es3like: decoded frames differ from the x264 source" >&2
+    rm -rf "$work"
+    return 1
+  fi
+  es3_fixture rewrite $d/360p30_es3like_poc0.h264 "$work/rewritten.h264"
+  trace=$("${DEC[@]}" -loglevel trace -i "$work/rewritten.h264" -c copy -bsf:v trace_headers -f null - 2>&1 || true)
+  for kv in level_idc=30 video_full_range_flag=0 colour_primaries=1 transfer_characteristics=1 \
+    matrix_coefficients=1 bitstream_restriction_flag=1 max_num_reorder_frames=0 \
+    max_dec_frame_buffering=1 pic_order_cnt_type=0; do
+    got=$(tv "$trace" "${kv%%=*}")
+    if [ "$got" != "${kv#*=}" ]; then
+      echo "es3like: rewritten SPS ${kv%%=*} is $got, want ${kv#*=}" >&2
+      rm -rf "$work"
+      return 1
+    fi
+  done
+  if [ "$("${DEC[@]}" -i "$work/rewritten.h264" -fps_mode passthrough -f md5 -)" != "$md5_src" ]; then
+    echo "es3like: the rewrite changed the decoded frames" >&2
+    rm -rf "$work"
+    return 1
+  fi
+  "${FF[@]}" -i $d/360p30_es3like_poc0.h264 -frames:v 1 -c copy \
+    -bsf:v "h264_metadata=level=3:video_full_range_flag=0:colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1,filter_units=pass_types=7" \
+    -f h264 "$work/meta.h264"
+  hex=$(od -An -tx1 -v "$work/meta.h264" | tr -d ' \n' | sed 's/^00000001//')
+  manifest $d/360p30_es3like_poc0.h264 60
+  jq --arg h "$hex" '. + {ffmpeg_level_vui_sps_hex: $h}' \
+    $d/360p30_es3like_poc0.h264.manifest.json > "$work/manifest.json"
+  mv "$work/manifest.json" $d/360p30_es3like_poc0.h264.manifest.json
+  rm -rf "$work"
 }
 
 large() {
@@ -142,7 +223,8 @@ large() {
 
 case "$MODE" in
   committed) committed ;;
+  es3like) es3like ;;
   large) large ;;
   clean) rm -rf fixtures/large ;;
-  *) echo "usage: $0 [committed|large|clean]" >&2; exit 2 ;;
+  *) echo "usage: $0 [committed|es3like|large|clean]" >&2; exit 2 ;;
 esac
