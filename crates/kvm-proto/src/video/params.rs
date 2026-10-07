@@ -166,17 +166,23 @@ impl ParamState {
     pub(crate) fn take_pps(&mut self, nal: &Bytes) -> Result<(), AdmissionError> {
         let pps = check_pps(&self.ctx, nal).map_err(|e| incompatible(Incompatible::Pps(e)))?;
         let id = pps.pic_parameter_set_id.id();
+        // `Bytes::clone()` would share `nal`'s backing allocation — the
+        // demuxer's whole tag buffer (up to the 4 MiB tag cap, §6.2) — for
+        // as long as this PPS stays cached. A PPS is tens of bytes, so copy
+        // it out instead: up to `max_pps` cached copies cost nothing next
+        // to one shared 4 MiB tag buffer kept alive per cached id (fix
+        // round 1, m5).
         match self.pps.binary_search_by_key(&id, |(i, _)| *i) {
             Ok(at) => {
                 if let Some(slot) = self.pps.get_mut(at) {
-                    slot.1 = nal.clone();
+                    slot.1 = Bytes::copy_from_slice(nal);
                 }
             }
             Err(at) => {
                 if self.pps.len() >= self.max_pps {
                     return Err(framing(Framing::TooManyPps));
                 }
-                self.pps.insert(at, (id, nal.clone()));
+                self.pps.insert(at, (id, Bytes::copy_from_slice(nal)));
             }
         }
         self.ctx.put_pic_param_set(pps);
@@ -442,5 +448,48 @@ mod tests {
             .build(),
         ))
         .unwrap();
+    }
+
+    /// A PPS refusal is `stream_incompatible`, not a transient framing
+    /// violation (§6.9's "slice/PPS check fails" row), and the context a PPS
+    /// is checked against holds only the *active* SPS: once a new SPS
+    /// supersedes it, a PPS naming the old id is refused, not silently
+    /// admitted against stale state (fix round 1, I1).
+    #[test]
+    fn a_refused_pps_is_stream_incompatible_and_needs_the_active_sps() {
+        use crate::h264::pps::PpsRefusal;
+        let mut st = state();
+        tag(&mut st, &[&baseline(39, 22)], &[]);
+        let groups = PpsCfg {
+            slice_groups: true,
+            ..PpsCfg::default()
+        };
+        assert_eq!(
+            st.take_pps(&Bytes::from(groups.build())),
+            Err(incompatible(Incompatible::Pps(PpsRefusal::SliceGroups)))
+        );
+        // After the active SPS becomes id 1, a PPS naming id 0 is refused.
+        let mut c = SpsCfg::main_1080p();
+        c.profile_idc = 66;
+        c.pic_width_in_mbs_minus1 = 39;
+        c.pic_height_in_map_units_minus1 = 22;
+        c.crop = None;
+        c.seq_parameter_set_id = 1;
+        tag(&mut st, &[&c.build()], &[]);
+        assert_eq!(
+            st.take_pps(&Bytes::from(PpsCfg::default().build())),
+            Err(incompatible(Incompatible::Pps(PpsRefusal::UnknownSps(0))))
+        );
+    }
+
+    /// Initial beats Resize beats Other beats nothing (fix round 1, m4): the
+    /// test helper above only ever calls `strongest(None, x)`, so a rank
+    /// swap between `Resize` and `Other` would pass every other test.
+    #[test]
+    fn strongest_ranks_initial_over_resize_over_other() {
+        use ParamClass::{Initial, Other, Resize};
+        assert_eq!(strongest(Some(Resize), Some(Other)), Some(Resize));
+        assert_eq!(strongest(Some(Other), Some(Initial)), Some(Initial));
+        assert_eq!(strongest(Some(Resize), None), Some(Resize));
     }
 }

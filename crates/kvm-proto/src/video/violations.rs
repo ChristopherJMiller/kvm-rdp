@@ -38,7 +38,13 @@ impl ViolationWindow {
         ViolationWindow {
             threshold,
             window,
-            recent: VecDeque::with_capacity(threshold),
+            // `record` never holds more than `threshold` entries (the
+            // cap-pop below), but `threshold` is caller-supplied
+            // configuration, not hostile stream input; `with_capacity`
+            // with an absurd value (e.g. `usize::MAX`) panics with
+            // "capacity overflow" (fix round 1, m2), so cap the eager
+            // allocation instead of trusting the argument.
+            recent: VecDeque::with_capacity(threshold.min(8)),
         }
     }
 
@@ -94,5 +100,25 @@ mod tests {
         // The first is 60 s old by now: only two remain in the window.
         assert_eq!(w.record(t0 + s(60)), ViolationVerdict::Transient);
         assert_eq!(w.record(t0 + s(61)), ViolationVerdict::Fatal);
+    }
+
+    /// `new` is a `pub` constructor a caller can misconfigure; it must not
+    /// panic however large `threshold` is (fix round 1, m2).
+    #[test]
+    fn a_huge_threshold_does_not_panic_on_construction() {
+        let mut w = ViolationWindow::new(usize::MAX, Duration::from_secs(60));
+        assert_eq!(w.record(Instant::now()), ViolationVerdict::Transient);
+    }
+
+    /// Storage never grows past `threshold`, however many violations land
+    /// inside the window (fix round 1, m3).
+    #[test]
+    fn storage_never_exceeds_the_threshold() {
+        let t0 = Instant::now();
+        let mut w = ViolationWindow::stream_corrupt();
+        for i in 0..10u64 {
+            w.record(t0 + Duration::from_millis(i));
+        }
+        assert_eq!(w.recent.len(), 3);
     }
 }

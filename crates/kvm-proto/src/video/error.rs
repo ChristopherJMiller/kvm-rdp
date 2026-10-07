@@ -109,8 +109,24 @@ mod tests {
 
     #[test]
     fn every_kind_label_is_distinct() {
+        // Every `FlvError` variant (fix round 1, m1): the previous version
+        // listed only `OversizeTag`, so renaming `Framing::TooManyPps`'s own
+        // label to collide with `FlvError::TooManyNals`'s `"too_many_nals"`
+        // passed. All 12 of `FlvError`'s current variants are listed so a
+        // label collision anywhere in that delegated match fails here too.
         let all = [
+            AdmissionError::from(FlvError::BadHeader),
+            AdmissionError::from(FlvError::BadPrevTagSize),
+            AdmissionError::from(FlvError::EncryptedTag),
+            AdmissionError::from(FlvError::BadStreamId),
             AdmissionError::from(FlvError::OversizeTag),
+            AdmissionError::from(FlvError::BadConfigRecord),
+            AdmissionError::from(FlvError::BadLengthSize),
+            AdmissionError::from(FlvError::NalBeforeSequenceHeader),
+            AdmissionError::from(FlvError::MalformedVideoTag),
+            AdmissionError::from(FlvError::TooManyNals),
+            AdmissionError::from(FlvError::ParamSetCount),
+            AdmissionError::from(FlvError::ParamSetSize),
             framing(Framing::UnknownTagType(3)),
             framing(Framing::Nal(NalRefusal::Empty)),
             framing(Framing::Nal(NalRefusal::ForbiddenBit)),
