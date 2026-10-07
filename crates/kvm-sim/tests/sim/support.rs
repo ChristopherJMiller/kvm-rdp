@@ -90,11 +90,13 @@ impl FlvClient {
         })
     }
 
-    /// The next demuxed tag, `Ok(None)` on a clean close.
+    /// The next demuxed tag. `Ok(None)` on EOF *or* a read error (PB17, n3:
+    /// a reset reads the same as a clean close — both mean "reconnect" to
+    /// every caller here, so this does not distinguish them).
     ///
     /// Fix round 1 (m4): a timeout is `Err(NextError::Timeout)`, distinct
-    /// from `Ok(None)` (the FLV actually closed) — the two used to be the
-    /// same value, which let a stall pass for "the FLV closes".
+    /// from `Ok(None)` — the two used to be the same value, which let a
+    /// stall pass for "the FLV closes".
     pub async fn next(&mut self) -> Result<Option<FlvTag>, NextError> {
         let mut buf = [0u8; 16 * 1024];
         loop {
@@ -126,6 +128,24 @@ pub enum NextError {
 impl From<kvm_proto::flv::FlvError> for NextError {
     fn from(e: kvm_proto::flv::FlvError) -> Self {
         NextError::Flv(e)
+    }
+}
+
+/// Task 8.5's fault tests read `FlvClient::next`'s error straight into the
+/// bridge's own refusal type: a demux-level `FlvError` is exactly one of
+/// `VideoAdmission::admit`'s framing refusals (`AdmissionError`'s own
+/// `From<FlvError>`); no fault in this batch should ever leave a tag
+/// unread for `T`, so a `Timeout` here is a test bug, not a refusal to
+/// classify — it panics with a clear message instead of being silently
+/// misclassified.
+impl From<NextError> for kvm_proto::video::AdmissionError {
+    fn from(e: NextError) -> Self {
+        match e {
+            NextError::Flv(e) => e.into(),
+            NextError::Timeout => {
+                panic!("FlvClient::next timed out instead of refusing or closing")
+            }
+        }
     }
 }
 

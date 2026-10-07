@@ -1,7 +1,7 @@
 use crate::support::{FlvClient, T, es3_sim, flv_raw_request, login, sim_with, target};
 use kvm_proto::flv::{FrameType, TagBody, VideoBody};
 use kvm_proto::video::{AdmissionConfig, ParamClass, VideoAdmission};
-use kvm_sim::{Fault, KvmSim, Pacing, Profile, ResizeSignal, SimConfig, SimEvent, Source};
+use kvm_sim::{KvmSim, Pacing, Profile, ResizeSignal, SimConfig, SimEvent, Source};
 use std::time::{Duration, Instant};
 
 fn nal_types(body: &TagBody) -> Vec<u8> {
@@ -465,8 +465,14 @@ async fn an_evicted_full_queue_viewer_closes_promptly_while_its_client_stays_sta
     // FLV connection must close promptly even though its client is still
     // not reading — not only once it resumes and drains what was already
     // queued (the bug I1 found: no FlvClose for 3s+, then hundreds of
-    // stale tags on resume).
-    sim.inject(Fault::Close);
+    // stale tags on resume). PB17/n2: a source switch is the control item
+    // here, not `Fault::Close` — Task 8.5 makes `Fault::Close` close every
+    // open viewer (the reader too), which this test's `flv_open == 1`
+    // assertion does not expect; a `Params` item still evicts the full
+    // queue the same way (`Encoder::broadcast`) without touching the
+    // reader beyond a harmless new sequence header.
+    let other = Source::fixture("480p30_main_full.h264").unwrap();
+    sim.switch_source(other, ResizeSignal::SequenceHeader);
     let ev = sim
         .wait_for(Duration::from_millis(500), |e| {
             e.iter()

@@ -1,21 +1,28 @@
 //! `GET /av.flv?token=…` (§3.1): a close-delimited HTTP-FLV stream in the
 //! profile's tag shape — one tag per access unit, `CompositionTime` per the
 //! profile on coded tags (0 on the sequence header), the profile's NAL
-//! length size. Every write is timed (`max_flv_write_block`) and each coded
-//! tag's is stamped (`FlvAu`'s instant is `sim_tx`).
+//! length size — with one-shot faults applied on the wire. Every write is
+//! timed (`max_flv_write_block`) and each coded tag's is stamped (`FlvAu`'s
+//! instant is `sim_tx`).
 use crate::encoder::{EncoderHandle, Item, OutFrame};
 use crate::http::{FLV_HEAD, Request, respond};
 use crate::source::nal_type;
 use crate::state::{Shared, SimEvent};
-use crate::{Profile, ResizeSignal};
+use crate::{Fault, Profile, ResizeSignal};
 use bytes::Bytes;
 use kvm_proto::flv::mux::{
-    TAG_VIDEO, avc_nalu_body, avc_sequence_header_body, write_flv_header, write_tag,
+    RawTagHeader, TAG_VIDEO, avc_end_of_sequence_body, avc_nalu_body, avc_sequence_header_body,
+    video_tag_byte, write_flv_header, write_raw_tag, write_tag,
 };
 use kvm_proto::h264::frame_id;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// A slice NAL whose header prefix is `first_mb 0, slice_type 1 (B), pps 0`.
+const B_SLICE: [u8; 2] = [0x41, 0xAC];
+/// A tiny AUD, repeated to exceed §6.2's 128 NALs per tag.
+const AUD: [u8; 2] = [0x09, 0xF0];
 
 /// Bound on the final `shutdown()`, so closing an evicted-but-stalled
 /// connection cannot itself hang (fix round 1, I1). A graceful TLS
@@ -32,6 +39,13 @@ struct Writer<W> {
     shared: Arc<Shared>,
     frames_written: u64,
     seen_idr: bool,
+    /// `Fault::Silence`: stop writing, keep the connection open.
+    silenced: bool,
+    /// A one-shot fault waiting for the next frame it can act on.
+    pending: Option<Fault>,
+    /// `Fault::TwoPictures`: the frame held back so it ships in the next
+    /// frame's tag instead of its own.
+    held: Option<Arc<OutFrame>>,
     inband_next: Option<(Bytes, Bytes)>,
 }
 
@@ -69,8 +83,19 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
     /// Returns false when the connection should close.
     async fn item(&mut self, item: Item) -> std::io::Result<bool> {
         match item {
-            // One-shot faults are Task 8.5's.
-            Item::Fault(_) => {}
+            Item::Fault(Fault::Close) => return Ok(false),
+            Item::Fault(Fault::Silence) => self.silenced = true,
+            Item::Fault(Fault::EndOfSequence) => {
+                let mut tag = Vec::new();
+                let _ = write_tag(
+                    &mut tag,
+                    TAG_VIDEO,
+                    self.timestamp(),
+                    &avc_end_of_sequence_body(),
+                );
+                self.write(&tag).await?;
+            }
+            Item::Fault(f) => self.pending = Some(f),
             Item::Params {
                 signal: ResizeSignal::CloseFlv,
                 ..
@@ -95,11 +120,20 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
     }
 
     async fn frame(&mut self, f: Arc<OutFrame>) -> std::io::Result<()> {
-        if !self.seen_idr && !f.idr {
+        if self.silenced || (!self.seen_idr && !f.idr) {
             return Ok(());
         }
         self.seen_idr = true;
+        if matches!(self.pending, Some(Fault::TwoPictures)) && self.held.is_none() {
+            self.held = Some(f);
+            return Ok(());
+        }
         let mut nals: Vec<Bytes> = Vec::new();
+        let mut fault = None;
+        if let Some(h) = self.held.take() {
+            nals.extend(h.nals.iter().cloned());
+            fault = self.pending.take();
+        }
         if f.idr
             && let Some((sps, pps)) = self.inband_next.take()
         {
@@ -107,31 +141,80 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             nals.push(pps);
         }
         nals.extend(f.nals.iter().cloned());
+        if fault.is_none() {
+            fault = self.pending.take();
+        }
+        let mut ct = self.profile.composition_time_ms;
+        match &fault {
+            Some(Fault::CompositionTime(c)) => ct = *c,
+            Some(Fault::BSlice) => nals = vec![Bytes::from_static(&B_SLICE)],
+            Some(Fault::StartCodeInNal) => corrupt_first_vcl(&mut nals, |v| {
+                v.splice(1..1, [0, 0, 1]);
+            }),
+            Some(Fault::ForbiddenBit) => corrupt_first_vcl(&mut nals, |v| {
+                if let Some(b) = v.first_mut() {
+                    *b |= 0x80;
+                }
+            }),
+            Some(Fault::TooManyNals) => nals = vec![Bytes::from_static(&AUD); 129],
+            _ => {}
+        }
         let refs: Vec<&[u8]> = nals.iter().map(|n| n.as_ref()).collect();
         let mut body = Vec::new();
-        let ct = self.profile.composition_time_ms;
         avc_nalu_body(&mut body, f.idr, ct, &refs, self.profile.length_size)
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+        let mut header = RawTagHeader {
+            type_byte: TAG_VIDEO,
+            timestamp_ms: self.timestamp(),
+            stream_id: 0,
+            data_size: None,
+            prev_tag_size: None,
+        };
+        match &fault {
+            Some(Fault::OversizeTag) => header.data_size = Some(0x00FF_FFFF),
+            Some(Fault::BadPrevTagSize) => {
+                header.prev_tag_size = Some(u32::try_from(body.len() + 12).unwrap_or(0));
+            }
+            Some(Fault::EncryptedTag) => header.type_byte = 0x20 | TAG_VIDEO,
+            Some(Fault::BadStreamId) => header.stream_id = 1,
+            Some(Fault::HevcCodecId) => {
+                if let Some(b) = body.first_mut() {
+                    *b = video_tag_byte(if f.idr { 1 } else { 2 }, 12);
+                }
+            }
+            Some(Fault::EnhancedHevc) => body = vec![0x80 | 0x10 | 1, b'h', b'v', b'c', b'1'],
+            _ => {}
+        }
         let mut tag = Vec::with_capacity(body.len() + 15);
-        write_tag(&mut tag, TAG_VIDEO, self.timestamp(), &body)
+        write_raw_tag(&mut tag, &header, &body)
             .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
         let sim_tx = self.write(&tag).await?;
         self.frames_written += 1;
-        let vcl = nals
-            .iter()
-            .filter(|n| matches!(nal_type(n), 1 | 5))
-            .map(|n| n.as_ref());
-        self.shared.record_at(
-            sim_tx,
-            SimEvent::FlvAu {
-                conn: self.conn,
-                seq: f.seq,
-                source_index: f.source_index,
-                frame_id: frame_id(vcl),
-                idr: f.idr,
-            },
-        );
+        if fault.is_none() {
+            let vcl = nals
+                .iter()
+                .filter(|n| matches!(nal_type(n), 1 | 5))
+                .map(|n| n.as_ref());
+            self.shared.record_at(
+                sim_tx,
+                SimEvent::FlvAu {
+                    conn: self.conn,
+                    seq: f.seq,
+                    source_index: f.source_index,
+                    frame_id: frame_id(vcl),
+                    idr: f.idr,
+                },
+            );
+        }
         Ok(())
+    }
+}
+
+fn corrupt_first_vcl(nals: &mut [Bytes], f: impl FnOnce(&mut Vec<u8>)) {
+    if let Some(n) = nals.iter_mut().find(|n| matches!(nal_type(n), 1 | 5)) {
+        let mut v = n.to_vec();
+        f(&mut v);
+        *n = Bytes::from(v);
     }
 }
 pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
@@ -186,6 +269,9 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         shared: shared.clone(),
         frames_written: 0,
         seen_idr: false,
+        silenced: false,
+        pending: None,
+        held: None,
         inband_next: None,
     };
     let mut head = FLV_HEAD.to_vec();

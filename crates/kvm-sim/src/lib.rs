@@ -6,13 +6,11 @@
 //! the bridge's L2/L3 tests and kvm-bench can assert on it. It replays
 //! committed fixtures only, never KVM captures.
 
-// av.flv's faults (Task 8.5) read `encoder::Item::Fault`; the websocket
-// (Task 8.6) is the last user of `state`.
-#[allow(dead_code)]
 mod encoder;
 mod flv;
 mod http;
 mod source;
+// The websocket (Task 8.6) is the last user of `state`.
 #[allow(dead_code)]
 mod state;
 mod tls;
