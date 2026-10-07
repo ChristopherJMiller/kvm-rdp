@@ -78,6 +78,75 @@ fn convert_all(data: &[u8], nal_length_size: usize, out: &mut Vec<u8>) -> Result
     Ok(())
 }
 
+/// Iterator over the NAL units of an Annex-B byte stream (B.1): each NAL is
+/// the bytes between one `00 00 01` start code (3- or 4-byte form) and the
+/// next, with trailing zero bytes (`trailing_zero_8bits` and a 4-byte start
+/// code's leading zero) removed. Bytes before the first start code are
+/// skipped. Panic-free over any input.
+#[derive(Debug, Clone)]
+pub struct AnnexBNals<'a> {
+    rest: &'a [u8],
+}
+
+/// Split an Annex-B stream into NAL units (see [`AnnexBNals`]).
+#[must_use]
+pub fn split_annex_b(data: &[u8]) -> AnnexBNals<'_> {
+    let start = find_start_code(data).map_or(data.len(), |(_, after)| after);
+    AnnexBNals {
+        rest: data.get(start..).unwrap_or(&[]),
+    }
+}
+
+/// `(index of the 00 00 01, index just past it)` of the first start code.
+fn find_start_code(data: &[u8]) -> Option<(usize, usize)> {
+    let at = data.windows(3).position(|w| w == [0, 0, 1])?;
+    Some((at, at.checked_add(3)?))
+}
+
+impl<'a> Iterator for AnnexBNals<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        loop {
+            if self.rest.is_empty() {
+                return None;
+            }
+            let (nal, rest) = match find_start_code(self.rest) {
+                Some((at, after)) => (
+                    self.rest.get(..at).unwrap_or(&[]),
+                    self.rest.get(after..).unwrap_or(&[]),
+                ),
+                None => (self.rest, &[][..]),
+            };
+            self.rest = rest;
+            let end = nal
+                .iter()
+                .rposition(|&b| b != 0)
+                .map_or(0, |i| i.saturating_add(1));
+            let nal = nal.get(..end).unwrap_or(&[]);
+            if !nal.is_empty() {
+                return Some(nal);
+            }
+        }
+    }
+}
+
+/// §10.2 FrameId: FNV-1a 64 over the VCL NALs (types 1 and 5) of one access
+/// unit, concatenated in order, header bytes included, without start codes
+/// or length prefixes. kvm-sim records it on send and test clients on
+/// receipt; the bridge never changes VCL bytes, so the two agree.
+#[must_use]
+pub fn frame_id<'a>(vcl: impl IntoIterator<Item = &'a [u8]>) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    for nal in vcl {
+        for &b in nal {
+            h = (h ^ u64::from(b)).wrapping_mul(PRIME);
+        }
+    }
+    h
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -172,5 +241,54 @@ mod tests {
             })
         );
         assert_eq!(out, seeded);
+    }
+}
+
+#[cfg(test)]
+mod split_tests {
+    #![allow(clippy::indexing_slicing)]
+    use super::*;
+
+    #[test]
+    fn splits_three_and_four_byte_start_codes_and_drops_trailing_zeros() {
+        let s = [
+            0xAA, 0xBB, // junk before the first start code
+            0, 0, 0, 1, 0x67, 0x42, 0, 0, // SPS + trailing_zero_8bits
+            0, 0, 1, 0x68, 0xCE, // 3-byte start code
+            0, 0, 0, 1, 0x65, 0x88, 0x80,
+        ];
+        let nals: Vec<&[u8]> = split_annex_b(&s).collect();
+        assert_eq!(
+            nals,
+            [&[0x67, 0x42][..], &[0x68, 0xCE], &[0x65, 0x88, 0x80]]
+        );
+    }
+
+    #[test]
+    fn empty_and_start_code_only_input_yield_nothing() {
+        assert_eq!(split_annex_b(&[]).count(), 0);
+        assert_eq!(split_annex_b(&[0, 0, 1]).count(), 0);
+        assert_eq!(split_annex_b(&[0, 0, 0, 1, 0, 0, 0, 1]).count(), 0);
+        assert_eq!(split_annex_b(&[1, 2, 3]).count(), 0);
+    }
+
+    #[test]
+    fn re_splits_what_avcc_to_annex_b_writes() {
+        let avcc = [0, 0, 0, 3, 0x67, 0x42, 0x10, 0, 0, 0, 2, 0x68, 0xCE];
+        let mut out = Vec::new();
+        avcc_to_annex_b(&avcc, 4, &mut out).unwrap_or_default();
+        let nals: Vec<&[u8]> = split_annex_b(&out).collect();
+        assert_eq!(nals, [&[0x67, 0x42, 0x10][..], &[0x68, 0xCE]]);
+    }
+
+    #[test]
+    fn frame_id_is_fnv1a_64_over_the_concatenation() {
+        // FNV-1a 64 reference values: "" and "a".
+        assert_eq!(frame_id(std::iter::empty::<&[u8]>()), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(frame_id([&b"a"[..]]), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(
+            frame_id([&[0x41, 0x9A][..], &[0x01, 0x02]]),
+            frame_id([&[0x41, 0x9A, 0x01, 0x02][..]])
+        );
     }
 }
