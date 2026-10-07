@@ -2,11 +2,33 @@
 
 | | |
 |---|---|
-| Status | Draft rev 6 — census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
+| Status | Draft rev 6.1 — Plan B's deviations recorded (2026-10-06); rev 6: census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
 | Repo | `github.com/ChristopherJMiller/kvm-rdp` (public, MIT OR Apache-2.0) |
 | First target | Angeet/Yeeso ES3 "ONE KVM" wired to a Mac Studio |
 | Client | Microsoft Windows App on macOS, through an rdpgw RD Gateway on 443 |
 | Companion spec | Deployment, gateway, edge gating and KVM isolation live in `luma-homeops` (separate spec, written after Milestone 0). §9.4 lists what this spec requires of it |
+
+**Rev 6.1 — Plan B (2026-10-06).** Records what building Milestones 1 and 2
+settled: POC type 1 is refused (§6.1); trailing zero bytes are trimmed from
+every NAL before the §6.2 checks, at most one AUD per tag comes before any
+slice, unknown FLV tag types are framing violations, burst marking is
+measured from the first coded tag, and the 4 SPS / 16 PPS limits also bound
+each tag's in-band sets (§6.2); one active SPS and a sequence header that
+replaces every PPS, with a PPS-only change classed `other` and
+byte-identical repeats raising nothing (§6.1); the level rewrite applies
+H.264 A.3.1's frame-size rules in full, and with level ≤ 5.1 admits at most
+32 768 MBs per frame at 30 fps (§6.8 (a)); a `level_idc` outside Table A-1,
+or above level 5.1, is `stream_incompatible` rather than guessed at, level
+1b ranks strictly between level 1 and level 1.1, and `constraint_set3_flag`
+clears on every level raise of a profile 66/77/88 SPS (§6.8); the
+fuzz-oracle module is the one `kvm-proto` module outside the parser lint
+denies (§6.2); kvm-sim speaks HTTP through httparse rather than hyper
+(§4.1), disconnects a full-but-connected viewer on its next control item
+instead of starving it forever, and alternates `idr_pic_id` between
+consecutive NO SIGNAL IDRs (§11.5); the POC-type-0 fixture is ES3-shaped —
+limited-range BT.709 pixels under the ES3's mislabels (§11.5); and the
+IronRDP fork pin moves to `kvm-rdp-egfx-patches-v2`, rebased onto upstream
+`2c08bda7` (§4.2).
 
 **Rev 6 — census-filled (2026-10-06).** Fills every census-dependent value
 from `docs/census.md` — Leg A, Leg B (direct) and Leg C (through rdpgw
@@ -186,7 +208,7 @@ Windows App ─ rdpgw ─┼─▶ RdpServer (Preempt, Hybrid/NLA)              
 |---|---|---|
 | `kvm-proto` | `bytes`, `h264-reader` — no IronRDP, no tokio, no TLS | FLV demux **and mux**, AVCC→Annex-B, NAL sanitiser, SPS/PPS/slice-header checks and SPS-change classification, SPS rewriter, HID encoders, scancode→HID and US-layout tables, login response parsing, and the sans-IO cores of §4.3 that need no IronRDP types |
 | `kvm-probe` | `kvm-proto`, tokio, hyper, tungstenite, rustls (aws-lc) | Census tool (§12). No IronRDP |
-| `kvm-sim` | `kvm-proto`, tokio, hyper, tokio-tungstenite, rustls (aws-lc) | Fake ES3 for tests and benches (§11.5), served over TLS |
+| `kvm-sim` | `kvm-proto`, tokio, httparse (hyper's parser), tokio-tungstenite, rustls (aws-lc) | Fake ES3 for tests and benches (§11.5), served over TLS; it writes HTTP itself so every FLV byte is observable and corruptible (rev 6.1) |
 | `kvm-rdp` | `kvm-proto`, IronRDP, tokio, rustls (aws-lc) | The bridge binary |
 | `kvm-bench` | `kvm-sim`, IronRDP client crates | Perf harness (§10.2) |
 | `fuzz/` | `kvm-proto` only | Separate cargo workspace, nightly, CI-only |
@@ -206,11 +228,18 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   capability ladder, re-advertise recovery, the ack-suspend fix and the pre-TLS
   DoS fix (#1515), and their `Avc420Region` bounds are inclusive where HEAD's
   are exclusive.
-- **Upstream prerequisites for Plan C.** Plan A writes four IronRDP patches
+- **Upstream prerequisites for Plan C.** Plan A wrote four IronRDP patches
   (each roughly 30–50 lines plus a test) on branch `kvm-rdp-egfx-patches`,
   off `38b074e`, of the owner's public fork
-  (`github.com/ChristopherJMiller/IronRDP`).
-  The upstream PR is deferred until the owner says to open it:
+  (`github.com/ChristopherJMiller/IronRDP`). **Rev 6.1**: rebased onto
+  upstream `2c08bda7`, which merged Devolutions/IronRDP#2034 — the
+  equivalent of the old patch 3 below. Upstream's version runs the discard
+  inside `run_connection`/`run_connection_with` themselves, so it covers both
+  entry points and also drops an embedder's `ServerEvent`s queued *before*
+  the call, not only ones left over from an earlier connection. Patch 3 is
+  dropped; the fork, renamed `kvm-rdp-egfx-patches-v2`, now carries three
+  patches. The upstream PR for what remains is deferred until the owner says
+  to open it:
   1. **Ack suspension survives resets.** (a) `FrameTracker::clear()` keeps
      `ack_suspended` — used by `resize_with_monitors`, i.e. every Setup;
      MS-RDPEGFX's ResetGraphics says nothing about acknowledgement. (b) The
@@ -227,26 +256,31 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
      suspension by feeding a synthetic `FrameAcknowledge{queue_depth: Suspend,
      frame_id: last_issued}` through the handle's `DvcProcessor::process`,
      ignores the resulting `on_frame_ack`, and forwards `drain_output()`.
-  2. **A per-generation outbound counter.** `EgfxServerMessage::SendMessages`
-     gains an optional `(Arc<AtomicU64>, weight: u64)`; once every byte of that
-     event has been written (TCP `write_all` + flush returned, or each UDP send
-     returned), IronRDP adds `weight` to the counter. The bridge sets `weight`
-     = Σ `DvcMessage::size()` of the drained batch and owns one counter per
-     generation (§6.6). The enum becomes `#[non_exhaustive]`.
-  3. **No stale events across connections**: `discard_stale_session_events()`
-     runs before serving every connection, on the Fresh path as well as after
-     preemption.
-  4. **A hard-close path**: a per-connection abort handle that drops the
-     connection future (so `on_disconnected` runs) even while the writer is
-     blocked on a peer that stopped reading; and a bounded write of the
-     SetErrorInfo PDU on bridge-initiated disconnects.
+  2. **A per-generation outbound write-progress counter.** Shipped as
+     `EgfxServerMessage::send_messages(..).with_write_counter(weight)` on a
+     `#[non_exhaustive]` variant (**rev 6.1**, breaking: not the bare
+     `(Arc<AtomicU64>, weight)` tuple field earlier drafts of this patch
+     carried) — once every byte of a batch has been written (TCP
+     `write_all` + flush returned; a UDP send counts when the send queue
+     *accepts* the payload, not when the send itself returns), IronRDP adds
+     `weight` to the counter. The bridge sets `weight` = Σ
+     `DvcMessage::size()` of the drained batch and owns one counter per
+     generation (§6.6).
+  3. **A hard-close path**: the per-connection abort handle now comes from
+     upstream's own `ConnectionInfo::abort_handle()`, taken in
+     `on_connection_info` (**rev 6.1**: not a fork-added field, as earlier
+     drafts had it) — dropping the connection future (so `on_disconnected`
+     runs) even while the writer is blocked on a peer that stopped reading;
+     and a bounded write of the SetErrorInfo PDU on bridge-initiated
+     disconnects.
 
-  **Plan C git-pins the fork branch**, which carries only these patches — a
-  documented, temporary exception to "upstream IronRDP", reverted when the
-  patches merge upstream (the PR is opened only when the owner says so).
-  Patch 1 alone can be replaced by its fallback; Leg B gave no reason to
-  prefer either, because FreeRDP never suspended acks (§6.6, `census.md`
-  Leg B), and Windows App's suspension behaviour is an acceptance item (§12).
+  **Plan C git-pins the fork branch** (`kvm-rdp-egfx-patches-v2`), which
+  carries only these three patches — a documented, temporary exception to
+  "upstream IronRDP", reverted when the patches merge upstream (the PR is
+  opened only when the owner says so). Patch 1 alone can be replaced by its
+  fallback; Leg B gave no reason to prefer either, because FreeRDP never
+  suspended acks (§6.6, `census.md` Leg B), and Windows App's suspension
+  behaviour is an acceptance item (§12).
 - CI fails if `cargo tree -d` shows a duplicate `ironrdp-*` crate. A pin bump
   is its own PR, reviewed monthly, and must pass the IronRDP golden tests (§11.2).
 - `ironrdp-server` with `default-features = false, features = ["egfx", "helper"]`.
@@ -460,6 +494,8 @@ SPS as sent fails them.
   `nal/vcl_hrd_parameters_present_flag == 0` — the ES3 uses neither
   (`census.md`: no scaling matrices, `nal_hrd` 0, `vcl_hrd` 0), so these stay
   refusals and no values are pinned.
+- **POC type 1 is refused** (rev 6.1): the POC rule below is computed for
+  types 0 (the ES3) and 2 (x264), and no source in scope uses type 1.
 - **PPS**: `num_slice_groups_minus1 == 0`; `num_ref_idx` defaults bounded;
   `pic_scaling_matrix_present_flag == 0` (the ES3 has none, `census.md`).
 - **Slice headers**: `slice_type ∈ {0, 2, 5, 7}` (P and I only); `pps_id` refers
@@ -501,13 +537,18 @@ Every SPS is classified on the KVM side and sent to the pump as
 | resize | Dimensions or level change, within limits | Replace the cache; resolution change (§6.4) |
 | other | Anything else (`num_ref_frames`, VUI, `log2_max_frame_num`, cropping, `sps_id`), within limits | Replace the cache; a flow cause (§6.5) — drop until the next IDR, which carries the new SPS; never a reconnect |
 
+Parameter-set model (rev 6.1): one active SPS, the latest admitted; a
+sequence header replaces every PPS, and cached PPSs that no longer parse
+against a new SPS are dropped; a PPS-only change is `other`; a byte-identical
+repeat (in-band SPS/PPS with every IDR) raises nothing.
+
 ### 6.2 FLV demux and NAL sanitiser (`kvm-proto`)
 
 Hand-rolled incremental state machine on `BytesMut`; no AMF0 parsing; no
 resync scanning.
 
 - Header `FLV`, version 1, `DataOffset` 9 (≤ 64 tolerated). Tag type 9 parsed;
-  8 and 18 skipped. `DataSize` is checked against the limit **before** anything
+  8 and 18 skipped; any other tag type is a framing violation (rev 6.1). `DataSize` is checked against the limit **before** anything
   is buffered. `PrevTagSize` must equal `11 + DataSize`. `StreamID` must be 0.
   An encrypted tag (`0x20`) or a bad header is a framing violation (§6.9).
 - `AVCDecoderConfigurationRecord`: version 1, `lengthSizeMinusOne ∈ {0,1,3}`,
@@ -519,17 +560,30 @@ resync scanning.
   removed from the AU; they travel as `SpsChanged`.
 - **Any NAL containing `00 00 00`, `00 00 01` or `00 00 02` is refused**, or
   the client's start-code scanner would find NALs we never checked.
-- Limits: tag 4 MiB, 128 NALs per AU, 4 SPS, 16 PPS.
+- Trailing zero bytes are trimmed from every NAL before these checks (rev
+  6.1): Annex B cannot tell them from `trailing_zero_8bits`, a conforming NAL
+  never ends in `00`, and the ES3 appends them to its SPS and PPS
+  (`census.md` `sps_hex`, `pps_hex`).
+- At most one AUD per tag, before any slice (rev 6.1); §6.3 sends it first.
+- Limits: tag 4 MiB, 128 NALs per AU, 4 SPS, 16 PPS — the SPS/PPS limits
+  bound a config record and, separately, each NALU tag's in-band sets: a
+  fifth SPS or seventeenth PPS in one tag is a framing violation, refused
+  before it is rewritten or parsed (rev 6.1).
 - One FLV tag is one access unit: Leg A found no multi-picture, continuation
   or non-VCL-picture tags in ≈ 2 700 (`census.md`). There is no AU assembler;
   a tag that is not exactly one picture (a second picture start, or a first
   slice with `first_mb_in_slice ≠ 0`) is a framing violation (§6.9).
 - **Bursts**: an AU whose FLV timestamp runs more than 100 ms ahead of its
-  receive time (measured since the FLV connection's first tag) is marked
+  receive time (measured since the FLV connection's first coded tag, rev
+  6.1) is marked
   `burst` — a GOP-caching source replaying on connect. The ES3 sends none
   (burst on connect 0 frames, `census.md`); the marking stays as a defence.
 - Parser modules deny `clippy::{indexing_slicing, unwrap_used, expect_used,
-  panic, arithmetic_side_effects, as_conversions}`.
+  panic, arithmetic_side_effects, as_conversions}`. The one exception is
+  `kvm_proto::fuzzing` (rev 6.1): the fuzz targets' bodies, whose panics are
+  findings, compiled only for tests and for `fuzz/` (feature `fuzzing`, which
+  CI forbids any workspace crate to enable). It parses nothing the bridge
+  receives.
 - Ownership: the demuxer splits AU payloads out of the FLV buffer as
   refcounted `Bytes` (no copy); the pump converts each AU into one reused
   Annex-B `Vec` immediately before sending.
@@ -812,9 +866,21 @@ Plan B builds the rewriter, with the POC-type-0 fixture (§11.5, §12).
 `video.sps_rewrite` is `["level", "vui", "restriction"]`.
 
 - (a) `"level"`: `level_idc` is raised to the lowest level whose MaxFS and
-  MaxMBPS (H.264 Table A-1) admit the coded size at `video.max_fps`, and never
-  lowered — **31 → 40** for the ES3's 1080p30 (MaxFS 8192 ≥ 8160 MBs; MaxMBPS
-  245 760 ≥ 8160 × 30 = 244 800; 60 fps would need 4.2). `level_idc` is the
+  MaxMBPS (H.264 Table A-1) admit the coded size at `video.max_fps` — with
+  A.3.1's `PicWidthInMbs²` and `FrameHeightInMbs²` ≤ 8 × MaxFS as well (rev
+  6.1), which matters only for extreme aspect ratios — and never lowered. With
+  §6.1's level ≤ 5.1 this admits at most 32 768 MBs per frame at 30 fps (e.g.
+  4096×2048): 4096×2304 needs level 5.2 and is refused after the rewrite.
+  **31 → 40** for the ES3's 1080p30 (MaxFS 8192 ≥ 8160 MBs; MaxMBPS
+  245 760 ≥ 8160 × 30 = 244 800; 60 fps would need 4.2). Level 1b (`level_idc`
+  11 with `constraint_set3_flag` set for profile 66/77/88, or `level_idc` 9
+  otherwise) ranks strictly between level 1 and level 1.1 and is never
+  lowered to level 1; on every level raise of a profile 66/77/88 SPS,
+  `constraint_set3_flag` (0x10) is cleared, even when the input was not
+  itself 1b (rev 6.1) — a stray flag below a non-1b level is reserved and
+  must not survive the raise. A `level_idc` outside Table A-1, or above
+  level 5.1, is refused (`RewriteError::UnknownLevel`) rather than guessed
+  at. `level_idc` is the
   SPS's third payload byte, before any Exp-Golomb field, so on its own this is
   a one-byte patch with no emulation-prevention change.
 - (b) `"vui"`: `video_full_range_flag` 0 and colour description **1/1/1**
@@ -831,10 +897,12 @@ Plan B builds the rewriter, with the POC-type-0 fixture (§11.5, §12).
   already carries `bitstream_restriction` keeps it. The same
   re-serialisation as (b), so it costs nothing extra.
 
-An SPS the rewriter cannot read (it reads only what §6.1 admits), or whose
-output h264-reader does not parse back to the input's fields apart from the
-rewritten ones, is `stream_incompatible` (§6.9). There is no pass-through:
-without the rewrite the ES3's stream cannot be admitted at all.
+An SPS the rewriter cannot read (it reads only what §6.1 admits), whose
+`level_idc` names no level in Table A-1 (`RewriteError::UnknownLevel`, rev
+6.1), or whose output h264-reader does not parse back to the input's fields
+apart from the rewritten ones, is `stream_incompatible` (§6.9). There is no
+pass-through: without the rewrite the ES3's stream cannot be admitted at
+all.
 
 ### 6.9 Upstream failure taxonomy and disconnects
 
@@ -1470,6 +1538,17 @@ questions belong to L5.
   there are none. The ES3's SPS/PPS bytes (`sps_hex`, `pps_hex`) are L0
   rewriter goldens, not kvm-sim streams: they do not match any fixture's
   slices.
+- Review hardenings (rev 6.1): a full-but-connected viewer is disconnected,
+  not left to silently drop frames forever, on its next control item (a
+  fault or a source switch); an evicted-but-stalled viewer's FLV write races
+  eviction so the server-side connection closes promptly instead of leaking,
+  bounded by a 50 ms shutdown timeout; the NO SIGNAL card alternates
+  `idr_pic_id` between consecutive IDRs, as a real encoder would; and
+  `Policy::refuse_concurrent_flv` is a count, so a make-before-break
+  reconnect after the refused opens is itself servable (§11.3). Every
+  refused `av.flv` carries `{"result":403}` only on an actual HTTP 403 — a
+  5xx or other refusal has no body — so §6.9's auth-vs-transient
+  classification cannot be confused.
 - Fixtures: ≤ 9 small Annex-B streams (≤ 0.5 MB each), generated by
   `scripts/gen-fixtures.sh` with the flake's pinned ffmpeg/x264 and committed:
   - full-range BT.709, baseline and main profile (360p);
@@ -1484,7 +1563,11 @@ questions belong to L5.
     re-escaping), verified by `trace_headers` and a decoded-frame md5 equal to
     the source. **Moved to Plan B** (a Plan A deviation): the transform needs
     the same bit-level SPS re-serialisation as the rewriter (§6.8), so Plan B
-    builds both together;
+    builds both together. Built as `360p30_es3like_poc0.h264` (rev 6.1):
+    Baseline, keyint 60, ref 1, limited-range BT.709 pixels as the ES3's
+    measure, under the ES3's mislabels (level 2.1 for 640×360, VUI full
+    range 5/6/5, constraint flags 0), and a decode md5 equal to its x264
+    source's — kvm-sim's ES3 profile streams it;
   - a second-resolution stream (480p) for resize cases.
 
   Plus one small ffmpeg-muxed `.flv` (`-c copy -f flv`) as an independent demux
@@ -1577,6 +1660,8 @@ the lists below:
 - The IronRDP patches are written on the owner's fork, branch
   `kvm-rdp-egfx-patches`; the upstream PR is
   deferred until the owner says so, and Plan C git-pins the fork (§4.2).
+  Renamed `kvm-rdp-egfx-patches-v2` in Plan B, after a rebase onto upstream
+  `2c08bda7` dropped patch 3 (rev 6.1, §4.2).
 
 Left open: the firmware version (no `Server` header; it is read from the
 UI's about page), and resolution-change signalling rests on one tentative
@@ -1845,7 +1930,7 @@ every RDP connection leaves one token to lapse); the KVM's HID report rate
 before `paste.pace` is fixed (§8). Still to be recorded in `census.md`: the
 firmware version (from the UI's about page).
 
-Watched: the IronRDP fork branch `kvm-rdp-egfx-patches` and, once the owner
+Watched: the IronRDP fork branch `kvm-rdp-egfx-patches-v2` and, once the owner
 opens it, its upstream PR (§4.2); IronRDP API churn and an upstream SVC/DVC
 reassembly cap (monthly pin review); rdpgw's legacy-transport refusal in
 token mode (#185) and any pin past `16cdaaf` (§9.4); FLV source latency —

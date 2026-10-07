@@ -209,9 +209,10 @@ async fn login_inner(
     Ok(token.into_string())
 }
 
-/// Bound for the whole logout exchange (final review m1; §3.2 "teardown
-/// calls logout, best effort, bounded"): connect, handshake, request and
-/// response head.
+/// Bound for the whole logout exchange (final review m1). Rev 5.1 reversed
+/// §3.2: **the bridge never calls logout**. This bounds kvm-probe's own
+/// optional, best-effort `--logout` for the census runbook only — connect,
+/// handshake, request and response head.
 const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Log out of the KVM session `token` belongs to: `GET` the path of
