@@ -1,6 +1,9 @@
 # Development resource budget (spec §13): the host is shared and loaded.
 [build]
 jobs = 4
+# Plan C design decision 8: incremental caches for the IronRDP-sized test
+# binaries cost disk the shared host does not have (spec §13, DC10).
+incremental = false
 
 [env]
 RUST_TEST_THREADS = "4"

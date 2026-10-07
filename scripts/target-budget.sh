@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Spec §13 / Plan C design decision 8: fail when the shared target dir grows
+# past the budget. The one cleanup that is always safe is `cargo clean`; the
+# next gate rebuilds (jobs = 4, niced).
+set -euo pipefail
+budget_gib=${KVM_RDP_TARGET_BUDGET_GIB:-8}
+case "$budget_gib" in
+  ''|*[!0-9]*|0) echo "target-budget: KVM_RDP_TARGET_BUDGET_GIB must be a positive integer" >&2; exit 2 ;;
+esac
+dir=${CARGO_TARGET_DIR:-$(git rev-parse --show-toplevel)/target}
+if [ ! -d "$dir" ]; then
+  echo "target-budget: $dir does not exist (nothing built yet)"
+  exit 0
+fi
+used_kib=$(du -sk "$dir" | cut -f1)
+budget_kib=$(( budget_gib * 1024 * 1024 ))
+used_gib=$(awk -v k="$used_kib" 'BEGIN { printf "%.2f", k / 1048576 }')
+if [ "$used_kib" -gt "$budget_kib" ]; then
+  echo "target-budget: $dir is ${used_gib} GiB, over the ${budget_gib} GiB budget." >&2
+  echo "target-budget: run 'cargo clean', then the per-task gate again. If it is over" >&2
+  echo "target-budget: budget again straight after that, stop and report the size;" >&2
+  echo "target-budget: never raise KVM_RDP_TARGET_BUDGET_GIB to get past this gate." >&2
+  exit 1
+fi
+echo "target-budget: $dir is ${used_gib} GiB of ${budget_gib} GiB"

@@ -26,12 +26,24 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --workspace --all-features
-      - name: Duplicate-dependency check (informational in Plan A)
+      - name: No duplicate ironrdp-* crate (spec §4.2)
         run: |
-          # Plan A has no IronRDP dependency, so this only prints duplicates.
-          # Plan C turns it into a hard gate that fails on a duplicate
-          # ironrdp-* crate (spec §4.2). Until then it must not fail CI.
-          cargo tree --workspace --duplicates || true
+          set +e
+          tree=$(cargo tree --workspace --target all -d --depth 0 --prefix none 2>"$RUNNER_TEMP/dups.err")
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::cargo tree failed while checking for duplicate ironrdp-* crates (spec §4.2):"
+            cat "$RUNNER_TEMP/dups.err"
+            exit "$rc"
+          fi
+          dups=$(printf '%s\n' "$tree" | grep -E '^ironrdp' || true)
+          if [ -n "$dups" ]; then
+            echo "::error::duplicate ironrdp-* crates (spec §4.2 pins one rev):"
+            echo "$dups"
+            exit 1
+          fi
+          echo "ironrdp: one version of every crate"
       - name: No ring in the dependency graph (spec §4.2)
         run: |
           # aws-lc-rs is the one crypto provider; nothing may pull in ring.

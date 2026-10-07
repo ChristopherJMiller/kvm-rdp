@@ -1,0 +1,17 @@
+//! `kvm-rdp`: the bridge from the ES3 IP-KVM to RDP (spec §4).
+//!
+//! Hostile input is parsed only in `kvm-proto`; this crate still never
+//! panics on anything the KVM or a client sends. The await lints are §4.3's
+//! (no lock held across an await); test modules opt out of the panic lints
+//! locally.
+#![deny(clippy::await_holding_lock, clippy::await_holding_refcell_ref)]
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::as_conversions
+)]
+
+#[cfg(test)]
+mod pin_goldens;

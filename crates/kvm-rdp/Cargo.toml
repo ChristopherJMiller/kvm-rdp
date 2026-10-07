@@ -1,0 +1,52 @@
+[package]
+name = "kvm-rdp"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+autotests = false
+
+[lib]
+name = "kvm_rdp"
+path = "src/lib.rs"
+doctest = false
+
+[dependencies]
+kvm-proto = { path = "../kvm-proto" }
+ironrdp-server = { workspace = true }
+ironrdp-egfx = { workspace = true }
+ironrdp-dvc = { workspace = true }
+ironrdp-svc = { workspace = true }
+ironrdp-pdu = { workspace = true }
+ironrdp-core = { workspace = true }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.9", default-features = false, features = ["std", "serde", "parse"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+x509-parser = "0.16"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "registry", "std"] }
+
+[dev-dependencies]
+kvm-sim = { path = "../kvm-sim" }
+ironrdp-graphics = { workspace = true }
+ironrdp-connector = { workspace = true }
+ironrdp-async = { workspace = true }
+ironrdp-tokio = { workspace = true, features = ["reqwest"] }
+ironrdp-tls = { workspace = true, features = ["rustls"] }
+ironrdp-session = { workspace = true }
+# default features would pull in ring (rcgen 0.13's default backend, §4.2)
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+tempfile = "3"
