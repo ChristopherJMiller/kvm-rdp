@@ -113,12 +113,12 @@ impl FlvClient {
     }
 }
 
-/// Why [`FlvClient::next`] stopped without a tag (fix round 1, m4). Never
-/// matched on by name — only ever surfaced via `Debug` in a panic message
-/// (`.unwrap()`/`.expect()`), which is why `Flv`'s payload needs the
-/// `#[allow]`: clippy's dead-code pass doesn't count a derive as a use.
+/// Why [`FlvClient::next`] stopped without a tag (fix round 1, m4).
+/// Surfaced via `Debug` in a panic message (`.unwrap()`/`.expect()`), and
+/// matched on by name in [`next_admitted`] (PB17 fix round 1, M2 — this
+/// doc used to say "never matched on by name", which `next_admitted`
+/// contradicts; fixed here rather than left stale).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum NextError {
     Flv(kvm_proto::flv::FlvError),
     /// No tag arrived within `T`: a stall (or a bug), not a close.
@@ -132,19 +132,22 @@ impl From<kvm_proto::flv::FlvError> for NextError {
 }
 
 /// Task 8.5's fault tests read `FlvClient::next`'s error straight into the
-/// bridge's own refusal type: a demux-level `FlvError` is exactly one of
-/// `VideoAdmission::admit`'s framing refusals (`AdmissionError`'s own
-/// `From<FlvError>`); no fault in this batch should ever leave a tag
-/// unread for `T`, so a `Timeout` here is a test bug, not a refusal to
-/// classify — it panics with a clear message instead of being silently
-/// misclassified.
-impl From<NextError> for kvm_proto::video::AdmissionError {
-    fn from(e: NextError) -> Self {
-        match e {
-            NextError::Flv(e) => e.into(),
-            NextError::Timeout => {
-                panic!("FlvClient::next timed out instead of refusing or closing")
-            }
+/// bridge's own refusal type, at their one call site: a demux-level
+/// `FlvError` is exactly one of `VideoAdmission::admit`'s framing refusals
+/// (`AdmissionError`'s own `From<FlvError>`). No fault in that batch should
+/// ever leave a tag unread for `T`, so a `Timeout` reaching here is a test
+/// bug, not a refusal to classify — it fails the test with a clear message
+/// instead of being silently misclassified.
+///
+/// A named function, not a `From` impl (PB17 fix round 1, M1): `From`'s
+/// contract is implicitly total, and a future caller could inherit this
+/// panic through `.into()`/`?` without reading this doc; naming it keeps
+/// the possible panic visible at the (one) place that calls it.
+pub fn next_admitted(e: NextError) -> kvm_proto::video::AdmissionError {
+    match e {
+        NextError::Flv(e) => e.into(),
+        NextError::Timeout => {
+            panic!("FlvClient::next timed out instead of refusing or closing")
         }
     }
 }

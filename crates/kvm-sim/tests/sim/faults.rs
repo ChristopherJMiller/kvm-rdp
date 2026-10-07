@@ -1,6 +1,6 @@
 //! Every one-shot fault reaches the bridge's admission as exactly its §6.9
 //! refusal (kvm-proto is the oracle).
-use crate::support::{FlvClient, es3_sim, login};
+use crate::support::{FlvClient, es3_sim, login, next_admitted};
 use kvm_proto::flv::FlvError;
 use kvm_proto::h264::picture::SliceRefusal;
 use kvm_proto::h264::sanitize::NalRefusal;
@@ -39,7 +39,7 @@ async fn first_refusal(fault: Option<Fault>, skip_sequence_header: bool) -> Outc
         let tag = match c.next().await {
             Ok(Some(t)) => t,
             Ok(None) => return Outcome::Eof,
-            Err(e) => return Outcome::Refused(AdmissionError::from(e)),
+            Err(e) => return Outcome::Refused(next_admitted(e)),
         };
         match adm.admit(tag, Instant::now()) {
             Ok(a) if a.end_of_sequence => return Outcome::EndOfSequence,

@@ -170,3 +170,85 @@ async fn paused_reads_back_up_the_clients_writes_until_resumed() {
     .await
     .unwrap();
 }
+
+/// PB17 fix round 1, I1: mirrors `flv.rs`'s
+/// `logout_is_global_but_open_streams_survive`. Neither the brief nor the
+/// spec names the control websocket here — §3.2 and `census.md`'s "Live
+/// streams on another session's logout: survive" measured only `av.flv`
+/// (a/b captures) — so this pins kvm-sim's own choice instead: the upgrade
+/// callback (`ws.rs`) checks the token once, at the handshake, and nothing
+/// re-checks it on an already-open connection, so an open control
+/// websocket survives another session's logout exactly the way an open
+/// FLV does.
+#[tokio::test]
+async fn logout_is_global_but_an_already_open_websocket_survives() {
+    let sim = es3_sim(Pacing::Manual).await;
+    let a = login(&sim).await;
+    let b = login(&sim).await;
+    let mut w = ws(&sim, &a, None).await.unwrap();
+    sim.wait_for(T, |e| {
+        e.iter().any(|e| matches!(e, SimEvent::WsOpen { .. }))
+    })
+    .await
+    .unwrap();
+    kvm_probe::kvm::logout(&target(&sim), Some(sim.spki_sha256()), &b)
+        .await
+        .unwrap();
+    // (a) every token died, including the one that did not log out: a new
+    // upgrade with it is refused.
+    assert!(ws(&sim, &a, None).await.is_err());
+    sim.wait_for(T, |e| e.contains(&SimEvent::WsRefused { status: 403 }))
+        .await
+        .unwrap();
+    // (b) … but the websocket opened before the logout keeps working — no
+    // re-check happens on an open connection, so a HID frame sent on it
+    // now still arrives, and the logout never closed it.
+    w.send(Message::Binary(HidFrame::SetMode { hid_type: 0 }.to_vec()))
+        .await
+        .unwrap();
+    sim.wait_for(T, |e| e.iter().any(|e| matches!(e, SimEvent::Hid { .. })))
+        .await
+        .unwrap();
+    assert_eq!(sim.stats().ws_open, 1, "A's websocket is still open");
+    assert_eq!(sim.stats().logouts, 1);
+}
+
+/// PB17 fix round 1, M3: `ws.rs` never calls `HidFrame::decode` itself —
+/// decoding is the bridge's job, not kvm-sim's — so a malformed frame
+/// cannot panic kvm-sim by construction. Pinned by test, not just by
+/// inspection: garbage bytes are still recorded verbatim, and the
+/// connection stays open and usable right after.
+#[tokio::test]
+async fn garbage_bytes_are_recorded_verbatim_and_the_connection_stays_sane() {
+    let sim = es3_sim(Pacing::Manual).await;
+    let token = login(&sim).await;
+    let mut w = ws(&sim, &token, None).await.unwrap();
+    let garbage = vec![0xFF, 0x00, 0x13, 0x37];
+    w.send(Message::Binary(garbage.clone())).await.unwrap();
+    // A well-formed frame right after, to prove the connection stayed
+    // sane (not wedged, not silently dropped) past the garbage.
+    let good = HidFrame::SetMode { hid_type: 0 };
+    w.send(Message::Binary(good.to_vec())).await.unwrap();
+    let ev = sim
+        .wait_for(T, |e| {
+            e.iter()
+                .filter(|e| matches!(e, SimEvent::Hid { .. }))
+                .count()
+                == 2
+        })
+        .await
+        .unwrap();
+    let got: Vec<Vec<u8>> = ev
+        .iter()
+        .filter_map(|e| match e {
+            SimEvent::Hid { bytes, .. } => Some(bytes.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(got, [garbage.clone(), good.to_vec()]);
+    assert!(
+        HidFrame::decode(&garbage).is_err(),
+        "not coincidentally a valid frame"
+    );
+    assert_eq!(sim.stats().ws_open, 1, "the connection stayed open");
+}
