@@ -278,6 +278,88 @@ impl PpsCfg {
     }
 }
 
+/// A slice NAL whose header h264-reader parses against `SpsCfg` (POC type 0
+/// or 2, frames only) and `PpsCfg`; the slice data is one filler byte.
+pub struct SliceCfg {
+    pub header_byte: u8, // 0x65 IDR, 0x41 P (ref), 0x01 non-ref
+    pub first_mb: u32,
+    pub slice_type: u32,
+    pub pps_id: u32,
+    pub frame_num: u32,
+    pub log2_max_frame_num: u32,
+    pub idr_pic_id: u32,
+    /// `(pic_order_cnt_lsb, bits)` for POC type 0.
+    pub poc_lsb: Option<(u32, u32)>,
+    pub mmco5: bool,
+}
+
+impl SliceCfg {
+    pub fn idr() -> Self {
+        Self {
+            header_byte: 0x65,
+            first_mb: 0,
+            slice_type: 7,
+            pps_id: 0,
+            frame_num: 0,
+            log2_max_frame_num: 4,
+            idr_pic_id: 0,
+            poc_lsb: None,
+            mmco5: false,
+        }
+    }
+    pub fn p(frame_num: u32) -> Self {
+        Self {
+            header_byte: 0x41,
+            slice_type: 5,
+            frame_num,
+            ..Self::idr()
+        }
+    }
+    pub fn build(&self) -> Vec<u8> {
+        let idr = self.header_byte & 0x1F == 5;
+        let is_p = matches!(self.slice_type % 5, 0);
+        let is_b = matches!(self.slice_type % 5, 1);
+        let mut w = BitWriter::new();
+        w.put_ue(self.first_mb);
+        w.put_ue(self.slice_type);
+        w.put_ue(self.pps_id);
+        w.put_bits(self.frame_num, self.log2_max_frame_num);
+        if idr {
+            w.put_ue(self.idr_pic_id);
+        }
+        if let Some((lsb, bits)) = self.poc_lsb {
+            w.put_bits(lsb, bits);
+        }
+        if is_b {
+            w.put_bit(true); // direct_spatial_mv_pred_flag
+        }
+        if is_p || is_b {
+            w.put_bit(false); // num_ref_idx_active_override_flag
+            w.put_bit(false); // ref_pic_list_modification_flag_l0
+            if is_b {
+                w.put_bit(false); // ref_pic_list_modification_flag_l1
+            }
+        }
+        if self.header_byte & 0x60 != 0 {
+            if idr {
+                w.put_bit(false); // no_output_of_prior_pics_flag
+                w.put_bit(false); // long_term_reference_flag
+            } else if self.mmco5 {
+                w.put_bit(true); // adaptive_ref_pic_marking_mode_flag
+                w.put_ue(5);
+                w.put_ue(0);
+            } else {
+                w.put_bit(false);
+            }
+        }
+        w.put_se(0); // slice_qp_delta
+        w.put_ue(1); // disable_deblocking_filter_idc
+        w.put_bits(0xA5, 8); // stand-in slice data
+        w.rbsp_trailing_bits();
+        wrap_nal(self.header_byte, &w.into_rbsp())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
