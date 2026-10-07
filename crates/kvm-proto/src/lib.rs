@@ -13,6 +13,7 @@
     clippy::as_conversions
 )]
 
+pub mod bits;
 pub mod flv;
 pub mod h264;
 pub mod login;
