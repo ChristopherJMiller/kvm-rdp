@@ -225,6 +225,59 @@ pub fn build_slice_nal(
     wrap_nal(header_byte, &w.into_rbsp())
 }
 
+/// A hand-built CAVLC PPS for `SpsCfg`'s SPS. The default has one slice
+/// group, no weighted prediction, deblocking control present and no scaling
+/// matrix; the other fields make §6.1's PPS refusals.
+#[derive(Clone, Copy, Default)]
+pub struct PpsCfg {
+    pub pps_id: u32,
+    pub sps_id: u32,
+    pub num_ref_idx_l0_default_active_minus1: u32,
+    pub chroma_qp_index_offset: i32,
+    /// Two slice groups (map type 0, run lengths 1) instead of one.
+    pub slice_groups: bool,
+    /// `pic_scaling_matrix_present_flag` 1 (every list absent → fallback).
+    pub scaling_matrix: bool,
+}
+
+impl PpsCfg {
+    pub fn build(&self) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.put_ue(self.pps_id);
+        w.put_ue(self.sps_id);
+        w.put_bit(false); // entropy_coding_mode_flag (CAVLC)
+        w.put_bit(false); // bottom_field_pic_order_in_frame_present_flag
+        if self.slice_groups {
+            w.put_ue(1); // num_slice_groups_minus1
+            w.put_ue(0); // slice_group_map_type: interleaved
+            w.put_ue(0); // run_length_minus1[0]
+            w.put_ue(0); // run_length_minus1[1]
+        } else {
+            w.put_ue(0);
+        }
+        w.put_ue(self.num_ref_idx_l0_default_active_minus1);
+        w.put_ue(0); // num_ref_idx_l1_default_active_minus1
+        w.put_bit(false); // weighted_pred_flag
+        w.put_bits(0, 2); // weighted_bipred_idc
+        w.put_se(0); // pic_init_qp_minus26
+        w.put_se(0); // pic_init_qs_minus26
+        w.put_se(self.chroma_qp_index_offset);
+        w.put_bit(true); // deblocking_filter_control_present_flag
+        w.put_bit(false); // constrained_intra_pred_flag
+        w.put_bit(false); // redundant_pic_cnt_present_flag
+        if self.scaling_matrix {
+            w.put_bit(false); // transform_8x8_mode_flag
+            w.put_bit(true); // pic_scaling_matrix_present_flag
+            for _ in 0..6 {
+                w.put_bit(false); // pic_scaling_list_present_flag[i]
+            }
+            w.put_se(0); // second_chroma_qp_index_offset
+        }
+        w.rbsp_trailing_bits();
+        wrap_nal(0x68, &w.into_rbsp())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
