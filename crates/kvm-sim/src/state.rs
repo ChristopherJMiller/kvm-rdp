@@ -213,6 +213,22 @@ impl Shared {
         f(&mut self.lock().policy);
     }
 
+    /// `true` exactly for the one `av.flv` open that spends the policy's
+    /// refusal (P3): `flv_open > 0` and `refuse_concurrent_flv > 0` are
+    /// tested and the latter decremented under the same lock acquisition,
+    /// so two concurrent opens racing a count of 1 cannot both read "still
+    /// refusing" before either decrements (fix round 1, m3 — `policy()`
+    /// then a separate `set_policy()` call let that happen).
+    pub(crate) fn take_flv_refusal(&self) -> bool {
+        let mut g = self.lock();
+        if g.stats.flv_open > 0 && g.policy.refuse_concurrent_flv > 0 {
+            g.policy.refuse_concurrent_flv = g.policy.refuse_concurrent_flv.saturating_sub(1);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Mint a `0.<digits>` token (§3.1); logins coexist (§3.2).
     pub(crate) fn mint_token(&self) -> String {
         let mut g = self.lock();

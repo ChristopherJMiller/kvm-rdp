@@ -39,6 +39,13 @@ pub(crate) struct Subscription {
     pub rx: mpsc::Receiver<Item>,
     pub sps: Bytes,
     pub pps: Bytes,
+    /// Resolves once `broadcast` evicts this viewer (a full queue on a
+    /// `Fault`/`Params` item). Fix round 1 (I1): dropping the paired
+    /// `oneshot::Sender` in `Encoder::viewers` signals this even while the
+    /// viewer's writer is stuck in an in-flight write the client isn't
+    /// draining, so `flv::serve` can abort that write instead of waiting
+    /// for the client to resume and drain the whole backlog first.
+    pub evicted: oneshot::Receiver<()>,
 }
 
 enum Cmd {
@@ -96,12 +103,16 @@ struct Encoder {
     /// NO SIGNAL IDR never repeats it back to back (`avoid_idr_repeat`).
     last_idr_source: Option<usize>,
     gop_cache: Vec<Arc<OutFrame>>,
-    viewers: Vec<mpsc::Sender<Item>>,
+    /// Each viewer's item queue, paired with a oneshot whose drop (on
+    /// eviction, in `broadcast`'s `retain`) is `Subscription::evicted`'s
+    /// signal (fix round 1, I1).
+    viewers: Vec<(mpsc::Sender<Item>, oneshot::Sender<()>)>,
 }
 
 impl Encoder {
     fn subscribe(&mut self) -> Subscription {
         let (tx, rx) = mpsc::channel(VIEWER_QUEUE);
+        let (evict_tx, evicted) = oneshot::channel();
         if self.profile.idr_on_new_connection {
             self.force_idr = true;
         }
@@ -110,11 +121,12 @@ impl Encoder {
                 let _ = tx.try_send(Item::Frame(f.clone()));
             }
         }
-        self.viewers.push(tx);
+        self.viewers.push((tx, evict_tx));
         Subscription {
             rx,
             sps: self.source.sps.clone(),
             pps: self.source.pps.clone(),
+            evicted,
         }
     }
 
@@ -195,19 +207,24 @@ impl Encoder {
     /// close or a new sequence header must not silently keep streaming
     /// under stale parameters once it resumes, so kvm-sim ends its stream
     /// the way a real server drops a client it can no longer keep up with.
+    /// `retain` dropping the tuple also drops its `oneshot::Sender`, which
+    /// is `Subscription::evicted`'s signal — even while the viewer's
+    /// writer is stuck in an in-flight write the client isn't draining
+    /// (fix round 1, I1).
     fn broadcast(&mut self, item: &Item) {
         let shared = &self.shared;
-        self.viewers.retain(|tx| match tx.try_send(item.clone()) {
-            Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(_)) => match item {
-                Item::Frame(_) => {
-                    shared.frame_dropped();
-                    true
-                }
-                Item::Fault(_) | Item::Params { .. } => false,
-            },
-            Err(mpsc::error::TrySendError::Closed(_)) => false,
-        });
+        self.viewers
+            .retain(|(tx, _)| match tx.try_send(item.clone()) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => match item {
+                    Item::Frame(_) => {
+                        shared.frame_dropped();
+                        true
+                    }
+                    Item::Fault(_) | Item::Params { .. } => false,
+                },
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            });
     }
 
     fn handle(&mut self, cmd: Cmd) {

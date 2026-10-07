@@ -1,7 +1,7 @@
-use crate::support::{FlvClient, T, es3_sim, login, sim_with, target};
+use crate::support::{FlvClient, T, es3_sim, flv_raw_request, login, sim_with, target};
 use kvm_proto::flv::{FrameType, TagBody, VideoBody};
 use kvm_proto::video::{AdmissionConfig, ParamClass, VideoAdmission};
-use kvm_sim::{KvmSim, Pacing, Profile, ResizeSignal, SimConfig, SimEvent, Source};
+use kvm_sim::{Fault, KvmSim, Pacing, Profile, ResizeSignal, SimConfig, SimEvent, Source};
 use std::time::{Duration, Instant};
 
 fn nal_types(body: &TagBody) -> Vec<u8> {
@@ -416,4 +416,124 @@ async fn sim_tx_follows_the_send_order_and_a_reader_never_blocks_a_write() {
         block > Duration::ZERO && block < Duration::from_millis(100),
         "{block:?}"
     );
+}
+
+/// I1 (fix round 1): a viewer whose queue filled because its client
+/// stopped reading is evicted by `Encoder::broadcast` on a control item,
+/// but its `av.flv` connection must close *promptly* — not only once the
+/// client resumes and drains the already-queued backlog. Same stall setup
+/// as `a_viewer_that_stops_reading_does_not_stall_the_others` (a 64 KiB
+/// send buffer, so the never-reading viewer's writer genuinely blocks on
+/// the socket, not just falls behind at the mpsc layer). Bounded by
+/// `wait_for`'s own timeout: this fails fast (never hangs) whether it
+/// passes or not.
+#[tokio::test]
+async fn an_evicted_full_queue_viewer_closes_promptly_while_its_client_stays_stalled() {
+    let sim = sim_with(|c| {
+        c.pacing = Pacing::Manual;
+        c.video_send_buffer = Some(64 * 1024);
+    })
+    .await;
+    let token = login(&sim).await;
+    let mut reader = FlvClient::open(&sim, &token).await.unwrap();
+    let _stalled = FlvClient::open(&sim, &token).await.unwrap(); // never read again
+    let stalled_conn = sim
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            SimEvent::FlvOpen { conn } => Some(*conn),
+            _ => None,
+        })
+        .nth(1)
+        .expect("the stalled viewer opened");
+    reader.next().await.unwrap().unwrap(); // sequence header
+    for _ in 0..20 {
+        sim.advance(100);
+        for _ in 0..100 {
+            reader
+                .next()
+                .await
+                .unwrap()
+                .expect("the reading viewer keeps getting tags");
+        }
+    }
+    assert!(
+        sim.stats().frames_dropped > 0,
+        "the stalled viewer's queue never overflowed"
+    );
+    // A control item evicts the full queue (Task 8.2's `broadcast`); its
+    // FLV connection must close promptly even though its client is still
+    // not reading — not only once it resumes and drains what was already
+    // queued (the bug I1 found: no FlvClose for 3s+, then hundreds of
+    // stale tags on resume).
+    sim.inject(Fault::Close);
+    let ev = sim
+        .wait_for(Duration::from_millis(500), |e| {
+            e.iter()
+                .any(|e| matches!(e, SimEvent::FlvClose { conn } if *conn == stalled_conn))
+        })
+        .await
+        .expect("the stalled viewer's FlvClose never arrived within 500ms");
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, SimEvent::FlvClose { conn } if *conn == stalled_conn))
+    );
+    assert_eq!(
+        sim.stats().flv_open,
+        1,
+        "only the reader is still open once the stalled viewer closes"
+    );
+}
+
+/// m1 (fix round 1): §6.9 classes `result: 403` as an auth failure (P2), so
+/// only an actual 403 may carry it — every other refusal's body is empty.
+#[tokio::test]
+async fn refusal_bodies_carry_result_403_only_on_an_actual_403() {
+    let sim = es3_sim(Pacing::Manual).await;
+    let token = login(&sim).await;
+
+    // 403: a bogus-but-well-formed token (query == cookie, but not live).
+    let (status, body) = flv_raw_request(&sim, "/av.flv?token=0.bogus", Some("0.bogus")).await;
+    assert_eq!(status, 403);
+    assert_eq!(body, b"{\"result\":403}");
+
+    // 404: the wrong path.
+    let (status, body) = flv_raw_request(&sim, "/nope?token=x", Some("x")).await;
+    assert_eq!(status, 404);
+    assert!(body.is_empty(), "{body:?}");
+
+    // 503 (`Policy::flv_status`) and 401 (§11.3's second consecutive auth
+    // failure): neither is `result: 403`, even though 401 is itself an
+    // auth status.
+    for want in [503u16, 401] {
+        sim.set_policy(|p| p.flv_status = Some(want));
+        let path = format!("/av.flv?token={token}");
+        let (status, body) = flv_raw_request(&sim, &path, Some(&token)).await;
+        assert_eq!(status, want);
+        assert!(body.is_empty(), "{want}: {body:?}");
+    }
+}
+
+/// m2 (fix round 1): the "both required, equal and live" token rule
+/// (flv.rs's `token_ok`) pinned for a missing cookie, a missing query
+/// token, and a query that disagrees with a live cookie — only the bogus-
+/// but-equal case (`bad_tokens_and_refused_side_connections`) was tested
+/// before.
+#[tokio::test]
+async fn a_missing_or_mismatched_token_is_refused() {
+    let sim = es3_sim(Pacing::Manual).await;
+    let token = login(&sim).await;
+
+    // No Cookie header at all.
+    let (status, _) = flv_raw_request(&sim, &format!("/av.flv?token={token}"), None).await;
+    assert_eq!(status, 403);
+
+    // No `token` query parameter.
+    let (status, _) = flv_raw_request(&sim, "/av.flv", Some(&token)).await;
+    assert_eq!(status, 403);
+
+    // A live cookie, but the query token names a different (also live) one.
+    let other = login(&sim).await;
+    let (status, _) = flv_raw_request(&sim, &format!("/av.flv?token={token}"), Some(&other)).await;
+    assert_eq!(status, 403);
 }

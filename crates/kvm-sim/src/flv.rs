@@ -14,8 +14,16 @@ use kvm_proto::flv::mux::{
 };
 use kvm_proto::h264::frame_id;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+/// Bound on the final `shutdown()`, so closing an evicted-but-stalled
+/// connection cannot itself hang (fix round 1, I1). A graceful TLS
+/// `shutdown()` writes a close_notify, which can block on the same
+/// congested socket a data write just did — short on purpose, since
+/// `FlvClose` is recorded right after this regardless of whether the
+/// write-side shutdown actually completed.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
 
 struct Writer<W> {
     out: W,
@@ -145,8 +153,10 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         Some(403)
     } else if let Some(s) = policy.flv_status {
         Some(s)
-    } else if policy.refuse_concurrent_flv > 0 && shared.stats().flv_open > 0 {
-        shared.set_policy(|p| p.refuse_concurrent_flv = p.refuse_concurrent_flv.saturating_sub(1));
+    } else if shared.take_flv_refusal() {
+        // m3 (fix round 1): tested and decremented under one lock in
+        // `Shared`, so two concurrent opens can't both see "still
+        // refusing" before either spends it.
         Some(503)
     } else {
         None
@@ -188,12 +198,24 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     while ok {
         tokio::select! {
             item = sub.rx.recv() => match item {
-                Some(item) => ok = w.item(item).await.unwrap_or(false),
+                // Race the write itself against eviction (I1, fix round
+                // 1): a full queue's `Fault`/`Params` drop in
+                // `Encoder::broadcast` must end this connection promptly
+                // even while its client isn't draining and this write is
+                // stuck — not only once the client resumes and the
+                // already-queued backlog drains naturally.
+                Some(item) => {
+                    ok = tokio::select! {
+                        r = w.item(item) => r.unwrap_or(false),
+                        _ = &mut sub.evicted => false,
+                    };
+                }
                 None => ok = false,
             },
             n = rd.read(&mut scratch) => ok = matches!(n, Ok(n) if n > 0),
+            _ = &mut sub.evicted => ok = false,
         }
     }
-    let _ = w.out.shutdown().await;
+    let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, w.out.shutdown()).await;
     shared.record(SimEvent::FlvClose { conn });
 }

@@ -65,7 +65,13 @@ impl FlvClient {
         let mut byte = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
             assert!(head.len() < 4096, "response head too long");
-            if io.read(&mut byte).await.unwrap() == 0 {
+            // Fix round 1 (m4): bounded, so a hang in `serve` after the TLS
+            // handshake fails this test fast instead of hanging it.
+            let n = tokio::time::timeout(T, io.read(&mut byte))
+                .await
+                .expect("timed out reading the response head")
+                .unwrap();
+            if n == 0 {
                 break;
             }
             head.push(byte[0]);
@@ -84,17 +90,73 @@ impl FlvClient {
         })
     }
 
-    /// The next demuxed tag, `Ok(None)` on EOF or timeout.
-    pub async fn next(&mut self) -> Result<Option<FlvTag>, kvm_proto::flv::FlvError> {
+    /// The next demuxed tag, `Ok(None)` on a clean close.
+    ///
+    /// Fix round 1 (m4): a timeout is `Err(NextError::Timeout)`, distinct
+    /// from `Ok(None)` (the FLV actually closed) — the two used to be the
+    /// same value, which let a stall pass for "the FLV closes".
+    pub async fn next(&mut self) -> Result<Option<FlvTag>, NextError> {
         let mut buf = [0u8; 16 * 1024];
         loop {
             if let Some(tag) = self.demux.next_tag()? {
                 return Ok(Some(tag));
             }
             match tokio::time::timeout(T, self.io.read(&mut buf)).await {
-                Ok(Ok(n)) if n > 0 => self.demux.push(&buf[..n]),
-                _ => return Ok(None),
+                Ok(Ok(0)) => return Ok(None),
+                Ok(Ok(n)) => self.demux.push(&buf[..n]),
+                Ok(Err(_)) => return Ok(None), // reset: treat as closed
+                Err(_) => return Err(NextError::Timeout),
             }
         }
     }
+}
+
+/// Why [`FlvClient::next`] stopped without a tag (fix round 1, m4). Never
+/// matched on by name — only ever surfaced via `Debug` in a panic message
+/// (`.unwrap()`/`.expect()`), which is why `Flv`'s payload needs the
+/// `#[allow]`: clippy's dead-code pass doesn't count a derive as a use.
+#[derive(Debug)]
+#[allow(dead_code)]
+pub enum NextError {
+    Flv(kvm_proto::flv::FlvError),
+    /// No tag arrived within `T`: a stall (or a bug), not a close.
+    Timeout,
+}
+
+impl From<kvm_proto::flv::FlvError> for NextError {
+    fn from(e: kvm_proto::flv::FlvError) -> Self {
+        NextError::Flv(e)
+    }
+}
+
+/// `GET <path>` on the video port with `cookie` as the `Cookie: token=`
+/// value (`None`: no `Cookie` header at all), returning the status and the
+/// full response body — so a test can check the body itself (m1, P2), not
+/// just the status `FlvClient::open` reports. Bounded by `T`: fails fast,
+/// never hangs.
+pub async fn flv_raw_request(sim: &KvmSim, path: &str, cookie: Option<&str>) -> (u16, Vec<u8>) {
+    let mut io = connect_to(&target(sim), sim.ports().video, Some(sim.spki_sha256()))
+        .await
+        .unwrap();
+    let cookie_hdr = cookie.map_or_else(String::new, |t| format!("Cookie: token={t}\r\n"));
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{cookie_hdr}\r\n");
+    io.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(T, io.read(&mut chunk)).await {
+            Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+            _ => break,
+        }
+    }
+    let head_end = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(buf.len(), |i| i + 4);
+    let status = String::from_utf8_lossy(&buf[..head_end])
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, buf[head_end..].to_vec())
 }
