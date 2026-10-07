@@ -13,6 +13,7 @@
     clippy::as_conversions
 )]
 
+pub mod admin;
 pub mod config;
 pub mod logging;
 pub mod metrics;
