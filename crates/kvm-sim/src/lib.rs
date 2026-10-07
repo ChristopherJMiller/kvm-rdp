@@ -83,7 +83,12 @@ pub enum Pacing {
     /// One frame every `1 / Profile::fps`, never catching up (the ES3 sends
     /// one tag every 33 ms whether the screen moves or not).
     RealTime,
-    /// Frames only on [`KvmSim::advance`]: deterministic tests.
+    /// Frames only on [`KvmSim::advance`]: deterministic tests. With the
+    /// default [`Timestamps::FrameCount`] a batch's FLV timestamps step
+    /// 33 ms per frame whatever the wall clock does, so admission marks
+    /// nearly every AU `burst` and the test exercises §6.5/§6.6's burst
+    /// path, never the soft gate. A test of the live path sets
+    /// [`Timestamps::WallClock`].
     Manual,
 }
 
@@ -125,10 +130,35 @@ pub enum Fault {
     Silence,
 }
 
+/// How kvm-sim stamps FLV tags (final review I2). Admission marks an AU
+/// `burst` when its stamp runs more than 100 ms ahead of its receive time,
+/// both measured from the connection's first coded tag (§6.2), and §6.5/§6.6
+/// treat burst AUs differently — exempt from the soft gate, chunked by
+/// `burst_chunk`, counted against the hard cap — so the stamps decide which
+/// path a test exercises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Timestamps {
+    /// `frames written on this connection × 1000 / fps`: the ES3's 33/34 ms
+    /// cadence. Under [`Pacing::RealTime`] that tracks the wall clock. Under
+    /// [`Pacing::Manual`] it does not: [`KvmSim::advance`] writes its frames
+    /// back to back while their stamps step 33 ms apart, so nearly every AU
+    /// is a burst (the final review saw 282 of 290) — the source-burst path.
+    #[default]
+    FrameCount,
+    /// Milliseconds since this FLV connection opened, read from the wall
+    /// clock as each tag is written. No AU runs ahead of real time, so
+    /// admission marks none `burst`, however many frames one `advance`
+    /// delivers: a Manual-paced test reaches the live, soft-gated path. A
+    /// `burst_on_connect` replay is stamped as live too, so source-burst
+    /// tests keep `FrameCount`.
+    WallClock,
+}
+
 pub struct SimConfig {
     pub password: String,
     pub profile: Profile,
     pub pacing: Pacing,
+    pub timestamps: Timestamps,
     pub source: Source,
     /// `SO_RCVBUF` for control-port sockets, so a test can make the
     /// bridge's websocket writes block quickly.
@@ -146,6 +176,7 @@ impl SimConfig {
             password: "kvm-sim-password".to_owned(),
             profile: Profile::es3(),
             pacing: Pacing::RealTime,
+            timestamps: Timestamps::FrameCount,
             source,
             control_recv_buffer: None,
             video_send_buffer: None,
@@ -193,6 +224,7 @@ struct ConnCtx {
     password: String,
     enc: EncoderHandle,
     profile: Profile,
+    timestamps: Timestamps,
 }
 
 /// One accepted connection: TLS, then its port's service.
@@ -213,7 +245,7 @@ async fn serve_connection(kind: PortKind, tcp: TcpStream, conn: u64, ctx: Arc<Co
         PortKind::Web => web::serve(tls, req, &ctx.shared, &ctx.password).await,
         _ => {
             let (shared, enc) = (ctx.shared.clone(), ctx.enc.clone());
-            flv::serve(tls, req, conn, shared, enc, ctx.profile).await;
+            flv::serve(tls, req, conn, shared, enc, ctx.profile, ctx.timestamps).await;
         }
     }
 }
@@ -247,6 +279,7 @@ impl KvmSim {
             password: cfg.password.clone(),
             enc: enc.clone(),
             profile: cfg.profile,
+            timestamps: cfg.timestamps,
         });
         let next_conn = Arc::new(AtomicU64::new(1));
         for (listener, kind) in [
@@ -334,7 +367,12 @@ impl KvmSim {
     pub fn expire_tokens(&self) {
         self.shared.clear_tokens();
     }
-    /// `Pacing::Manual`: encode `frames` frames now.
+    /// `Pacing::Manual`: encode `frames` frames now; every open FLV writes
+    /// them back to back. Under the default [`Timestamps::FrameCount`] their
+    /// stamps still step 33 ms apart, so every AU more than 100 ms (three
+    /// frames) ahead of the wall clock since the connection's first coded
+    /// tag arrives as a `burst` — with back-to-back calls, every AU from the
+    /// fifth on. [`Timestamps::WallClock`] stamps them as live instead.
     pub fn advance(&self, frames: u32) {
         self.enc.advance(frames);
     }

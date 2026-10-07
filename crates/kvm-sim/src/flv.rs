@@ -1,14 +1,14 @@
 //! `GET /av.flv?token=…` (§3.1): a close-delimited HTTP-FLV stream in the
 //! profile's tag shape — one tag per access unit, `CompositionTime` per the
 //! profile on coded tags (0 on the sequence header), the profile's NAL
-//! length size — with one-shot faults applied on the wire. Every write is
-//! timed (`max_flv_write_block`) and each coded tag's is stamped (`FlvAu`'s
-//! instant is `sim_tx`).
+//! length size, timestamps per `SimConfig::timestamps` — with one-shot
+//! faults applied on the wire. Every write is timed (`max_flv_write_block`)
+//! and each coded tag's is stamped (`FlvAu`'s instant is `sim_tx`).
 use crate::encoder::{EncoderHandle, Item, OutFrame};
 use crate::http::{FLV_HEAD, Request, respond};
 use crate::source::nal_type;
 use crate::state::{Shared, SimEvent};
-use crate::{Fault, Profile, ResizeSignal};
+use crate::{Fault, Profile, ResizeSignal, Timestamps};
 use bytes::Bytes;
 use kvm_proto::flv::mux::{
     RawTagHeader, TAG_VIDEO, avc_end_of_sequence_body, avc_nalu_body, avc_sequence_header_body,
@@ -35,6 +35,9 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
 struct Writer<W> {
     out: W,
     profile: Profile,
+    timestamps: Timestamps,
+    /// When this FLV connection opened: `Timestamps::WallClock`'s zero.
+    opened: Instant,
     conn: u64,
     shared: Arc<Shared>,
     frames_written: u64,
@@ -50,8 +53,16 @@ struct Writer<W> {
 }
 
 impl<W: AsyncWrite + Unpin> Writer<W> {
+    /// The next tag's FLV timestamp (final review I2: see [`Timestamps`]).
     fn timestamp(&self) -> u32 {
-        let ms = self.frames_written * 1000 / u64::from(self.profile.fps.max(1));
+        let ms = match self.timestamps {
+            Timestamps::FrameCount => {
+                self.frames_written * 1000 / u64::from(self.profile.fps.max(1))
+            }
+            Timestamps::WallClock => {
+                u64::try_from(self.opened.elapsed().as_millis()).unwrap_or(u64::MAX)
+            }
+        };
         u32::try_from(ms).unwrap_or(u32::MAX)
     }
 
@@ -224,6 +235,7 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     shared: Arc<Shared>,
     enc: EncoderHandle,
     profile: Profile,
+    timestamps: Timestamps,
 ) {
     let policy = shared.policy();
     let token_ok = match (req.query_token(), req.cookie_token.as_deref()) {
@@ -265,6 +277,8 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let mut w = Writer {
         out: wr,
         profile,
+        timestamps,
+        opened: Instant::now(),
         conn,
         shared: shared.clone(),
         frames_written: 0,

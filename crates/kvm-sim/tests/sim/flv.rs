@@ -1,7 +1,7 @@
 use crate::support::{FlvClient, T, es3_sim, flv_raw_request, login, sim_with, target};
 use kvm_proto::flv::{FrameType, TagBody, VideoBody};
 use kvm_proto::video::{AdmissionConfig, ParamClass, VideoAdmission};
-use kvm_sim::{KvmSim, Pacing, Profile, ResizeSignal, SimConfig, SimEvent, Source};
+use kvm_sim::{KvmSim, Pacing, Profile, ResizeSignal, SimConfig, SimEvent, Source, Timestamps};
 use std::time::{Duration, Instant};
 
 fn nal_types(body: &TagBody) -> Vec<u8> {
@@ -542,4 +542,53 @@ async fn a_missing_or_mismatched_token_is_refused() {
     let other = login(&sim).await;
     let (status, _) = flv_raw_request(&sim, &format!("/av.flv?token={token}"), Some(&other)).await;
     assert_eq!(status, 403);
+}
+
+/// Final review I2: what `Pacing::Manual` hands admission, by timestamp
+/// mode, read end to end and admitted on receipt as the bridge will. The
+/// default frame-count stamps step 33 ms per frame whatever the clock does,
+/// so one `advance` batch is nearly all `burst` — the source-burst path of
+/// §6.5/§6.6, not the live one. Wall-clock stamps never run ahead of real
+/// time, so no AU is a burst and a Manual-paced test reaches the soft gate.
+/// Multi-threaded, so the reader keeps up with the writer as the bridge's
+/// KVM actor would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn manual_pacing_bursts_with_frame_count_stamps_and_never_with_wall_clock_ones() {
+    const FRAMES: u32 = 30;
+    for stamps in [Timestamps::FrameCount, Timestamps::WallClock] {
+        let sim = sim_with(|c| {
+            c.pacing = Pacing::Manual;
+            c.timestamps = stamps;
+        })
+        .await;
+        let token = login(&sim).await;
+        let mut c = FlvClient::open(&sim, &token).await.unwrap();
+        sim.advance(FRAMES);
+        let mut adm = VideoAdmission::new(AdmissionConfig::default());
+        adm.flv_opened();
+        let (mut stamped, mut bursts) = (Vec::new(), 0);
+        while stamped.len() < FRAMES as usize {
+            let tag = c.next().await.unwrap().unwrap();
+            let ts = tag.timestamp;
+            if let Some(au) = adm.admit(tag, Instant::now()).unwrap().au {
+                stamped.push(ts);
+                bursts += usize::from(au.burst);
+            }
+        }
+        match stamps {
+            Timestamps::FrameCount => {
+                let cadence: Vec<u32> = (0..FRAMES).map(|k| k * 1000 / 30).collect();
+                assert_eq!(stamped, cadence);
+                // AU k is 33·k ms ahead of the first; past 100 ms of real
+                // time it is a burst. Every AU from the 11th on is, unless
+                // reading ten tags took over 233 ms (the review: 282/290).
+                assert!(bursts >= 20, "{bursts} of {FRAMES} bursts");
+            }
+            Timestamps::WallClock => {
+                assert!(stamped.windows(2).all(|w| w[0] <= w[1]), "{stamped:?}");
+                assert!(stamped[29] - stamped[0] < 500, "{stamped:?}");
+                assert_eq!(bursts, 0, "{stamped:?}");
+            }
+        }
+    }
 }
