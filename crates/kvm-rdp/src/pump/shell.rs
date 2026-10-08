@@ -322,29 +322,28 @@ impl PumpShell {
         if !ours {
             return; // another generation's word (§4.3)
         }
-        let inputs = match ev {
-            KvmEvent::FlvOpened { origin, .. } => vec![Input::FlvOpened { origin }],
+        // Fixed-size steps: the per-AU path allocates no input list (m1).
+        let cmds = match ev {
+            KvmEvent::FlvOpened { origin, .. } => self.step([Input::FlvOpened { origin }]),
             KvmEvent::SpsChanged { class, params, .. } => {
-                vec![Input::SpsChanged { class, params }]
+                self.step([Input::SpsChanged { class, params }])
             }
             KvmEvent::Au { au, .. } => {
-                let mut v = self.samples();
-                v.push(Input::Au(au));
-                v
+                let [suppress, backlog] = self.samples();
+                self.step([suppress, backlog, Input::Au(au)])
             }
-            KvmEvent::UpstreamFatal { cause, .. } => vec![Input::UpstreamFatal(cause)],
+            KvmEvent::UpstreamFatal { cause, .. } => self.step([Input::UpstreamFatal(cause)]),
         };
-        let cmds = self.step(inputs);
         self.exec(cmds).await;
     }
 
     /// DC6: the suppression flag and this generation's write counter.
-    fn samples(&self) -> Vec<Input> {
+    fn samples(&self) -> [Input; 2] {
         let written = self
             .link
             .as_ref()
             .map_or(0, |l| l.counter.load(Ordering::Relaxed));
-        vec![
+        [
             Input::Suppress(self.d.suppressed.load(Ordering::Relaxed)),
             Input::Backlog { written },
         ]
@@ -354,9 +353,8 @@ impl PumpShell {
         if self.link.is_none() {
             return;
         }
-        let mut inputs = self.samples();
-        inputs.push(Input::Tick);
-        let cmds = self.step(inputs);
+        let [suppress, backlog] = self.samples();
+        let cmds = self.step([suppress, backlog, Input::Tick]);
         self.exec(cmds).await;
     }
 
@@ -1514,6 +1512,104 @@ mod tests {
                     "8 + 8 + the last 4 at the next tick"
                 );
                 assert_eq!(t.metrics.frames_sent.get(), 21);
+            })
+            .await;
+    }
+
+    /// §6.5 (m3): after each burst chunk the shell yields, so the RDP
+    /// thread's other work — IronRDP writing the chunk, reading client
+    /// input — runs before the next chunk is stepped. The test body is that
+    /// other work here: it sees chunk k when exactly 1 + 8k frames have been
+    /// sent. (Without the yield the whole burst is stepped first: 21.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_shell_yields_between_burst_chunks() {
+        LocalSet::new()
+            .run_until(async {
+                let tick = Duration::from_millis(250);
+                let mut t = spawn(|_| {}, |s| s.with_tick(tick));
+                let generation = t.start();
+                t.queue_first_idr_and_burst(generation, 20);
+                let mut seen = Vec::new();
+                for _ in 0..4 {
+                    // The Setup, the IDR, then the first two chunks.
+                    assert!(egfx(&t.event().await).is_some());
+                    seen.push(t.metrics.frames_sent.get());
+                }
+                assert_eq!(
+                    &seen[2..],
+                    [9, 17],
+                    "frames sent as each chunk left: {seen:?}"
+                );
+            })
+            .await;
+    }
+
+    /// DC6 (m2): the shell samples the write counter before each AU, not
+    /// only at ticks. With a 1-byte `backlog_limit` the Setup's bytes shut
+    /// the backlog gate until their write is fed in; IronRDP writes them,
+    /// and the IDR that follows must see it — with the tick slowed to an
+    /// hour, nothing else can feed it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_write_counter_is_sampled_before_each_au() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = spawn(
+                    |c| c.flow.backlog_limit = 1,
+                    |s| s.with_tick(Duration::from_secs(3600)),
+                );
+                let generation = t.start();
+                let setup = egfx(&t.event().await).expect("the Setup").1;
+                t.counter.fetch_add(setup, Ordering::SeqCst); // IronRDP wrote it
+                t.first_idr(generation).await;
+                let idr = tokio::time::timeout(Duration::from_secs(2), t.events.recv())
+                    .await
+                    .expect("the IDR was gated on a backlog already written")
+                    .unwrap();
+                assert!(egfx(&idr).is_some(), "{idr:?}");
+                assert_eq!(t.metrics.frames_dropped.get("backlog"), 0);
+            })
+            .await;
+    }
+
+    /// This thread's CPU time (Linux: `/proc/thread-self/schedstat`, its
+    /// first field is nanoseconds on CPU).
+    #[cfg(target_os = "linux")]
+    fn thread_cpu() -> Duration {
+        let stat = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
+        let ns = stat.split_whitespace().next().unwrap().parse().unwrap();
+        Duration::from_nanos(ns)
+    }
+
+    /// m4: once the KVM stream closes (the KVM actor ends at
+    /// `KvmCommand::Shutdown`), the shell stops polling it: the RDP thread
+    /// does not spin on the closed stream, and the ticks still run — here
+    /// a suppression release lands. (Unguarded, the closed stream is ready
+    /// on every poll; since I1 the tick still goes first, so the cost is the
+    /// spin, measured as this thread's CPU time.)
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_closed_kvm_stream_is_not_polled_again() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = shell(|c| c.suppress_debounce = Duration::from_millis(100));
+                let generation = t.start();
+                t.event().await; // the Setup
+                t.first_idr(generation).await;
+                t.event().await; // a KVM frame went out: suppression counts (§6.6)
+                t.kvm = mpsc::channel(1).0; // its only sender gone: the stream closes
+                let (cpu0, wall0) = (thread_cpu(), Instant::now());
+                t.suppressed.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let (cpu, wall) = (thread_cpu().saturating_sub(cpu0), wall0.elapsed());
+                assert_eq!(
+                    t.metrics.release_all.get("suppression"),
+                    1,
+                    "no tick ran once the KVM stream closed"
+                );
+                assert!(
+                    cpu < wall / 3,
+                    "the RDP thread spun on the closed KVM stream: {cpu:?} of CPU in {wall:?}"
+                );
             })
             .await;
     }
