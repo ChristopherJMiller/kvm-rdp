@@ -301,7 +301,7 @@ impl<'d> Session<'d> {
             KvmCommand::RequestIdr { generation }
                 if generation == self.generation && !self.fatal =>
             {
-                self.request_idr();
+                self.request_idr().await;
                 None
             }
             KvmCommand::OpenFlv { .. }
@@ -408,8 +408,21 @@ impl<'d> Session<'d> {
         }
     }
 
-    fn request_idr(&mut self) {
+    async fn request_idr(&mut self) {
         self.deps.metrics.idr_requests.inc("side");
+        // A side FLV that has finished is not busy, even if `run`'s biased
+        // select — commands first — has not taken its result yet: take it
+        // now, so this request is not turned away (n3, PC9 fix round 2).
+        // Its result may itself be fatal (a certificate mismatch).
+        if self.side.as_ref().is_some_and(JoinHandle::is_finished)
+            && let Some(done) = self.side.take()
+        {
+            let r = done.await;
+            self.side_done(r).await;
+            if self.fatal {
+                return;
+            }
+        }
         if self.side.is_some() {
             self.deps.metrics.idr_side_failures.inc("busy");
             return;
@@ -1022,6 +1035,55 @@ mod tests {
 
     /// §6.5: `RequestIdr` → one side FLV; a refused one is counted and
     /// neither retried nor answered with a re-login.
+    /// n3 (PC9 fix round 2): a side FLV that has finished, its result not
+    /// yet taken — the actor's biased select polls commands before the side
+    /// slot — does not turn the next `RequestIdr` away `busy`: its result is
+    /// counted and the new request goes ahead (here it finds no token).
+    #[tokio::test]
+    async fn a_finished_side_flv_never_makes_the_next_request_busy() {
+        let metrics = Arc::new(Metrics::default());
+        let deps = KvmDeps {
+            ep: Arc::new(KvmEndpoint::new(
+                Scheme::Https,
+                "127.0.0.1",
+                (1, 1, 1),
+                &"0".repeat(64),
+            )),
+            cfg: Arc::new(SessionConfig {
+                password: Secret::new("unused"),
+                connect_timeout: Duration::from_secs(1),
+                login_timeout: Duration::from_secs(1),
+                backoff: BackoffConfig {
+                    initial: Duration::from_millis(50),
+                    factor: 2,
+                    max: Duration::from_millis(400),
+                    jitter_percent: 0,
+                },
+                upstream_deadline: Duration::from_secs(4),
+                flv_idle_timeout: Duration::from_secs(2),
+                idr_side_timeout: Duration::from_secs(1),
+                hid_write_timeout: Duration::from_secs(1),
+                admission: AdmissionConfig::default(),
+            }),
+            to_pump: mpsc::channel(8).0,
+            hid: Arc::new(HidControl::new(16, metrics.clone())),
+            metrics: metrics.clone(),
+        };
+        let mut s = Session::new(1, &deps);
+        s.side = Some(tokio::spawn(async { Err(KvmError::Http(503)) }));
+        while !s.side.as_ref().is_some_and(JoinHandle::is_finished) {
+            tokio::task::yield_now().await;
+        }
+        s.request_idr().await;
+        let f = &metrics.idr_side_failures;
+        assert_eq!(
+            (f.get("busy"), f.get("http"), f.get("no_token")),
+            (0, 1, 1),
+            "busy / the finished side's result / the new request"
+        );
+        s.ws_task.abort();
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_idr_runs_one_side_flv_and_counts_a_refusal() {
         let mut r = rig(None, |_| {}).await;
@@ -1045,12 +1107,22 @@ mod tests {
         r.sim.set_policy(|p| p.refuse_concurrent_flv = 1);
         r.tx.send(KvmCommand::RequestIdr { generation: 1 }).unwrap();
         tokio::time::timeout(T, async {
-            while r.metrics.idr_side_failures.get("http") == 0 {
+            while r.metrics.idr_side_failures.total() == 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
-        .unwrap();
+        .expect("the second side request never finished");
+        // n3 (PC9 fix round 2): the first side FLV is done (kvm-sim logged
+        // its close), so this one must run — never be turned away `busy`.
+        let kinds: Vec<(&str, u64)> = [
+            "busy", "no_token", "http", "timeout", "eof", "protocol", "connect", "tls", "task",
+        ]
+        .into_iter()
+        .map(|k| (k, r.metrics.idr_side_failures.get(k)))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+        assert_eq!(kinds, [("http", 1)], "the second side request");
         // `refuse_concurrent_flv` is spent: a retry would now open a side
         // FLV. Wait past `idr_side_timeout` (1 s) and look for one.
         tokio::time::sleep(Duration::from_millis(1500)).await;
