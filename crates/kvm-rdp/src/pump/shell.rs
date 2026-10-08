@@ -387,16 +387,31 @@ impl PumpShell {
                         self.send_dvc(b).await;
                     }
                 }
+                // m5: the shared state — the display's size (the next
+                // connection's), mouse scaling's surface, the HID release —
+                // belongs to the current session only, like every send. A
+                // link whose generation has ended (`on_disconnected` ran,
+                // its `SessionStop` not yet stepped) already released all
+                // (SessionEnd). The watchdog's release is always current:
+                // it fires only while `on_disconnected` has not come.
                 Command::DisplayResize { width, height } => {
-                    self.d.display.set_size((width, height));
-                    if current && !self.d.display.resize(width, height) {
-                        tracing::warn!(width, height, "no display stream for a resize");
+                    if current {
+                        self.d.display.set_size((width, height));
+                        if !self.d.display.resize(width, height) {
+                            tracing::warn!(width, height, "no display stream for a resize");
+                        }
                     }
                 }
                 Command::SurfaceSize { width, height } => {
-                    self.d.display.set_surface((width, height))
+                    if current {
+                        self.d.display.set_surface((width, height));
+                    }
                 }
-                Command::ReleaseAll(trigger) => self.d.hid.release_all(trigger),
+                Command::ReleaseAll(trigger) => {
+                    if current {
+                        self.d.hid.release_all(trigger);
+                    }
+                }
                 Command::OpenFlv => {
                     let _ = self.d.to_kvm.send(KvmCommand::OpenFlv { generation });
                 }
@@ -516,7 +531,7 @@ mod tests {
     )]
     use super::*;
     use crate::msg::FlvOrigin;
-    use crate::pump::rig::{self, CHAN, ES3, Null};
+    use crate::pump::rig::{self, CHAN, ES3, Null, P480};
     use crate::rdp::accept::AcceptRate;
     use crate::rdp::gfx::{GfxFactory, GfxSlot};
     use crate::rdp::handler::Lifecycle;
@@ -603,6 +618,7 @@ mod tests {
         suppressed: Arc<AtomicBool>,
         rtt: Arc<AtomicU32>,
         counter: Arc<AtomicU64>,
+        display: Arc<DisplayShared>,
     }
 
     /// The shell on the current `LocalSet` over a 640×360 display (the ES3
@@ -625,12 +641,13 @@ mod tests {
         let gens = Arc::new(Generations::default());
         let suppressed = Arc::new(AtomicBool::new(false));
         let rtt = Arc::new(AtomicU32::new(u32::MAX));
+        let display = DisplayShared::new((640, 360));
         let deps = ShellDeps {
             cfg: cfg.clone(),
             metrics: metrics.clone(),
             gens: gens.clone(),
             hid: Arc::new(HidControl::new(16, metrics.clone())),
-            display: DisplayShared::new((640, 360)),
+            display: display.clone(),
             events: etx,
             suppressed: suppressed.clone(),
             rtt: rtt.clone(),
@@ -658,6 +675,7 @@ mod tests {
             suppressed,
             rtt,
             counter,
+            display,
         }
     }
 
@@ -1125,6 +1143,68 @@ mod tests {
                     "a Disconnect went out for an ended generation"
                 );
                 t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
+            })
+            .await;
+    }
+
+    /// m5: like the gated sends, the shared state belongs to the current
+    /// session only. A generation `on_disconnected` has ended (its
+    /// `SessionStop` not yet stepped) already released all (SessionEnd); its
+    /// late Setup, resize and close must not size the display for the next
+    /// connection, set mouse scaling's surface, or release the HID again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_ended_generation_leaves_the_display_and_the_hid_alone() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = shell(|_| {});
+                let generation = t.session_start();
+                // A 480p SPS before negotiation: the Setup will resize.
+                let Input::SpsChanged { class, params } = rig::sps(ParamClass::Initial, P480)
+                else {
+                    unreachable!()
+                };
+                let size = (params.summary.width, params.summary.height);
+                assert_ne!(size, (640, 360));
+                t.kvm
+                    .send(KvmEvent::SpsChanged {
+                        generation,
+                        class,
+                        params,
+                    })
+                    .await
+                    .unwrap();
+                until("the SPS to be stepped", || {
+                    t.kvm.capacity() == t.kvm.max_capacity()
+                })
+                .await;
+                t.gens.end(); // on_disconnected ran; its SessionStop not yet stepped
+                t.ready(); // Setup, SurfaceSize, then DisplayResize to 480p
+                let (done, rx) = oneshot::channel();
+                t.rdp.send(RdpInput::Shutdown { done }).unwrap(); // ReleaseAll(closing)
+                t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), rx)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    t.display.size(),
+                    (640, 360),
+                    "an ended session sized the display"
+                );
+                assert_eq!(
+                    t.display.surface(),
+                    None,
+                    "an ended session set the surface"
+                );
+                assert_eq!(
+                    t.metrics.release_all.get("closing"),
+                    0,
+                    "an ended session released again"
+                );
+                assert!(
+                    t.events.try_recv().is_err(),
+                    "a ServerEvent for an ended session"
+                );
             })
             .await;
     }
