@@ -116,6 +116,58 @@ async fn the_video_oracle_holds_under_wait() {
     oracle(IdrPolicy::Wait).await;
 }
 
+/// PC17 N1 (§6.5 `reconnect`): a candidate whose first tag lags the old
+/// FLV's copy of the IDR its open forced — 150 ms here; on the ES3 an
+/// https first tag is p50 183 ms, p95 300 ms — replays the IDR and the P
+/// frames the old FLV already delivered. The client gets every AU once:
+/// the run across the swap is contiguous, with nothing repeated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lagging_candidate_never_repeats_an_au_across_the_swap() {
+    let env = env(es3(), |c| {
+        sized(c);
+        c.video.idr_policy = IdrPolicy::Reconnect;
+    })
+    .await;
+    let c = env.client(Opts::new(2));
+    // Past the FLV's setup window: the re-advertise's request goes at once.
+    c.wait_for(T, |e| pictures(e).len() >= 45).await;
+    env.sim.set_policy(|p| p.delay_flv_header = Some(ms(150)));
+    let n = c.with_log(<[Ev]>::len);
+    c.readvertise();
+    let evs = c
+        .wait_for(T, |e| {
+            confirmed(e, n).is_some_and(|k| pictures(&e[k..]).len() >= 30)
+        })
+        .await;
+    let map = barcodes(ES3_FIXTURE);
+    let got: Vec<usize> = pictures(&evs[confirmed(&evs, n).unwrap()..])
+        .iter()
+        .map(|p| index_of(&map, &p.annex_b))
+        .collect();
+    let log = env
+        .sim
+        .wait_for(CATCH_UP, |l| flv_opens(l).len() >= 2)
+        .await
+        .unwrap_or_else(|l| l);
+    let candidate = *flv_opens(&log).get(1).expect("no ReconnectFlv candidate");
+    let log = env
+        .sim
+        .wait_for(CATCH_UP, |l| sent_on(l, candidate).len() >= got.len())
+        .await
+        .unwrap_or_else(|l| l);
+    let mut seen = std::collections::HashSet::new();
+    let twice: Vec<usize> = got.iter().copied().filter(|i| !seen.insert(*i)).collect();
+    assert!(
+        twice.is_empty(),
+        "AUs the client got twice: {twice:?} in {got:?}"
+    );
+    assert_run(&got, &sent_on(&log, candidate), "across the swap");
+    assert!(
+        env.metrics().frames_dropped.get("repeat") >= 2,
+        "no replay to drop: the candidate did not lag ({got:?})"
+    );
+}
+
 /// The long-GOP fixture at the ES3's pacing, sized, `idr_side_timeout` set,
 /// streaming past the wrap-around IDR (the 31st picture) and the 1 s setup
 /// window: the next periodic IDR is ≈9 s away and a re-advertise is not

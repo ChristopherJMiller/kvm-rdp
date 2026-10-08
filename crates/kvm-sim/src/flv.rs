@@ -273,6 +273,9 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         return;
     };
     shared.record(SimEvent::FlvOpen { conn });
+    if let Some(d) = policy.delay_flv_header {
+        tokio::time::sleep(d).await;
+    }
     let (mut rd, wr) = tokio::io::split(io);
     let mut w = Writer {
         out: wr,

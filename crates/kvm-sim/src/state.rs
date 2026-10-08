@@ -103,6 +103,11 @@ pub struct Policy {
     /// New TCP connections are accepted, then left silent — no TLS, no
     /// bytes — until the client gives up: an unreachable KVM (§11.3).
     pub blackhole: bool,
+    /// A new FLV holds its response — head, sequence header and the frames
+    /// queued meanwhile — this long after it subscribed, while the other
+    /// viewers already get the IDR its open forced: a `ReconnectFlv`
+    /// candidate whose first tag lags the old FLV (PC17 N1).
+    pub delay_flv_header: Option<Duration>,
 }
 
 /// A command for every open websocket.
