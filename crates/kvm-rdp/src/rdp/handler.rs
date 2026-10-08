@@ -37,9 +37,16 @@ impl ConnectionHandler for Lifecycle {
             self.metrics.accept_refused.inc();
             return false;
         }
-        if !self.rate.admit(Instant::now()) {
+        let now = Instant::now();
+        if !self.rate.admit(now) {
             self.metrics.accept_refused.inc();
-            tracing::warn!("security.accept_rate exceeded; connection refused");
+            // One line now, then at most one per interval (m8).
+            if let Some(refused) = self.rate.refusal_report(now) {
+                tracing::warn!(
+                    refused,
+                    "security.accept_rate exceeded; refusing connections"
+                );
+            }
             return false;
         }
         true
@@ -183,6 +190,43 @@ mod tests {
     fn step(pump: &mut Pump, gfx: &GfxServerHandle, input: Input) -> Vec<Command> {
         let mut g = gfx.lock().unwrap();
         pump.step(&mut g, Instant::now(), input)
+    }
+
+    /// Counts WARN events on this thread.
+    struct Warnings(Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            if *e.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+
+    fn warnings_during(f: impl FnOnce()) -> usize {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sub = tracing_subscriber::registry().with(Warnings(n.clone()));
+        tracing::subscriber::with_default(sub, f);
+        n.load(Ordering::SeqCst)
+    }
+
+    /// m8: a TCP flood is not a log flood. Every refusal is counted; the
+    /// warning is one line now and then at most one per
+    /// `REFUSAL_LOG_INTERVAL` (the loop takes milliseconds).
+    #[test]
+    fn a_refused_flood_is_counted_in_full_and_logged_in_a_line_or_two() {
+        let mut r = rig(2);
+        let lines = warnings_during(|| {
+            for _ in 0..1000 {
+                r.h.on_accept(peer());
+            }
+        });
+        assert_eq!(r.metrics.accept_refused.get(), 998);
+        assert!(
+            (1..=2).contains(&lines),
+            "{lines} warning lines for 998 refusals"
+        );
     }
 
     /// §5.1, DC4: the generation is minted, bound to the GFX handle built
