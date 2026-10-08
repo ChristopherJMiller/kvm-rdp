@@ -79,4 +79,26 @@ mod tests {
         assert!(Slate::from_annex_b(&[0, 0, 0, 1, 0x09, 0x10]).is_none());
         assert!(Slate::from_annex_b(&[]).is_none());
     }
+
+    /// §6.3/§6.4 (m3): the embedded slate's NAL sequence is pinned exactly
+    /// (AUD, SPS, PPS, IDR — the SEI dropped), and removing its one VCL NAL
+    /// — leaving every other allowlisted NAL intact — still has no slate.
+    /// `a_stream_without_a_picture_is_no_slate` above only ever fails
+    /// earlier, on the missing SPS; this reaches the picture check itself.
+    #[test]
+    fn removing_the_only_picture_nal_from_the_slate_leaves_no_slate() {
+        let s = Slate::embedded().unwrap();
+        let types: Vec<u8> = split_annex_b(&s.annex_b).map(|n| n[0] & 0x1F).collect();
+        assert_eq!(types, [9, 7, 8, 5]);
+
+        let mut without_idr = Vec::new();
+        for nal in split_annex_b(&s.annex_b) {
+            if nal.first().map(|b| b & 0x1F) == Some(5) {
+                continue;
+            }
+            without_idr.extend_from_slice(&[0, 0, 0, 1]);
+            without_idr.extend_from_slice(nal);
+        }
+        assert!(Slate::from_annex_b(&without_idr).is_none());
+    }
 }

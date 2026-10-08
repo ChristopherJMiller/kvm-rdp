@@ -139,9 +139,17 @@ impl Rtt {
         if !self.active || self.unchanged >= 8 || self.last == Some(u32::MAX) {
             return None;
         }
-        let mut sorted: Vec<u32> = self.samples.iter().copied().collect();
-        sorted.sort_unstable();
-        let median = *sorted.get(sorted.len() / 2)?;
+        // A fixed stack buffer instead of a per-call `Vec`: `samples` never
+        // holds more than 8 (the push/pop in `sample` enforces it).
+        let mut buf = [0u32; 8];
+        let mut len = 0usize;
+        for (slot, v) in buf.iter_mut().zip(self.samples.iter()) {
+            *slot = *v;
+            len = len.saturating_add(1);
+        }
+        let (filled, _) = buf.split_at_mut(len);
+        filled.sort_unstable();
+        let median = *filled.get(len / 2)?;
         Some(median.saturating_sub(self.baseline?))
     }
 }
@@ -394,6 +402,18 @@ mod tests {
         assert_eq!(f.gates(c.at(1700), false, false, false), Gate::Open);
     }
 
+    /// §6.6 grace: only an IDR consumes the flag (never a P-frame, M8), and
+    /// an FLV open re-arms it the same as a Setup (M9).
+    #[test]
+    fn grace_applies_only_to_an_idr_and_an_flv_open_rearms_it() {
+        let mut f = Flow::new(cfg());
+        f.on_setup();
+        assert!(!f.take_grace(false), "a P-frame is never grace");
+        assert!(f.take_grace(true));
+        f.on_flv_opened();
+        assert!(f.take_grace(true), "an FLV open re-arms grace");
+    }
+
     /// §6.6: the soft gate is the age of the oldest unacked frame, so a
     /// 5 fps → 60 fps transition never closes it.
     #[test]
@@ -478,6 +498,38 @@ mod tests {
         assert!(!f.stall_expired(c.at(40_000), false), "any ack disarms");
     }
 
+    /// §6.6 stall: an open gate never arms the timer (M2), and a second
+    /// closure while already armed does not restart the clock (M1).
+    #[test]
+    fn the_stall_arms_only_once_at_the_first_closure() {
+        let c = Clock(Instant::now());
+        let mut f = Flow::new(cfg());
+        assert_eq!(f.gates(c.at(0), false, false, false), Gate::Open);
+        assert!(
+            !f.stall_expired(c.at(20_000), false),
+            "an open gate never arms"
+        );
+
+        let mut f = Flow::new(cfg());
+        f.record(0, c.at(0), false, false, false);
+        assert_eq!(f.gates(c.at(600), false, false, false), Gate::Soft);
+        assert_eq!(f.gates(c.at(5_000), false, false, false), Gate::Soft);
+        assert!(
+            f.stall_expired(c.at(10_600), false),
+            "armed at 600, not re-armed at 5 000"
+        );
+    }
+
+    /// §6.6: the soft gate is bypassed while acks are suspended, even for a
+    /// frame recorded before suspension began (M11).
+    #[test]
+    fn the_soft_gate_is_bypassed_while_suspended() {
+        let c = Clock(Instant::now());
+        let mut f = Flow::new(cfg());
+        f.record(0, c.at(0), false, false, false);
+        assert_eq!(f.gates(c.at(1_000), false, true, false), Gate::Open);
+    }
+
     /// §6.6 suspension: nothing is recorded, the soft gate and back-pressure
     /// are bypassed; the first non-suspend ack clears the set first.
     #[test]
@@ -516,6 +568,10 @@ mod tests {
         );
         f.set_written(0);
         assert!(!f.suspended_backlog_expired(c.at(6_000), true));
+        assert!(
+            !f.suspended_backlog_expired(c.at(12_000), true),
+            "the dip restarted the clock at 6 s"
+        );
         assert!(f.suspended_backlog_expired(c.at(16_000), true));
         assert!(
             !f.suspended_backlog_expired(c.at(16_000), false),
@@ -535,8 +591,18 @@ mod tests {
         assert_eq!(f.gates(c.at(0), false, false, false), Gate::Open);
         f.set_written(9 << 20);
         assert_eq!(f.backlog(), 0);
-        f.on_ack(12345, 0);
-        f.on_ack(12345, 0);
+        // An unknown id does not corrupt the set (M10); a stale repeat of an
+        // already-removed id is a no-op, not a second removal.
+        f.record(0, c.at(0), false, false, false);
+        f.record(1, c.at(0), false, false, false);
+        assert_eq!(f.in_flight(), 2);
+        f.on_ack(77, 0);
+        assert_eq!(f.in_flight(), 2, "an unknown id is ignored");
+        f.on_ack(1, 0);
+        assert_eq!(f.in_flight(), 1);
+        f.on_ack(1, 0);
+        assert_eq!(f.in_flight(), 1, "a stale repeat is ignored");
+        f.on_ack(0, 0);
         assert_eq!(f.in_flight(), 0);
     }
 
@@ -564,5 +630,36 @@ mod tests {
         assert_eq!(f.gates(c.at(0), false, false, false), Gate::Open);
         f.rtt_sample(u32::MAX);
         assert_eq!(f.standing_delay_ms(), None);
+    }
+
+    /// §6.6 standing delay, pinned precisely: a repeated reference still has
+    /// not moved (M7); the window is exactly the last 8 live samples, so an
+    /// older one is evicted (M5); the baseline is the minimum since this
+    /// generation began, not just of the current window (M6); and
+    /// "unchanged" means consecutive repeats, not a lifetime count (M23).
+    #[test]
+    fn standing_delay_tracks_a_sliding_median_against_a_lifetime_baseline() {
+        let mut f = Flow::new(cfg());
+        assert!(!f.rtt_sample(10), "reference");
+        assert!(!f.rtt_sample(10), "the reference repeated has not moved");
+        assert_eq!(f.standing_delay_ms(), None);
+        assert!(f.rtt_sample(5));
+        for v in 600..608 {
+            assert!(f.rtt_sample(v));
+        }
+        assert_eq!(
+            f.standing_delay_ms(),
+            Some(604 - 5),
+            "median of the last 8 (600..=607, the 5 evicted) minus the min since start"
+        );
+        f.rtt_sample(607); // one repeat
+        f.rtt_sample(610); // moves again
+        for _ in 0..7 {
+            f.rtt_sample(610);
+        }
+        assert!(
+            f.standing_delay_ms().is_some(),
+            "8 repeats across the test in all, but never 8 consecutive"
+        );
     }
 }

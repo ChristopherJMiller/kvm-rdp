@@ -251,4 +251,66 @@ mod tests {
         let s = format!("{b:?}");
         assert!(s.contains("weight: 99") && s.contains("messages: 0"), "{s}");
     }
+
+    /// m4: `from_config` is otherwise untested, so a mutant that swaps two
+    /// same-typed fields (e.g. `soft_gate` ↔ `standing_delay_limit`, both
+    /// 500 ms by default) would pass every other test. Every `[video]` key
+    /// gets a distinct, non-default value here and is checked by name.
+    #[test]
+    fn from_config_maps_every_knob_and_not_a_neighbour() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("kvm.pass"), "kvm-secret\n").unwrap();
+        std::fs::write(dir.path().join("nla.pass"), "0123456789abcdefghijklmnop\n").unwrap();
+        std::fs::write(dir.path().join("cert.pem"), "not read by config\n").unwrap();
+        std::fs::write(dir.path().join("key.pem"), "not read by config\n").unwrap();
+        let toml = r#"
+[rdp]
+nla_password_file = "nla.pass"
+tls_cert_file = "cert.pem"
+tls_key_file = "key.pem"
+[kvm]
+host = "192.168.0.50"
+spki_sha256 = "F94841875EC7FA56220D48FFADAA5C0F2D84FFBBD1BEEB060245DED1419B614F"
+password_file = "kvm.pass"
+[video]
+max_fps = 20
+hard_cap = "4s"
+soft_gate = "501ms"
+backlog_limit = 1234567
+standing_delay_limit = "502ms"
+rtt_probe_interval = "251ms"
+first_ack_grace = "1601ms"
+stall_timeout = "11s"
+idr_policy = "reconnect"
+idr_side_timeout = "2s"
+idr_wait_max = "4s"
+flv_reconnect_interval_setup = "3s"
+flv_reconnect_interval_flow = "9s"
+burst_chunk = 9
+avc420_timeout = "13s"
+suppress_debounce = "1100ms"
+disconnect_watchdog = "4500ms"
+region_qp = 23
+"#;
+        let c = Config::from_toml(toml, dir.path()).unwrap();
+        let p = PumpConfig::from_config(&c);
+
+        assert_eq!(p.hard_cap, 80, "hard_cap_frames: 4s x 20fps");
+        assert_eq!(p.flow.soft_gate, Duration::from_millis(501));
+        assert_eq!(p.flow.backlog_limit, 1_234_567);
+        assert_eq!(p.flow.standing_delay_limit, Duration::from_millis(502));
+        assert_eq!(p.flow.first_ack_grace, Duration::from_millis(1601));
+        assert_eq!(p.flow.stall_timeout, Duration::from_secs(11));
+        assert_eq!(p.idr.policy, IdrPolicy::Reconnect);
+        assert_eq!(p.idr.side_timeout, Duration::from_secs(2));
+        assert_eq!(p.idr.wait_max, Duration::from_secs(4));
+        assert_eq!(p.idr.interval_setup, Duration::from_secs(3));
+        assert_eq!(p.idr.interval_flow, Duration::from_secs(9));
+        assert_eq!(p.rtt_probe_interval, Duration::from_millis(251));
+        assert_eq!(p.burst_chunk, 9);
+        assert_eq!(p.avc420_timeout, Duration::from_secs(13));
+        assert_eq!(p.suppress_debounce, Duration::from_millis(1100));
+        assert_eq!(p.disconnect_watchdog, Duration::from_millis(4500));
+        assert_eq!(p.region_qp, 23);
+    }
 }
