@@ -56,6 +56,9 @@ pub enum Push {
     Coalesced,
     /// The queue was full: cleared, and the final state goes out next.
     Resync,
+    /// Stamped before a release that has since happened: dropped whole —
+    /// neither queued nor kept as resync state (§7.3; PC7 fix round 1, I1).
+    Discarded,
 }
 
 pub struct HidQueue {
@@ -188,22 +191,37 @@ impl HidControl {
 
     /// Queue one full-state report at the current epoch (never blocks).
     pub fn push(&self, frame: HidFrame, motion_only: bool) -> Push {
+        self.push_at(self.epoch(), frame, motion_only)
+    }
+
+    /// Queue a report stamped with the epoch its state was built at, taken
+    /// before the queue lock. If a release has moved the epoch since — it won
+    /// the lock first — the report is dropped whole: not queued, and not
+    /// written into the resync state the release just zeroed, so a
+    /// pre-release key can neither go out after the zero reports nor come
+    /// back in a later resync (§7.3; §7.4 "never a down-up-down glitch";
+    /// PC7 fix round 1, I1).
+    pub(crate) fn push_at(&self, stamp: u64, frame: HidFrame, motion_only: bool) -> Push {
         let r = {
-            // The epoch is read under the queue lock, which `release_all`
-            // also bumps it under: a report can never be stamped before a
-            // release and land after it, where it would overwrite the
-            // queue's zeroed latest state and come back in a resync.
             let mut q = self.q();
-            let epoch = self.epoch();
-            q.push(Report {
-                epoch,
-                frame,
-                motion_only,
-            })
+            if self.epoch() == stamp {
+                q.push(Report {
+                    epoch: stamp,
+                    frame,
+                    motion_only,
+                })
+            } else {
+                Push::Discarded
+            }
         };
         match r {
             Push::Coalesced => self.metrics.hid_reports_coalesced.inc(),
             Push::Resync => self.metrics.hid_resyncs.inc(),
+            Push::Discarded => {
+                // Nothing new to write: no wake-up.
+                self.metrics.hid_epoch_discards.inc();
+                return r;
+            }
             Push::Queued => {}
         }
         self.notify.notify_one();
@@ -220,8 +238,10 @@ impl HidControl {
                 .hid_epoch_discards
                 .add(u64::try_from(q.len()).unwrap_or(u64::MAX));
             q.release();
+            // Under the lock (PC7 m2): `next_frame` sees the flag and the
+            // cleared queue together.
+            self.release_pending.store(true, Ordering::SeqCst);
         }
-        self.release_pending.store(true, Ordering::SeqCst);
         self.metrics.release_all.inc(trigger.label());
         self.notify.notify_one();
     }
@@ -230,9 +250,18 @@ impl HidControl {
         self.release_pending.swap(false, Ordering::SeqCst)
     }
 
+    /// The next report to write — `None` while a release is pending, so the
+    /// zero reports always go first (§7.3 "services it before anything
+    /// else"; PC7 m2).
     pub fn next_frame(&self) -> Option<HidFrame> {
         let mut discarded = 0;
-        let f = self.q().pop(self.epoch(), &mut discarded);
+        let f = {
+            let mut q = self.q();
+            if self.release_pending.load(Ordering::SeqCst) {
+                return None;
+            }
+            q.pop(self.epoch(), &mut discarded)
+        };
         if discarded > 0 {
             self.metrics.hid_epoch_discards.add(discarded);
         }
@@ -427,5 +456,78 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    /// PC7 I1, §7.3/§7.4: a report stamped before a release that lands after
+    /// it — the input handler built it, then lost the race for the queue
+    /// lock to `release_all` — is dropped whole: never sent after the zero
+    /// reports, and never kept as the state a later resync replays.
+    #[test]
+    fn a_report_stamped_before_a_release_and_pushed_after_it_is_dropped_whole() {
+        let c = ctl(2);
+        c.push(kbd(9), false); // a key held before the release
+        let stamp = c.epoch();
+        c.release_all(ReleaseTrigger::Closing);
+        let pushed = c.push_at(stamp, kbd(4), false);
+        assert!(c.take_release());
+        assert_eq!(
+            drain(&c),
+            [],
+            "a pre-release report went out after the zeros"
+        );
+        // Overflow the queue: the resync replays the zeroed keyboard state.
+        for i in 1..=3 {
+            c.push(mouse(0, i, i), false);
+        }
+        assert_eq!(
+            drain(&c),
+            [KBD_ZERO, mouse(0, 3, 3)],
+            "the resync re-pressed a key"
+        );
+        assert_eq!(pushed, Push::Discarded);
+        // `kbd(9)` cleared by the release, `kbd(4)` dropped at the push.
+        assert_eq!(c.metrics.hid_epoch_discards.get(), 2);
+    }
+
+    /// PC7 I2: a release zeroes the keyboard half of the resync state — a
+    /// later overflow never re-presses a key held before the release.
+    #[test]
+    fn a_resync_after_a_release_replays_no_key_held_before_it() {
+        let c = ctl(2);
+        c.push(kbd(4), false);
+        c.release_all(ReleaseTrigger::Closing);
+        assert!(c.take_release());
+        for i in 1..=3 {
+            c.push(mouse(0, i, i), false);
+        }
+        assert_eq!(drain(&c), [KBD_ZERO, mouse(0, 3, 3)]);
+    }
+
+    /// PC7 I2: a release zeroes the pointer's buttons in the resync state —
+    /// a later overflow never re-presses a button held before the release.
+    #[test]
+    fn a_resync_after_a_release_replays_no_button_held_before_it() {
+        let c = ctl(2);
+        c.push(mouse(1, 9, 9), false);
+        c.release_all(ReleaseTrigger::Closing);
+        assert!(c.take_release());
+        for k in 1..=3 {
+            c.push(kbd(k), false);
+        }
+        assert_eq!(drain(&c), [kbd(3), mouse(0, 9, 9)]);
+    }
+
+    /// PC7 m2, §7.3 ("services it before anything else"): a release raised
+    /// after the writer last looked for one still goes out before a report
+    /// pushed after it — no frame is handed out while a release is pending.
+    #[test]
+    fn no_frame_is_handed_out_while_a_release_is_pending() {
+        let c = ctl(8);
+        assert!(!c.take_release()); // the writer looked: nothing pending
+        c.release_all(ReleaseTrigger::Closing);
+        c.push(kbd(2), false); // fresh input after the release
+        assert_eq!(c.next_frame(), None, "a report went out before the zeros");
+        assert!(c.take_release());
+        assert_eq!(c.next_frame(), Some(kbd(2)));
     }
 }
