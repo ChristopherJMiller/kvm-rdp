@@ -918,6 +918,33 @@ mod tests {
         );
     }
 
+    /// P7 at `spawn` (PC15 review m1): the baseline is taken *before*
+    /// `tls::load`, so a renewal racing the load counts as a change. The
+    /// certificate is a FIFO: the load blocks on it until the "renewal"
+    /// writes it, and the write moves the FIFO's mtime — so the state after
+    /// the load differs from the baseline only if the baseline came first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renewal_racing_the_load_is_seen() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let sim = sim().await;
+        let d = tempfile::tempdir().unwrap();
+        let cfg = config_for(&sim, d.path(), |_| {});
+        let cert = d.path().join("cert.pem");
+        let pem = std::fs::read(&cert).unwrap();
+        std::fs::remove_file(&cert).unwrap();
+        let path = std::ffi::CString::new(cert.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        std::thread::sleep(Duration::from_millis(20));
+        let writer = std::thread::spawn(move || std::fs::write(&cert, pem).unwrap());
+        let mut h = start(cfg).await.unwrap();
+        writer.join().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), h.exit_requested())
+            .await
+            .expect("a renewal racing the load was missed");
+        stop(h).await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unbindable_rdp_listener_fails_spawn() {
         let sim = sim().await;
