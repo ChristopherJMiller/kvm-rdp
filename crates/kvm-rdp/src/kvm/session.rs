@@ -1241,6 +1241,194 @@ mod tests {
         r.stop(1).await;
     }
 
+    /// A loopback listener that answers nothing (a KVM port that hangs
+    /// mid-handshake), counting accepts and recording when each
+    /// connection's client side ends.
+    struct Silent {
+        port: u16,
+        accepts: Arc<std::sync::atomic::AtomicUsize>,
+        ended: Arc<Mutex<Vec<std::time::Instant>>>,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Silent {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn silent() -> Silent {
+        use tokio::io::AsyncReadExt as _;
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ended = Arc::new(Mutex::new(Vec::new()));
+        let (a, e) = (accepts.clone(), ended.clone());
+        let task = tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                a.fetch_add(1, Ordering::SeqCst);
+                let e = e.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while matches!(s.read(&mut buf).await, Ok(n) if n > 0) {}
+                    e.lock().unwrap().push(std::time::Instant::now());
+                });
+            }
+        });
+        Silent {
+            port,
+            accepts,
+            ended,
+            task,
+        }
+    }
+
+    /// m2 (PC9 fix round 1, XP5): a fatal cause aborts a side FLV still in
+    /// flight — here one stuck in a TLS handshake the video port never
+    /// answers. Left alone it would hold the connection until its own
+    /// `connect_timeout` (5 s here), and could still force one more IDR on
+    /// the shared encoder after the session failed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fatal_cause_aborts_a_side_flv_in_flight() {
+        let sim = start_sim().await;
+        let p = sim.ports();
+        let video = proxy(p.video).await;
+        let hang = silent().await;
+        let pin = sim.spki_sha256().to_owned();
+        let mut r = rig_on(sim, (p.web, video.port, p.control), &pin, |c| {
+            c.connect_timeout = Duration::from_secs(5);
+            c.idr_side_timeout = Duration::from_secs(30);
+        });
+        r.streaming(1).await;
+        video.to.store(hang.port, Ordering::SeqCst);
+        r.tx.send(KvmCommand::RequestIdr { generation: 1 }).unwrap();
+        tokio::time::timeout(T, async {
+            while hang.accepts.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the side FLV never connected");
+        r.sim.inject(Fault::BSlice);
+        assert_eq!(r.fatal().await, Cause::StreamIncompatible);
+        let t0 = std::time::Instant::now();
+        let ended = tokio::time::timeout(T, async {
+            loop {
+                if let Some(t) = hang.ended.lock().unwrap().first().copied() {
+                    return t;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the side FLV outlived the fatal cause");
+        assert!(
+            ended.saturating_duration_since(t0) < Duration::from_millis(500),
+            "the side FLV ended {:?} after the fatal cause",
+            ended.saturating_duration_since(t0)
+        );
+        assert_eq!(
+            r.metrics.idr_side_failures.total(),
+            0,
+            "aborted, not failed"
+        );
+        r.stop(1).await;
+    }
+
+    /// I3b (PC9 fix round 1, XP3; §4.3 generations): `Start{2}` while
+    /// session 1 is live (a Preempt takeover) closes it — its release
+    /// flushed on the old websocket before the new one opens — and a stale
+    /// `Stop{1}` arriving after it (the pump's watchdog `Abort` racing the
+    /// lifecycle) is acked and ignored: the live session keeps serving.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_stop_never_ends_the_live_session() {
+        let mut r = rig(None, |_| {}).await;
+        r.streaming(1).await;
+        r.input_ready().await;
+        r.hid.push(
+            HidFrame::Keyboard {
+                modifiers: 0x08,
+                keys: [4, 0, 0, 0, 0],
+            },
+            false,
+        );
+        let hid_count = |e: &[SimEvent]| {
+            e.iter()
+                .filter(|e| matches!(e, SimEvent::Hid { .. }))
+                .count()
+        };
+        r.sim.wait_for(T, |e| hid_count(e) >= 3).await.unwrap();
+        r.hid.release_all(ReleaseTrigger::SessionEnd);
+        r.tx.send(KvmCommand::Start { generation: 2 }).unwrap();
+        r.sim.wait_for(T, |e| hid_count(e) >= 6).await.unwrap();
+        let key = vec![0xAA, 0xAA, 0x08, 0, 0x08, 0, 0, 4, 0, 0, 0, 0];
+        assert_eq!(
+            r.hid_bytes(),
+            [
+                SET_MODE.to_vec(),
+                KBD_ZERO.to_vec(),
+                key,
+                KBD_ZERO.to_vec(),
+                SET_MODE.to_vec(),
+                KBD_ZERO.to_vec()
+            ]
+        );
+        r.stop(1).await; // stale: acked, ignored
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let s = r.sim.stats();
+        assert_eq!(
+            (s.ws_open, s.ws_max_open, s.logins_ok, s.logouts),
+            (1, 1, 2, 0),
+            "a stale Stop ended the live session"
+        );
+        let (done, ack) = oneshot::channel();
+        r.tx.send(KvmCommand::FlushHid { done }).unwrap();
+        tokio::time::timeout(T, ack).await.unwrap().unwrap();
+        r.tx.send(KvmCommand::OpenFlv { generation: 2 }).unwrap();
+        r.wait(|e| matches!(e, KvmEvent::FlvOpened { generation: 2, .. }))
+            .await;
+        r.stop(2).await;
+    }
+
+    /// I3a (XP8; §6.9 certificate row, one pin on all three ports): only
+    /// the control websocket meets the wrong certificate — fatal at once,
+    /// after the one login, rather than a session running on with its input
+    /// dead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_websocket_with_the_wrong_certificate_is_fatal() {
+        let (sim, other) = (start_sim().await, start_sim().await);
+        let p = sim.ports();
+        let pin = sim.spki_sha256().to_owned();
+        let mut r = rig_on(sim, (p.web, p.video, other.ports().control), &pin, |_| {});
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        assert_eq!(r.fatal().await, Cause::KvmCertMismatch);
+        assert_eq!(r.sim.stats().logins_ok, 1);
+        assert_eq!(other.stats().accepts_control, 1);
+        r.stop(1).await;
+    }
+
+    /// m2 (XP4): the command channel closing — the bridge is going away —
+    /// ends the actor, after the same full close a Stop does, and no
+    /// logout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_actor_exits_when_its_commands_close() {
+        let mut r = rig(None, |_| {}).await;
+        r.streaming(1).await;
+        let Rig { sim, tx, actor, .. } = r;
+        drop(tx);
+        tokio::time::timeout(T, actor)
+            .await
+            .expect("the actor never exited")
+            .unwrap();
+        sim.wait_for(T, |_| {
+            let s = sim.stats();
+            s.ws_open == 0 && s.flv_open == 0
+        })
+        .await
+        .unwrap();
+        assert_eq!(sim.stats().logouts, 0);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconnect_flv_is_make_before_break() {
         let mut r = rig(None, |_| {}).await;

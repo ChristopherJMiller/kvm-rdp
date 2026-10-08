@@ -711,6 +711,53 @@ mod tests {
         assert_eq!(t.metrics.upstream_reconnects.total(), 1);
     }
 
+    /// §5.2 W5 (PC9 fix round 1, m1): a release pending when `Flush`
+    /// arrives — whichever came first, with no turn of the runtime between
+    /// them, so the writer sees both at once — is written by the `Flush`
+    /// arm before it acks: the biased select takes control first, whatever
+    /// order the wake-ups came in. The socket is blocked, so an ack that
+    /// did not wait for the write shows while the write is still pending.
+    #[tokio::test]
+    async fn flush_writes_the_pending_release_before_it_acks() {
+        for flush_first in [false, true] {
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, ctl) = task(hid.clone(), Duration::from_secs(5));
+            let sink = GateSink::new(true);
+            let s2 = sink.clone();
+            let drive =
+                tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
+            wait_sent(&sink, 2).await;
+            sink.set(false);
+            let (done, mut ack) = oneshot::channel();
+            if flush_first {
+                ctl.send(WsCtl::Flush { done }).unwrap();
+                hid.release_all(ReleaseTrigger::Shutdown);
+            } else {
+                hid.release_all(ReleaseTrigger::Shutdown);
+                ctl.send(WsCtl::Flush { done }).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(
+                matches!(
+                    ack.try_recv(),
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                ),
+                "Flush acked before the pending release was written (flush first: {flush_first})"
+            );
+            sink.set(true);
+            tokio::time::timeout(Duration::from_secs(2), ack)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                sink.sent(),
+                [SET_MODE.to_vec(), KBD_ZERO.to_vec(), KBD_ZERO.to_vec()]
+            );
+            close(&ctl).await;
+            ended(drive).await;
+        }
+    }
+
     /// §7.3: `on_disconnected` releases and then closes over the same path —
     /// the zero reports are written before the close.
     #[tokio::test]
