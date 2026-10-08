@@ -11,3 +11,4 @@ mod client;
 mod harness;
 mod lifecycle;
 mod sessions;
+mod video;
