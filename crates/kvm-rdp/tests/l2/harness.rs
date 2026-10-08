@@ -14,8 +14,9 @@ use kvm_rdp::config::Config;
 use kvm_rdp::metrics::Metrics;
 use kvm_sim::{KvmSim, SimConfig, SimEvent, Source};
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -57,8 +58,29 @@ pub fn sized(c: &mut Config) {
     c.video.default_size = (640, 360);
 }
 
+/// A loopback address no other `Env` binds — 127.128-191.x.y, from this
+/// process's id and a counter — for one bridge's RDP and admin listeners.
+/// On 127.0.0.1 a freed ephemeral port can be re-bound by a concurrent
+/// case's `bind(0)` (kvm-sim binds three there per case), so a "listener
+/// is closed" probe by connecting could reach a neighbour (PC15, 212a099:
+/// about 1 in 45-80 runs). The lib's `testkit::private_loopback` mirrored —
+/// `cfg(test)` items are invisible to this target — in its own range
+/// (the lib uses 127.64-127), so lib tests and L2 never share an address.
+pub fn private_loopback() -> IpAddr {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed) % 250;
+    let [_, _, hi, lo] = std::process::id().to_be_bytes();
+    Ipv4Addr::new(127, 128 | (hi & 0x3f), lo, u8::try_from(n + 2).unwrap()).into()
+}
+
+/// In `private_loopback`'s range.
+pub fn is_private_loopback(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V4(v) if v.octets()[0] == 127 && v.octets()[1] & 0xC0 == 0x80)
+}
+
 /// A deployment's files in `dir`: the secrets, a fresh TLS pair, and a
-/// config for `sim` with ephemeral loopback listeners, scaled per §11.1.
+/// config for `sim` with ephemeral listeners on a fresh private loopback
+/// address, scaled per §11.1.
 pub fn write_files(sim: &KvmSim, dir: &Path) {
     let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
     std::fs::write(dir.join("cert.pem"), ck.cert.pem()).unwrap();
@@ -66,10 +88,11 @@ pub fn write_files(sim: &KvmSim, dir: &Path) {
     std::fs::write(dir.join("nla.pass"), format!("{NLA}\n")).unwrap();
     std::fs::write(dir.join("kvm.pass"), format!("{}\n", sim.password())).unwrap();
     let p = sim.ports();
+    let ip = private_loopback();
     let toml = format!(
-        "[rdp]\nlisten = \"127.0.0.1:0\"\nusername = \"{USER}\"\nnla_password_file = \"nla.pass\"\n\
+        "[rdp]\nlisten = \"{ip}:0\"\nusername = \"{USER}\"\nnla_password_file = \"nla.pass\"\n\
          tls_cert_file = \"cert.pem\"\ntls_key_file = \"key.pem\"\n\
-         [admin]\nlisten = \"127.0.0.1:0\"\nliveness_timeout = \"1s\"\n\
+         [admin]\nlisten = \"{ip}:0\"\nliveness_timeout = \"1s\"\n\
          [kvm]\nhost = \"{host}\"\nspki_sha256 = \"{pin}\"\npassword_file = \"kvm.pass\"\n\
          web_port = {web}\nvideo_port = {video}\ncontrol_port = {control}\n\
          connect_timeout = \"1s\"\nlogin_timeout = \"2s\"\nupstream_deadline = \"5s\"\n\
@@ -100,6 +123,8 @@ pub struct Env {
     pub rdp: SocketAddr,
     pub admin: SocketAddr,
     bridge: Option<BridgeHandle>,
+    /// `Drop` waits for the bridge to stop unless a case took it.
+    taken: bool,
 }
 
 /// kvm-sim, then the bridge over it, configured by the real loader and
@@ -116,12 +141,18 @@ pub async fn env(sim: SimConfig, edit: impl FnOnce(&mut Config)) -> Env {
         .expect("the bridge did not start")
         .unwrap()
         .unwrap();
+    let (rdp, admin) = (bridge.rdp_addr, bridge.admin_addr);
+    assert!(
+        is_private_loopback(rdp.ip()) && admin.ip() == rdp.ip(),
+        "the listeners are not on the Env's private loopback address: {rdp}, {admin}"
+    );
     Env {
-        rdp: bridge.rdp_addr,
-        admin: bridge.admin_addr,
+        rdp,
+        admin,
         sim,
         dir,
         bridge: Some(bridge),
+        taken: false,
     }
 }
 
@@ -184,6 +215,7 @@ impl Env {
 
     /// The bridge, for a case that shuts it down its own way.
     pub fn take_bridge(&mut self) -> BridgeHandle {
+        self.taken = true;
         self.bridge.take().unwrap()
     }
 
@@ -211,14 +243,42 @@ impl Env {
 }
 
 impl Drop for Env {
+    /// The bridge stops first. Dropping its handle shuts its KVM runtime
+    /// down in the background, so wait until the admin listener — a task on
+    /// that runtime — refuses: by then the runtime polls nothing more, so
+    /// the KVM actor and the certificate watcher never see kvm-sim or the
+    /// config directory vanish (both drop after this, as fields). §3.2's
+    /// check comes last, so it covers the teardown too.
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            assert_eq!(
-                self.sim.stats().logouts,
-                0,
-                "§3.2: the bridge never logs out"
-            );
+        drop(self.bridge.take());
+        let stopped = self.taken || refuses_within(self.admin, T);
+        if std::thread::panicking() {
+            return;
         }
+        assert!(
+            stopped,
+            "the bridge's KVM runtime outlived its handle by {T:?}"
+        );
+        assert_eq!(
+            self.sim.stats().logouts,
+            0,
+            "§3.2: the bridge never logs out"
+        );
+    }
+}
+
+/// Whether a TCP connect to `addr` is refused within `limit` (blocking; a
+/// listener on a private loopback address, so no neighbour can hold it).
+pub fn refuses_within(addr: SocketAddr, limit: Duration) -> bool {
+    let t0 = Instant::now();
+    loop {
+        if std::net::TcpStream::connect_timeout(&addr, ms(100)).is_err() {
+            return true;
+        }
+        if t0.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(ms(2));
     }
 }
 
