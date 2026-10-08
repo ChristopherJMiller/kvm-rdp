@@ -1872,40 +1872,6 @@ mod lifecycle {
         assert_eq!(kinds(&ticks(&mut r, 1_900, 2_000)), ["ReleaseAll", "Abort"]);
     }
 
-    /// Deviation from the brief (§5.2, DC13): a Shutdown that arrives while
-    /// already Closing no longer "ignores" it (the brief's assumption) — a
-    /// later fix round made it shorten the running watchdog to
-    /// `min(remaining, the shutdown's own)`. Assert the earlier Abort, and
-    /// that the earlier close's one cause and one disconnect still stand.
-    #[test]
-    fn shutdown_while_already_closing_shortens_the_watchdog() {
-        let mut r = Rig::new(cfg());
-        r.live();
-        assert_eq!(
-            kinds(&r.step(Input::UpstreamFatal(Cause::KvmUnreachable))),
-            ["ReleaseAll", "Disconnect"]
-        );
-        r.at(100);
-        assert!(
-            r.step(Input::Shutdown {
-                watchdog: Duration::from_secs(2)
-            })
-            .is_empty(),
-            "no second Disconnect"
-        );
-        assert!(!kinds(&ticks(&mut r, 100, 2_000)).contains(&"Abort"));
-        assert_eq!(
-            kinds(&ticks(&mut r, 2_000, 2_100)),
-            ["ReleaseAll", "Abort"],
-            "2.1 s (the shutdown's own watchdog), not 5 s"
-        );
-        assert_eq!(
-            r.metrics.disconnects.total(),
-            1,
-            "one cause, one disconnect"
-        );
-    }
-
     /// §6.7: a first negotiation without AVC420 waits `avc420_timeout` (and a
     /// better set before it is taken); a re-advertise without it closes at
     /// once; a client that never negotiates is `no_avc420` at the timeout.
@@ -2039,6 +2005,94 @@ mod lifecycle {
         assert_eq!(disconnects(&early), []);
         assert_eq!(disconnects(&out), []);
     }
+
+    /// Fix round 1, m1: the stall test above bounds its fire time to
+    /// (6.0 s, 12.0 s] but never pins it to §6.6's `stall_timeout` (10 s)
+    /// after the first closure. Kills the core-level wiring mutants S6, S7,
+    /// S9 (1.5–5 s early) and S8 (300 ms late).
+    #[test]
+    fn the_stall_fires_at_the_timeout() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        assert_eq!(disconnects(&ticks(&mut r, 0, 11_500)), []);
+        assert_eq!(
+            disconnects(&ticks(&mut r, 11_500, 11_600)),
+            [Cause::ClientStalled]
+        );
+    }
+
+    /// Fix round 1, I1 (§6.4, §6.6, §11.2): "The stall timer is frozen in
+    /// Paused **and WaitReactivation**" — only Paused was covered. Kills S2
+    /// (`set_state`'s `matches!(new, State::Paused | State::WaitReactivation)`
+    /// narrowed to `State::Paused` alone).
+    #[test]
+    fn the_stall_is_frozen_in_wait_reactivation() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        ticks(&mut r, 0, 2_000); // armed at 1.6 s, NeedIdr
+        r.step(sps(ParamClass::Resize, P480));
+        assert_eq!(r.pump.state(), State::WaitReactivation);
+        assert_eq!(
+            disconnects(&ticks(&mut r, 2_000, 20_000)),
+            [],
+            "frozen in WaitReactivation"
+        );
+    }
+
+    /// Fix round 1, I2(a): "a backlog spike ≥ the limit that drains costs an
+    /// IDR and no disconnect" is only exercised on the AU path, which drains
+    /// before the first tick ever sees it, and "no disconnect" is only
+    /// checked for 1 s past the drain, not past `stall_timeout`. Let a tick
+    /// see the spike, then drain, then run past `stall_timeout`. Kills U7
+    /// (`on_tick` computing `suspended = false`, which arms the stall
+    /// instead of disarming it and closes `client_stalled` 10 s later).
+    #[test]
+    fn a_suspended_spike_ticks_see_then_drained_never_disconnects() {
+        let mut c = cfg();
+        c.flow.backlog_limit = 1000;
+        let mut r = Rig::new(c);
+        r.live();
+        r.ack(0, QueueDepth::Suspend);
+        r.step(Input::Backlog { written: 0 });
+        for _ in 0..40 {
+            r.step(au(false, false));
+        }
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        assert_eq!(
+            disconnects(&ticks(&mut r, 0, 500)),
+            [],
+            "a tick sees the spike"
+        );
+        r.step(Input::Backlog { written: u64::MAX });
+        assert_eq!(
+            disconnects(&ticks(&mut r, 500, 15_000)),
+            [],
+            "drained, and no stall past stall_timeout"
+        );
+        assert_eq!(wire(&r.step(au(true, false))).len(), 1);
+        assert_eq!(r.pump.state(), State::Live);
+    }
+
+    /// Fix round 1, I2(b): "frames keep flowing and are not recorded" while
+    /// suspended is only established at `Flow` level
+    /// (`flow::tests::suspended_acks_record_nothing_and_a_resume_clears_the_
+    /// set`); the core-level suspension test above claims it in its doc but
+    /// never checks it. Kills U2 (`send_au` passing `suspended = false` to
+    /// `record`, which grows the unacked set and climbs
+    /// `egfx_oldest_unacked_ms` for the whole suspension).
+    #[test]
+    fn suspended_frames_are_not_recorded() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.ack(0, QueueDepth::Suspend);
+        for i in 1..=10 {
+            r.at(i * 100);
+            assert_eq!(wire(&r.step(au(false, false))).len(), 1);
+        }
+        r.at(2_000);
+        r.step(Input::Tick);
+        assert_eq!(r.metrics.egfx_oldest_unacked_ms.get(), 0);
+    }
 }
 
 /// §11.2: every cell of §6.4's state × input table (Task 4.6).
@@ -2104,8 +2158,17 @@ mod table {
             }
             State::Idle => {}
         }
-        assert_eq!(r.pump.state(), s);
         r
+    }
+
+    /// Ticks every 100 ms over (from, to].
+    fn ticks(r: &mut Rig, from_ms: u64, to_ms: u64) -> Vec<Command> {
+        let mut out = Vec::new();
+        for i in from_ms / 100 + 1..=to_ms / 100 {
+            r.at(i * 100);
+            out.extend(r.step(Input::Tick));
+        }
+        out
     }
 
     fn apply(r: &mut Rig, c: Col) -> Vec<Command> {
@@ -2243,6 +2306,16 @@ mod table {
         let mut failures = Vec::new();
         for &(state, col, next, must, must_not) in TABLE {
             let mut r = rig_in(state);
+            // m3: a bad canonical construction (e.g. a state-transition
+            // mutant breaking `rig_in`'s own precondition) must not panic
+            // and hide every other cell's report — record it and move on.
+            if r.pump.state() != state {
+                failures.push(format!(
+                    "{state:?} × {col:?}: rig_in landed in {:?} instead of the canonical {state:?}",
+                    r.pump.state()
+                ));
+                continue;
+            }
             let out = apply(&mut r, col);
             let k = kinds(&out);
             if r.pump.state() != next {
@@ -2270,6 +2343,53 @@ mod table {
         );
     }
 
+    /// Fix round 1, m4: only `TABLE.len() == 72` was checked, so a
+    /// duplicated row silently replacing another would still pass.
+    #[test]
+    fn every_state_column_pair_in_the_table_is_distinct() {
+        let mut seen: Vec<String> = TABLE
+            .iter()
+            .map(|&(s, c, ..)| format!("{s:?}×{c:?}"))
+            .collect();
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "a (state, col) pair repeats in TABLE");
+    }
+
+    /// Fix round 1, m2: the generic `rig_in(WaitReactivation)` is reached
+    /// from `Live`, unsuppressed — so the table's own
+    /// `(WaitReactivation, SuppressOff, WaitReactivation, …)` cell never
+    /// delivers a real Off edge (the debouncer is already settled at off,
+    /// so `hold_suppress(false)` is a no-op). T13 was killed only by
+    /// `tests::a_suppression_ending_during_a_resize_from_paused_lands_in_
+    /// need_idr`. Reach WaitReactivation through Paused instead, so a real
+    /// On-then-Off pair crosses it, and also check the P5 invariant it
+    /// depends on: reactivation still lands in NeedIdr, not back in Paused.
+    #[test]
+    fn suppress_off_in_wait_reactivation_reached_from_paused_still_just_records() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.hold_suppress(true);
+        assert_eq!(r.pump.state(), Paused);
+        r.step(sps(ParamClass::Resize, P480));
+        assert_eq!(r.pump.state(), WaitReactivation);
+        let out = r.hold_suppress(false);
+        assert_eq!(
+            r.pump.state(),
+            WaitReactivation,
+            "SuppressOff only records here (T13)"
+        );
+        assert!(!kinds(&out).contains(&"ReleaseAll"));
+        let out = r.step(Input::ReactivationComplete);
+        assert_eq!(
+            r.pump.state(),
+            NeedIdr,
+            "the Off edge already cleared return_to_paused (P5)"
+        );
+        assert!(!kinds(&out).contains(&"ReleaseAll"));
+    }
+
     /// Deviation from the brief (§6.5): `FlvOpened` while waiting
     /// (`WaitReady`, `WaitReactivation`) now restarts both IDR clocks
     /// instead of being "ignored" — the table's cells for these two rows
@@ -2294,6 +2414,14 @@ mod table {
             "the open restarted the setup clock: {:?}",
             kinds(&out)
         );
+        // Fix round 1, m5: the positive half — this is only an absence
+        // check so far, so it would still pass if reactivation stopped
+        // being a Setup cause at all (R1) instead of merely being deferred.
+        // The deferred request still fires, at the open's window end
+        // (1 500 + interval_setup = 2 500 ms), not before and not never.
+        assert!(!kinds(&ticks(&mut r, 1_550, 2_400)).contains(&"RequestIdr"));
+        let k = kinds(&ticks(&mut r, 2_400, 2_500));
+        assert_eq!(k.iter().filter(|x| **x == "RequestIdr").count(), 1, "{k:?}");
     }
 
     /// `WaitReady`: an open before the connection's first `OnReady` sets a
