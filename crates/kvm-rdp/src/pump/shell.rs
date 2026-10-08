@@ -201,6 +201,14 @@ impl PumpShell {
         self.link.as_mut().filter(|l| l.slot == slot)
     }
 
+    /// The link's generation has ended: `on_disconnected` ran, and its
+    /// `SessionStop` is queued behind the input being read.
+    fn link_ended(&self) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|l| !self.d.gens.is_current(l.generation))
+    }
+
     async fn rdp_input(&mut self, input: RdpInput) {
         match input {
             RdpInput::SessionStart {
@@ -255,7 +263,13 @@ impl PumpShell {
                 }
             }
             RdpInput::OnReady { slot, version } => {
-                if self.link_for(slot).is_none() {
+                // PC17: IronRDP can run a re-advertise's `on_ready`, then the
+                // teardown's `on_close` and `on_disconnected`, before the
+                // shell reads any of them. The Setup this would run meets
+                // the closed channel, which IronRDP refuses (m7), and would
+                // count a `no_avc420` disconnect for a session the client
+                // ended. An ended generation runs no Setup.
+                if self.link_for(slot).is_none() || self.link_ended() {
                     return;
                 }
                 self.d
@@ -306,6 +320,10 @@ impl PumpShell {
                 }
             }
             RdpInput::Updates => {
+                // PC17: the reactivation's Setup, same window as `OnReady`.
+                if self.link_ended() {
+                    return;
+                }
                 let cmds = self.step([Input::ReactivationComplete]);
                 self.exec(cmds).await;
             }
@@ -1029,6 +1047,12 @@ mod tests {
                 self.id,
                 CreationStatus::OK,
             )));
+            self.advertise();
+        }
+
+        /// The census capability pair on the open channel: IronRDP's
+        /// `on_ready` (again, for a re-advertise).
+        fn advertise(&mut self) {
             let adv = encode_vec(&GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(
                 rig::census_caps(),
             )))
@@ -1185,6 +1209,8 @@ mod tests {
     /// `SessionStop` not yet stepped) already released all (SessionEnd); its
     /// late Setup, resize and close must not size the display for the next
     /// connection, set mouse scaling's surface, or release the HID again.
+    /// (Since PC17 its late `on_ready` runs no Setup at all; the gated
+    /// display and surface writes stay as a second line.)
     #[tokio::test(flavor = "current_thread")]
     async fn an_ended_generation_leaves_the_display_and_the_hid_alone() {
         LocalSet::new()
@@ -1211,7 +1237,7 @@ mod tests {
                 })
                 .await;
                 t.gens.end(); // on_disconnected ran; its SessionStop not yet stepped
-                t.ready(); // Setup, SurfaceSize, then DisplayResize to 480p
+                t.ready(); // its late on_ready (a Setup and a 480p resize before PC17)
                 let (done, rx) = oneshot::channel();
                 t.rdp.send(RdpInput::Shutdown { done }).unwrap(); // ReleaseAll(closing)
                 t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
@@ -1796,6 +1822,77 @@ mod tests {
             })
             .await;
     }
+
+    /// PC17 (found by L2's quick-reconnect case): a client re-advertises
+    /// and disconnects at once. IronRDP runs the re-advertise's `on_ready`,
+    /// then the teardown's `on_close` and `on_disconnected`, all before the
+    /// shell next runs, so the shell reads that `OnReady` after its
+    /// generation has ended. It is not a cause: no Setup on the closed
+    /// channel — which IronRDP refuses, m7's `no_avc420` — no close, and no
+    /// bridge-initiated disconnect counted for a session the client ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_on_ready_read_after_its_generation_ended_is_not_a_cause() {
+        LocalSet::new()
+            .run_until(async {
+                let mut w = wired();
+                let (mut chan, _) = w.live().await;
+                chan.advertise();
+                w.teardown(chan);
+                w.settled().await;
+                assert_eq!(
+                    w.metrics.disconnects.get("no_avc420"),
+                    0,
+                    "a re-advertise read after the teardown was counted as no_avc420"
+                );
+                assert_eq!(w.metrics.disconnects.total(), 0);
+                assert_eq!(w.metrics.release_all.get("closing"), 0);
+                while let Ok(ev) = w.events.try_recv() {
+                    assert!(!matches!(ev, ServerEvent::Disconnect(_)), "{ev:?}");
+                }
+            })
+            .await;
+    }
+
+    /// PC17: the same window at a reactivation — IronRDP's `updates()` after
+    /// a resize, then the client's teardown, both before the shell next
+    /// runs. The `ReactivationComplete` it would step runs the Setup on the
+    /// closed channel; read after the generation ended, it is not a cause.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reactivation_read_after_its_generation_ended_is_not_a_cause() {
+        LocalSet::new()
+            .run_until(async {
+                let mut w = wired();
+                let (chan, generation) = w.live().await;
+                let Input::SpsChanged { class, params } = rig::sps(ParamClass::Resize, P480) else {
+                    unreachable!()
+                };
+                w.kvm
+                    .send(KvmEvent::SpsChanged {
+                        generation,
+                        class,
+                        params,
+                    })
+                    .await
+                    .unwrap();
+                // The resize is stepped: the pump waits for the reactivation.
+                until("the resize to be stepped", || {
+                    w.kvm.capacity() == w.kvm.max_capacity()
+                })
+                .await;
+                tokio::task::yield_now().await;
+                w.rdp.send(RdpInput::Updates).unwrap();
+                w.teardown(chan);
+                w.settled().await;
+                assert_eq!(
+                    w.metrics.disconnects.get("no_avc420"),
+                    0,
+                    "a reactivation read after the teardown was counted as no_avc420"
+                );
+                assert_eq!(w.metrics.disconnects.total(), 0);
+            })
+            .await;
+    }
+
     /// PC15 review m2: with no session the shell sleeps — no tick and no
     /// loop turn (the 50 ms tick was 354 RDP-thread wakeups in 10 s idle) —
     /// ticks while a session lives, and sleeps again once it stopped.
