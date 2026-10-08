@@ -6,7 +6,9 @@ pub mod endpoint;
 pub mod error;
 pub mod flv;
 pub mod login;
+pub mod side;
 pub mod upstream;
+pub mod video;
 pub mod ws;
 
 pub use endpoint::KvmEndpoint;
