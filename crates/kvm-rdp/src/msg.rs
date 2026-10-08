@@ -216,6 +216,13 @@ pub enum RdpInput {
         frame_id: u32,
         queue_depth: u32,
     },
+    /// The slot's EGFX channel closed (`GraphicsPipelineHandler::on_close`;
+    /// PC11 n2). A client's mid-session DVC Close and every connection's
+    /// teardown both run it; the shell tells them apart with
+    /// `rdp::gfx::closed_channel_input`.
+    GfxClosed {
+        slot: u64,
+    },
     /// `RdpServerDisplay::updates()` ran: an activation or reactivation.
     Updates,
     /// Close the live session with cause `shutdown` (§5.2).
@@ -235,6 +242,7 @@ impl std::fmt::Debug for RdpInput {
             RdpInput::CapsAdvertised { .. } => "CapsAdvertised",
             RdpInput::OnReady { .. } => "OnReady",
             RdpInput::FrameAck { .. } => "FrameAck",
+            RdpInput::GfxClosed { .. } => "GfxClosed",
             RdpInput::Updates => "Updates",
             RdpInput::Shutdown { .. } => "Shutdown",
             RdpInput::Stall(_) => "Stall",
