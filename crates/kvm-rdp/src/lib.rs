@@ -21,6 +21,7 @@ pub mod logging;
 pub mod metrics;
 pub mod msg;
 pub mod pump;
+pub mod rdp;
 
 #[cfg(test)]
 mod pin_goldens;
