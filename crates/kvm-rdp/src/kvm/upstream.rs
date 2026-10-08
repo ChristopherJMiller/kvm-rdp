@@ -207,6 +207,42 @@ mod tests {
         assert!(seen.len() > 50, "jitter is not spreading: {}", seen.len());
     }
 
+    /// m3 (fix round 1): every attempt's jitter stays within ±20 % of
+    /// *its own* base (250 ms, 500 ms, … up to the 8 s cap, as
+    /// `backoff_doubles_to_its_cap_and_resets` pins them) and lands on
+    /// both sides of it. The old test checked only the first attempt and
+    /// only that draws stayed inside the band; a one-sided
+    /// `% (span + 1)` (offsets only in `[0, span]`, so every delay is at
+    /// or below its base) would still pass that check but never produces
+    /// a draw above any base — this test catches it.
+    #[test]
+    fn backoff_jitter_stays_inside_twenty_percent_on_every_attempt() {
+        let bases_ms: [u64; 8] = [250, 500, 1000, 2000, 4000, 8000, 8000, 8000];
+        for (attempt, &base_ms) in bases_ms.iter().enumerate() {
+            let base_us = base_ms.saturating_mul(1000);
+            let span_us = base_us / 5; // ±20 %
+            let (lo, hi) = (base_us - span_us, base_us + span_us);
+            let (mut below, mut above) = (false, false);
+            for seed in 0..200u64 {
+                let mut b = Backoff::new(cfg(20), Jitter::new(seed));
+                for _ in 0..attempt {
+                    b.next_delay();
+                }
+                let d = u64::try_from(b.next_delay().as_micros()).unwrap();
+                assert!(
+                    (lo..=hi).contains(&d),
+                    "attempt {attempt}: {d} not in [{lo},{hi}]"
+                );
+                below |= d < base_us;
+                above |= d > base_us;
+            }
+            assert!(
+                below && above,
+                "attempt {attempt}: jitter is one-sided (below={below}, above={above})"
+            );
+        }
+    }
+
     /// §6.9: re-login once; a second consecutive failure with no successful
     /// re-login in between is fatal; a success resets the count.
     #[test]
@@ -273,5 +309,20 @@ mod tests {
         );
         d.tag();
         assert!(!d.expired(at(600)));
+    }
+
+    /// m3 (fix round 1): a second `flv_wanted` must not push the deadline
+    /// out — `get_or_insert` only arms it once. An assignment in its
+    /// place would reset the clock on every reconnect attempt, which the
+    /// non-extension check in `the_deadline_covers_login_and_tags` only
+    /// exercised for `flv_lost`, not `flv_wanted`.
+    #[test]
+    fn flv_wanted_does_not_extend_an_already_armed_deadline() {
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut d = Deadline::new(Duration::from_secs(20));
+        d.flv_wanted(at(0));
+        d.flv_wanted(at(10));
+        assert!(d.expired(at(20)));
     }
 }
