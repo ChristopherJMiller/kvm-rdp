@@ -39,13 +39,32 @@ impl fmt::Debug for Secret {
     }
 }
 
+/// What a config file's TOML can be wrong with: the only words a parse error
+/// carries besides its position (I1, PC15 re-review). toml's and serde's
+/// own text echoes the file — keys, values, the source line — and cannot be
+/// made safe by redaction, so none of it is kept.
+pub const PARSE_CATEGORIES: [&str; 7] = [
+    "unknown key",
+    "wrong value type",
+    "missing required key",
+    "duplicate key",
+    "syntax error",
+    "file too large",
+    "not UTF-8",
+];
+
 #[derive(Debug)]
 pub enum ConfigError {
     Read {
         path: PathBuf,
         kind: std::io::ErrorKind,
     },
-    Parse(String),
+    /// Where (1-based line and column, when toml says) and a category from
+    /// `PARSE_CATEGORIES` — never toml's or serde's text.
+    Parse {
+        at: Option<(usize, usize)>,
+        what: &'static str,
+    },
     Invalid(String),
 }
 
@@ -53,7 +72,11 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::Read { path, kind } => write!(f, "cannot read {}: {kind}", path.display()),
-            ConfigError::Parse(e) => write!(f, "invalid TOML: {e}"),
+            ConfigError::Parse {
+                at: Some((line, column)),
+                what,
+            } => write!(f, "invalid TOML at line {line}, column {column}: {what}"),
+            ConfigError::Parse { at: None, what } => write!(f, "invalid TOML: {what}"),
             ConfigError::Invalid(e) => write!(f, "invalid config: {e}"),
         }
     }
@@ -245,57 +268,37 @@ impl Config {
     }
 }
 
-/// I1 (PC15 review, §9.2): a parse error says where and what, never the
-/// file's text. toml's `Display` quotes the offending source line — a
-/// secret file passed as the config, or an inline secret, would reach
-/// stderr — so only the position and the redacted message are kept.
+/// I1 (PC15 review and re-review, §9.2): a parse error is a position and a
+/// category, never text. toml's `Display` quotes the source line, and its
+/// message quotes keys and values in ways no redaction can bound (a key
+/// holding a backtick, a value holding ", expected "), so the message is
+/// only matched against known prefixes to pick a category; none of it is
+/// kept.
 fn parse_error(text: &str, e: &toml::de::Error) -> ConfigError {
-    let what = redacted(e.message());
-    ConfigError::Parse(match e.span() {
-        Some(span) => {
-            let (line, column) = position(text, span.start);
-            format!("line {line}, column {column}: {what}")
-        }
-        None => what,
-    })
+    ConfigError::Parse {
+        at: e.span().map(|span| position(text, span.start)),
+        what: category(e.message()),
+    }
 }
 
-/// A toml/serde message with every quoted span before its `, expected …`
-/// replaced by `…`. What precedes "expected" can quote the source — a
-/// value (`invalid type: string "…"`), an unknown key or variant (in
-/// backticks); what follows is the schema's or the grammar's (`u16`, the
-/// known keys, `=`). "missing field `…`" names a schema field and is kept.
-fn redacted(message: &str) -> String {
-    let (head, tail) = match message.find(", expected ") {
-        Some(i) => message.split_at(i),
-        None => (message, ""),
-    };
-    if head.starts_with("missing field ") {
-        return message.to_owned();
-    }
-    let mut out = String::with_capacity(message.len().min(256));
-    let mut chars = head.chars();
-    while let Some(c) = chars.next() {
-        if c != '"' && c != '`' {
-            out.push(c);
-            continue;
-        }
-        let mut escaped = false;
-        for q in chars.by_ref() {
-            if escaped {
-                escaped = false;
-            } else if q == '\\' && c == '"' {
-                escaped = true;
-            } else if q == c {
-                break;
-            }
-        }
-        out.push(c);
-        out.push('…');
-        out.push(c);
-    }
-    out.push_str(tail);
-    out
+/// The category for a toml or serde message, by its leading words (which
+/// are theirs, not the file's); anything else is a syntax error. Only the
+/// `&'static str` chosen here leaves — never the message.
+fn category(message: &str) -> &'static str {
+    const BY_PREFIX: [(&str, &str); 8] = [
+        ("unknown field", "unknown key"),
+        ("invalid type", "wrong value type"),
+        ("invalid value", "wrong value type"),
+        ("invalid length", "wrong value type"),
+        ("unknown variant", "wrong value type"),
+        ("missing field", "missing required key"),
+        ("duplicate key", "duplicate key"),
+        ("duplicate field", "duplicate key"),
+    ];
+    BY_PREFIX
+        .iter()
+        .find(|(prefix, _)| message.starts_with(prefix))
+        .map_or("syntax error", |&(_, what)| what)
 }
 
 /// `--config <file>` or `--config=<file>`, else `KVM_RDP_CONFIG` (§4.4) —
@@ -848,7 +851,7 @@ fn build(raw: Raw, base: &Path) -> Result<Config, ConfigError> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::unwrap_used,
         clippy::expect_used,
@@ -1044,7 +1047,7 @@ mod tests {
         ] {
             let r = load(d.path(), &format!("{base}{extra}"));
             assert!(
-                matches!(r, Err(ConfigError::Invalid(_) | ConfigError::Parse(_))),
+                matches!(r, Err(ConfigError::Invalid(_) | ConfigError::Parse { .. })),
                 "{what}: {r:?}"
             );
         }
@@ -1088,60 +1091,227 @@ mod tests {
         }
     }
 
-    /// I1 (PC15 review; §4.4, §9.2): a config error never echoes the file —
-    /// `--config` pointed at a secret file, an inline secret under a key the
-    /// schema refuses, a malformed line, a wrong-typed value, a secret used
-    /// as a key, a bad duration. The sentinel reaches neither the error's
-    /// `Display` or `Debug` nor the line `main` prints; a parse error still
-    /// says where.
-    #[test]
-    fn config_errors_never_echo_the_file() {
-        const S: &str = "s3ntinel-Zq7vP2mX9kLr4TfW8";
-        let d = tempfile::tempdir().unwrap();
-        let base = minimal(d.path());
-        let cases = [
-            (format!("{S}\n"), "a secret file as the config"),
-            (
-                base.replace("[rdp]\n", &format!("[rdp]\nnla_password = \"{S}\"\n")),
-                "an inline secret under an unknown key",
+    /// What the leak shapes embed: a word; digits (serde echoes integers in
+    /// backticks); a date and an invalid date (toml echoes date-times).
+    pub(crate) const SENTINELS: [&str; 4] =
+        ["SNTL7qZq7vP2", "7531902468", "2975-03-19", "2975-13-45"];
+
+    /// I1 (PC15 re-review): every shape the two reviews probed — a secret
+    /// written into the config as a key, a value or a header, in every TOML
+    /// syntax, next to a backtick or `, expected `; a secret file passed as
+    /// the config; a file that is not UTF-8. `(file bytes, what)`.
+    pub(crate) fn leak_shapes(dir: &Path) -> Vec<(Vec<u8>, &'static str)> {
+        let [s, n, d, bad_date] = SENTINELS;
+        let base = minimal(dir);
+        let rdp = |line: String| base.replace("[rdp]\n", &format!("[rdp]\n{line}\n"));
+        let kvm = |line: String| base.replace("[kvm]\n", &format!("[kvm]\n{line}\n"));
+        let admin = |line: String| format!("{base}[admin]\n{line}\n");
+        let video = |line: String| format!("{base}[video]\n{line}\n");
+        let t = |text: String, what: &'static str| (text.into_bytes(), what);
+        vec![
+            // The seven the re-review found leaking through fix round 1.
+            t(admin(format!("\"a`b {s}\" = 1")), "a key with a backtick"),
+            t(
+                admin(format!("\"x, expected y {s}\" = 1")),
+                "a key holding ', expected '",
             ),
-            (
-                format!("{base}[video]\nmax_fps = {S}\n"),
-                "a malformed line",
+            t(
+                kvm(format!("web_port = \"x, expected y {s}\"")),
+                "a wrong-typed value holding ', expected '",
             ),
-            (
-                base.replace("[kvm]\n", &format!("[kvm]\nweb_port = \"{S}\"\n")),
-                "a string where a port goes",
+            t(
+                kvm(format!("web_port = 'x, expected y {s}'")),
+                "the same, as a literal string",
             ),
-            (
-                base.replace("[kvm]\n", &format!("[kvm]\nusername = {{ x = \"{S}\" }}\n")),
-                "a table under an unknown key",
+            t(
+                admin(format!("\"`x`, expected `y`, {s}\" = 1")),
+                "a key of backticks and ', expected '",
             ),
-            (format!("{base}[admin]\n{S} = 1\n"), "a secret as a key"),
-            (
-                format!("{base}[video]\nidr_side_timeout = \"{S}\"\n"),
-                "a bad duration",
+            t(
+                admin(format!("\"a\\\\` {s}\" = 1")),
+                "a key with an escaped backslash and a backtick",
             ),
-            (format!("{base}[paste]\npace = \"{S}\"\n"), "a bad pace"),
-            (
-                format!("{base}[rdp]\nlisten = \"{S}\"\n"),
+            t(
+                admin(format!("\"\\\"`{s}\" = 1")),
+                "a key with an escaped quote and a backtick",
+            ),
+            // A secret file passed as the config.
+            t(format!("{s}\n"), "a secret file as the config"),
+            t(format!("{s} word two\n"), "a secret file with spaces"),
+            // An inline secret under a key the schema refuses.
+            t(
+                rdp(format!("nla_password = \"{s}\"")),
+                "an inline secret, basic string",
+            ),
+            t(
+                rdp(format!("nla_password = '{s}'")),
+                "an inline secret, literal string",
+            ),
+            // Headers.
+            t(format!("{base}[{s}]\n"), "a table header"),
+            t(format!("{base}[[{s}]]\n"), "an array-of-tables header"),
+            t(format!("{base}[{s}\n"), "an unclosed header"),
+            t(format!("{base}[\"{s}\"]\n"), "a quoted header"),
+            t(
+                format!("{base}[rdp]\nlisten = \"{s}\"\n"),
                 "a duplicate table",
             ),
-        ];
+            // Keys.
+            t(admin(format!("{s} = 1")), "a secret as a key"),
+            t(admin(format!("{s} =")), "a key with no value"),
+            t(admin(format!("a.{s} = 1")), "a dotted key"),
+            t(admin(format!("{n} = 1")), "an integer-looking key"),
+            t(admin(format!("\"{s}\\\"q\" = 1")), "a key holding a quote"),
+            t(
+                admin(format!("\"{s}\\nx\" = 1")),
+                "a key holding a newline escape",
+            ),
+            // Values.
+            t(admin(format!("listen = {s}")), "a bare-word value"),
+            t(
+                kvm(format!("web_port = {n}{s}")),
+                "an integer-looking value",
+            ),
+            t(
+                rdp(format!("username = {n}")),
+                "an integer where a string goes",
+            ),
+            t(kvm(format!("web_port = {n}{n}{n}")), "an integer overflow"),
+            t(kvm(format!("web_port = {n}")), "a port out of range"),
+            t(
+                kvm(format!("web_port = {d}T02:46:51Z")),
+                "an offset date-time",
+            ),
+            t(kvm(format!("web_port = {d}")), "a local date"),
+            t(kvm(format!("web_port = 02:46:51.{n}")), "a local time"),
+            t(kvm(format!("web_port = {bad_date}")), "an invalid date"),
+            t(
+                kvm(format!("web_port = \"\"\"{s}\nline\"\"\"")),
+                "a multi-line basic string",
+            ),
+            t(
+                kvm(format!("web_port = '''{s}\nline'''")),
+                "a multi-line literal string",
+            ),
+            t(kvm(format!("web_port = \"{s}")), "an unterminated string"),
+            t(
+                kvm(format!("web_port = \"\"\"{s}")),
+                "an unterminated multi-line string",
+            ),
+            t(
+                kvm(format!("web_port = '{s}\\\"'")),
+                "a literal string holding \\\"",
+            ),
+            t(kvm(format!("web_port = [\"{s}\"]")), "an array of strings"),
+            t(kvm(format!("web_port = [{s}]")), "an array of bare words"),
+            t(kvm(format!("web_port = [1, \"{s}\"]")), "a mixed array"),
+            t(
+                kvm(format!("web_port = {{ {s} = 1 }}")),
+                "an inline table keyed by the secret",
+            ),
+            t(
+                rdp(format!("username = {{ x = \"{s}\" }}")),
+                "an inline table where a string goes",
+            ),
+            t(kvm(format!("web_port = \"\\q{s}\"")), "an invalid escape"),
+            t(
+                kvm(format!("web_port = \"{s}\u{1}\"")),
+                "a control character",
+            ),
+            t(kvm(format!("web_port = 1.5{s}")), "a float with a suffix"),
+            t(
+                kvm(format!("web_port = {n}.5")),
+                "a float where a port goes",
+            ),
+            // Validation, after the parse.
+            t(kvm(format!("scheme = \"{s}\"")), "a bad scheme"),
+            t(
+                video(format!("idr_side_timeout = \"{s}\"")),
+                "a bad duration",
+            ),
+            t(format!("{base}[paste]\npace = \"{s}\"\n"), "a bad pace"),
+            t(
+                video(format!("default_size = \"{s}\"")),
+                "a bad default size",
+            ),
+            t(
+                video(format!("sps_rewrite = [\"{s}\"]")),
+                "a bad SPS rewrite",
+            ),
+            // Not UTF-8.
+            (
+                [
+                    format!("{base}[admin]\nlisten = \"").as_bytes(),
+                    b"\xff\xfe",
+                    s.as_bytes(),
+                    b"\"\n",
+                ]
+                .concat(),
+                "a file that is not UTF-8",
+            ),
+        ]
+    }
+
+    /// I1 (PC15 review and re-review; §4.4, §9.2): a config error never
+    /// echoes the file. For every shape above, no sentinel reaches the
+    /// error's `Display` or `Debug` (the binary's stderr is pinned through
+    /// the binary's own body in `cli`).
+    #[test]
+    fn config_errors_never_echo_the_file() {
+        let d = tempfile::tempdir().unwrap();
+        let shapes = leak_shapes(d.path());
+        assert!(shapes.len() >= 40, "{} shapes", shapes.len());
         let toml = d.path().join("kvm-rdp.toml");
-        for (text, what) in &cases {
-            std::fs::write(&toml, text).unwrap();
+        let mut leaks = Vec::new();
+        for (bytes, what) in &shapes {
+            std::fs::write(&toml, bytes).unwrap();
             let e = Config::load(&toml).expect_err(what);
-            let shown = format!("{e} {e:?}");
-            assert!(!shown.contains(S), "{what}: {shown}");
-            let line =
-                from_command_line(["--config".into(), toml.clone().into()], None).expect_err(what);
-            assert!(!line.contains(S), "{what}: {line}");
-            assert!(line.starts_with("kvm-rdp: "), "{line}");
-            if matches!(e, ConfigError::Parse(_)) {
-                assert!(shown.contains("line "), "{what}: no position in {shown}");
+            let shown = format!("{e} | {e:?}");
+            if SENTINELS.iter().any(|s| shown.contains(s)) {
+                leaks.push(format!("{what}: {shown}"));
+            }
+            if let ConfigError::Parse { what: category, .. } = e {
+                assert!(PARSE_CATEGORIES.contains(&category), "{what}: {category}");
             }
         }
+        assert!(
+            leaks.is_empty(),
+            "{}/{} shapes leaked:\n{}",
+            leaks.len(),
+            shapes.len(),
+            leaks.join("\n")
+        );
+    }
+
+    /// I1: the category is picked from toml's and serde's leading words —
+    /// never their text — and anything unrecognised is a syntax error.
+    #[test]
+    fn a_parse_error_is_named_by_its_category() {
+        let d = tempfile::tempdir().unwrap();
+        let base = minimal(d.path());
+        for (extra, want) in [
+            ("[admin]\nnla_password = 1\n", "unknown key"),
+            ("[admin]\nlisten = 1\n", "wrong value type"),
+            ("[input]\nqueue = -1\n", "wrong value type"),
+            ("[video]\nsps_rewrite = \"level\"\n", "wrong value type"),
+            ("[rdp]\nlisten = \"127.0.0.1:1\"\n", "duplicate key"),
+            ("[admin]\nlisten =\n", "syntax error"),
+            ("[admin\n", "syntax error"),
+        ] {
+            let e = load(d.path(), &format!("{base}{extra}")).unwrap_err();
+            assert!(
+                matches!(e, ConfigError::Parse { at: Some(_), what } if what == want),
+                "{extra:?}: {e:?}"
+            );
+        }
+        assert_eq!(category("missing field `x`"), "missing required key");
+        assert_eq!(category("duplicate field `x`"), "duplicate key");
+        assert_eq!(
+            category("unknown variant `x`, expected `a`"),
+            "wrong value type"
+        );
+        assert_eq!(category("invalid length 3, expected 2"), "wrong value type");
+        assert_eq!(category("anything else, expected `=`"), "syntax error");
     }
 
     /// The parse error's position: 1-based line and column (characters).
@@ -1150,8 +1320,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let e = load(d.path(), "[rdp]\n\u{e9}t\u{e9} =\n").unwrap_err();
         assert!(
-            matches!(&e, ConfigError::Parse(m) if m.starts_with("line 2, column ")),
-            "{e}"
+            matches!(
+                &e,
+                ConfigError::Parse {
+                    at: Some((2, _)),
+                    what: "syntax error"
+                }
+            ),
+            "{e:?}"
         );
         assert_eq!(position("ab\ncd\u{e9}f", 7), (2, 4));
         assert_eq!(position("ab", 99), (1, 3));

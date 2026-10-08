@@ -15,6 +15,7 @@
 
 pub mod admin;
 pub mod bridge;
+pub mod cli;
 pub mod config;
 pub mod hid;
 pub mod kvm;
@@ -26,3 +27,5 @@ pub mod rdp;
 
 #[cfg(test)]
 mod pin_goldens;
+#[cfg(test)]
+mod testkit;

@@ -706,6 +706,7 @@ mod tests {
         clippy::indexing_slicing
     )]
     use super::*;
+    use crate::testkit::{is_child, passes_in_a_child};
     use ironrdp_pdu::nego::{ConnectionConfirm, ConnectionRequest, RequestFlags, SecurityProtocol};
     use ironrdp_pdu::x224::X224;
     use kvm_sim::{KvmSim, SimConfig, Source};
@@ -1261,7 +1262,7 @@ mod tests {
             startup_log_in_a_child();
             return;
         }
-        passes_in_a_child("startup_logs_the_tls_key_type_at_info");
+        passes_in_a_child("bridge::tests::startup_logs_the_tls_key_type_at_info");
     }
 
     fn startup_log_in_a_child() {
@@ -1691,50 +1692,6 @@ mod tests {
         );
     }
 
-    /// Set in a copy of this test binary re-executed by `passes_in_a_child`:
-    /// the test it runs takes its child branch.
-    const CHILD: &str = "KVM_RDP_TEST_CHILD";
-
-    fn is_child() -> bool {
-        std::env::var_os(CHILD).is_some()
-    }
-
-    /// Run `bridge::tests::<name>` alone in a child process — this test
-    /// binary re-executed with `CHILD` set — for what needs a process of its
-    /// own (a signal, a process-wide subscriber), and require that it passed.
-    /// The child is killed if it outlives 30 s.
-    fn passes_in_a_child(name: &str) {
-        let test = format!("bridge::tests::{name}");
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let pid = libc::pid_t::try_from(child.id()).unwrap();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
-        });
-        let Ok(out) = rx.recv_timeout(Duration::from_secs(30)) else {
-            // SAFETY: kill(2) on our own child, not yet reaped (the waiting
-            // thread is still blocked in waitpid).
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            panic!("{test}: the child did not finish within 30 s");
-        };
-        let out = out.unwrap();
-        let (stdout, stderr) = (
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        assert!(out.status.success(), "{:?}\n{stdout}\n{stderr}", out.status);
-        assert!(
-            stdout.contains("test result: ok. 1 passed"),
-            "{test}: the child ran no test:\n{stdout}"
-        );
-    }
-
     /// P37: a SIGTERM sent the moment "kvm-rdp ready" is logged is already
     /// the bridge's — §5.2's shutdown and `Exit::Signal` — never the default
     /// disposition. Run in a child process, which raises SIGTERM on the
@@ -1746,7 +1703,7 @@ mod tests {
             sigterm_at_the_ready_line();
             return;
         }
-        passes_in_a_child("a_sigterm_right_after_the_ready_line_is_a_clean_exit");
+        passes_in_a_child("bridge::tests::a_sigterm_right_after_the_ready_line_is_a_clean_exit");
     }
 
     /// A layer that runs `f` inside the "kvm-rdp ready" event, on the thread
@@ -1825,6 +1782,6 @@ mod tests {
             assert_eq!((why, why.code()), (Exit::CertificateChanged, 0));
             return;
         }
-        passes_in_a_child("a_renewal_ends_the_binary_loop_for_a_restart");
+        passes_in_a_child("bridge::tests::a_renewal_ends_the_binary_loop_for_a_restart");
     }
 }
