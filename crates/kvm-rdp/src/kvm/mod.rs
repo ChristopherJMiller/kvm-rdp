@@ -6,6 +6,7 @@ pub mod endpoint;
 pub mod error;
 pub mod flv;
 pub mod login;
+pub mod session;
 pub mod side;
 pub mod upstream;
 pub mod video;
