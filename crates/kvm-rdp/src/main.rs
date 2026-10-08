@@ -3,7 +3,7 @@
 //! bridge, and run until SIGTERM, SIGINT or a certificate change; exit 0
 //! after §5.2's shutdown. Exit 1 if startup failed or the RDP server
 //! stopped on its own, 2 on a config or logging error.
-use kvm_rdp::bridge::{self, Exit};
+use kvm_rdp::bridge;
 use kvm_rdp::config;
 use std::process::ExitCode;
 
@@ -30,8 +30,6 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match handle.run_until_signal() {
-        Exit::Signal | Exit::CertificateChanged => ExitCode::SUCCESS,
-        Exit::ServerStopped => ExitCode::FAILURE,
-    }
+    // 0 after a signal or a certificate change, 1 if the server stopped.
+    ExitCode::from(handle.run_until_signal().code())
 }

@@ -86,6 +86,17 @@ impl Exit {
             Exit::ServerStopped => "server_stopped",
         }
     }
+
+    /// The binary's exit code: 0 after a signal or a certificate change (the
+    /// orchestrator restarts it, on the new pair for the latter), 1 when the
+    /// RDP server stopped on its own.
+    #[must_use]
+    pub fn code(self) -> u8 {
+        match self {
+            Exit::Signal | Exit::CertificateChanged => 0,
+            Exit::ServerStopped => 1,
+        }
+    }
 }
 
 /// What the shutdown sequence touches.
@@ -1357,6 +1368,48 @@ mod tests {
         assert!(DISCONNECT_WAIT > crate::pump::shell::SHUTDOWN_WATCHDOG + crate::pump::shell::TICK);
     }
 
+    /// I2 (PC15 review): the binary's exits besides a signal. A certificate
+    /// change resolves `wait_for_exit` to `CertificateChanged`, exit 0 — the
+    /// orchestrator restarts the bridge on the new pair; the RDP server
+    /// stopping, or its thread gone, to `ServerStopped`, exit 1. A watcher
+    /// that went away without asking is no exit at all.
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_exit_maps_a_renewal_and_a_stopped_server_to_their_exit_codes() {
+        let wait = |exit, done| tokio::spawn(wait_for_exit(None, None, exit, done));
+        let (exit_tx, exit) = watch::channel(false);
+        let (_done_tx, done) = watch::channel(false);
+        let w = wait(exit, done);
+        exit_tx.send_replace(true);
+        let why = within_5s(w).await.unwrap();
+        assert_eq!((why, why.code()), (Exit::CertificateChanged, 0));
+
+        let (_exit_tx, exit) = watch::channel(false);
+        let (done_tx, done) = watch::channel(false);
+        let w = wait(exit, done);
+        done_tx.send_replace(true);
+        let why = within_5s(w).await.unwrap();
+        assert_eq!((why, why.code()), (Exit::ServerStopped, 1));
+
+        let (_exit_tx, exit) = watch::channel(false);
+        let (done_tx, done) = watch::channel(false);
+        drop(done_tx); // the RDP thread ended
+        assert_eq!(
+            within_5s(wait(exit, done)).await.unwrap(),
+            Exit::ServerStopped
+        );
+
+        let (exit_tx, exit) = watch::channel(false);
+        let (_done_tx, done) = watch::channel(false);
+        drop(exit_tx); // the watcher ended without asking
+        assert!(
+            tokio::time::timeout(Duration::from_secs(60), wait(exit, done))
+                .await
+                .is_err(),
+            "a vanished watcher read as a certificate change"
+        );
+        assert_eq!(Exit::Signal.code(), 0);
+    }
+
     /// A handle over `control()`'s channels, with no bridge behind it.
     fn handle_over(ctl: Arc<Control>, metrics: Arc<Metrics>) -> BridgeHandle {
         let (_, exit) = watch::channel(false);
@@ -1468,39 +1521,39 @@ mod tests {
         passes_in_a_child("a_sigterm_right_after_the_ready_line_is_a_clean_exit");
     }
 
-    /// P37's child: the bridge on kvm-sim, then `run_until_signal` under a
-    /// layer that raises SIGTERM inside the "kvm-rdp ready" event.
-    fn sigterm_at_the_ready_line() {
+    /// A layer that runs `f` inside the "kvm-rdp ready" event, on the thread
+    /// that logs it (`run_until_signal`'s, after its handlers, P37).
+    struct AtReady<F>(F);
+
+    struct IsReady(bool);
+
+    impl tracing::field::Visit for IsReady {
+        fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+            if f.name() == "message" && format!("{v:?}") == "kvm-rdp ready" {
+                self.0 = true;
+            }
+        }
+    }
+
+    impl<S, F> tracing_subscriber::Layer<S> for AtReady<F>
+    where
+        S: tracing::Subscriber,
+        F: Fn() + 'static,
+    {
+        fn on_event(&self, e: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+            let mut ready = IsReady(false);
+            e.record(&mut ready);
+            if ready.0 {
+                (self.0)();
+            }
+        }
+    }
+
+    /// The bridge on kvm-sim in this (child) process, then
+    /// `run_until_signal` with `at_ready` run inside the ready line; what it
+    /// returned, within §5.2's 5 s of the line plus `limit`.
+    fn run_binary_loop(at_ready: impl Fn(&Path) + Send + Sync + 'static, limit: Duration) -> Exit {
         use tracing_subscriber::layer::SubscriberExt as _;
-
-        struct RaiseAtReady;
-
-        struct IsReady(bool);
-
-        impl tracing::field::Visit for IsReady {
-            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
-                if f.name() == "message" && format!("{v:?}") == "kvm-rdp ready" {
-                    self.0 = true;
-                }
-            }
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RaiseAtReady {
-            fn on_event(
-                &self,
-                e: &tracing::Event<'_>,
-                _: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut ready = IsReady(false);
-                e.record(&mut ready);
-                if ready.0 {
-                    // SAFETY: raise(3) with a valid signal number; it
-                    // returns once the signal was handled on this thread.
-                    assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
-                }
-            }
-        }
-
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -1509,12 +1562,41 @@ mod tests {
         let sim = rt.block_on(sim());
         let d = tempfile::tempdir().unwrap();
         let h = spawn(config_for(&sim, d.path(), |_| {})).unwrap();
-        let sub = tracing_subscriber::registry().with(RaiseAtReady);
+        let dir = d.path().to_owned();
+        let sub = tracing_subscriber::registry().with(AtReady(move || at_ready(&dir)));
         let t0 = Instant::now();
         let why = tracing::subscriber::with_default(sub, || h.run_until_signal());
-        assert_eq!(why, Exit::Signal);
-        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        let took = t0.elapsed();
+        assert!(took < Duration::from_secs(5) + limit, "{took:?}");
         drop(sim);
         rt.shutdown_timeout(Duration::from_secs(1));
+        why
+    }
+
+    /// P37's child: SIGTERM raised inside the "kvm-rdp ready" event.
+    fn sigterm_at_the_ready_line() {
+        let why = run_binary_loop(
+            |_| {
+                // SAFETY: raise(3) with a valid signal number; it returns
+                // once the signal was handled on this thread.
+                assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+            },
+            Duration::ZERO,
+        );
+        assert_eq!(why, Exit::Signal);
+    }
+
+    /// I2 (PC15 review), end to end: the binary's loop — `run_until_signal`
+    /// with its signal handlers live — ends `CertificateChanged`, exit 0,
+    /// when the certificate is renewed with no client connected, within 5×
+    /// the 200 ms poll. Child-only: it registers SIGTERM and SIGINT.
+    #[test]
+    fn a_renewal_ends_the_binary_loop_for_a_restart() {
+        if is_child() {
+            let why = run_binary_loop(|dir| renew(&dir.join("cert.pem")), Duration::from_secs(1));
+            assert_eq!((why, why.code()), (Exit::CertificateChanged, 0));
+            return;
+        }
+        passes_in_a_child("a_renewal_ends_the_binary_loop_for_a_restart");
     }
 }
