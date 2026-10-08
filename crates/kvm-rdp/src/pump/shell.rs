@@ -44,8 +44,12 @@ pub const TICK: Duration = Duration::from_millis(50);
 pub const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(2);
 /// The `Stall` test hook never blocks longer than this.
 const MAX_STALL: Duration = Duration::from_secs(30);
-/// How often a held resize re-reads IronRDP's write counter (PC17 I4).
+/// A held resize re-reads IronRDP's write counter this long after it was
+/// held, then twice as long each time, up to `RESIZE_POLL_MAX` (PC17 I4,
+/// n1): a client that stopped reading holds the resize for the session's
+/// life, and nothing ends a session in WaitReactivation (§6.4).
 const RESIZE_POLL: Duration = Duration::from_millis(5);
+const RESIZE_POLL_MAX: Duration = Duration::from_millis(250);
 
 pub struct ShellDeps {
     pub cfg: PumpConfig,
@@ -90,6 +94,8 @@ pub struct PumpShell {
     shutdown_watchdog: Duration,
     /// `TICK`; slowed down only by tests.
     tick_every: Duration,
+    /// The held resize's next re-read, backing off (PC17 n1).
+    resize_poll: Duration,
     /// The run loop's turns, counted only by tests.
     #[cfg(test)]
     turns: Option<Arc<AtomicU64>>,
@@ -116,6 +122,7 @@ impl PumpShell {
             shutting_down: false,
             shutdown_watchdog: SHUTDOWN_WATCHDOG,
             tick_every: TICK,
+            resize_poll: RESIZE_POLL,
             #[cfg(test)]
             turns: None,
         }
@@ -179,7 +186,9 @@ impl PumpShell {
                 },
                 // PC17 I4: IronRDP's write counter moves without waking this
                 // loop; re-read it while a resize is held.
-                () = tokio::time::sleep(RESIZE_POLL), if self.resize_held() => {}
+                () = tokio::time::sleep(self.resize_poll), if self.resize_held() => {
+                    self.resize_poll = self.resize_poll.saturating_mul(2).min(RESIZE_POLL_MAX);
+                }
             }
             // Whatever woke the loop, a held resize goes once IronRDP has
             // written the EGFX sent before it.
@@ -471,6 +480,7 @@ impl PumpShell {
                         if let Some(l) = self.link.as_mut() {
                             l.held_resize = Some((width, height));
                         }
+                        self.resize_poll = RESIZE_POLL;
                         self.release_resize();
                     }
                 }
@@ -1999,6 +2009,98 @@ mod tests {
                     other => panic!("{other:?}"),
                 }
                 assert_eq!(t.display.size(), (854, 480));
+            })
+            .await;
+    }
+
+    /// PC17 n1: a client that stops reading during a resize keeps it held
+    /// for the session's life — nothing ends a session in WaitReactivation
+    /// (§6.4, §6.6: the stall timer is frozen there) — so the held resize's
+    /// re-read backs off, 5 ms doubling to 250 ms, instead of waking the RDP
+    /// thread 200 times a second: a handful of re-reads in the first second,
+    /// then four a second at the cap. Once the counter moves, the resize goes
+    /// at the next re-read, and the next resize held starts again at 5 ms.
+    /// The tick is slowed to an hour, so every loop turn here is a re-read
+    /// (or the input that held a resize).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_held_resize_backs_off_its_re_read() {
+        LocalSet::new()
+            .run_until(async {
+                let turns = Arc::new(AtomicU64::new(0));
+                let c = turns.clone();
+                let mut t = spawn(
+                    |_| {},
+                    move |s| s.with_tick(Duration::from_secs(3600)).with_turns(c),
+                );
+                let (dtx, _drx) = mpsc::unbounded_channel();
+                let mut updates = crate::rdp::display::BridgeDisplay::new(t.display.clone(), dtx)
+                    .updates()
+                    .await
+                    .unwrap();
+                let generation = t.start();
+                let mut sent = egfx(&t.event().await).unwrap().1;
+                t.first_idr(generation).await;
+                sent += egfx(&t.event().await).unwrap().1;
+                let Input::SpsChanged { class, params } = rig::sps(ParamClass::Resize, P480) else {
+                    unreachable!()
+                };
+                t.kvm
+                    .send(KvmEvent::SpsChanged {
+                        generation,
+                        class,
+                        params,
+                    })
+                    .await
+                    .unwrap();
+                until("the resize to be held", || t.display.size() == (854, 480)).await;
+                let turns_in = |d: Duration| {
+                    let turns = turns.clone();
+                    let before = turns.load(Ordering::SeqCst);
+                    async move {
+                        tokio::time::sleep(d).await;
+                        turns.load(Ordering::SeqCst) - before
+                    }
+                };
+                let n = turns_in(Duration::from_secs(1)).await;
+                assert!(
+                    n <= 12,
+                    "{n} loop turns in the first second of a held resize"
+                );
+                assert!(n >= 3, "the held resize was not re-read: {n} turns");
+                let n = turns_in(Duration::from_secs(1)).await;
+                assert!(
+                    (2..=6).contains(&n),
+                    "{n} re-reads in the second second (the 250 ms cap: 4)"
+                );
+                t.counter.store(sent, Ordering::SeqCst);
+                let r = tokio::time::timeout(Duration::from_millis(600), updates.next_update())
+                    .await
+                    .expect("the resize was not sent within one backed-off re-read");
+                assert!(matches!(r, Ok(Some(DisplayUpdate::Resize(_)))), "{r:?}");
+                // The reactivation (a Setup at 854×480), then a resize back: a
+                // new hold re-reads from 5 ms again.
+                t.rdp.send(RdpInput::Updates).unwrap();
+                assert!(egfx(&t.event().await).is_some(), "the reactivation's Setup");
+                let Input::SpsChanged { class, params } = rig::sps(ParamClass::Resize, ES3) else {
+                    unreachable!()
+                };
+                t.kvm
+                    .send(KvmEvent::SpsChanged {
+                        generation,
+                        class,
+                        params,
+                    })
+                    .await
+                    .unwrap();
+                until("the second resize to be held", || {
+                    t.display.size() == (640, 360)
+                })
+                .await;
+                let n = turns_in(Duration::from_millis(100)).await;
+                assert!(
+                    n >= 2,
+                    "the second hold did not start at 5 ms: {n} turns in 100 ms"
+                );
             })
             .await;
     }
