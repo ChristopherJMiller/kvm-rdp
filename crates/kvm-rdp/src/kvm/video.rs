@@ -29,9 +29,20 @@ pub struct FlvSettings {
     pub admission: AdmissionConfig,
 }
 
-/// What `ready` produced, for `on_ready`.
+/// What `ready` produced, for `on_ready` (opaque to callers).
+///
+/// Contract: hand every `Ready` to `on_ready` before the next `ready()` or
+/// any other call on the same `Video`. `ready()` has already taken a
+/// finished open out of its slot (so polling again never re-polls a
+/// completed future), which means a `Ready::Opened` dropped instead closes
+/// that connection and leaves nothing scheduled to replace it — only the
+/// next request or the upstream deadline would act.
 pub enum Ready {
-    Opened(Result<FlvConn, KvmError>),
+    Opened {
+        res: Result<FlvConn, KvmError>,
+        origin: FlvOrigin,
+        seq: u64,
+    },
     Main(Result<Option<Bytes>, KvmError>),
     Pending(Result<Option<Bytes>, KvmError>),
 }
@@ -141,11 +152,17 @@ fn drain(demux: &mut FlvDemuxer, bytes: &[u8]) -> (Vec<FlvTag>, Option<FlvError>
     }
 }
 
-async fn opening_result(slot: &mut Option<Opening>) -> Result<FlvConn, KvmError> {
-    match slot {
-        Some(o) => (&mut o.fut).await,
-        None => std::future::pending().await,
-    }
+/// The open in `slot`, taken out of it in the poll that completes it, so
+/// a finished future is never polled again (m4). Cancel-safe: a poll that
+/// does not complete leaves the slot as it was.
+async fn opening_result(slot: &mut Option<Opening>) -> Ready {
+    let Some(o) = slot.as_mut() else {
+        return std::future::pending().await;
+    };
+    let res = (&mut o.fut).await;
+    let (origin, seq) = (o.origin, o.seq);
+    *slot = None;
+    Ready::Opened { res, origin, seq }
 }
 
 async fn stream_chunk(slot: &mut Option<Stream>) -> Result<Option<Bytes>, KvmError> {
@@ -205,10 +222,24 @@ impl Video {
     /// `ReconnectFlv`: open a second FLV and swap at its first tag (§6.5).
     /// At most one is in flight: every FLV open forces an IDR on every
     /// viewer of the shared encoder (census Leg A).
+    ///
+    /// With no main FLV there is nothing to make before breaking, and a
+    /// reopen is always already scheduled (`retry_at`, after `lost` or a
+    /// transient open failure), in flight (`opening`) or waiting for a new
+    /// token (`waiting_token`, after a refusal); its `FlvOpened` serves the
+    /// request. Opening here instead would bypass the backoff, or reuse the
+    /// token just refused (m2, PC8 fix round 1).
     pub fn reconnect(&mut self, now: Instant, token: Option<&(u64, Token)>) {
         let Some(t) = token else { return };
         if !self.wanted {
             self.want(now, Some(t));
+            return;
+        }
+        if self.main.is_none() {
+            debug_assert!(
+                self.opening.is_some() || self.retry_at.is_some() || self.waiting_token,
+                "no main FLV and no reopen scheduled"
+            );
             return;
         }
         if self.opening.is_some() || self.pending.is_some() {
@@ -251,22 +282,33 @@ impl Video {
         });
     }
 
-    /// The next thing to act on. Cancel-safe.
+    /// The next thing to act on. Cancel-safe; see [`Ready`] for what must
+    /// happen to its result.
     pub async fn ready(&mut self) -> Ready {
         tokio::select! {
-            r = opening_result(&mut self.opening) => Ready::Opened(r),
+            r = opening_result(&mut self.opening) => r,
             c = stream_chunk(&mut self.pending) => Ready::Pending(c),
             c = stream_chunk(&mut self.main) => Ready::Main(c),
         }
     }
 
+    /// Act on what `ready` produced.
+    ///
+    /// **Not cancel-safe**: run it to completion — in a `select!` arm's
+    /// body, never as a branch. Cancelled once it has made a connection the
+    /// main FLV, it loses that connection's `FlvOpened` and the chunk's
+    /// tags, and the pump would wait on an FLV it never heard of. Its only
+    /// awaits are the control sends to the pump (§4.3).
     pub async fn on_ready(&mut self, r: Ready, now: Instant) -> Option<Outcome> {
         match r {
-            Ready::Opened(res) => {
-                let o = self.opening.take()?;
+            Ready::Opened { res, origin, seq } => {
+                // `close()` ran since `ready`: nothing reopens.
+                if !self.wanted {
+                    return None;
+                }
                 match res {
-                    Ok(conn) => self.opened(conn, o.origin, now).await,
-                    Err(e) => self.open_failed(e, o.origin, o.seq, now),
+                    Ok(conn) => self.opened(conn, origin, now).await,
+                    Err(e) => self.open_failed(e, origin, seq, now),
                 }
             }
             Ready::Main(c) => self.main_chunk(c, now).await,
@@ -350,19 +392,31 @@ impl Video {
         seq: u64,
         now: Instant,
     ) -> Option<Outcome> {
-        if origin == FlvOrigin::Commanded && self.main.is_some() {
-            // The old FLV still flows; the IDR core asks again later.
-            self.metrics.upstream_reconnects.inc("commanded_failed");
-            return None;
-        }
+        // A `ReconnectFlv` candidate, with the old FLV still flowing.
+        let candidate = origin == FlvOrigin::Commanded && self.main.is_some();
         match e.class() {
+            // §6.9 excludes only side FLVs from the auth class (m1, PC8 fix
+            // round 1): a main-path refusal goes to the session's gate,
+            // which re-logs in once. A flowing main needs no token, so only
+            // a lost one waits for the next (a candidate must not leave
+            // `waiting_token` set, or a later loss of the main is stranded).
             FailClass::Auth => {
-                self.waiting_token = true;
+                if candidate {
+                    self.metrics.upstream_reconnects.inc("commanded_failed");
+                } else {
+                    self.waiting_token = true;
+                }
                 Some(Outcome::Refused { seq })
             }
+            // Nor from the certificate class: fatal at once (§6.9).
             FailClass::Cert => {
                 self.close();
                 Some(Outcome::Fatal(Cause::KvmCertMismatch))
+            }
+            FailClass::Transient if candidate => {
+                // The old FLV still flows; the IDR core asks again later.
+                self.metrics.upstream_reconnects.inc("commanded_failed");
+                None
             }
             FailClass::Transient => {
                 self.metrics.upstream_reconnects.inc(e.kind());
@@ -406,6 +460,10 @@ impl Video {
             self.metrics.upstream_reconnects.inc("commanded_failed");
             return None;
         };
+        // A candidate's bytes are FLV bytes too, the swap chunk's included.
+        self.metrics
+            .flv_bytes
+            .add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let p = self.pending.as_mut()?;
         let (tags, err) = drain(&mut p.demux, &bytes);
         if tags.is_empty() {
@@ -1174,6 +1232,154 @@ mod tests {
             "the candidate's violation was not counted"
         );
         assert_eq!(r.metrics.parse_errors.total(), 3);
+    }
+
+    /// m1 (PC8 fix round 1): §6.9 excludes only side FLVs from the auth
+    /// class. A `ReconnectFlv` candidate refused for its token is
+    /// `Refused` with that token's sequence number — the session's gate
+    /// re-logs in — while the old FLV keeps flowing; and it does not leave
+    /// the flowing main waiting for a token, so a later reopen is not
+    /// stranded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_candidate_refused_for_its_token_goes_to_the_auth_gate() {
+        let mut r = rig(64, |_| {}, |_| {}).await;
+        r.video.want(Instant::now(), Some(&r.token));
+        r.run(Duration::from_millis(400), true).await;
+        r.sim.expire_tokens();
+        r.video.reconnect(Instant::now(), Some(&r.token));
+        let (evs, out) = r.run(Duration::from_secs(2), true).await;
+        assert_eq!(out, Some(Outcome::Refused { seq: 1 }));
+        assert!(
+            !kinds(&evs).iter().any(|k| k.starts_with("open:")),
+            "{:?}",
+            kinds(&evs)
+        );
+        assert_eq!(r.metrics.upstream_reconnects.get("commanded_failed"), 1);
+        let (evs, _) = r.run(Duration::from_millis(300), true).await;
+        assert!(
+            kinds(&evs).iter().any(|k| k == "p" || k == "idr"),
+            "the main FLV stopped"
+        );
+        r.relogin().await;
+        r.sim.inject(Fault::Close);
+        let (evs, out) = r.run_until(Duration::from_secs(5), reopened).await;
+        assert_eq!(out, None);
+        assert!(
+            kinds(&evs).contains(&"open:transient".to_owned()),
+            "stranded: {:?}",
+            kinds(&evs)
+        );
+    }
+
+    /// m1: nor is a candidate excluded from §6.9's certificate class — an
+    /// SPKI mismatch on it is fatal at once. kvm-sim cannot change its
+    /// certificate mid-session, so the failure is fed in directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_candidate_with_a_cert_mismatch_is_fatal() {
+        let mut r = rig(64, |_| {}, |_| {}).await;
+        r.video.want(Instant::now(), Some(&r.token));
+        r.run_until(Duration::from_secs(5), |e| {
+            kinds(e).contains(&"idr".to_owned())
+        })
+        .await;
+        let out = r.video.open_failed(
+            KvmError::CertMismatch,
+            FlvOrigin::Commanded,
+            1,
+            Instant::now(),
+        );
+        assert_eq!(out, Some(Outcome::Fatal(Cause::KvmCertMismatch)));
+    }
+
+    /// m2 (PC8 fix round 1): with no main FLV there is nothing to make
+    /// before breaking, so `reconnect` opens nothing — the reopen already
+    /// scheduled, in flight or waiting for a token serves it. Here it is
+    /// waiting for a new token, and the refused one must not be used again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reconnect_with_no_main_leaves_the_scheduled_reopen_to_serve() {
+        let mut r = rig(64, |_| {}, |_| {}).await;
+        r.video.want(Instant::now(), Some(&r.token));
+        r.run(Duration::from_millis(400), true).await;
+        r.sim.expire_tokens();
+        r.sim.inject(Fault::Close);
+        let (_, out) = r.run(Duration::from_secs(2), true).await;
+        assert_eq!(out, Some(Outcome::Refused { seq: 1 }));
+        r.video.reconnect(Instant::now(), Some(&r.token));
+        let (_, out) = r.run(Duration::from_millis(300), true).await;
+        assert_eq!(out, None, "the refused token was used again");
+        let refused = r
+            .sim
+            .events()
+            .iter()
+            .filter(|e| matches!(e, SimEvent::FlvRefused { .. }))
+            .count();
+        assert_eq!(refused, 1);
+        assert_eq!(r.metrics.idr_requests.get("reconnect"), 0);
+        r.relogin().await;
+        let (evs, out) = r.run_until(Duration::from_secs(5), |e| !e.is_empty()).await;
+        assert_eq!(out, None);
+        assert_eq!(
+            kinds(&evs).first().map(String::as_str),
+            Some("open:transient")
+        );
+    }
+
+    /// m3 (PC8 fix round 1): a candidate's bytes count in `flv_bytes` like
+    /// the main FLV's — here the 13-byte FLV header (with `PreviousTagSize0`)
+    /// of a candidate that never sends a tag, while the main (Manual
+    /// pacing) sends nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_candidates_bytes_are_counted() {
+        let mut r = rig(
+            64,
+            |c| c.pacing = Pacing::Manual,
+            |s| s.idle_timeout = Duration::from_secs(30),
+        )
+        .await;
+        r.video.want(Instant::now(), Some(&r.token));
+        r.run(Duration::from_millis(300), true).await;
+        let b0 = r.metrics.flv_bytes.get();
+        assert!(b0 > 0);
+        r.sim.set_policy(|p| p.skip_sequence_header = true);
+        r.video.reconnect(Instant::now(), Some(&r.token));
+        let t0 = Instant::now();
+        while flv_opens(&r.sim).len() < 2 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "the candidate never opened"
+            );
+            r.run(Duration::from_millis(20), true).await;
+        }
+        r.run(Duration::from_millis(200), true).await;
+        assert_eq!(r.metrics.flv_bytes.get() - b0, 13);
+    }
+
+    /// m4 (PC8 fix round 1): `ready()` takes a finished open out of its
+    /// slot as it completes, so a poll after a `Ready::Opened` that was not
+    /// consumed (a contract breach) never re-polls the completed future,
+    /// which would panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_never_repolls_a_finished_open() {
+        let mut r = rig(64, |_| {}, |_| {}).await;
+        r.video.want(Instant::now(), Some(&r.token));
+        let first = tokio::time::timeout(Duration::from_secs(5), r.video.ready()).await;
+        drop(first.expect("the open never completed"));
+        let again = tokio::time::timeout(Duration::from_millis(200), r.video.ready()).await;
+        assert!(again.is_err(), "nothing is left to be ready");
+    }
+
+    /// m4: an open that finished before `close()` opens nothing after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_finished_before_close_is_dropped_after_it() {
+        let mut r = rig(64, |_| {}, |_| {}).await;
+        r.video.want(Instant::now(), Some(&r.token));
+        let ready = tokio::time::timeout(Duration::from_secs(5), r.video.ready())
+            .await
+            .unwrap();
+        r.video.close();
+        assert_eq!(r.video.on_ready(ready, Instant::now()).await, None);
+        assert!(r.video.main.is_none() && r.video.pending.is_none());
+        assert!(r.rx.try_recv().is_err(), "an FlvOpened after close");
     }
 
     /// §6.5 `side`: one extra FLV, closed after its first tag; the main FLV
