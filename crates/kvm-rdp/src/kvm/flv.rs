@@ -86,9 +86,13 @@ async fn request(
         .handshake(TokioIo::new(io))
         .await
         .map_err(|_| KvmError::Protocol("http handshake"))?;
-    let conn = AbortOnDrop(tokio::spawn(async move {
-        let _ = conn.await;
-    }));
+    // Reaped: `Session::close` waits until a dropped FLV's socket is gone.
+    let conn = AbortOnDrop::reaped(
+        tokio::spawn(async move {
+            let _ = conn.await;
+        }),
+        ep.reaper.clone(),
+    );
     let req = hyper::Request::builder()
         .method("GET")
         .uri(format!("/av.flv?token={}", token.as_str()))

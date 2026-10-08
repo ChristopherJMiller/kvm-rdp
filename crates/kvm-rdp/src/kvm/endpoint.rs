@@ -12,11 +12,12 @@ use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signat
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
 
 pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -31,6 +32,29 @@ pub struct KvmEndpoint {
     pub control_port: u16,
     pin: String,
     provider: Arc<CryptoProvider>,
+    /// The FLV connection tasks dropped and aborted, not yet waited for.
+    pub(crate) reaper: Arc<Reaper>,
+}
+
+/// Connection tasks that were aborted but may not have been dropped yet
+/// (PC17 I1). Each task owns its socket, so the socket closes only once
+/// the runtime next polls the task. `Session::close` waits for these, so
+/// an old FLV's close is on the wire before the next session's login.
+#[derive(Default)]
+pub struct Reaper(Mutex<Vec<JoinHandle<()>>>);
+
+impl Reaper {
+    /// Keep an aborted task (dropping the finished ones kept before).
+    pub(crate) fn keep(&self, task: JoinHandle<()>) {
+        let mut kept = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        kept.retain(|t| !t.is_finished());
+        kept.push(task);
+    }
+
+    /// Every task kept since the last call.
+    pub(crate) fn take(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
 }
 
 impl KvmEndpoint {
@@ -48,6 +72,7 @@ impl KvmEndpoint {
             control_port: ports.2,
             pin: spki_sha256_hex.to_ascii_lowercase(),
             provider: Arc::new(rustls::crypto::aws_lc_rs::default_provider()),
+            reaper: Arc::default(),
         }
     }
 

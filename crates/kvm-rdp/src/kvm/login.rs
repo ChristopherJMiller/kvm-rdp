@@ -1,7 +1,7 @@
 //! `POST /cgi-bin/login.lua` (§3.1). One login per session, a re-login only
 //! after an auth failure (§5.1), bounded in time and size. No logout exists.
 use crate::config::Secret;
-use crate::kvm::endpoint::KvmEndpoint;
+use crate::kvm::endpoint::{KvmEndpoint, Reaper};
 use crate::kvm::error::KvmError;
 use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
@@ -10,6 +10,7 @@ use hyper::body::Incoming;
 use hyper_util::rt::TokioIo;
 use kvm_proto::{LoginError, Token, parse_login_token};
 use serde::Serialize;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A login response body is read only up to this many bytes; the first
@@ -20,12 +21,38 @@ pub const MAX_LOGIN_BODY: usize = 64 * 1024;
 /// ~400 KiB; 8 KiB is its minimum.
 pub(crate) const MAX_RESPONSE_HEAD: usize = 16 * 1024;
 
-/// Aborts a hyper connection task when the request is done or dropped.
-pub(crate) struct AbortOnDrop(pub tokio::task::JoinHandle<()>);
+/// Aborts a hyper connection task when the request is done or dropped and,
+/// given a reaper, hands it the aborted task, so a closing session can
+/// wait until the connection's socket is gone (PC17 I1).
+pub(crate) struct AbortOnDrop {
+    task: Option<tokio::task::JoinHandle<()>>,
+    reaper: Option<Arc<Reaper>>,
+}
+
+impl AbortOnDrop {
+    pub(crate) fn new(task: tokio::task::JoinHandle<()>) -> AbortOnDrop {
+        AbortOnDrop {
+            task: Some(task),
+            reaper: None,
+        }
+    }
+
+    pub(crate) fn reaped(task: tokio::task::JoinHandle<()>, reaper: Arc<Reaper>) -> AbortOnDrop {
+        AbortOnDrop {
+            task: Some(task),
+            reaper: Some(reaper),
+        }
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(task) = self.task.take() {
+            task.abort();
+            if let Some(r) = &self.reaper {
+                r.keep(task);
+            }
+        }
     }
 }
 
@@ -60,7 +87,7 @@ async fn login_inner(
         .handshake(TokioIo::new(io))
         .await
         .map_err(|_| KvmError::Protocol("http handshake"))?;
-    let _conn = AbortOnDrop(tokio::spawn(async move {
+    let _conn = AbortOnDrop::new(tokio::spawn(async move {
         let _ = conn.await;
     }));
     let time = SystemTime::now()

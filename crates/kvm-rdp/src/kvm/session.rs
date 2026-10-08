@@ -514,7 +514,8 @@ impl<'d> Session<'d> {
 
     async fn close(&mut self) {
         self.login = None;
-        if let Some(side) = self.side.take() {
+        let side = self.side.take();
+        if let Some(side) = &side {
             side.abort();
         }
         // §11.3's order: release-all and the websocket close first (the
@@ -527,13 +528,32 @@ impl<'d> Session<'d> {
         // write is aborted, and dropping it resets its connection (I2);
         // that drop is asynchronous, so wait for it (bounded), so the
         // bridge's side of the old websocket is gone before the next Start.
+        //
+        // Then the FLVs, in the same bound (`STOP_BOUND` is unchanged).
+        // Dropping one only aborts its connection task — the socket closes
+        // when the runtime next polls that task — so wait for every one:
+        // the main FLV, a `ReconnectFlv` candidate, an open in flight (their
+        // tasks are in the endpoint's reaper once dropped) and a side FLV
+        // (its task drops its connection into the reaper). The old FLV's
+        // close is then on the wire before the next session's login (PC17
+        // I1, §11.3: FLV close → login).
         self.ws_task.abort();
-        if tokio::time::timeout(ABORT_WAIT, &mut self.ws_task)
-            .await
-            .is_err()
-        {
-            tracing::warn!("the websocket task outlived its abort wait");
+        let reaper = self.deps.ep.reaper.clone();
+        let gone = tokio::time::timeout(ABORT_WAIT, async {
+            let _ = (&mut self.ws_task).await;
+            self.video.close();
+            if let Some(side) = side {
+                let _ = side.await;
+            }
+            for task in reaper.take() {
+                let _ = task.await;
+            }
+        })
+        .await;
+        if gone.is_err() {
+            tracing::warn!("a websocket or FLV task outlived its abort wait");
         }
+        // Past the bound, the FLVs still close (the call is idempotent).
         self.video.close();
         // Never a logout (§3.2): the token lapses on the KVM.
     }
@@ -1198,6 +1218,66 @@ mod tests {
 
     async fn proxy(to: u16) -> Proxy {
         proxy_delayed(to, Duration::ZERO).await
+    }
+
+    /// `proxy`, keeping a second descriptor on every connection it accepts
+    /// (the bridge's side), so a test can see when the bridge closed it.
+    async fn watching_proxy(to: u16) -> (Proxy, Arc<Mutex<Vec<std::net::TcpStream>>>) {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        let task = tokio::spawn(async move {
+            while let Ok((mut a, _)) = l.accept().await {
+                let dup = socket2::SockRef::from(&a).try_clone().unwrap();
+                kept.lock().unwrap().push(std::net::TcpStream::from(dup));
+                tokio::spawn(async move {
+                    if let Ok(mut b) = tokio::net::TcpStream::connect(("127.0.0.1", to)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+                    }
+                });
+            }
+        });
+        let proxy = Proxy {
+            port,
+            to: Arc::new(AtomicU16::new(to)),
+            task,
+        };
+        (proxy, seen)
+    }
+
+    /// The bridge has closed its end of `s`: its FIN is here (loopback
+    /// delivers it within the `close`), and nothing is left unread.
+    fn peer_closed(s: &std::net::TcpStream) -> bool {
+        s.set_nonblocking(true).unwrap();
+        matches!(s.peek(&mut [0u8; 1]), Ok(0))
+    }
+
+    /// PC17 I1: a Stop answers only once the session's FLV socket is
+    /// closed, so the old FLV's FIN precedes anything the next session
+    /// sends (§11.3: FLV close → login). Dropping a connection only aborts
+    /// its task, and the socket closes when the runtime next polls it. One
+    /// worker, as on the bridge's KVM runtime, with this test's body on it:
+    /// the Stop's answer wakes the body into the worker's next slot, ahead
+    /// of a task the actor aborted on its way out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_stop_answers_only_once_its_flv_socket_is_closed() {
+        tokio::spawn(async {
+            let sim = start_sim().await;
+            let (p, pin) = (sim.ports(), sim.spki_sha256().to_owned());
+            let (video, seen) = watching_proxy(p.video).await;
+            let mut r = rig_on(sim, (p.web, video.port, p.control), &pin, |_| {});
+            r.streaming(1).await;
+            let flv = seen.lock().unwrap().remove(0);
+            assert!(!peer_closed(&flv), "the FLV was closed before the Stop");
+            r.stop(1).await;
+            assert!(
+                peer_closed(&flv),
+                "the Stop answered with the FLV socket still open"
+            );
+        })
+        .await
+        .unwrap();
     }
 
     /// A proxy that holds each new connection for `delay` before it
