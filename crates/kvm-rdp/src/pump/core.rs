@@ -2040,3 +2040,286 @@ mod lifecycle {
         assert_eq!(disconnects(&out), []);
     }
 }
+
+/// §11.2: every cell of §6.4's state × input table (Task 4.6).
+#[cfg(test)]
+mod table {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::*;
+    use crate::msg::FlvOrigin;
+    use crate::pump::rig::*;
+    use State::{Closing, Live, NeedIdr, Paused, WaitReactivation, WaitReady};
+
+    /// §6.4's columns.
+    #[derive(Debug, Clone, Copy)]
+    enum Col {
+        ReadyAvc,
+        ReadyNoAvc,
+        SpsNeedingResize,
+        SpsSameOrOther,
+        FlvOpened,
+        Reactivated,
+        SuppressOn,
+        SuppressOff,
+        IdrAu,
+        PAu,
+        GateCloses,
+        Fatal,
+    }
+    use Col::*;
+
+    /// Each row's canonical state; suppression counts in every one (a KVM
+    /// frame was delivered) except WaitReady.
+    fn rig_in(s: State) -> Rig {
+        let mut r = Rig::new(cfg());
+        match s {
+            WaitReady => {
+                r.start((640, 360));
+            }
+            NeedIdr => {
+                r.live();
+                r.step(Input::FlvOpened {
+                    origin: FlvOrigin::Transient,
+                });
+            }
+            Live => {
+                r.live();
+            }
+            WaitReactivation => {
+                r.live();
+                r.step(sps(ParamClass::Resize, P480));
+            }
+            Paused => {
+                r.live();
+                r.hold_suppress(true);
+            }
+            Closing => {
+                r.live();
+                r.step(Input::UpstreamFatal(Cause::KvmUnreachable));
+            }
+            State::Idle => {}
+        }
+        assert_eq!(r.pump.state(), s);
+        r
+    }
+
+    fn apply(r: &mut Rig, c: Col) -> Vec<Command> {
+        let at_size = if r.pump.size() == (640, 360) {
+            ES3
+        } else {
+            P480
+        };
+        let other_size = if r.pump.size() == (640, 360) {
+            P480
+        } else {
+            ES3
+        };
+        match c {
+            ReadyAvc => r.negotiate(census_caps()),
+            ReadyNoAvc => r.negotiate(v8_only()),
+            SpsNeedingResize => r.step(sps(ParamClass::Resize, other_size)),
+            SpsSameOrOther => r.step(sps(ParamClass::Other, at_size)),
+            FlvOpened => r.step(Input::FlvOpened {
+                origin: FlvOrigin::Transient,
+            }),
+            Reactivated => r.step(Input::ReactivationComplete),
+            SuppressOn => r.hold_suppress(true),
+            SuppressOff => r.hold_suppress(false),
+            IdrAu => r.step(au(true, false)),
+            PAu => r.step(au(false, false)),
+            GateCloses => {
+                let later = r.ms() + 2_000; // the unacked IDR's grace runs out
+                r.at(later);
+                r.step(Input::Tick)
+            }
+            Fatal => r.step(Input::UpstreamFatal(Cause::StreamCorrupt)),
+        }
+    }
+
+    const SEND: &str = "SendDvc";
+    const RESIZE: &str = "DisplayResize";
+    const RELEASE: &str = "ReleaseAll";
+    const DISC: &str = "Disconnect";
+    const OPEN: &str = "OpenFlv";
+
+    /// (state, column, next state, must issue, must not issue).
+    type Cell = (
+        State,
+        Col,
+        State,
+        &'static [&'static str],
+        &'static [&'static str],
+    );
+
+    #[rustfmt::skip]
+    const TABLE: &[Cell] = &[
+        (WaitReady, ReadyAvc, NeedIdr, &[SEND, OPEN], &[]),
+        (WaitReady, ReadyNoAvc, WaitReady, &[], &[DISC]),
+        (WaitReady, SpsNeedingResize, WaitReady, &[], &[RESIZE]),
+        (WaitReady, SpsSameOrOther, WaitReady, &[], &[SEND]),
+        (WaitReady, FlvOpened, WaitReady, &[], &[SEND]),
+        (WaitReady, Reactivated, WaitReady, &[], &[SEND]),
+        (WaitReady, SuppressOn, WaitReady, &[], &[RELEASE]),
+        (WaitReady, SuppressOff, WaitReady, &[], &[RELEASE]),
+        (WaitReady, IdrAu, WaitReady, &[], &[SEND]),
+        (WaitReady, PAu, WaitReady, &[], &[SEND]),
+        (WaitReady, GateCloses, WaitReady, &[], &[SEND]),
+        (WaitReady, Fatal, Closing, &[DISC], &[SEND]),
+
+        (NeedIdr, ReadyAvc, NeedIdr, &[SEND], &[DISC]),
+        (NeedIdr, ReadyNoAvc, Closing, &[DISC], &[SEND]),
+        (NeedIdr, SpsNeedingResize, WaitReactivation, &[RESIZE], &[SEND]),
+        (NeedIdr, SpsSameOrOther, NeedIdr, &[], &[SEND, "ReconnectFlv"]),
+        (NeedIdr, FlvOpened, NeedIdr, &[], &[SEND, "RequestIdr"]),
+        (NeedIdr, Reactivated, NeedIdr, &[], &[SEND]),
+        (NeedIdr, SuppressOn, Paused, &[RELEASE], &[SEND]),
+        (NeedIdr, SuppressOff, NeedIdr, &[], &[RELEASE]),
+        (NeedIdr, IdrAu, Live, &[SEND], &[]),
+        (NeedIdr, PAu, NeedIdr, &[], &[SEND]),
+        (NeedIdr, GateCloses, NeedIdr, &[], &[SEND]),
+        (NeedIdr, Fatal, Closing, &[DISC], &[SEND]),
+
+        (Live, ReadyAvc, NeedIdr, &[SEND], &[DISC]),
+        (Live, ReadyNoAvc, Closing, &[DISC], &[SEND]),
+        (Live, SpsNeedingResize, WaitReactivation, &[RESIZE], &[SEND]),
+        (Live, SpsSameOrOther, NeedIdr, &[], &[SEND, "ReconnectFlv"]),
+        (Live, FlvOpened, NeedIdr, &[], &[SEND, "RequestIdr"]),
+        (Live, Reactivated, Live, &[], &[SEND]),
+        (Live, SuppressOn, Paused, &[RELEASE], &[SEND]),
+        (Live, SuppressOff, Live, &[], &[RELEASE]),
+        (Live, IdrAu, Live, &[SEND], &[]),
+        (Live, PAu, Live, &[SEND], &[]),
+        (Live, GateCloses, NeedIdr, &[], &[SEND]),
+        (Live, Fatal, Closing, &[DISC], &[SEND]),
+
+        (WaitReactivation, ReadyAvc, WaitReactivation, &[], &[SEND]),
+        (WaitReactivation, ReadyNoAvc, Closing, &[DISC], &[SEND]),
+        (WaitReactivation, SpsNeedingResize, WaitReactivation, &[], &[RESIZE, SEND]),
+        (WaitReactivation, SpsSameOrOther, WaitReactivation, &[], &[SEND]),
+        (WaitReactivation, FlvOpened, WaitReactivation, &[], &[SEND]),
+        (WaitReactivation, Reactivated, NeedIdr, &[SEND], &[]),
+        (WaitReactivation, SuppressOn, WaitReactivation, &[RELEASE], &[SEND]),
+        (WaitReactivation, SuppressOff, WaitReactivation, &[], &[SEND]),
+        (WaitReactivation, IdrAu, WaitReactivation, &[], &[SEND]),
+        (WaitReactivation, PAu, WaitReactivation, &[], &[SEND]),
+        (WaitReactivation, GateCloses, WaitReactivation, &[], &[SEND]),
+        (WaitReactivation, Fatal, Closing, &[DISC], &[SEND]),
+
+        (Paused, ReadyAvc, Paused, &[SEND], &[DISC]),
+        (Paused, ReadyNoAvc, Closing, &[DISC], &[SEND]),
+        (Paused, SpsNeedingResize, WaitReactivation, &[RESIZE], &[SEND]),
+        (Paused, SpsSameOrOther, Paused, &[], &[SEND]),
+        (Paused, FlvOpened, Paused, &[], &[SEND]),
+        (Paused, Reactivated, Paused, &[], &[SEND]),
+        (Paused, SuppressOn, Paused, &[], &[RELEASE]),
+        (Paused, SuppressOff, NeedIdr, &[], &[RELEASE]),
+        (Paused, IdrAu, Paused, &[], &[SEND]),
+        (Paused, PAu, Paused, &[], &[SEND]),
+        (Paused, GateCloses, Paused, &[], &[SEND]),
+        (Paused, Fatal, Closing, &[DISC], &[SEND]),
+
+        (Closing, ReadyAvc, Closing, &[], &[SEND, OPEN, DISC]),
+        (Closing, ReadyNoAvc, Closing, &[], &[SEND, DISC]),
+        (Closing, SpsNeedingResize, Closing, &[], &[RESIZE, SEND]),
+        (Closing, SpsSameOrOther, Closing, &[], &[SEND]),
+        (Closing, FlvOpened, Closing, &[], &[SEND]),
+        (Closing, Reactivated, Closing, &[], &[SEND]),
+        (Closing, SuppressOn, Closing, &[], &[RELEASE]),
+        (Closing, SuppressOff, Closing, &[], &[RELEASE]),
+        (Closing, IdrAu, Closing, &[], &[SEND]),
+        (Closing, PAu, Closing, &[], &[SEND]),
+        (Closing, GateCloses, Closing, &[], &[SEND, "Abort"]),
+        (Closing, Fatal, Closing, &[], &[DISC]),
+    ];
+
+    #[test]
+    fn every_cell_of_the_section_6_4_table() {
+        assert_eq!(TABLE.len(), 72, "6 states × 12 inputs");
+        let mut failures = Vec::new();
+        for &(state, col, next, must, must_not) in TABLE {
+            let mut r = rig_in(state);
+            let out = apply(&mut r, col);
+            let k = kinds(&out);
+            if r.pump.state() != next {
+                failures.push(format!(
+                    "{state:?} × {col:?}: now {:?}, want {next:?} ({k:?})",
+                    r.pump.state()
+                ));
+            }
+            for m in must {
+                if !k.contains(m) {
+                    failures.push(format!("{state:?} × {col:?}: missing {m} ({k:?})"));
+                }
+            }
+            for m in must_not {
+                if k.contains(m) {
+                    failures.push(format!("{state:?} × {col:?}: must not {m} ({k:?})"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} cells wrong:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    /// Deviation from the brief (§6.5): `FlvOpened` while waiting
+    /// (`WaitReady`, `WaitReactivation`) now restarts both IDR clocks
+    /// instead of being "ignored" — the table's cells for these two rows
+    /// are unconstrained on `RequestIdr`/`ReconnectFlv` (an absence-only
+    /// effect per the reviewer's P30 ruling), so this asserts the restart
+    /// directly rather than leaving it untested.
+    ///
+    /// `WaitReactivation`: an open just before `ReactivationComplete`
+    /// pushes the setup clock's reference forward; without the restart the
+    /// clock would still be at the connection's first FLV open (long since
+    /// expired), and the reactivation's Setup cause would fire at once.
+    #[test]
+    fn flv_opened_in_wait_reactivation_restarts_the_clock_so_reactivation_requests_nothing() {
+        let mut r = rig_in(WaitReactivation);
+        r.at(1_500);
+        assert!(apply(&mut r, FlvOpened).is_empty());
+        r.at(1_550);
+        let out = apply(&mut r, Reactivated);
+        assert_eq!(r.pump.state(), NeedIdr);
+        assert!(
+            !kinds(&out).contains(&"RequestIdr"),
+            "the open restarted the setup clock: {:?}",
+            kinds(&out)
+        );
+    }
+
+    /// `WaitReady`: an open before the connection's first `OnReady` sets a
+    /// reference for the setup clock even though the first Setup never
+    /// calls `setup_cause` itself (§6.5: "except the first Setup, whose
+    /// `OpenFlv` serves"); a re-advertise shortly after must still see that
+    /// reference and defer, not fire at once (which it would with no
+    /// reference at all — the pre-fix "ignore" behaviour).
+    #[test]
+    fn flv_opened_in_wait_ready_restarts_the_clock_so_the_next_setup_cause_is_deferred() {
+        let mut r = rig_in(WaitReady);
+        r.at(100);
+        assert!(apply(&mut r, FlvOpened).is_empty());
+        let out = apply(&mut r, ReadyAvc);
+        assert_eq!(r.pump.state(), NeedIdr);
+        assert!(
+            !kinds(&out).contains(&"RequestIdr"),
+            "the first Setup: {:?}",
+            kinds(&out)
+        );
+        r.at(150);
+        let out = apply(&mut r, ReadyAvc);
+        assert!(
+            !kinds(&out).contains(&"RequestIdr"),
+            "the open restarted the setup clock: {:?}",
+            kinds(&out)
+        );
+    }
+}
