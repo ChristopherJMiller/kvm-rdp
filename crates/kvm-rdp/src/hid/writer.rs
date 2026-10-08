@@ -15,8 +15,10 @@
 //! by the spec's rule, while one whose session-start writes fail keeps
 //! backing off.
 //!
-//! A websocket ends with a FIN only after a close the KVM answered — it read
-//! everything up to our close frame. Every other end (a failed or blocked
+//! A websocket ends with a FIN only after a close the KVM answered with its
+//! own close frame — it read everything up to ours (a bare EOF proves
+//! nothing: it may be a half-close with our backlog unread). Every other
+//! end (a failed or blocked
 //! write, a lost read side, a close it never answered, the task aborted)
 //! resets the connection (`SO_LINGER` 0), so a backlog of HID reports it had
 //! not read is discarded with the connection rather than delivered after
@@ -79,7 +81,7 @@ pub struct WsTask {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Exit {
-    /// `WsCtl::Close`, answered by the KVM within `CLOSE_BUDGET`: end the
+    /// `WsCtl::Close`, answered by the KVM's close frame within `CLOSE_BUDGET`: end the
     /// task; the connection ends with a FIN.
     Closed,
     /// Told to close (or the session went away), but the KVM never answered
@@ -308,16 +310,19 @@ impl WsTask {
                             let sent = written && closed;
                             // Wait for the KVM's side of the close, so the
                             // next session's websocket never overlaps this
-                            // one. Its close frame, or its end of the stream,
-                            // means it read everything up to ours (I2).
+                            // one. Only its close frame proves it read
+                            // everything up to ours (I2, n1): an EOF or an
+                            // error may be a half-close with our backlog
+                            // unread. Once it has answered we are done — it
+                            // may wait for our FIN before closing (n2).
                             loop {
                                 match stream.next().await {
-                                    Some(Ok(Message::Close(_))) => answered = sent,
-                                    Some(Ok(_)) => {}
-                                    Some(Err(_)) | None => {
+                                    Some(Ok(Message::Close(_))) => {
                                         answered = sent;
                                         break;
                                     }
+                                    Some(Ok(_)) => {}
+                                    Some(Err(_)) | None => break,
                                 }
                             }
                         })
@@ -1111,6 +1116,8 @@ mod tests {
     struct Peer {
         port: u16,
         drain: Option<oneshot::Sender<()>>,
+        /// Not reading: shut its write side (a FIN, no close frame) now.
+        half_close: Option<oneshot::Sender<()>>,
         ending: oneshot::Receiver<Ending>,
     }
 
@@ -1124,6 +1131,7 @@ mod tests {
             let listener = sock.listen(8).unwrap();
             let port = listener.local_addr().unwrap().port();
             let (drain, drain_rx) = oneshot::channel::<()>();
+            let (half_close, mut half_rx) = oneshot::channel::<()>();
             let (end_tx, ending) = oneshot::channel();
             tokio::spawn(async move {
                 let Ok((s, _)) = listener.accept().await else {
@@ -1141,7 +1149,15 @@ mod tests {
                 if reading {
                     while let Some(Ok(_)) = ws.next().await {}
                 } else {
-                    let _ = drain_rx.await;
+                    let mut drain_rx = drain_rx;
+                    tokio::select! {
+                        _ = &mut drain_rx => {}
+                        Ok(()) = &mut half_rx => {
+                            use tokio::io::AsyncWriteExt as _;
+                            let _ = ws.get_mut().shutdown().await;
+                            let _ = drain_rx.await;
+                        }
+                    }
                 }
                 let tcp = ws.get_mut();
                 let mut buf = vec![0u8; 64 * 1024];
@@ -1161,6 +1177,7 @@ mod tests {
             Peer {
                 port,
                 drain: Some(drain),
+                half_close: Some(half_close),
                 ending,
             }
         }
@@ -1213,7 +1230,10 @@ mod tests {
     }
 
     /// I2 (PC9 fix round 1): a close the KVM answered — it read everything
-    /// up to our close frame, then answered — ends with a FIN.
+    /// up to our close frame, then answered — ends with a FIN. n2 (fix
+    /// round 2): the answer is its close frame, so a KVM that then waits
+    /// for our FIN before closing its side (as RFC 6455 lets a server do)
+    /// costs the Stop nothing — not the whole `CLOSE_BUDGET`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_answered_close_ends_with_a_fin() {
         let mut p = Peer::start(true).await;
@@ -1221,12 +1241,59 @@ mod tests {
         let (t, ctl) = p.task(hid.clone(), Duration::from_secs(1));
         let run = tokio::spawn(t.run());
         flood_until(&hid, || hid.metrics.hid_reports_sent.get() >= 2).await;
+        let t0 = Instant::now();
         close(&ctl).await;
+        let took = t0.elapsed();
+        assert!(
+            took < CLOSE_BUDGET / 2,
+            "the close waited {took:?} for the KVM's FIN after its close frame"
+        );
         tokio::time::timeout(Duration::from_secs(5), run)
             .await
             .unwrap()
             .unwrap();
         assert_eq!(p.ending().await, Ending::Fin);
+    }
+
+    /// n1 (PC9 fix round 2): only the KVM's close frame answers our close.
+    /// A KVM that stopped reading with a backlog queued and then half-closes
+    /// — an EOF, no close frame — has read none of it; a FIN would deliver
+    /// the whole backlog, release last, after the next websocket's session
+    /// start. It is reset instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_half_close_with_a_backlog_unread_is_reset() {
+        let mut p = Peer::start(false).await;
+        let hid = Arc::new(HidControl::new(1024, Arc::new(Metrics::default())));
+        let (t, ctl) = p.task(hid.clone(), Duration::from_secs(5));
+        let run = tokio::spawn(t.run());
+        flood_until(&hid, || hid.metrics.hid_reports_sent.get() >= 2).await;
+        // A backlog the peer has not read, short of blocking a write.
+        for k in 0..300u32 {
+            hid.push(kbd(4 + u8::try_from(k % 20).unwrap()), false);
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hid.metrics.hid_reports_sent.get() < 302 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the backlog blocked a write");
+        hid.release_all(ReleaseTrigger::SessionEnd);
+        let (done, ack) = oneshot::channel();
+        ctl.send(WsCtl::Close { done }).unwrap();
+        // The release and our close frame are written; the Close arm waits
+        // for an answer (`CLOSE_BUDGET`, 400 ms). The peer half-closes.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = p.half_close.take().unwrap().send(());
+        tokio::time::timeout(Duration::from_secs(2), ack)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.ending().await, Ending::Reset);
     }
 
     /// I2: a close the KVM never answers within `CLOSE_BUDGET` — it is not
