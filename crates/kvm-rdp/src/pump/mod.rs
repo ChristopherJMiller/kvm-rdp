@@ -2,6 +2,7 @@
 //! the flow, IDR and debounce cores, and an async shell (Task 5.3) that
 //! only locks, steps and carries out commands.
 pub mod flow;
+pub mod idr;
 pub mod slate;
 pub mod types;
 
