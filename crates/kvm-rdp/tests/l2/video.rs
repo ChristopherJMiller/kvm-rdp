@@ -264,6 +264,8 @@ async fn a_readvertise_takes_one_side_flv_and_never_closes_the_main_one() {
     let side_timeout = ms(500);
     let (env, c) = longgop(side_timeout).await;
     let main = flv_opens(&env.sim.events())[0];
+    // kvm-sim's log from the re-advertise on (see `forced` below).
+    let mark = env.sim.events().len();
     let n = c.with_log(<[Ev]>::len);
     let t0 = Instant::now();
     c.readvertise();
@@ -288,18 +290,19 @@ async fn a_readvertise_takes_one_side_flv_and_never_closes_the_main_one() {
         })
         .await
         .unwrap();
-    let side = flv_opens(&log)[1];
     let after = pictures(&evs[confirmed(&evs, n).unwrap()..]);
     assert_eq!(
         nal_types(&after[0].annex_b),
         [7, 8, 5],
         "the first KVM AU after the re-advertise"
     );
-    let side_open = log
-        .iter()
-        .position(|e| *e == SimEvent::FlvOpen { conn: side })
-        .unwrap();
-    let forced = log[side_open..]
+    // The first IDR on the main FLV since the re-advertise. Not searched
+    // from the side's `FlvOpen`: kvm-sim records that only after the
+    // subscription that forced the IDR, so under load the main FLV can
+    // write and log the forced IDR first (seen under 16 busy loops, PC18).
+    // No periodic IDR is due for ≈9 s on this fixture, and
+    // frame 300 is the GOP restart only a new FLV forces.
+    let forced = log[mark..]
         .iter()
         .find_map(|e| match e {
             SimEvent::FlvAu {
@@ -310,7 +313,7 @@ async fn a_readvertise_takes_one_side_flv_and_never_closes_the_main_one() {
             } if *conn == main => Some(*source_index),
             _ => None,
         })
-        .expect("no forced IDR on the main FLV after the side open");
+        .expect("no IDR on the main FLV after the re-advertise");
     assert_eq!(forced, 300, "the side open restarts the GOP at frame 300");
     assert_eq!(
         index_of(&barcodes(LONGGOP), &after[0].annex_b),
