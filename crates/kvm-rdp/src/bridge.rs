@@ -1068,33 +1068,34 @@ mod tests {
         }
     }
 
-    /// PC13 m10: startup names the TLS key's type and size at INFO, through
-    /// the bridge's own subscriber; an ECDSA key is neither refused nor
-    /// warned about (§9.1 leaves RSA vs ECDSA to the acceptance check).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn startup_logs_the_tls_key_type_at_info() {
-        let sim = sim().await;
-        let d = tempfile::tempdir().unwrap();
-        let cfg = config_for(&sim, d.path(), |_| {});
+    /// PC13 m10 (PC15 review m7): startup names the TLS key's type and size
+    /// at INFO, through the bridge's own subscriber; an ECDSA key is neither
+    /// refused nor warned about (§9.1 leaves RSA vs ECDSA to the acceptance
+    /// check). Run in a child with the subscriber process-wide, so every
+    /// thread's lines are seen — the RDP and KVM runtimes', not only the
+    /// caller's — from startup through §5.2's shutdown.
+    #[test]
+    fn startup_logs_the_tls_key_type_at_info() {
+        if is_child() {
+            startup_log_in_a_child();
+            return;
+        }
+        passes_in_a_child("startup_logs_the_tls_key_type_at_info");
+    }
+
+    fn startup_log_in_a_child() {
         let out = Captured::default();
         let sub = crate::logging::subscriber("info", out.clone()).unwrap();
-        // tracing-core caches each callsite's interest when it is first hit.
-        // With exactly one dispatcher registered (this test's scoped one) it
-        // takes a fast path that asks only the registering thread's default
-        // — so another test's `spawn`, hitting "TLS identity loaded" first
-        // with no subscriber, would cache `never` for this thread too. A
-        // second live dispatcher makes every registration ask them all.
-        let _second = tracing::Dispatch::new(tracing_subscriber::registry());
-        let h = tokio::time::timeout(
-            STARTUP_WAIT * 2,
-            tokio::task::spawn_blocking(move || {
-                tracing::subscriber::with_default(sub, || spawn(cfg))
-            }),
-        )
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
+        tracing::subscriber::set_global_default(sub).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let sim = rt.block_on(sim());
+        let d = tempfile::tempdir().unwrap();
+        let h = spawn(config_for(&sim, d.path(), |_| {})).unwrap();
+        rt.block_on(stop(h));
         let lines = out.lines();
         let loaded = lines
             .iter()
@@ -1103,11 +1104,23 @@ mod tests {
         assert_eq!(loaded["level"], "INFO");
         assert_eq!(loaded["fields"]["key_type"], "ECDSA");
         assert_eq!(loaded["fields"]["key_bits"], 256);
+        // The other threads were heard: the RDP thread's and the KVM
+        // runtime's lines from the shutdown.
+        for (message, thread) in [
+            ("RDP server stopped", "the RDP thread"),
+            ("shutdown complete", "the KVM runtime"),
+        ] {
+            assert!(
+                lines.iter().any(|v| v["fields"]["message"] == message),
+                "nothing from {thread} in {lines:?}"
+            );
+        }
         assert!(
             lines.iter().all(|v| v["level"] == "INFO"),
-            "startup warned or failed: {lines:?}"
+            "a line above INFO from some thread: {lines:?}"
         );
-        stop(h).await;
+        drop(sim);
+        rt.shutdown_timeout(Duration::from_secs(1));
     }
 
     /// The channels `shutdown_sequence` talks to, with no bridge behind them.
@@ -1397,39 +1410,37 @@ mod tests {
         );
     }
 
-    /// Set in the re-executed test binary that runs P37's child.
-    const P37_CHILD: &str = "KVM_RDP_TEST_P37_CHILD";
-    const P37_TEST: &str = "bridge::tests::a_sigterm_right_after_the_ready_line_is_a_clean_exit";
+    /// Set in a copy of this test binary re-executed by `passes_in_a_child`:
+    /// the test it runs takes its child branch.
+    const CHILD: &str = "KVM_RDP_TEST_CHILD";
 
-    /// P37: a SIGTERM sent the moment "kvm-rdp ready" is logged is already
-    /// the bridge's — §5.2's shutdown and `Exit::Signal` — never the default
-    /// disposition. Run in a child process (this test binary re-executed),
-    /// which raises SIGTERM on the logging thread from inside the log call:
-    /// with the handlers registered after the line, the child dies by the
-    /// signal instead of passing.
-    #[test]
-    fn a_sigterm_right_after_the_ready_line_is_a_clean_exit() {
-        if std::env::var_os(P37_CHILD).is_some() {
-            sigterm_at_the_ready_line();
-            return;
-        }
+    fn is_child() -> bool {
+        std::env::var_os(CHILD).is_some()
+    }
+
+    /// Run `bridge::tests::<name>` alone in a child process — this test
+    /// binary re-executed with `CHILD` set — for what needs a process of its
+    /// own (a signal, a process-wide subscriber), and require that it passed.
+    /// The child is killed if it outlives 30 s.
+    fn passes_in_a_child(name: &str) {
+        let test = format!("bridge::tests::{name}");
         let child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([P37_TEST, "--exact", "--nocapture", "--test-threads=1"])
-            .env(P37_CHILD, "1")
+            .args([test.as_str(), "--exact", "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let pid = child.id().to_string();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(child.wait_with_output());
         });
         let Ok(out) = rx.recv_timeout(Duration::from_secs(30)) else {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &pid])
-                .status();
-            panic!("the child did not finish within 30 s");
+            // SAFETY: kill(2) on our own child, not yet reaped (the waiting
+            // thread is still blocked in waitpid).
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+            panic!("{test}: the child did not finish within 30 s");
         };
         let out = out.unwrap();
         let (stdout, stderr) = (
@@ -1439,8 +1450,22 @@ mod tests {
         assert!(out.status.success(), "{:?}\n{stdout}\n{stderr}", out.status);
         assert!(
             stdout.contains("test result: ok. 1 passed"),
-            "the child ran no test:\n{stdout}"
+            "{test}: the child ran no test:\n{stdout}"
         );
+    }
+
+    /// P37: a SIGTERM sent the moment "kvm-rdp ready" is logged is already
+    /// the bridge's — §5.2's shutdown and `Exit::Signal` — never the default
+    /// disposition. Run in a child process, which raises SIGTERM on the
+    /// logging thread from inside the log call: with the handlers registered
+    /// after the line, the child dies by the signal instead of passing.
+    #[test]
+    fn a_sigterm_right_after_the_ready_line_is_a_clean_exit() {
+        if is_child() {
+            sigterm_at_the_ready_line();
+            return;
+        }
+        passes_in_a_child("a_sigterm_right_after_the_ready_line_is_a_clean_exit");
     }
 
     /// P37's child: the bridge on kvm-sim, then `run_until_signal` under a
