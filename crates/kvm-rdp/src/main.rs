@@ -4,24 +4,18 @@
 //! after §5.2's shutdown. Exit 1 if startup failed or the RDP server
 //! stopped on its own, 2 on a config or logging error.
 use kvm_rdp::bridge::{self, Exit};
-use kvm_rdp::config::{Config, config_path};
+use kvm_rdp::config;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
-    let path = match config_path(
+    // The error is a line that never carries the file's contents (§9.2).
+    let cfg = match config::from_command_line(
         std::env::args_os().skip(1),
         std::env::var_os("KVM_RDP_CONFIG"),
     ) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("kvm-rdp: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    let cfg = match Config::load(&path) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("kvm-rdp: {}: {e}", path.display());
+        Err(line) => {
+            eprintln!("{line}");
             return ExitCode::from(2);
         }
     };

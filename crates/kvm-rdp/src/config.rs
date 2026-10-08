@@ -240,9 +240,62 @@ impl Config {
     }
 
     pub fn from_toml(text: &str, base: &Path) -> Result<Config, ConfigError> {
-        let raw: Raw = toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let raw: Raw = toml::from_str(text).map_err(|e| parse_error(text, &e))?;
         build(raw, base)
     }
+}
+
+/// I1 (PC15 review, §9.2): a parse error says where and what, never the
+/// file's text. toml's `Display` quotes the offending source line — a
+/// secret file passed as the config, or an inline secret, would reach
+/// stderr — so only the position and the redacted message are kept.
+fn parse_error(text: &str, e: &toml::de::Error) -> ConfigError {
+    let what = redacted(e.message());
+    ConfigError::Parse(match e.span() {
+        Some(span) => {
+            let (line, column) = position(text, span.start);
+            format!("line {line}, column {column}: {what}")
+        }
+        None => what,
+    })
+}
+
+/// A toml/serde message with every quoted span before its `, expected …`
+/// replaced by `…`. What precedes "expected" can quote the source — a
+/// value (`invalid type: string "…"`), an unknown key or variant (in
+/// backticks); what follows is the schema's or the grammar's (`u16`, the
+/// known keys, `=`). "missing field `…`" names a schema field and is kept.
+fn redacted(message: &str) -> String {
+    let (head, tail) = match message.find(", expected ") {
+        Some(i) => message.split_at(i),
+        None => (message, ""),
+    };
+    if head.starts_with("missing field ") {
+        return message.to_owned();
+    }
+    let mut out = String::with_capacity(message.len().min(256));
+    let mut chars = head.chars();
+    while let Some(c) = chars.next() {
+        if c != '"' && c != '`' {
+            out.push(c);
+            continue;
+        }
+        let mut escaped = false;
+        for q in chars.by_ref() {
+            if escaped {
+                escaped = false;
+            } else if q == '\\' && c == '"' {
+                escaped = true;
+            } else if q == c {
+                break;
+            }
+        }
+        out.push(c);
+        out.push('…');
+        out.push(c);
+    }
+    out.push_str(tail);
+    out
 }
 
 /// `--config <file>` or `--config=<file>`, else `KVM_RDP_CONFIG` (§4.4) —
@@ -270,6 +323,35 @@ pub fn config_path(
     found
         .or_else(|| env.map(PathBuf::from))
         .ok_or_else(|| invalid("no config: pass --config <file> or set KVM_RDP_CONFIG"))
+}
+
+/// The 1-based line and column (in characters) of byte `offset` in `text`;
+/// an offset inside a character rounds down, one past the end clamps.
+fn position(text: &str, offset: usize) -> (usize, usize) {
+    let mut end = offset.min(text.len());
+    while !text.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    let before = text.get(..end).unwrap_or("");
+    let line = before.matches('\n').count().saturating_add(1);
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |l| l.chars().count())
+        .saturating_add(1);
+    (line, column)
+}
+
+/// `main`'s config step (§4.4): the path from the command line or
+/// `KVM_RDP_CONFIG`, then that file, loaded and validated. `Err` is the line
+/// `main` prints to stderr before exiting 2 — fixed text, the path and a
+/// position, never the file's contents (§9.2).
+pub fn from_command_line(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    env: Option<std::ffi::OsString>,
+) -> Result<Config, String> {
+    let path = config_path(args, env).map_err(|e| format!("kvm-rdp: {e}"))?;
+    Config::load(&path).map_err(|e| format!("kvm-rdp: {}: {e}", path.display()))
 }
 
 /// `"250ms"`, `"1.6s"`, `"10s"`: a non-negative number of ms or s, ≤ 1 h.
@@ -411,8 +493,9 @@ fn dur(v: Option<&String>, default: Duration, key: &str) -> Result<Duration, Con
     let d = match v {
         None => default,
         Some(s) => parse_duration(s).ok_or_else(|| {
+            // Named, not quoted: a config error never echoes the file (I1).
             invalid(format!(
-                "{key}: {s:?} is not a duration like \"250ms\" or \"1.6s\" (at most 1 h)"
+                "{key} is not a duration like \"250ms\" or \"1.6s\" (at most 1 h)"
             ))
         })?,
     };
@@ -425,9 +508,7 @@ fn dur(v: Option<&String>, default: Duration, key: &str) -> Result<Duration, Con
 fn dur_or_zero(v: Option<&String>, default: Duration, key: &str) -> Result<Duration, ConfigError> {
     match v {
         None => Ok(default),
-        Some(s) => {
-            parse_duration(s).ok_or_else(|| invalid(format!("{key}: {s:?} is not a duration")))
-        }
+        Some(s) => parse_duration(s).ok_or_else(|| invalid(format!("{key} is not a duration"))),
     }
 }
 
@@ -1005,6 +1086,80 @@ mod tests {
         for bad in ["3601s", "-1s", "1h", "s", "", "NaNs", "infs"] {
             assert_eq!(parse_duration(bad), None, "{bad}");
         }
+    }
+
+    /// I1 (PC15 review; §4.4, §9.2): a config error never echoes the file —
+    /// `--config` pointed at a secret file, an inline secret under a key the
+    /// schema refuses, a malformed line, a wrong-typed value, a secret used
+    /// as a key, a bad duration. The sentinel reaches neither the error's
+    /// `Display` or `Debug` nor the line `main` prints; a parse error still
+    /// says where.
+    #[test]
+    fn config_errors_never_echo_the_file() {
+        const S: &str = "s3ntinel-Zq7vP2mX9kLr4TfW8";
+        let d = tempfile::tempdir().unwrap();
+        let base = minimal(d.path());
+        let cases = [
+            (format!("{S}\n"), "a secret file as the config"),
+            (
+                base.replace("[rdp]\n", &format!("[rdp]\nnla_password = \"{S}\"\n")),
+                "an inline secret under an unknown key",
+            ),
+            (
+                format!("{base}[video]\nmax_fps = {S}\n"),
+                "a malformed line",
+            ),
+            (
+                base.replace("[kvm]\n", &format!("[kvm]\nweb_port = \"{S}\"\n")),
+                "a string where a port goes",
+            ),
+            (
+                base.replace("[kvm]\n", &format!("[kvm]\nusername = {{ x = \"{S}\" }}\n")),
+                "a table under an unknown key",
+            ),
+            (format!("{base}[admin]\n{S} = 1\n"), "a secret as a key"),
+            (
+                format!("{base}[video]\nidr_side_timeout = \"{S}\"\n"),
+                "a bad duration",
+            ),
+            (format!("{base}[paste]\npace = \"{S}\"\n"), "a bad pace"),
+            (
+                format!("{base}[rdp]\nlisten = \"{S}\"\n"),
+                "a duplicate table",
+            ),
+        ];
+        let toml = d.path().join("kvm-rdp.toml");
+        for (text, what) in &cases {
+            std::fs::write(&toml, text).unwrap();
+            let e = Config::load(&toml).expect_err(what);
+            let shown = format!("{e} {e:?}");
+            assert!(!shown.contains(S), "{what}: {shown}");
+            let line =
+                from_command_line(["--config".into(), toml.clone().into()], None).expect_err(what);
+            assert!(!line.contains(S), "{what}: {line}");
+            assert!(line.starts_with("kvm-rdp: "), "{line}");
+            if matches!(e, ConfigError::Parse(_)) {
+                assert!(shown.contains("line "), "{what}: no position in {shown}");
+            }
+        }
+    }
+
+    /// The parse error's position: 1-based line and column (characters).
+    #[test]
+    fn a_parse_error_names_its_line_and_column() {
+        let d = tempfile::tempdir().unwrap();
+        let e = load(d.path(), "[rdp]\n\u{e9}t\u{e9} =\n").unwrap_err();
+        assert!(
+            matches!(&e, ConfigError::Parse(m) if m.starts_with("line 2, column ")),
+            "{e}"
+        );
+        assert_eq!(position("ab\ncd\u{e9}f", 7), (2, 4));
+        assert_eq!(position("ab", 99), (1, 3));
+        assert_eq!(
+            position("\u{e9}", 1),
+            (1, 1),
+            "mid-character offsets round down"
+        );
     }
 
     #[test]

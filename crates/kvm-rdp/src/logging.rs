@@ -190,6 +190,29 @@ mod tests {
         assert!(subscriber("kvm_rdp=loud", Buf::default()).is_err());
     }
 
+    /// I1 sweep (PC15 review): a bad `log.filter` is refused without echoing
+    /// it. `EnvFilter`'s errors are fixed text today (a level list, "error
+    /// building NFA"); this pins that, since `LogError` passes them through.
+    #[test]
+    fn a_bad_filter_is_not_echoed() {
+        const S: &str = "s3ntinel-Zq7vP2mX9kLr4TfW8";
+        let mut refused = 0;
+        for filter in [
+            format!("kvm_rdp={S}"),
+            format!("kvm_rdp[{{{S}=/(/}}]=info"),
+            format!("[{{x={S}}}]=x{S}"),
+            format!("{S}=info,,=\x00{S}"),
+        ] {
+            let Err(e) = subscriber(&filter, Buf::default()) else {
+                continue; // accepted: nothing to echo
+            };
+            refused += 1;
+            let shown = format!("{e} {e:?}");
+            assert!(!shown.contains(S), "{filter}: {shown}");
+        }
+        assert!(refused >= 2, "only {refused} filters were refused");
+    }
+
     #[test]
     fn urls_are_logged_without_their_query() {
         assert_eq!(
