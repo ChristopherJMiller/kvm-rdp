@@ -7,6 +7,13 @@
 //! the token; this task never logs in (and nothing here can log out).
 //! At most one websocket is open or opening at a time: a control message
 //! during an open is answered without abandoning the handshake (P20).
+//!
+//! The backoff resets in `drive` right after the session-start writes
+//! succeed: that is §4.4's reset point for the websocket ("once a reopened
+//! websocket has sent the session-start sequence"). So a KVM that accepts
+//! the websocket and drops it at once is retried at `kvm.backoff.initial`,
+//! by the spec's rule, while one whose session-start writes fail keeps
+//! backing off.
 use crate::hid::{HidControl, ReleaseTrigger};
 use crate::kvm::endpoint::KvmEndpoint;
 use crate::kvm::error::FailClass;
@@ -243,7 +250,9 @@ impl WsTask {
                         let _ = tokio::time::timeout(CLOSE_BUDGET, async {
                             if self.hid.take_release() {
                                 for f in self.hid.release_frames() {
-                                    if !self.write(&mut sink, f).await {
+                                    // PC7 m1: the task ends either way — a
+                                    // failure here is not a reconnect.
+                                    if !self.send_frame(&mut sink, f).await {
                                         break;
                                     }
                                 }
@@ -272,7 +281,22 @@ impl WsTask {
         }
     }
 
+    /// One write on a websocket that stays in service: a failure ends it
+    /// with `Exit::Failed` and a reconnect, counted here once (P21).
     async fn write<S: Sink<Message, Error = WsError> + Unpin>(
+        &self,
+        sink: &mut S,
+        f: HidFrame,
+    ) -> bool {
+        let ok = self.send_frame(sink, f).await;
+        if !ok {
+            self.metrics.upstream_reconnects.inc("websocket_write");
+        }
+        ok
+    }
+
+    /// One write bounded by `hid_write_timeout`; uncounted (PC7 m1).
+    async fn send_frame<S: Sink<Message, Error = WsError> + Unpin>(
         &self,
         sink: &mut S,
         f: HidFrame,
@@ -283,10 +307,7 @@ impl WsTask {
                 self.hid.note_sent(&f);
                 true
             }
-            _ => {
-                self.metrics.upstream_reconnects.inc("websocket_write");
-                false
-            }
+            _ => false,
         }
     }
 }
@@ -312,6 +333,8 @@ mod tests {
     #[derive(Default)]
     struct Gate {
         open: bool,
+        /// Every write fails at once (a dead socket).
+        fail: bool,
         sent: Vec<Vec<u8>>,
         waker: Option<Waker>,
     }
@@ -336,13 +359,18 @@ mod tests {
         fn sent(&self) -> Vec<Vec<u8>> {
             self.0.lock().unwrap().sent.clone()
         }
+        fn fail(&self) {
+            self.0.lock().unwrap().fail = true;
+        }
     }
 
     impl Sink<Message> for GateSink {
         type Error = WsError;
         fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), WsError>> {
             let mut g = self.0.lock().unwrap();
-            if g.open {
+            if g.fail {
+                Poll::Ready(Err(WsError::ConnectionClosed))
+            } else if g.open {
                 Poll::Ready(Ok(()))
             } else {
                 g.waker = Some(cx.waker().clone());
@@ -424,6 +452,103 @@ mod tests {
             .unwrap();
     }
 
+    /// PC7 m4: a spawned `drive`, bounded from outside — a regression that
+    /// acks `Close` and keeps looping fails the test instead of hanging it.
+    async fn ended(drive: tokio::task::JoinHandle<Exit>) -> Exit {
+        tokio::time::timeout(Duration::from_secs(5), drive)
+            .await
+            .expect("drive did not end after Close")
+            .unwrap()
+    }
+
+    /// A loopback websocket endpoint that accepts TCP and answers the first
+    /// upgrade only when the test says so; later connections are held open,
+    /// never answered. Counts every accept; forwards each binary message of
+    /// the first websocket.
+    struct UpgradeStub {
+        port: u16,
+        accepts: Arc<AtomicUsize>,
+        answer: Option<oneshot::Sender<()>>,
+        got: mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    impl UpgradeStub {
+        async fn start() -> UpgradeStub {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let (answer, answer_rx) = oneshot::channel::<()>();
+            let (got_tx, got) = mpsc::unbounded_channel::<Vec<u8>>();
+            let a2 = accepts.clone();
+            tokio::spawn(async move {
+                let mut answer_rx = Some(answer_rx);
+                let mut held = Vec::new();
+                while let Ok((s, _)) = listener.accept().await {
+                    a2.fetch_add(1, Ordering::SeqCst);
+                    let Some(rx) = answer_rx.take() else {
+                        held.push(s); // never answered
+                        continue;
+                    };
+                    let got = got_tx.clone();
+                    tokio::spawn(async move {
+                        // Answer the upgrade only once the test says so.
+                        let _ = rx.await;
+                        let Ok(mut ws) = tokio_tungstenite::accept_async(s).await else {
+                            return;
+                        };
+                        while let Some(Ok(m)) = ws.next().await {
+                            if let Message::Binary(b) = m {
+                                let _ = got.send(b);
+                            }
+                        }
+                    });
+                }
+            });
+            UpgradeStub {
+                port,
+                accepts,
+                answer: Some(answer),
+                got,
+            }
+        }
+
+        fn accepts(&self) -> usize {
+            self.accepts.load(Ordering::SeqCst)
+        }
+
+        async fn wait_accepts(&self, n: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self.accepts() < n {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        fn answer(&mut self) {
+            self.answer.take().unwrap().send(()).unwrap();
+        }
+
+        /// A task pointed at the stub, with a token and an open long
+        /// enough (3 s) to outlast the test's control messages.
+        fn task(&self) -> (WsTask, mpsc::UnboundedSender<WsCtl>) {
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, ctl) = task(hid, Duration::from_secs(1));
+            t.ep = Arc::new(KvmEndpoint::new(
+                Scheme::Http,
+                "127.0.0.1",
+                (self.port, self.port, self.port),
+                &"0".repeat(64),
+            ));
+            t.connect_timeout = Duration::from_secs(3);
+            let token = kvm_proto::parse_login_token(br#"{"result":0,"token":"0.1"}"#).unwrap();
+            // The sender is dropped: the current token stays readable.
+            t.token = watch::channel(Some((1, token))).1;
+            (t, ctl)
+        }
+    }
+
     /// §3.3: on open the session-start sequence goes first, with no pointer
     /// report before one was ever sent; reports made while down are gone.
     #[tokio::test]
@@ -438,7 +563,7 @@ mod tests {
         hid.push(kbd(5), false);
         wait_sent(&sink, 3).await;
         close(&ctl).await;
-        assert_eq!(drive.await.unwrap(), Exit::Closed);
+        assert_eq!(ended(drive).await, Exit::Closed);
         assert_eq!(
             sink.sent(),
             [SET_MODE.to_vec(), KBD_ZERO.to_vec(), kbd(5).to_vec()]
@@ -466,7 +591,7 @@ mod tests {
         sink.set(true);
         wait_sent(&sink, 5).await;
         close(&ctl).await;
-        drive.await.unwrap();
+        assert_eq!(ended(drive).await, Exit::Closed);
         let sent = sink.sent();
         assert_eq!(
             sent[2..],
@@ -494,6 +619,8 @@ mod tests {
             t0.elapsed() >= Duration::from_millis(50) && t0.elapsed() < Duration::from_millis(500)
         );
         assert_eq!(hid.metrics.upstream_reconnects.get("websocket_write"), 1);
+        // P21: one failure, one count.
+        assert_eq!(hid.metrics.upstream_reconnects.total(), 1);
     }
 
     /// §3.2: inbound data is read and discarded; a stream error ends it.
@@ -516,6 +643,9 @@ mod tests {
             2,
             "only the session-start sequence went out"
         );
+        // P21: the read-side loss, counted once.
+        assert_eq!(t.metrics.upstream_reconnects.get("websocket"), 1);
+        assert_eq!(t.metrics.upstream_reconnects.total(), 1);
     }
 
     /// §7.3: `on_disconnected` releases and then closes over the same path —
@@ -532,7 +662,7 @@ mod tests {
         wait_sent(&sink, 3).await;
         hid.release_all(ReleaseTrigger::SessionEnd);
         close(&ctl).await;
-        assert_eq!(drive.await.unwrap(), Exit::Closed);
+        assert_eq!(ended(drive).await, Exit::Closed);
         assert_eq!(sink.sent().last().unwrap(), &KBD_ZERO.to_vec());
     }
 
@@ -600,6 +730,9 @@ mod tests {
             ]
         );
         assert_eq!(hid.metrics.release_all.get("websocket_reconnect"), 1);
+        // P21: one loss, counted once, under one reason.
+        assert_eq!(hid.metrics.upstream_reconnects.get("websocket"), 1);
+        assert_eq!(hid.metrics.upstream_reconnects.total(), 1);
         close(&ctl).await;
         // P22: bounded from outside.
         tokio::time::timeout(Duration::from_secs(5), run)
@@ -732,56 +865,10 @@ mod tests {
     /// session-start sequence, and no second connection is made beside it.
     #[tokio::test]
     async fn a_flush_during_the_open_keeps_the_one_handshake() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let accepts = Arc::new(AtomicUsize::new(0));
-        let (answer_tx, answer_rx) = oneshot::channel::<()>();
-        let (got_tx, mut got) = mpsc::unbounded_channel::<Vec<u8>>();
-        let a2 = accepts.clone();
-        tokio::spawn(async move {
-            let mut answer_rx = Some(answer_rx);
-            let mut held = Vec::new();
-            while let Ok((s, _)) = listener.accept().await {
-                a2.fetch_add(1, Ordering::SeqCst);
-                let Some(rx) = answer_rx.take() else {
-                    held.push(s); // never answered
-                    continue;
-                };
-                let got = got_tx.clone();
-                tokio::spawn(async move {
-                    // Answer the upgrade only once the test says so.
-                    let _ = rx.await;
-                    let Ok(mut ws) = tokio_tungstenite::accept_async(s).await else {
-                        return;
-                    };
-                    while let Some(Ok(m)) = ws.next().await {
-                        if let Message::Binary(b) = m {
-                            let _ = got.send(b);
-                        }
-                    }
-                });
-            }
-        });
-        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
-        let (mut t, ctl) = task(hid, Duration::from_secs(1));
-        t.ep = Arc::new(KvmEndpoint::new(
-            Scheme::Http,
-            "127.0.0.1",
-            (port, port, port),
-            &"0".repeat(64),
-        ));
-        t.connect_timeout = Duration::from_secs(3);
-        let token = kvm_proto::parse_login_token(br#"{"result":0,"token":"0.1"}"#).unwrap();
-        let (_tok_tx, tok_rx) = watch::channel(Some((1, token)));
-        t.token = tok_rx;
+        let mut stub = UpgradeStub::start().await;
+        let (t, ctl) = stub.task();
         let run = tokio::spawn(t.run());
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while accepts.load(Ordering::SeqCst) < 1 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
+        stub.wait_accepts(1).await;
         for _ in 0..3 {
             let (done, rx) = oneshot::channel();
             ctl.send(WsCtl::Flush { done }).unwrap();
@@ -790,10 +877,10 @@ mod tests {
                 .expect("a flush during the open was not acked")
                 .unwrap();
         }
-        answer_tx.send(()).unwrap();
+        stub.answer();
         let mut first = Vec::new();
         for _ in 0..2 {
-            let m = tokio::time::timeout(Duration::from_secs(2), got.recv())
+            let m = tokio::time::timeout(Duration::from_secs(2), stub.got.recv())
                 .await
                 .expect("the in-flight handshake was thrown away")
                 .unwrap();
@@ -801,7 +888,7 @@ mod tests {
         }
         assert_eq!(first, [SET_MODE.to_vec(), KBD_ZERO.to_vec()]);
         assert_eq!(
-            accepts.load(Ordering::SeqCst),
+            stub.accepts(),
             1,
             "a second connection was opened beside the first"
         );
@@ -810,5 +897,87 @@ mod tests {
             .await
             .expect("run did not end after Close")
             .unwrap();
+    }
+
+    /// PC7 m3 (W8), P20: `Close` while the open is in flight abandons it —
+    /// acked, the task ends, nothing is ever written, and no second
+    /// connection is made.
+    #[tokio::test]
+    async fn a_close_during_the_open_abandons_it() {
+        let mut stub = UpgradeStub::start().await;
+        let (t, ctl) = stub.task();
+        let run = tokio::spawn(t.run());
+        stub.wait_accepts(1).await;
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("run kept opening after Close")
+            .unwrap();
+        // Answer the abandoned upgrade now: it must carry nothing.
+        stub.answer();
+        let late = tokio::time::timeout(Duration::from_millis(300), stub.got.recv()).await;
+        assert!(late.is_err(), "a frame was written after Close: {late:?}");
+        assert_eq!(stub.accepts(), 1, "a second connection was made");
+    }
+
+    /// PC7 m3 (W11), §4.4: the websocket's backoff resets once a reopened
+    /// websocket has sent the session-start sequence — and not before, so a
+    /// websocket whose session-start writes fail keeps backing off.
+    #[tokio::test]
+    async fn the_backoff_resets_only_after_the_session_start_sequence_is_written() {
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (mut t, _ctl) = task(hid, Duration::from_millis(50));
+        // Two failed opens' worth of backoff (0 % jitter: 50 ms, 100 ms).
+        assert_eq!(t.backoff.next_delay(), Duration::from_millis(50));
+        assert_eq!(t.backoff.next_delay(), Duration::from_millis(100));
+        // The first session-start write never completes: no reset.
+        let exit = tokio::time::timeout(
+            Duration::from_secs(5),
+            t.drive(GateSink::new(false), futures_util::stream::pending()),
+        )
+        .await
+        .expect("drive never returned");
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(
+            t.backoff.next_delay(),
+            Duration::from_millis(200),
+            "reset before the session-start sequence was written"
+        );
+        // The sequence is written, then the websocket fails: reset.
+        let sink = GateSink::new(true);
+        let inbound =
+            futures_util::stream::iter(vec![Err::<Message, _>(WsError::ConnectionClosed)]);
+        let exit = tokio::time::timeout(Duration::from_secs(5), t.drive(sink.clone(), inbound))
+            .await
+            .expect("drive never returned");
+        assert_eq!(exit, Exit::Failed);
+        assert_eq!(sink.sent().len(), 2);
+        assert_eq!(
+            t.backoff.next_delay(),
+            Duration::from_millis(50),
+            "§4.4: no reset after the session-start sequence"
+        );
+    }
+
+    /// PC7 m1, §10.4: a release write that fails inside `Close` ends the
+    /// task — no reconnect follows, so `upstream_reconnects` does not count
+    /// it.
+    #[tokio::test]
+    async fn a_release_write_failing_while_closing_is_not_a_reconnect() {
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (mut t, ctl) = task(hid.clone(), Duration::from_secs(1));
+        let sink = GateSink::new(true);
+        let s2 = sink.clone();
+        let drive = tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
+        wait_sent(&sink, 2).await;
+        // One turn of this current-thread runtime: a release, a socket that
+        // now fails every write, and `Close` — which the biased select takes
+        // first, so the release is written (and fails) inside the Close path.
+        hid.release_all(ReleaseTrigger::SessionEnd);
+        sink.fail();
+        close(&ctl).await;
+        assert_eq!(ended(drive).await, Exit::Closed);
+        assert_eq!(sink.sent().len(), 2, "the dead socket took a frame");
+        assert_eq!(hid.metrics.upstream_reconnects.total(), 0);
     }
 }
