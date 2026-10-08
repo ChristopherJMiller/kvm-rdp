@@ -73,7 +73,9 @@ impl IdrCore {
         }
     }
 
-    /// Idr-wait accounting: the gates' state now.
+    /// Idr-wait accounting: the gates' state now. The core samples it on
+    /// ticks only, with the gates computed as for a live frame (no burst
+    /// soft-gate exemption), never on the AU that resolves NeedIdr (m2, m3).
     pub fn observe_gates(&mut self, now: Instant, open: bool) -> Option<IdrAction> {
         if !self.waiting {
             return None;

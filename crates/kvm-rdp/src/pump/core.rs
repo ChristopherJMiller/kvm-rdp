@@ -598,7 +598,16 @@ impl Pump {
                 }
                 self.flow.on_flv_opened();
             }
-            State::WaitReady | State::WaitReactivation | State::Idle | State::Closing => {}
+            State::WaitReady | State::WaitReactivation => {
+                // m1 (§6.5): "Any FLV open … restarts both clocks", whatever
+                // the state — every open forces an IDR on every viewer. The
+                // table's "ignore" is the state transition. Nothing can be
+                // deferred here: IdrCore is idle outside NeedIdr. (Grace is
+                // re-armed by the Setup that precedes the next NeedIdr.)
+                let cancelled = self.idr.flv_opened(now);
+                debug_assert!(!cancelled, "IdrCore is idle outside NeedIdr");
+            }
+            State::Idle | State::Closing => {}
         }
     }
 
@@ -636,9 +645,10 @@ impl Pump {
             .flow
             .gates(now, a.au.burst, suspended, gfx.should_backpressure());
         if self.state == State::NeedIdr {
-            if let Some(act) = self.idr.observe_gates(now, gate.is_open()) {
-                self.push_idr(act, out);
-            }
+            // Idr-wait is sampled on ticks only (m2, m3), never here: the
+            // tick computes the gates without the burst soft-gate exemption,
+            // so a burst AU never counts as open time; and the AU that
+            // resolves NeedIdr never also requests the IDR it brings.
             if !a.au.idr {
                 self.metrics.frames_dropped.inc("awaiting_idr");
                 return;
@@ -1216,5 +1226,113 @@ mod tests {
         assert_eq!(r.pump.state(), State::NeedIdr);
         r.step(au(true, false));
         assert_eq!(r.pump.state(), State::Live);
+    }
+
+    /// Ticks every 100 ms over (from, to].
+    fn ticks(r: &mut Rig, from_ms: u64, to_ms: u64) -> Vec<Command> {
+        let mut out = Vec::new();
+        for i in from_ms / 100 + 1..=to_ms / 100 {
+            r.at(i * 100);
+            out.extend(r.step(Input::Tick));
+        }
+        out
+    }
+
+    fn requests(k: &[&str]) -> (usize, usize) {
+        (count(k, "RequestIdr"), count(k, "ReconnectFlv"))
+    }
+
+    /// m1 (§6.5: "Any FLV open … restarts both clocks"): an FLV that opens
+    /// while a resize is reactivating restarts them, so the reactivation's
+    /// Setup cause is deferred, and that FLV's own IDR cancels it. Before,
+    /// the clock still ran from the first open, and the Setup cause forced
+    /// a second IDR on every viewer 40 ms after the open's.
+    #[test]
+    fn an_flv_open_during_reactivation_restarts_the_clocks() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.ack(0, QueueDepth::Unavailable);
+        r.at(2000);
+        r.step(sps(ParamClass::Resize, P480));
+        assert_eq!(r.pump.state(), State::WaitReactivation);
+        r.at(2010);
+        assert!(
+            r.step(Input::FlvOpened {
+                origin: FlvOrigin::Transient
+            })
+            .is_empty()
+        );
+        r.at(2050);
+        let k = kinds(&r.step(Input::ReactivationComplete));
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        assert_eq!(requests(&k), (0, 0), "deferred to the open's window: {k:?}");
+        r.at(2200);
+        let out = r.step(au(true, false));
+        assert_eq!(r.pump.state(), State::Live);
+        assert!(
+            kinds(&out).contains(&"CancelIdrRequest"),
+            "{:?}",
+            kinds(&out)
+        );
+        assert_eq!(r.metrics.idr_cancelled.get(), 1);
+        r.ack(1, QueueDepth::Unavailable);
+        assert_eq!(requests(&kinds(&ticks(&mut r, 2200, 6000))), (0, 0));
+    }
+
+    /// m2: the AU that resolves NeedIdr never also requests an IDR. Here the
+    /// IDR arrives just as idr-wait crosses `idr_wait_max` (2.8 s of open
+    /// gates sampled by ticks, then 300 ms more), after the flow window: it
+    /// is sent and nothing is requested.
+    #[test]
+    fn the_idr_that_resolves_need_idr_requests_nothing() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.ack(0, QueueDepth::Unavailable);
+        r.at(10_000);
+        r.step(sps(ParamClass::Other, ES3));
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        assert_eq!(requests(&kinds(&ticks(&mut r, 10_000, 12_900))), (0, 0));
+        r.at(13_100);
+        let out = r.step(au(true, false));
+        assert_eq!(kinds(&out), ["SendDvc"]);
+        assert_eq!(r.pump.state(), State::Live);
+        r.ack(1, QueueDepth::Unavailable);
+        assert_eq!(requests(&kinds(&ticks(&mut r, 13_100, 16_000))), (0, 0));
+    }
+
+    /// m3: idr-wait counts open time only as the ticks see it, without the
+    /// burst soft-gate exemption. A live frame left unacked holds the soft
+    /// gate shut; burst P frames every 10 ms in NeedIdr must not count as
+    /// open time (they did: 40 ms of every 50, and a forced IDR at 10 s —
+    /// one the still-shut soft gate would drop).
+    #[test]
+    fn burst_aus_never_count_as_open_gate_time() {
+        let mut c = cfg();
+        c.flow.stall_timeout = Duration::from_secs(30);
+        let mut r = Rig::new(c);
+        r.live();
+        r.ack(0, QueueDepth::Unavailable);
+        assert_eq!(
+            wire(&r.step(au(false, false))).len(),
+            1,
+            "frame 1, never acked"
+        );
+        ticks(&mut r, 0, 500);
+        assert_eq!(
+            r.pump.state(),
+            State::NeedIdr,
+            "the soft gate shut at 500 ms"
+        );
+        let mut out = Vec::new();
+        for t in (510..=12_000).step_by(10) {
+            r.at(t);
+            out.extend(r.step(au(false, true)));
+            if t % 50 == 0 {
+                out.extend(r.step(Input::Tick));
+            }
+        }
+        assert_eq!(r.metrics.frames_dropped.get("awaiting_idr"), 1150);
+        assert_eq!(requests(&kinds(&out)), (0, 0), "{:?}", kinds(&out));
+        assert_eq!(r.pump.state(), State::NeedIdr);
     }
 }
