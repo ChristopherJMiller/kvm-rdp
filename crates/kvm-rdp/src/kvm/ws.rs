@@ -3,7 +3,7 @@
 //! an error before it is buffered), no write buffering.
 use crate::config::Scheme;
 use crate::kvm::endpoint::{KvmEndpoint, KvmIo};
-use crate::kvm::error::KvmError;
+use crate::kvm::error::{KvmError, result_403};
 use kvm_proto::Token;
 use std::time::Duration;
 use tokio_tungstenite::WebSocketStream;
@@ -50,9 +50,17 @@ pub async fn open_ws(
         Err(_) => Err(KvmError::Timeout("ws upgrade")),
         Ok(Ok((ws, _))) => Ok(ws),
         Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => {
-            match resp.status().as_u16() {
-                401 | 403 => Err(KvmError::Auth),
-                s => Err(KvmError::Http(s)),
+            let status = resp.status().as_u16();
+            // §6.9/§7 (I3, fix round 1): a refusal can also arrive as a
+            // non-101 body carrying `{"result":403}` rather than the
+            // status line itself. The bytes are whatever tungstenite
+            // already buffered while trying to parse the handshake head
+            // (`handshake/client.rs`'s `stage_finished`), bounded by its
+            // own `AttackCheck` (64 KiB / 512 packets) — no extra read.
+            if matches!(status, 401 | 403) || resp.body().as_deref().is_some_and(result_403) {
+                Err(KvmError::Auth)
+            } else {
+                Err(KvmError::Http(status))
             }
         }
         Ok(Err(_)) => Err(KvmError::Protocol("ws upgrade")),
@@ -72,6 +80,7 @@ mod tests {
     use crate::kvm::login::login;
     use futures_util::StreamExt as _;
     use kvm_sim::{KvmSim, SimConfig, Source};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const CT: Duration = Duration::from_secs(1);
 
@@ -105,8 +114,11 @@ mod tests {
         );
     }
 
-    /// §3.2: an oversize message closes the socket without buffering it —
-    /// kvm-sim declares 64 MiB and sends 4 KiB of it.
+    /// I2 (fix round 1): 8 KiB is over our 4 KiB cap but under
+    /// tungstenite's 16 MiB default `max_frame_size`, so this only fails
+    /// with our config applied — the original 64 MiB declaration was
+    /// already refused by tungstenite's own built-in default and proved
+    /// nothing about `open_ws` actually using `ws_config()`.
     #[tokio::test]
     async fn an_oversize_message_is_an_error_not_a_buffer() {
         let (sim, ep, token) = sim_and_token().await;
@@ -114,7 +126,7 @@ mod tests {
         sim.wait_for(CT, |_| sim.stats().ws_open == 1)
             .await
             .unwrap();
-        sim.send_ws_oversize(64 << 20);
+        sim.send_ws_oversize(8 * 1024);
         let next = tokio::time::timeout(CT, ws.next()).await.unwrap();
         assert!(matches!(next, Some(Err(_))), "{next:?}");
     }
@@ -127,5 +139,56 @@ mod tests {
             (Some(4096), Some(4096))
         );
         assert_eq!(c.write_buffer_size, 0);
+        assert_eq!(c.max_write_buffer_size, 64 * 1024);
+    }
+
+    /// I1 (fix round 1): the handshake-status arms via kvm-sim's existing
+    /// `ws_status` policy, not just the already-covered token-expiry 403.
+    #[tokio::test]
+    async fn every_ws_status_classifies_by_section_6_9() {
+        let (sim, ep, token) = sim_and_token().await;
+        for (status, want) in [
+            (401, KvmError::Auth),
+            (403, KvmError::Auth),
+            (503, KvmError::Http(503)),
+        ] {
+            sim.set_policy(|p| p.ws_status = Some(status));
+            let e = open_ws(&ep, &token, CT).await.err().unwrap();
+            assert_eq!(e, want, "status {status}");
+        }
+    }
+
+    /// I3 (fix round 1): §6.9/§7 — a refusal answered `200 {"result":403}`
+    /// (no 401/403 on the wire) is still `Auth`, not a transient
+    /// `Http(200)`. kvm-sim's handshake callback cannot shape an arbitrary
+    /// body, so this is a raw loopback stub, like `login`'s `hostile()`
+    /// rig.
+    #[tokio::test]
+    async fn a_result_403_body_on_a_200_handshake_is_auth() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut s, _)) = listener.accept().await {
+                let mut req = [0u8; 4096];
+                let _ = s.read(&mut req).await;
+                let body: &[u8] = b"{\"result\":403}";
+                let mut resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                resp.extend_from_slice(body);
+                let _ = s.write_all(&resp).await;
+            }
+        });
+        let ep = KvmEndpoint::new(
+            Scheme::Http,
+            "127.0.0.1",
+            (port, port, port),
+            &"0".repeat(64),
+        );
+        let token = kvm_proto::parse_login_token(br#"{"result":0,"token":"0.1"}"#).unwrap();
+        let e = open_ws(&ep, &token, CT).await.err().unwrap();
+        assert_eq!(e, KvmError::Auth);
     }
 }
