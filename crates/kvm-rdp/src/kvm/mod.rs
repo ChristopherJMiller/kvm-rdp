@@ -4,7 +4,9 @@
 //! function that could.
 pub mod endpoint;
 pub mod error;
+pub mod flv;
 pub mod login;
+pub mod ws;
 
 pub use endpoint::KvmEndpoint;
 pub use error::{FailClass, KvmError};
