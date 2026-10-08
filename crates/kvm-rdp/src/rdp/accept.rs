@@ -6,6 +6,7 @@
 //! must not become a log flood, and `kvm_rdp_accept_refused` already
 //! counts every one.
 use std::collections::VecDeque;
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// At most one refusal log line per interval.
@@ -65,6 +66,69 @@ impl AcceptRate {
     #[cfg(test)]
     fn held(&self) -> usize {
         self.admitted.len()
+    }
+}
+
+/// How long an admitted connection counts as handshaking without being
+/// reported finished (DC21, PC15 review m4). IronRDP reports nothing for a
+/// Preempt candidate that fails NLA or is dropped at the handoff, and does
+/// not bound a fresh connection's TLS and CredSSP, so a silent peer must not
+/// hold a renewal off for ever. A real one is done well inside this: its
+/// candidate negotiation is bounded at 10 s, the handoff and eviction graces
+/// at 0.75 s each, and the winner's finalize at 30 s.
+pub const HANDSHAKE_GRACE: Duration = Duration::from_secs(45);
+/// At most this many handshakes are tracked (the accept rate bounds them
+/// far lower; this bounds the memory whatever it is set to).
+pub const MAX_HANDSHAKES: usize = 1024;
+
+/// Connections between `on_accept` and their session's start (or their end
+/// before one): DC21's "a client is connected" counts these as well as a
+/// live generation. Each is an anonymous admission time; a finish retires
+/// the oldest (the conservative choice: the younger ones expire later).
+/// The lock is held only to push, pop or prune — never across an await,
+/// never while calling IronRDP.
+pub struct Handshakes {
+    grace: Duration,
+    admitted: Mutex<VecDeque<Instant>>,
+}
+
+impl Handshakes {
+    #[must_use]
+    pub fn new(grace: Duration) -> Handshakes {
+        Handshakes {
+            grace,
+            admitted: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// `on_accept` admitted a connection at `now`.
+    pub fn admit(&self, now: Instant) {
+        let mut q = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.len() >= MAX_HANDSHAKES {
+            q.pop_front();
+        }
+        q.push_back(now);
+    }
+
+    /// One handshake ended: its session began, or it went before one did.
+    pub fn finish(&self) {
+        self.admitted
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+    }
+
+    /// Admitted connections still handshaking at `now`.
+    #[must_use]
+    pub fn in_flight(&self, now: Instant) -> usize {
+        let mut q = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
+        while q
+            .front()
+            .is_some_and(|&t| now.saturating_duration_since(t) > self.grace)
+        {
+            q.pop_front();
+        }
+        q.len()
     }
 }
 
@@ -138,5 +202,43 @@ mod tests {
             r.admit(t0 + Duration::from_millis(i));
         }
         assert_eq!(r.held(), 5);
+    }
+
+    /// DC21 (PC15 review m4): a connection counts as handshaking from its
+    /// admission until it finishes; one never reported finished (a failed
+    /// Preempt candidate, a silent TCP peer) stops counting after the grace.
+    #[test]
+    fn handshakes_count_until_they_finish_or_the_grace_runs_out() {
+        let t0 = Instant::now();
+        let h = Handshakes::new(s(45));
+        assert_eq!(h.in_flight(t0), 0);
+        h.admit(t0);
+        h.admit(t0 + s(1));
+        assert_eq!(h.in_flight(t0 + s(2)), 2);
+        h.finish();
+        assert_eq!(h.in_flight(t0 + s(2)), 1);
+        assert_eq!(
+            h.in_flight(t0 + s(45)),
+            1,
+            "the younger one counts until its own grace"
+        );
+        assert_eq!(h.in_flight(t0 + s(47)), 0, "never finished: expired");
+        h.finish();
+        h.finish();
+        assert_eq!(h.in_flight(t0 + s(47)), 0, "finishing nothing is a no-op");
+        h.admit(t0 + s(50));
+        assert_eq!(h.in_flight(t0 + s(50)), 1, "no finish was banked");
+    }
+
+    /// The tracker's memory is capped whatever the admissions do.
+    #[test]
+    fn the_handshake_tracker_is_bounded() {
+        let t0 = Instant::now();
+        let h = Handshakes::new(s(45));
+        for _ in 0..(MAX_HANDSHAKES * 3) {
+            h.admit(t0);
+        }
+        assert_eq!(h.in_flight(t0), MAX_HANDSHAKES);
+        assert_eq!(HANDSHAKE_GRACE, s(45));
     }
 }

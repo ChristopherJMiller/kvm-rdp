@@ -10,7 +10,7 @@
 use crate::hid::{HidControl, ReleaseTrigger};
 use crate::metrics::Metrics;
 use crate::msg::{Generations, KvmCommand, RdpInput};
-use crate::rdp::accept::AcceptRate;
+use crate::rdp::accept::{AcceptRate, Handshakes};
 use crate::rdp::gfx::{GfxSlot, take_latest};
 use ironrdp_server::{ConnectionHandler, ConnectionInfo, PostConnectionAction, ServerError};
 use std::net::SocketAddr;
@@ -29,6 +29,8 @@ pub struct Lifecycle {
     pub metrics: Arc<Metrics>,
     pub to_pump: UnboundedSender<RdpInput>,
     pub to_kvm: UnboundedSender<KvmCommand>,
+    /// Connections admitted and not yet in a session or gone (DC21, m4).
+    pub handshakes: Arc<Handshakes>,
 }
 
 impl ConnectionHandler for Lifecycle {
@@ -49,6 +51,8 @@ impl ConnectionHandler for Lifecycle {
             }
             return false;
         }
+        // DC21 (m4): a client from here until its session begins or it goes.
+        self.handshakes.admit(now);
         true
     }
 
@@ -68,6 +72,10 @@ impl ConnectionHandler for Lifecycle {
             return;
         };
         let generation = self.gens.begin();
+        // After `begin`: the certificate watcher reads the handshakes first,
+        // so it never sees this client in neither (DC21, m4). An aborted
+        // connection (above) is finished by `on_disconnected` instead.
+        self.handshakes.finish();
         self.metrics.sessions.inc();
         self.hid.release_all(ReleaseTrigger::SessionStart);
         let counter = Arc::new(AtomicU64::new(0));
@@ -101,6 +109,10 @@ impl ConnectionHandler for Lifecycle {
                 error = error.is_some(),
                 "session end"
             );
+        } else {
+            // It went before a session began: NLA failed, it was aborted,
+            // or the peer left mid-handshake (DC21, m4).
+            self.handshakes.finish();
         }
         PostConnectionAction::Continue
     }
@@ -118,6 +130,7 @@ mod tests {
     use crate::msg::Cause;
     use crate::pump::rig::{census_caps, cfg};
     use crate::pump::{Command, Input, Pump, State};
+    use crate::rdp::accept::HANDSHAKE_GRACE;
     use crate::rdp::gfx::{GfxFactory, closed_channel_input};
     use ironrdp_core::encode_vec;
     use ironrdp_dvc::DvcProcessor as _;
@@ -137,9 +150,11 @@ mod tests {
         hid: Arc<HidControl>,
         gens: Arc<Generations>,
         accepting: Arc<AtomicBool>,
+        handshakes: Arc<Handshakes>,
     }
 
     fn rig(rate: u32) -> Rig {
+        let handshakes = Arc::new(Handshakes::new(HANDSHAKE_GRACE));
         let metrics = Arc::new(Metrics::default());
         let hid = Arc::new(HidControl::new(16, metrics.clone()));
         let gens = Arc::new(Generations::default());
@@ -157,6 +172,7 @@ mod tests {
             metrics: metrics.clone(),
             to_pump: ptx,
             to_kvm: ktx,
+            handshakes: handshakes.clone(),
         };
         Rig {
             h,
@@ -167,6 +183,7 @@ mod tests {
             hid,
             gens,
             accepting,
+            handshakes,
         }
     }
 
@@ -326,6 +343,52 @@ mod tests {
         r.h.on_connection_info(&info());
         assert!(r.pump.try_recv().is_err() && r.kvm.try_recv().is_err());
         assert_eq!(r.gens.current(), None);
+    }
+
+    fn in_flight(r: &Rig) -> usize {
+        r.handshakes.in_flight(Instant::now())
+    }
+
+    /// DC21 (PC15 review m4): a connection is in flight from `on_accept`
+    /// until its session begins (`on_connection_info`) or it goes before one
+    /// did (`on_disconnected` with no generation) — never counted twice.
+    #[test]
+    fn a_connection_is_in_flight_from_accept_until_its_session_or_its_end() {
+        let mut r = rig(30);
+        assert!(r.h.on_accept(peer()));
+        assert_eq!(in_flight(&r), 1, "admitted: handshaking");
+        r.factory.build_server_with_handle().unwrap();
+        r.h.on_connection_info(&info());
+        assert_eq!(in_flight(&r), 0, "its session began");
+        assert!(r.h.on_accept(peer()), "a Preempt candidate");
+        r.h.on_disconnected(peer(), Duration::from_secs(5), None);
+        assert_eq!(in_flight(&r), 1, "the session's end is not the candidate's");
+        r.h.on_disconnected(peer(), Duration::ZERO, None);
+        assert_eq!(in_flight(&r), 0, "the candidate failed NLA");
+        assert!(!rig_refusing(&mut r));
+        assert_eq!(in_flight(&r), 0, "a refused connection is never in flight");
+    }
+
+    fn rig_refusing(r: &mut Rig) -> bool {
+        r.accepting.store(false, Ordering::SeqCst);
+        let admitted = r.h.on_accept(peer());
+        r.accepting.store(true, Ordering::SeqCst);
+        admitted
+    }
+
+    /// DC13 with DC21: a connection aborted in `on_connection_info` (it
+    /// finished NLA after stop-accepting) stays in flight until IronRDP
+    /// reports its end — not counted finished twice.
+    #[test]
+    fn an_aborted_connection_is_in_flight_until_it_ends() {
+        let mut r = rig(30);
+        assert!(r.h.on_accept(peer()));
+        r.factory.build_server_with_handle().unwrap();
+        r.accepting.store(false, Ordering::SeqCst);
+        r.h.on_connection_info(&info());
+        assert_eq!(in_flight(&r), 1);
+        r.h.on_disconnected(peer(), Duration::ZERO, None);
+        assert_eq!(in_flight(&r), 0);
     }
 
     /// §4.3: the callbacks run with the GFX mutex held and never lock the

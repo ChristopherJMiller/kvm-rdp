@@ -961,6 +961,9 @@ mod tests {
             metrics: metrics.clone(),
             to_pump: rdp.clone(),
             to_kvm: ktx.clone(),
+            handshakes: Arc::new(crate::rdp::accept::Handshakes::new(
+                crate::rdp::accept::HANDSHAKE_GRACE,
+            )),
         };
         let deps = ShellDeps {
             cfg: cfg.clone(),

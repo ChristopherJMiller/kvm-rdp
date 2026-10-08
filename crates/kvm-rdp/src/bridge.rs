@@ -12,7 +12,7 @@ use crate::metrics::Metrics;
 use crate::msg::{Generations, KvmCommand, KvmEvent, RdpInput, kvm_stream_capacity};
 use crate::pump::PumpConfig;
 use crate::pump::shell::{PumpShell, ShellDeps};
-use crate::rdp::accept::AcceptRate;
+use crate::rdp::accept::{AcceptRate, HANDSHAKE_GRACE, Handshakes};
 use crate::rdp::display::{BridgeDisplay, DisplayShared};
 use crate::rdp::gfx::{GfxFactory, GfxSlot};
 use crate::rdp::handler::Lifecycle;
@@ -175,6 +175,7 @@ pub fn spawn(cfg: Config) -> Result<BridgeHandle, BridgeError> {
     let health = Arc::new(Health::new(cfg.admin.liveness_timeout));
     health.set_tls_loaded();
     let gens = Arc::new(Generations::default());
+    let handshakes = Arc::new(Handshakes::new(HANDSHAKE_GRACE));
     let hid = Arc::new(HidControl::new(cfg.input.queue, metrics.clone()));
     let display = DisplayShared::new(cfg.video.default_size);
     let accepting = Arc::new(AtomicBool::new(true));
@@ -235,6 +236,7 @@ pub fn spawn(cfg: Config) -> Result<BridgeHandle, BridgeError> {
         first_print,
         cfg.rdp.cert_poll_interval,
         gens.clone(),
+        handshakes.clone(),
         exit_tx,
     ));
 
@@ -261,6 +263,7 @@ pub fn spawn(cfg: Config) -> Result<BridgeHandle, BridgeError> {
                 metrics: metrics.clone(),
                 to_pump: to_pump.clone(),
                 to_kvm: to_kvm.clone(),
+                handshakes,
             },
             suppressed: suppressed.clone(),
             rtt: rtt.clone(),
@@ -408,16 +411,21 @@ async fn heartbeat(health: Arc<Health>, every: Duration) {
 /// the orchestrator starts it again with the new pair — but never under a
 /// live session: once the change is seen, the exit waits until no client is
 /// connected (the companion deployment spec's decision 8: an LE renewal
-/// must not cut the operator off). Polled at most every second meanwhile;
-/// a client that connects in the gap before §5.2 stops accepting is ended
-/// with cause `shutdown` like any other. `first` is the fingerprint `spawn`
-/// took before loading the pair (P7), never one taken here.
+/// must not cut the operator off). "Connected" is a live generation or a
+/// connection between `on_accept` and its session's start — a fresh
+/// client's TLS and CredSSP, a Preempt winner after the old session's end
+/// (`Handshakes`, PC15 review m4; one never reported finished stops
+/// counting after `HANDSHAKE_GRACE`). Polled at most every second
+/// meanwhile; a client admitted in the gap before §5.2 stops accepting is
+/// ended with cause `shutdown` like any other. `first` is the fingerprint
+/// `spawn` took before loading the pair (P7), never one taken here.
 async fn watch_certificate(
     cert: PathBuf,
     key: PathBuf,
     first: Option<tls::Fingerprint>,
     every: Duration,
     gens: Arc<Generations>,
+    handshakes: Arc<Handshakes>,
     exit: watch::Sender<bool>,
 ) {
     let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
@@ -431,7 +439,10 @@ async fn watch_certificate(
     let mut idle = tokio::time::interval(every.min(Duration::from_secs(1)));
     loop {
         idle.tick().await;
-        if gens.current().is_none() {
+        // Handshakes first: `on_connection_info` begins the generation
+        // before it finishes the handshake, so read in this order a client
+        // is always in one or the other (m4).
+        if handshakes.in_flight(Instant::now()) == 0 && gens.current().is_none() {
             tracing::info!("no client connected; exiting to load the new certificate");
             exit.send_replace(true);
             return;
@@ -873,6 +884,7 @@ mod tests {
             first,
             poll,
             gens.clone(),
+            idle_handshakes(),
             tx,
         ));
         renew(&cert);
@@ -889,6 +901,87 @@ mod tests {
             exited.is_ok_and(|r| r.is_ok()),
             "no exit once the session ended"
         );
+    }
+
+    fn idle_handshakes() -> Arc<Handshakes> {
+        Arc::new(Handshakes::new(HANDSHAKE_GRACE))
+    }
+
+    /// DC21 (PC15 review m4): a client mid-handshake — TLS and CredSSP, or a
+    /// Preempt winner between the old session's end and its own start — has
+    /// no generation yet, but it is a client: the exit waits for it too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_certificate_change_waits_for_a_handshake_in_flight() {
+        let d = tempfile::tempdir().unwrap();
+        let (cert, key) = pair_in(d.path());
+        let first = tls::fingerprint(&cert, &key);
+        let handshakes = idle_handshakes();
+        handshakes.admit(Instant::now()); // a client is negotiating
+        let (tx, mut rx) = watch::channel(false);
+        let poll = Duration::from_millis(100);
+        tokio::spawn(watch_certificate(
+            cert.clone(),
+            key,
+            first,
+            poll,
+            Arc::new(Generations::default()),
+            handshakes.clone(),
+            tx,
+        ));
+        renew(&cert);
+        assert!(
+            tokio::time::timeout(poll * 10, rx.wait_for(|v| *v))
+                .await
+                .is_err(),
+            "the certificate change cut a client mid-handshake"
+        );
+        handshakes.finish(); // it went (or its session began and ended)
+        let exited =
+            tokio::time::timeout(poll * 5 + Duration::from_secs(1), rx.wait_for(|v| *v)).await;
+        assert!(
+            exited.is_ok_and(|r| r.is_ok()),
+            "no exit once the handshake ended"
+        );
+    }
+
+    /// DC21 end to end on the real listener: a client that sent its X.224
+    /// request and is mid-TLS (IronRDP waits for its ClientHello) holds a
+    /// renewal's exit off; once it goes, the bridge asks to exit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_renewal_waits_for_a_client_mid_handshake() {
+        let sim = sim().await;
+        let d = tempfile::tempdir().unwrap();
+        let mut h = start(config_for(&sim, d.path(), |_| {})).await.unwrap();
+        let mut s = tokio::time::timeout(T, tokio::net::TcpStream::connect(h.rdp_addr))
+            .await
+            .unwrap()
+            .unwrap();
+        let request = ConnectionRequest {
+            nego_data: None,
+            flags: RequestFlags::empty(),
+            protocol: SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX,
+            correlation_info: None,
+        };
+        s.write_all(&ironrdp_core::encode_vec(&X224(request)).unwrap())
+            .await
+            .unwrap();
+        let mut confirm = [0u8; 19];
+        tokio::time::timeout(T, s.read_exact(&mut confirm))
+            .await
+            .expect("no Connection Confirm")
+            .unwrap();
+        renew(&d.path().join("cert.pem"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1000), h.exit_requested())
+                .await
+                .is_err(),
+            "the renewal cut a client mid-handshake (5x the 200 ms poll)"
+        );
+        drop(s); // the client goes: IronRDP's `on_disconnected`
+        tokio::time::timeout(Duration::from_secs(2), h.exit_requested())
+            .await
+            .expect("no exit once the client went");
+        stop(h).await;
     }
 
     /// P7: the baseline is the one `spawn` took before loading the pair, not
@@ -908,6 +1001,7 @@ mod tests {
             first,
             poll,
             Arc::new(Generations::default()),
+            idle_handshakes(),
             tx,
         ));
         let exited =
