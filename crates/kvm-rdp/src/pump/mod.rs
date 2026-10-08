@@ -7,6 +7,7 @@ pub mod flow;
 pub mod idr;
 #[cfg(test)]
 pub(crate) mod rig;
+pub mod shell;
 pub mod slate;
 pub mod types;
 
