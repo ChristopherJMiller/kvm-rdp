@@ -1,17 +1,26 @@
 //! The pump's async shell (§4.3). It owns no timing rule: it feeds the core
-//! — RDP-side inputs first (`biased`, DC4), then this generation's KVM
-//! events, then a 50 ms tick, sampling the suppression flag and the write
-//! counter before each tick and each AU (DC6) — one GFX lock per step, and
-//! carries out the commands. Every `ServerEvent`, `Disconnect` included, is
-//! sent only for the current generation.
+//! — RDP-side inputs first, then the 50 ms tick, then this generation's KVM
+//! events (`biased`, in that order), sampling the suppression flag and the
+//! write counter before each tick and each AU (DC6) — one GFX lock per step,
+//! and carries out the commands. Every `ServerEvent`, `Disconnect`
+//! included, is sent only for the current generation.
 //!
 //! DC4's order is decided here. `on_connection_info` pushes `SessionStart`
 //! and sends `KvmCommand::Start` on this thread, so both are queued before
 //! the shell next runs; a KVM event for the new generation can be queued
 //! by then too, and the `biased` select steps the session's start before
-//! it. Nothing here holds a lock across an await, and the GFX lock is held
-//! only inside `step` — IronRDP's GFX callbacks, which run under it, only
-//! push.
+//! it.
+//!
+//! The tick goes ahead of the KVM stream (I1). The KVM is the hostile side,
+//! and a stream that never empties must not stop the disconnect watchdog,
+//! the stall and IDR timers, the RTT probes or the suppression debounce —
+//! all tick-driven. A tick is ready at most once per `TICK`
+//! (`MissedTickBehavior::Delay`), so it cannot starve KVM events in turn.
+//! It stays behind the RDP side, so a tick never steps an ended
+//! generation's link ahead of its queued `SessionStop`.
+//!
+//! Nothing here holds a lock across an await, and the GFX lock is held only
+//! inside `step` — IronRDP's GFX callbacks, which run under it, only push.
 use crate::hid::HidControl;
 use crate::metrics::Metrics;
 use crate::msg::{Cause, Gen, Generations, KvmCommand, KvmEvent, RdpInput};
@@ -72,6 +81,8 @@ pub struct PumpShell {
     shutting_down: bool,
     /// `SHUTDOWN_WATCHDOG`; scaled down only by tests.
     shutdown_watchdog: Duration,
+    /// `TICK`; slowed down only by tests.
+    tick_every: Duration,
 }
 
 fn lock(gfx: &GfxServerHandle) -> MutexGuard<'_, GraphicsPipelineServer> {
@@ -94,6 +105,7 @@ impl PumpShell {
             waiters: Vec::new(),
             shutting_down: false,
             shutdown_watchdog: SHUTDOWN_WATCHDOG,
+            tick_every: TICK,
         }
     }
 
@@ -104,30 +116,41 @@ impl PumpShell {
         self
     }
 
-    /// Runs until `rdp` closes. The select returns at least every `TICK`;
-    /// inside an arm the only await is a burst chunk's `yield_now`.
+    /// A slower tick, so a test can place a burst between two ticks.
+    #[cfg(test)]
+    fn with_tick(mut self, every: Duration) -> PumpShell {
+        self.tick_every = every;
+        self
+    }
+
+    /// Runs until `rdp` closes. A due tick is taken within one step of its
+    /// deadline whatever the KVM stream does; only a backlog of RDP-side
+    /// inputs (IronRDP's, on this same thread) goes ahead of it. Inside an
+    /// arm the only await is a burst chunk's `yield_now`.
     pub async fn run(
         mut self,
         mut rdp: mpsc::UnboundedReceiver<RdpInput>,
         mut kvm: mpsc::Receiver<KvmEvent>,
     ) {
-        let mut tick = tokio::time::interval(TICK);
+        let mut tick = tokio::time::interval(self.tick_every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut kvm_open = true;
         loop {
             tokio::select! {
-                // DC4: a session's start is always stepped before any KVM
-                // event queued alongside it.
+                // RDP, then the tick, then KVM. DC4: a session's start (and
+                // an ended one's stop) is stepped before any tick or KVM
+                // event queued alongside it. I1: a due tick goes ahead of
+                // the KVM stream, which may never empty.
                 biased;
                 input = rdp.recv() => match input {
                     Some(i) => self.rdp_input(i).await,
                     None => return,
                 },
+                _ = tick.tick() => self.tick().await,
                 ev = kvm.recv(), if kvm_open => match ev {
                     Some(e) => self.kvm_event(e).await,
                     None => kvm_open = false,
                 },
-                _ = tick.tick() => self.tick().await,
             }
         }
     }
@@ -586,11 +609,11 @@ mod tests {
     /// fixture's size: no resize), no slate, RTT probes off unless `set`
     /// turns them on, and a GFX server the test plays the client for.
     fn shell(set: impl FnOnce(&mut PumpConfig)) -> T {
-        spawn(set, None)
+        spawn(set, |s| s)
     }
 
-    /// `shell`, with the shutdown watchdog scaled down if `shutdown` says.
-    fn spawn(set: impl FnOnce(&mut PumpConfig), shutdown: Option<Duration>) -> T {
+    /// `shell`, with its test seams (shutdown watchdog, tick) set by `seams`.
+    fn spawn(set: impl FnOnce(&mut PumpConfig), seams: impl FnOnce(PumpShell) -> PumpShell) -> T {
         let mut cfg = rig::cfg();
         cfg.rtt_probe_interval = Duration::from_secs(3600);
         set(&mut cfg);
@@ -614,13 +637,12 @@ mod tests {
             to_kvm: ktx,
         };
         let pump = Pump::with_slate(cfg, metrics.clone(), None);
-        let mut shell = PumpShell::with_pump(deps, pump);
-        // DC13: every shell closes at shutdown with the 2 s watchdog.
+        let shell = PumpShell::with_pump(deps, pump);
+        // DC13 and DC6: every shell closes at shutdown with the 2 s
+        // watchdog and ticks every 50 ms; only these seams change that.
         assert_eq!(shell.shutdown_watchdog, SHUTDOWN_WATCHDOG);
-        if let Some(d) = shutdown {
-            shell = shell.with_shutdown_watchdog(d);
-        }
-        tokio::task::spawn_local(shell.run(rdp_rx, kvm_rx));
+        assert_eq!(shell.tick_every, TICK);
+        tokio::task::spawn_local(seams(shell).run(rdp_rx, kvm_rx));
         let gfx: GfxServerHandle =
             Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(Null))));
         gfx.lock().unwrap().start(CHAN).unwrap();
@@ -692,6 +714,30 @@ mod tests {
             first_idr(&self.kvm, generation).await;
         }
 
+        /// `first_idr` and then `burst` burst AUs, queued without an await,
+        /// so that a shell not yet polled finds them all at once.
+        fn queue_first_idr_and_burst(&self, generation: Gen, burst: usize) {
+            let send = |ev| self.kvm.try_send(ev).unwrap();
+            send(KvmEvent::FlvOpened {
+                generation,
+                origin: FlvOrigin::First,
+            });
+            let Input::SpsChanged { class, params } = rig::sps(ParamClass::Initial, ES3) else {
+                unreachable!()
+            };
+            send(KvmEvent::SpsChanged {
+                generation,
+                class,
+                params,
+            });
+            for idr in std::iter::once(true).chain(std::iter::repeat_n(false, burst)) {
+                let Input::Au(au) = rig::au(idr, !idr) else {
+                    unreachable!()
+                };
+                send(KvmEvent::Au { generation, au });
+            }
+        }
+
         /// The client acknowledges `frame_id`: IronRDP first, then the
         /// callback's push (as `GfxCallbacks::on_frame_ack` would).
         fn ack(&self, frame_id: u32) {
@@ -720,6 +766,120 @@ mod tests {
             }) => Some((c, *w)),
             _ => None,
         }
+    }
+
+    /// A KVM side that never lets the stream empty, as a fast KVM actor's
+    /// `try_send` of every AU does: another thread offers AUs for
+    /// `generation` until dropped (bounded: 10 s, or the shell gone).
+    struct Flood {
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Flood {
+        fn start(kvm: &mpsc::Sender<KvmEvent>, generation: Gen) -> Flood {
+            let (tx, stop) = (kvm.clone(), Arc::new(AtomicBool::new(false)));
+            let halt = stop.clone();
+            let Input::Au(au) = rig::au(false, false) else {
+                unreachable!()
+            };
+            let thread = std::thread::spawn(move || {
+                let t0 = Instant::now();
+                while !halt.load(Ordering::Relaxed) && t0.elapsed() < Duration::from_secs(10) {
+                    let ev = KvmEvent::Au {
+                        generation,
+                        au: au.clone(),
+                    };
+                    match tx.try_send(ev) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
+                }
+            });
+            Flood {
+                stop,
+                thread: Some(thread),
+            }
+        }
+    }
+
+    impl Drop for Flood {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// I1: a KVM stream that never empties (the hostile side, §3.2) cannot
+    /// hold off the ticks: the disconnect watchdog of a Closing session
+    /// still fires on time, within 5× and not before 0.5×, while AUs keep
+    /// arriving.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_kvm_flood_cannot_hold_off_the_disconnect_watchdog() {
+        LocalSet::new()
+            .run_until(async {
+                let wd = Duration::from_millis(300);
+                let mut t = shell(|c| c.disconnect_watchdog = wd);
+                let generation = t.start();
+                t.event().await; // the Setup
+                assert!(matches!(t.cmd().await, KvmCommand::OpenFlv { .. }));
+                let t0 = Instant::now();
+                t.kvm
+                    .send(KvmEvent::UpstreamFatal {
+                        generation,
+                        cause: Cause::StreamCorrupt,
+                    })
+                    .await
+                    .unwrap();
+                assert!(matches!(t.event().await, ServerEvent::Disconnect(_)));
+                let flood = Flood::start(&t.kvm, generation);
+                let stop = tokio::time::timeout(wd * 5, t.cmds.recv()).await;
+                let took = t0.elapsed();
+                drop(flood);
+                let stop = stop
+                    .expect("the KVM flood held the disconnect watchdog off")
+                    .unwrap();
+                assert!(
+                    matches!(stop, KvmCommand::Stop { generation: g, done: None } if g == generation),
+                    "{stop:?}"
+                );
+                assert!(took >= wd / 2, "{took:?}");
+                assert!(t.metrics.frames_dropped.get("closing") > 0, "no flood");
+            })
+            .await;
+    }
+
+    /// I1: under the same flood a Live session keeps its RTT probes — and
+    /// with them every other tick-driven timer (stall, IDR, debounce): at
+    /// least one per 5× the probe interval.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rtt_probes_keep_flowing_under_a_kvm_flood() {
+        LocalSet::new()
+            .run_until(async {
+                let interval = Duration::from_millis(100);
+                let mut t = shell(|c| c.rtt_probe_interval = interval);
+                let generation = t.start();
+                t.event().await; // the Setup
+                t.first_idr(generation).await;
+                until("the first IDR", || t.metrics.frames_sent.get() == 1).await;
+                let flood = Flood::start(&t.kvm, generation);
+                let window = interval * 10;
+                let t0 = Instant::now();
+                let mut probes = 0;
+                while let Ok(Some(ev)) =
+                    tokio::time::timeout(window.saturating_sub(t0.elapsed()), t.events.recv()).await
+                {
+                    probes += usize::from(matches!(ev, ServerEvent::AutoDetectRttRequest));
+                }
+                drop(flood);
+                assert!(
+                    probes >= 2,
+                    "{probes} RTT probes in {window:?} under a KVM flood"
+                );
+            })
+            .await;
     }
 
     /// The bridge's wiring around the shell, as Task 5.4 assembles it:
@@ -1081,7 +1241,10 @@ mod tests {
         LocalSet::new()
             .run_until(async {
                 let wd = Duration::from_millis(300);
-                let mut t = spawn(|c| c.disconnect_watchdog = Duration::from_secs(30), Some(wd));
+                let mut t = spawn(
+                    |c| c.disconnect_watchdog = Duration::from_secs(30),
+                    |s| s.with_shutdown_watchdog(wd),
+                );
                 let generation = t.start();
                 t.event().await;
                 assert!(matches!(t.cmd().await, KvmCommand::OpenFlv { .. }));
@@ -1189,23 +1352,24 @@ mod tests {
     /// §6.5 through the shell: burst AUs leave in chunks of `burst_chunk`
     /// (8), one `ServerEvent` each. The shell steps `Suppress` and `Backlog`
     /// before every AU (DC6); those samples must not split a chunk.
+    ///
+    /// A tick does flush a partial chunk (the last 4 leave at one), and
+    /// since I1 a due tick goes ahead of queued AUs; so the burst is queued
+    /// before the shell first runs — it runs right after its first,
+    /// immediate tick — and the tick is slowed to 250 ms, leaving no tick
+    /// inside the burst.
     #[tokio::test(flavor = "current_thread")]
     async fn burst_aus_leave_in_chunks_of_burst_chunk() {
         LocalSet::new()
             .run_until(async {
-                let mut t = shell(|_| {});
+                let tick = Duration::from_millis(250);
+                let mut t = spawn(|_| {}, |s| s.with_tick(tick));
                 let generation = t.start();
-                t.event().await; // the Setup
-                t.first_idr(generation).await;
+                t.queue_first_idr_and_burst(generation, 20);
+                assert!(egfx(&t.event().await).is_some(), "the Setup");
                 assert!(egfx(&t.event().await).is_some(), "the IDR");
-                for _ in 0..20 {
-                    let Input::Au(au) = rig::au(false, true) else {
-                        unreachable!()
-                    };
-                    t.kvm.send(KvmEvent::Au { generation, au }).await.unwrap();
-                }
                 let mut events = 0;
-                while !t.quiet(Duration::from_millis(300)).await {
+                while !t.quiet(tick * 2).await {
                     events += 1;
                 }
                 assert_eq!(
