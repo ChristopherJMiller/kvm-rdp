@@ -232,6 +232,9 @@ pub enum RdpInput {
     /// Test hook: block the RDP runtime (L2 `/livez`).
     #[doc(hidden)]
     Stall(Duration),
+    /// Test hook (PC15 review m5): the pump shell panics, as a bug would.
+    #[cfg(test)]
+    InjectedPanic,
 }
 
 impl std::fmt::Debug for RdpInput {
@@ -246,6 +249,8 @@ impl std::fmt::Debug for RdpInput {
             RdpInput::Updates => "Updates",
             RdpInput::Shutdown { .. } => "Shutdown",
             RdpInput::Stall(_) => "Stall",
+            #[cfg(test)]
+            RdpInput::InjectedPanic => "InjectedPanic",
         };
         f.write_str(name)
     }

@@ -140,7 +140,12 @@ struct RdpParts {
     kvm_events: mpsc::Receiver<KvmEvent>,
     health: Arc<Health>,
     beat: Duration,
+    /// The KVM runtime's essential tasks (m5); the shell joins them.
+    essential: Essential,
 }
+
+/// The tasks the bridge cannot work without (PC15 review m5), by name.
+type Essential = Vec<(&'static str, tokio::task::JoinHandle<()>)>;
 
 type Ready = Result<(SocketAddr, mpsc::UnboundedSender<ServerEvent>), BridgeError>;
 
@@ -215,12 +220,12 @@ pub fn spawn(cfg: Config) -> Result<BridgeHandle, BridgeError> {
             return Err(BridgeError::AdminBind(e.kind()));
         }
     };
-    kvm_rt.spawn(admin::serve(
+    let admin_task = kvm_rt.spawn(admin::serve(
         admin_listener,
         health.clone(),
         metrics.clone(),
     ));
-    kvm_rt.spawn(session::run_actor(
+    let actor_task = kvm_rt.spawn(session::run_actor(
         kvm_cmds,
         KvmDeps {
             ep: Arc::new(KvmEndpoint::from_config(&cfg.kvm)),
@@ -230,7 +235,7 @@ pub fn spawn(cfg: Config) -> Result<BridgeHandle, BridgeError> {
             metrics: metrics.clone(),
         },
     ));
-    kvm_rt.spawn(watch_certificate(
+    let watcher_task = kvm_rt.spawn(watch_certificate(
         cfg.rdp.tls_cert_file.clone(),
         cfg.rdp.tls_key_file.clone(),
         first_print,
@@ -281,6 +286,11 @@ pub fn spawn(cfg: Config) -> Result<BridgeHandle, BridgeError> {
         rdp_inputs,
         kvm_events,
         health: health.clone(),
+        essential: vec![
+            ("KVM actor", actor_task),
+            ("admin listener", admin_task),
+            ("certificate watcher", watcher_task),
+        ],
         beat: (cfg.admin.liveness_timeout / 4)
             .clamp(Duration::from_millis(10), Duration::from_secs(1)),
     };
@@ -350,6 +360,7 @@ fn rdp_main(p: RdpParts, ready: std::sync::mpsc::Sender<Ready>, done: watch::Sen
             kvm_events,
             health,
             beat,
+            mut essential,
         } = p;
         let mut server = server::build(parts);
         let events = server.event_sender().clone();
@@ -364,9 +375,10 @@ fn rdp_main(p: RdpParts, ready: std::sync::mpsc::Sender<Ready>, done: watch::Sen
             rtt: shell.rtt,
             to_kvm: shell.to_kvm,
         };
-        tokio::task::spawn_local(PumpShell::new(deps).run(rdp_inputs, kvm_events));
+        let shell = tokio::task::spawn_local(PumpShell::new(deps).run(rdp_inputs, kvm_events));
+        essential.push(("pump shell", shell));
         tokio::task::spawn_local(heartbeat(health, beat));
-        let run =
+        let mut run =
             tokio::task::spawn_local(
                 async move { server.run().await.map_err(|e| format!("{e:#}")) },
             );
@@ -389,13 +401,50 @@ fn rdp_main(p: RdpParts, ready: std::sync::mpsc::Sender<Ready>, done: watch::Sen
                 return;
             }
         }
-        match run.await {
-            Ok(Ok(())) => tracing::info!("RDP server stopped"),
-            Ok(Err(e)) => tracing::error!(error = %e, "RDP server failed"),
-            Err(_) => tracing::error!("RDP server task failed"),
+        // m5: a panicked essential task stops the server in every build —
+        // release's `panic = "abort"` exits on its own, a debug build would
+        // otherwise keep serving NLA with no pump or no KVM side behind it.
+        let ended = tokio::select! {
+            r = &mut run => Some(r),
+            task = first_panic(essential) => {
+                tracing::error!(task, "a task the bridge needs panicked; stopping the RDP server");
+                None
+            }
+        };
+        match ended {
+            Some(Ok(Ok(()))) => tracing::info!("RDP server stopped"),
+            Some(Ok(Err(e))) => tracing::error!(error = %e, "RDP server failed"),
+            Some(Err(_)) => tracing::error!("RDP server task failed"),
+            None => {
+                // Dropped before `done`: the listener is closed by then.
+                run.abort();
+                let _ = run.await;
+            }
         }
         done.send_replace(true);
     });
+}
+
+/// Resolves with the name of the first essential task that panicked. A
+/// normal end is not a death — the KVM actor returns at §5.2 step 4, the
+/// certificate watcher after asking for an exit — nor is a cancellation
+/// (its runtime shutting down): those are waited past, and with none left
+/// this never resolves.
+async fn first_panic(tasks: Essential) -> &'static str {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    for (name, task) in tasks {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if task.await.is_err_and(|e| e.is_panic()) {
+                let _ = tx.send(name);
+            }
+        });
+    }
+    drop(tx);
+    match rx.recv().await {
+        Some(name) => name,
+        None => std::future::pending().await,
+    }
 }
 
 /// §4.5: the RDP runtime's heartbeat for `/livez`.
@@ -1487,6 +1536,64 @@ mod tests {
         assert_eq!(held.lock().unwrap().len(), 2, "FlushHid and Shutdown only");
         assert!(KVM_CLOSE_WAIT > crate::kvm::session::STOP_BOUND);
         assert!(DISCONNECT_WAIT > crate::pump::shell::SHUTDOWN_WATCHDOG + crate::pump::shell::TICK);
+    }
+
+    /// m5: of the essential tasks, only a panic is a death. The KVM actor
+    /// returns normally at §5.2 step 4, the certificate watcher after asking
+    /// for an exit, and a runtime shutting down cancels them — none of those
+    /// may stop the server early.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_panicked_essential_task_is_a_death() {
+        let ends = tokio::spawn(async {});
+        let cancelled = tokio::spawn(std::future::pending::<()>());
+        cancelled.abort();
+        let quiet: Essential = vec![("ends", ends), ("cancelled", cancelled)];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), first_panic(quiet))
+                .await
+                .is_err(),
+            "a normal end or a cancellation was read as a death"
+        );
+        let lives = tokio::spawn(std::future::pending::<()>());
+        let dies = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            panic!("injected");
+        });
+        let tasks: Essential = vec![("lives", lives), ("dies", dies)];
+        assert_eq!(
+            tokio::time::timeout(T, first_panic(tasks)).await.unwrap(),
+            "dies"
+        );
+    }
+
+    /// PC15 review m5: a task the bridge cannot work without panicking —
+    /// here the pump shell — stops the bridge in every build, not only under
+    /// release's `panic = "abort"`: the RDP server stops and its listener
+    /// closes rather than serving NLA with no pump behind it, and the
+    /// binary's loop ends `ServerStopped`, exit 1.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_pump_shell_stops_the_bridge() {
+        let sim = sim().await;
+        let d = tempfile::tempdir().unwrap();
+        let h = start(config_for(&sim, d.path(), |_| {})).await.unwrap();
+        h.ctl.to_pump.send(RdpInput::InjectedPanic).unwrap();
+        let mut done = h.ctl.rdp_done.clone();
+        tokio::time::timeout(T, done.wait_for(|v| *v))
+            .await
+            .expect("the bridge kept serving without its pump")
+            .unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(h.rdp_addr).await.is_err(),
+            "the RDP listener is still open"
+        );
+        let why = tokio::time::timeout(
+            T,
+            wait_for_exit(None, None, h.exit.clone(), h.ctl.rdp_done.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!((why, why.code()), (Exit::ServerStopped, 1));
+        stop(h).await;
     }
 
     /// I2 (PC15 review): the binary's exits besides a signal. A certificate

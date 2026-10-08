@@ -326,6 +326,10 @@ impl PumpShell {
             }
             // Test hook (L2 `/livez`): block this runtime's thread.
             RdpInput::Stall(d) => std::thread::sleep(d.min(MAX_STALL)),
+            // Test hook (PC15 review m5): a bug in the shell.
+            #[cfg(test)]
+            #[allow(clippy::panic)]
+            RdpInput::InjectedPanic => panic!("injected: the pump shell panics"),
         }
     }
 
