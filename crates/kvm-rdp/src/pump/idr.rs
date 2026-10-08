@@ -197,14 +197,20 @@ mod tests {
     use crate::config::IdrPolicy;
 
     fn core(policy: IdrPolicy) -> (IdrCore, impl Fn(u64) -> Instant) {
+        core_with(move |c| c.policy = policy)
+    }
+
+    /// The defaults (`side`, 1 s / 3 s / 1 s / 10 s), then `tweak`.
+    fn core_with(tweak: impl FnOnce(&mut IdrConfig)) -> (IdrCore, impl Fn(u64) -> Instant) {
         let t0 = Instant::now();
-        let cfg = IdrConfig {
-            policy,
+        let mut cfg = IdrConfig {
+            policy: IdrPolicy::Side,
             side_timeout: Duration::from_secs(1),
             wait_max: Duration::from_secs(3),
             interval_setup: Duration::from_secs(1),
             interval_flow: Duration::from_secs(10),
         };
+        tweak(&mut cfg);
         (IdrCore::new(cfg), move |ms| t0 + Duration::from_millis(ms))
     }
 
@@ -374,6 +380,42 @@ mod tests {
                 (3000, IdrAction::RequestIdr),
                 (13_000, IdrAction::FallbackReconnect),
                 (23_000, IdrAction::RequestIdr)
+            ]
+        );
+    }
+
+    /// m4(a): `idr_side_timeout` is its own knob. At 2 s, above the 1 s
+    /// setup window, the fallback lands 2 s after its request, not at the
+    /// window's end.
+    #[test]
+    fn a_side_timeout_longer_than_the_setup_window_times_the_fallback() {
+        let (mut c, at) = core_with(|c| c.side_timeout = Duration::from_secs(2));
+        assert_eq!(c.setup_cause(at(0)), Some(IdrAction::RequestIdr));
+        assert_eq!(
+            ticks(&mut c, &at, 0, 6000),
+            [(2000, IdrAction::FallbackReconnect)]
+        );
+    }
+
+    /// m4(b): a deferred request is replaced only by one that fires earlier.
+    /// With `idr_wait_max` (0.5 s) below the setup window, a flow request is
+    /// deferred to the flow window's end (10 s). A Setup cause inside the
+    /// setup window then takes the slot and fires at 1 s, not 10 s; the
+    /// flow request it replaced is served by that IDR, so nothing else
+    /// follows but the Setup request's own fallback.
+    #[test]
+    fn a_setup_cause_replaces_a_later_ending_deferred_flow_request() {
+        let (mut c, at) = core_with(|c| c.wait_max = Duration::from_millis(500));
+        assert!(!c.flv_opened(at(0)));
+        c.flow_cause(at(0));
+        assert_eq!(c.observe_gates(at(0), true), None);
+        assert_eq!(c.observe_gates(at(500), true), None, "deferred to 10 s");
+        assert_eq!(c.setup_cause(at(700)), None, "deferred to 1 s");
+        assert_eq!(
+            ticks(&mut c, &at, 700, 12_000),
+            [
+                (1000, IdrAction::RequestIdr),
+                (2000, IdrAction::FallbackReconnect)
             ]
         );
     }

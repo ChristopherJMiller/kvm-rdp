@@ -908,9 +908,14 @@ mod tests {
         );
         let mut out = r.step(sps(ParamClass::Other, ES3));
         assert_eq!(r.pump.state(), State::NeedIdr);
+        let mut requested_at = Vec::new();
         for i in 1..=105 {
             r.at(i * 100);
-            out.extend(r.step(Input::Tick));
+            let step = r.step(Input::Tick);
+            if kinds(&step).contains(&"RequestIdr") {
+                requested_at.push(i * 100);
+            }
+            out.extend(step);
         }
         let k = kinds(&out);
         assert!(!k.contains(&"ReconnectFlv"), "{k:?}");
@@ -919,6 +924,9 @@ mod tests {
             1,
             "deferred to the flow window's end"
         );
+        // m4(c): idr-wait is satisfied at 3.1 s, but the request waits for
+        // the flow window the first FLV open started at 0.
+        assert_eq!(requested_at, [10_000], "at the flow window's end");
     }
 
     /// §6.6: `send_avc420_frame` returning `None` is a flow cause and a metric.
