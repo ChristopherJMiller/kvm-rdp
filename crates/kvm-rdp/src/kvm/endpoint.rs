@@ -73,18 +73,51 @@ impl KvmEndpoint {
 
     /// TCP (+ pinned TLS) to `port`, bounded by `timeout`.
     pub async fn connect(&self, port: u16, timeout: Duration) -> Result<KvmIo, KvmError> {
-        match tokio::time::timeout(timeout, self.connect_inner(port)).await {
-            Ok(r) => r,
+        match tokio::time::timeout(timeout, self.connect_inner(port, false)).await {
+            Ok(r) => r.map(|(io, _)| io),
             Err(_) => Err(KvmError::Timeout("connect")),
         }
     }
 
-    async fn connect_inner(&self, port: u16) -> Result<KvmIo, KvmError> {
+    /// `connect`, plus a second handle on the connection's socket, so its
+    /// owner can end it with a reset (`SocketHandle::reset_on_close`).
+    pub async fn connect_resettable(
+        &self,
+        port: u16,
+        timeout: Duration,
+    ) -> Result<(KvmIo, SocketHandle), KvmError> {
+        match tokio::time::timeout(timeout, self.connect_inner(port, true)).await {
+            Ok(Ok((io, Some(h)))) => Ok((io, h)),
+            Ok(Ok((_, None))) => Err(KvmError::Protocol("socket handle")),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(KvmError::Timeout("connect")),
+        }
+    }
+
+    async fn connect_inner(
+        &self,
+        port: u16,
+        handle: bool,
+    ) -> Result<(KvmIo, Option<SocketHandle>), KvmError> {
         let tcp = TcpStream::connect((self.host.as_str(), port))
             .await
             .map_err(|e| KvmError::Connect(e.kind()))?;
         tcp.set_nodelay(true)
             .map_err(|e| KvmError::Connect(e.kind()))?;
+        let handle = if handle {
+            let dup = socket2::SockRef::from(&tcp)
+                .try_clone()
+                .map_err(|e| KvmError::Connect(e.kind()))?;
+            Some(SocketHandle(dup))
+        } else {
+            None
+        };
+        let io = self.secure(tcp).await?;
+        Ok((io, handle))
+    }
+
+    /// Pinned TLS over `tcp` for `https`; `tcp` itself for `http`.
+    async fn secure(&self, tcp: TcpStream) -> Result<KvmIo, KvmError> {
         match self.scheme {
             Scheme::Http => Ok(Box::new(tcp)),
             Scheme::Https => {
@@ -108,6 +141,21 @@ impl KvmEndpoint {
                 }
             }
         }
+    }
+}
+
+/// A second handle on a connection's socket (a duplicated descriptor; I2,
+/// PC9 fix round 1). Dropping it does nothing to the connection, but it
+/// keeps the socket open while it lives: hold it no longer than the
+/// connection.
+pub struct SocketHandle(socket2::Socket);
+
+impl SocketHandle {
+    /// End the connection with a reset (`SO_LINGER` 0 → RST) once its last
+    /// handle closes: whatever the kernel has not yet sent is discarded,
+    /// never delivered late.
+    pub fn reset_on_close(&self) {
+        let _ = self.0.set_linger(Some(Duration::ZERO));
     }
 }
 

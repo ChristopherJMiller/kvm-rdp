@@ -2,7 +2,7 @@
 //! the token cookie, 4 KiB message and frame limits (an oversize message is
 //! an error before it is buffered), no write buffering.
 use crate::config::Scheme;
-use crate::kvm::endpoint::{KvmEndpoint, KvmIo};
+use crate::kvm::endpoint::{KvmEndpoint, KvmIo, SocketHandle};
 use crate::kvm::error::{KvmError, result_403};
 use kvm_proto::Token;
 use std::time::Duration;
@@ -25,12 +25,16 @@ pub fn ws_config() -> WebSocketConfig {
     }
 }
 
+/// The websocket, and a second handle on its socket so the HID writer can end
+/// it with a reset when its writes may not all have been read (I2).
 pub async fn open_ws(
     ep: &KvmEndpoint,
     token: &Token,
     connect_timeout: Duration,
-) -> Result<KvmWs, KvmError> {
-    let io = ep.connect(ep.control_port, connect_timeout).await?;
+) -> Result<(KvmWs, SocketHandle), KvmError> {
+    let (io, sock) = ep
+        .connect_resettable(ep.control_port, connect_timeout)
+        .await?;
     let scheme = match ep.scheme {
         Scheme::Https => "wss",
         Scheme::Http => "ws",
@@ -48,7 +52,7 @@ pub async fn open_ws(
     .await
     {
         Err(_) => Err(KvmError::Timeout("ws upgrade")),
-        Ok(Ok((ws, _))) => Ok(ws),
+        Ok(Ok((ws, _))) => Ok((ws, sock)),
         Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => {
             let status = resp.status().as_u16();
             // §6.9/§7 (I3, fix round 1): a refusal can also arrive as a
@@ -122,7 +126,7 @@ mod tests {
     #[tokio::test]
     async fn an_oversize_message_is_an_error_not_a_buffer() {
         let (sim, ep, token) = sim_and_token().await;
-        let mut ws = open_ws(&ep, &token, CT).await.unwrap();
+        let (mut ws, _sock) = open_ws(&ep, &token, CT).await.unwrap();
         sim.wait_for(CT, |_| sim.stats().ws_open == 1)
             .await
             .unwrap();

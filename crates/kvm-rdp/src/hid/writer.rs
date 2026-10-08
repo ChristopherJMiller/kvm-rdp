@@ -14,8 +14,17 @@
 //! the websocket and drops it at once is retried at `kvm.backoff.initial`,
 //! by the spec's rule, while one whose session-start writes fail keeps
 //! backing off.
+//!
+//! A websocket ends with a FIN only after a close the KVM answered — it read
+//! everything up to our close frame. Every other end (a failed or blocked
+//! write, a lost read side, a close it never answered, the task aborted)
+//! resets the connection (`SO_LINGER` 0), so a backlog of HID reports it had
+//! not read is discarded with the connection rather than delivered after
+//! the next websocket's session-start sequence (§7.4; PC9 fix round 1, I2).
+//! What already sits in the KVM's own receive buffer it may still read: the
+//! re-assert after a reconnect settles is Plan D's (§7.4, §9.3).
 use crate::hid::{HidControl, ReleaseTrigger};
-use crate::kvm::endpoint::KvmEndpoint;
+use crate::kvm::endpoint::{KvmEndpoint, SocketHandle};
 use crate::kvm::error::FailClass;
 use crate::kvm::upstream::Backoff;
 use crate::kvm::ws::open_ws;
@@ -70,10 +79,31 @@ pub struct WsTask {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Exit {
-    /// `WsCtl::Close` (or the session went away): end the task.
+    /// `WsCtl::Close`, answered by the KVM within `CLOSE_BUDGET`: end the
+    /// task; the connection ends with a FIN.
     Closed,
+    /// Told to close (or the session went away), but the KVM never answered
+    /// the close: end the task; the connection is reset (I2).
+    Abandoned,
     /// The websocket failed: reconnect.
     Failed,
+}
+
+/// Resets the websocket's connection when dropped unless the KVM answered
+/// our close (I2). It lives in `run` beside the open websocket, so an abort
+/// of the task — a Stop whose `Close` a blocked write never read — drops it
+/// too.
+struct ResetUnlessAnswered {
+    sock: SocketHandle,
+    answered: bool,
+}
+
+impl Drop for ResetUnlessAnswered {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.sock.reset_on_close();
+        }
+    }
 }
 
 impl WsTask {
@@ -110,10 +140,20 @@ impl WsTask {
                 }
             };
             match opened {
-                Ok(ws) => {
+                Ok((ws, sock)) => {
+                    // Dropped with this arm — or with the task, if it is
+                    // aborted mid-write — it resets the connection unless
+                    // the KVM answered our close (I2).
+                    let mut reset = ResetUnlessAnswered {
+                        sock,
+                        answered: false,
+                    };
                     let _ = self.events.send(WsEvent::Up { seq });
                     let (sink, stream) = ws.split();
-                    if self.drive(sink, stream).await == Exit::Closed {
+                    let exit = self.drive(sink, stream).await;
+                    reset.answered = exit == Exit::Closed;
+                    drop(reset);
+                    if exit != Exit::Failed {
                         return;
                     }
                     // P21: `drive` counted the loss under its one reason
@@ -251,26 +291,43 @@ impl WsTask {
                         }
                     }
                     Some(WsCtl::Close { done }) => {
+                        let mut answered = false;
                         let _ = tokio::time::timeout(CLOSE_BUDGET, async {
+                            let mut written = true;
                             if self.hid.take_release() {
                                 for f in self.hid.release_frames() {
                                     // PC7 m1: the task ends either way — a
                                     // failure here is not a reconnect.
                                     if !self.send_frame(&mut sink, f).await {
+                                        written = false;
                                         break;
                                     }
                                 }
                             }
-                            let _ = sink.close().await;
+                            let closed = sink.close().await.is_ok();
+                            let sent = written && closed;
                             // Wait for the KVM's side of the close, so the
-                            // next session's websocket never overlaps this one.
-                            while let Some(Ok(_)) = stream.next().await {}
+                            // next session's websocket never overlaps this
+                            // one. Its close frame, or its end of the stream,
+                            // means it read everything up to ours (I2).
+                            loop {
+                                match stream.next().await {
+                                    Some(Ok(Message::Close(_))) => answered = sent,
+                                    Some(Ok(_)) => {}
+                                    Some(Err(_)) | None => {
+                                        answered = sent;
+                                        break;
+                                    }
+                                }
+                            }
                         })
                         .await;
                         let _ = done.send(());
-                        return Exit::Closed;
+                        // Answered: a FIN delivers nothing late. Otherwise
+                        // the connection is reset (I2).
+                        return if answered { Exit::Closed } else { Exit::Abandoned };
                     }
-                    None => return Exit::Closed,
+                    None => return Exit::Abandoned,
                 },
                 () = self.hid.wait() => {}
                 msg = stream.next() => match msg {
@@ -567,7 +624,8 @@ mod tests {
         hid.push(kbd(5), false);
         wait_sent(&sink, 3).await;
         close(&ctl).await;
-        assert_eq!(ended(drive).await, Exit::Closed);
+        // The stub never answers the close: reset, not FIN (I2).
+        assert_eq!(ended(drive).await, Exit::Abandoned);
         assert_eq!(
             sink.sent(),
             [SET_MODE.to_vec(), KBD_ZERO.to_vec(), kbd(5).to_vec()]
@@ -595,7 +653,8 @@ mod tests {
         sink.set(true);
         wait_sent(&sink, 5).await;
         close(&ctl).await;
-        assert_eq!(ended(drive).await, Exit::Closed);
+        // The stub never answers the close: reset, not FIN (I2).
+        assert_eq!(ended(drive).await, Exit::Abandoned);
         let sent = sink.sent();
         assert_eq!(
             sent[2..],
@@ -666,7 +725,8 @@ mod tests {
         wait_sent(&sink, 3).await;
         hid.release_all(ReleaseTrigger::SessionEnd);
         close(&ctl).await;
-        assert_eq!(ended(drive).await, Exit::Closed);
+        // The stub never answers the close: reset, not FIN (I2).
+        assert_eq!(ended(drive).await, Exit::Abandoned);
         assert_eq!(sink.sent().last().unwrap(), &KBD_ZERO.to_vec());
     }
 
@@ -980,8 +1040,205 @@ mod tests {
         hid.release_all(ReleaseTrigger::SessionEnd);
         sink.fail();
         close(&ctl).await;
-        assert_eq!(ended(drive).await, Exit::Closed);
+        // A failed release write and an unanswered close: reset (I2).
+        assert_eq!(ended(drive).await, Exit::Abandoned);
         assert_eq!(sink.sent().len(), 2, "the dead socket took a frame");
         assert_eq!(hid.metrics.upstream_reconnects.total(), 0);
+    }
+
+    /// How the bridge ended a connection, as its peer reads it.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Ending {
+        /// EOF after the bytes: a FIN, so everything sent was delivered.
+        Fin,
+        /// ECONNRESET: a reset — what the bridge had not sent is gone.
+        Reset,
+        Other(std::io::ErrorKind),
+    }
+
+    /// One loopback websocket peer (plain `ws`) with a 4 KiB receive
+    /// buffer. `reading`: it reads every message and answers a close.
+    /// Otherwise it reads nothing — the bridge's writes back up and block —
+    /// until `drain` fires. Then it reads the raw connection to its end and
+    /// reports how the bridge ended it. Later connections are held open.
+    struct Peer {
+        port: u16,
+        drain: Option<oneshot::Sender<()>>,
+        ending: oneshot::Receiver<Ending>,
+    }
+
+    impl Peer {
+        async fn start(reading: bool) -> Peer {
+            use tokio::io::AsyncReadExt as _;
+            let sock = tokio::net::TcpSocket::new_v4().unwrap();
+            sock.set_recv_buffer_size(4096).unwrap();
+            sock.bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+                .unwrap();
+            let listener = sock.listen(8).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (drain, drain_rx) = oneshot::channel::<()>();
+            let (end_tx, ending) = oneshot::channel();
+            tokio::spawn(async move {
+                let Ok((s, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut held = Vec::new();
+                    while let Ok((s, _)) = listener.accept().await {
+                        held.push(s);
+                    }
+                });
+                let Ok(mut ws) = tokio_tungstenite::accept_async(s).await else {
+                    return;
+                };
+                if reading {
+                    while let Some(Ok(_)) = ws.next().await {}
+                } else {
+                    let _ = drain_rx.await;
+                }
+                let tcp = ws.get_mut();
+                let mut buf = vec![0u8; 64 * 1024];
+                let end = loop {
+                    match tokio::time::timeout(Duration::from_secs(10), tcp.read(&mut buf)).await {
+                        Ok(Ok(0)) => break Ending::Fin,
+                        Ok(Ok(_)) => {}
+                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                            break Ending::Reset;
+                        }
+                        Ok(Err(e)) => break Ending::Other(e.kind()),
+                        Err(_) => break Ending::Other(std::io::ErrorKind::TimedOut),
+                    }
+                };
+                let _ = end_tx.send(end);
+            });
+            Peer {
+                port,
+                drain: Some(drain),
+                ending,
+            }
+        }
+
+        /// A task pointed at this peer.
+        fn task(
+            &self,
+            hid: Arc<HidControl>,
+            write_timeout: Duration,
+        ) -> (WsTask, mpsc::UnboundedSender<WsCtl>) {
+            let (mut t, ctl) = task(hid, write_timeout);
+            t.ep = Arc::new(KvmEndpoint::new(
+                Scheme::Http,
+                "127.0.0.1",
+                (self.port, self.port, self.port),
+                &"0".repeat(64),
+            ));
+            let token = kvm_proto::parse_login_token(br#"{"result":0,"token":"0.1"}"#).unwrap();
+            t.token = watch::channel(Some((1, token))).1;
+            (t, ctl)
+        }
+
+        /// Let it read; how did the bridge end the connection?
+        async fn ending(&mut self) -> Ending {
+            if let Some(d) = self.drain.take() {
+                let _ = d.send(());
+            }
+            tokio::time::timeout(Duration::from_secs(15), &mut self.ending)
+                .await
+                .expect("the connection never ended")
+                .unwrap()
+        }
+    }
+
+    /// Push key presses until `done` holds (bounded: 15 s).
+    async fn flood_until(hid: &HidControl, done: impl Fn() -> bool) {
+        let t0 = Instant::now();
+        let mut k = 0u8;
+        while !done() {
+            assert!(
+                t0.elapsed() < Duration::from_secs(15),
+                "the writes never blocked"
+            );
+            for _ in 0..64 {
+                k = k.wrapping_add(1);
+                hid.push(kbd(4 + k % 20), false);
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// I2 (PC9 fix round 1): a close the KVM answered — it read everything
+    /// up to our close frame, then answered — ends with a FIN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_answered_close_ends_with_a_fin() {
+        let mut p = Peer::start(true).await;
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (t, ctl) = p.task(hid.clone(), Duration::from_secs(1));
+        let run = tokio::spawn(t.run());
+        flood_until(&hid, || hid.metrics.hid_reports_sent.get() >= 2).await;
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.ending().await, Ending::Fin);
+    }
+
+    /// I2: a close the KVM never answers within `CLOSE_BUDGET` — it is not
+    /// reading, so our release and close frame may sit unread behind older
+    /// reports — is reset, not ended with a FIN that would deliver them
+    /// after the next websocket's session start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_close_resets_the_websocket() {
+        let mut p = Peer::start(false).await;
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (t, ctl) = p.task(hid.clone(), Duration::from_secs(1));
+        let run = tokio::spawn(t.run());
+        flood_until(&hid, || hid.metrics.hid_reports_sent.get() >= 2).await;
+        hid.release_all(ReleaseTrigger::SessionEnd);
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.ending().await, Ending::Reset);
+    }
+
+    /// I2: a websocket given up on a blocked write (§6.9) is reset, so the
+    /// backlog the KVM has not read is discarded with it rather than
+    /// delivered after the next websocket's session start (§7.4).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_timeout_resets_the_websocket() {
+        let mut p = Peer::start(false).await;
+        let hid = Arc::new(HidControl::new(256, Arc::new(Metrics::default())));
+        let (t, ctl) = p.task(hid.clone(), Duration::from_millis(200));
+        let run = tokio::spawn(t.run());
+        flood_until(&hid, || {
+            hid.metrics.upstream_reconnects.get("websocket_write") == 1
+        })
+        .await;
+        assert_eq!(p.ending().await, Ending::Reset);
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// I2: an aborted websocket task — a Stop whose `Close` a blocked write
+    /// never read (§5.2) — resets its connection: the drop guard, not the
+    /// close path, decides. Aborted here with the session-start sequence
+    /// unread by the peer; the blocked-write case end to end is the
+    /// session's `a_stop_with_a_blocked_write_resets_the_websocket`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_aborted_websocket_task_resets_its_connection() {
+        let mut p = Peer::start(false).await;
+        let hid = Arc::new(HidControl::new(256, Arc::new(Metrics::default())));
+        let (t, _ctl) = p.task(hid.clone(), Duration::from_secs(30));
+        let run = tokio::spawn(t.run());
+        flood_until(&hid, || hid.metrics.hid_reports_sent.get() >= 2).await;
+        run.abort();
+        let _ = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap();
+        assert_eq!(p.ending().await, Ending::Reset);
     }
 }

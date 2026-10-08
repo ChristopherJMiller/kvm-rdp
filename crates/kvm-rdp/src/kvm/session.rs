@@ -45,9 +45,13 @@ use tokio::task::{JoinError, JoinHandle};
 const TICK: Duration = Duration::from_millis(100);
 /// A Stop waits this long for the websocket to flush and close (§5.2).
 const CLOSE_WAIT: Duration = Duration::from_millis(500);
-/// After an abort, how long a Stop waits for the websocket task to be
-/// dropped (its socket closed), so the next session's websocket never
-/// overlaps it (census: never two control websockets).
+/// After aborting a websocket task that did not answer `Close` (a blocked
+/// write), how long a Stop waits for the task to be dropped. Dropping it
+/// resets the connection (I2): the bridge's side is gone and its unsent
+/// backlog discarded, though the KVM may still read what its own receive
+/// buffer already holds (Plan D re-asserts state after a reconnect). Past
+/// it the Stop goes on, with a warning; the reset follows when the task is
+/// dropped. A Stop therefore takes at most `CLOSE_WAIT + ABORT_WAIT`.
 const ABORT_WAIT: Duration = Duration::from_millis(100);
 
 pub struct SessionConfig {
@@ -503,10 +507,17 @@ impl<'d> Session<'d> {
         if self.ws_ctl.send(WsCtl::Close { done }).is_ok() {
             let _ = tokio::time::timeout(CLOSE_WAIT, rx).await;
         }
+        // A task that answered `Close` has already ended. One stuck in a
+        // write is aborted, and dropping it resets its connection (I2);
+        // that drop is asynchronous, so wait for it (bounded), so the
+        // bridge's side of the old websocket is gone before the next Start.
         self.ws_task.abort();
-        // An aborted task is dropped asynchronously: wait (bounded) until
-        // its socket is closed, so the next Start never has two websockets.
-        let _ = tokio::time::timeout(ABORT_WAIT, &mut self.ws_task).await;
+        if tokio::time::timeout(ABORT_WAIT, &mut self.ws_task)
+            .await
+            .is_err()
+        {
+            tracing::warn!("the websocket task outlived its abort wait");
+        }
         self.video.close();
         // Never a logout (§3.2): the token lapses on the KVM.
     }
@@ -545,11 +556,13 @@ mod tests {
     }
 
     async fn start_sim() -> KvmSim {
-        KvmSim::start(SimConfig::es3(
-            Source::fixture("360p30_es3like_poc0.h264").unwrap(),
-        ))
-        .await
-        .unwrap()
+        start_sim_with(|_| {}).await
+    }
+
+    async fn start_sim_with(set: impl FnOnce(&mut SimConfig)) -> KvmSim {
+        let mut cfg = SimConfig::es3(Source::fixture("360p30_es3like_poc0.h264").unwrap());
+        set(&mut cfg);
+        KvmSim::start(cfg).await.unwrap()
     }
 
     async fn rig(pin: Option<&str>, set: impl FnOnce(&mut SessionConfig)) -> Rig {
@@ -1339,6 +1352,174 @@ mod tests {
             .unwrap();
         assert_eq!(r.hid_bytes().last().unwrap(), &KBD_ZERO.to_vec());
         assert_eq!(r.sim.stats().ws_open, 1);
+        r.stop(1).await;
+    }
+
+    /// Every websocket kvm-sim opened, in order.
+    fn ws_conns(log: &[SimEvent]) -> Vec<u64> {
+        log.iter()
+            .filter_map(|e| {
+                if let SimEvent::WsOpen { conn } = e {
+                    Some(*conn)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// The log positions of the HID reports kvm-sim read on `conn`.
+    fn hid_at(log: &[SimEvent], on: u64) -> Vec<usize> {
+        log.iter()
+            .enumerate()
+            .filter_map(|(i, e)| match e {
+                SimEvent::Hid { conn, .. } if *conn == on => Some(i),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Push key presses until the HID writer is blocked — kvm-sim is not
+    /// reading — with nothing written for 200 ms (bounded: 15 s).
+    async fn flood_until_blocked(r: &Rig) {
+        let t0 = std::time::Instant::now();
+        let sent = || r.metrics.hid_reports_sent.get();
+        let (mut n, mut at) = (sent(), std::time::Instant::now());
+        let mut k = 0u8;
+        loop {
+            assert!(
+                t0.elapsed() < Duration::from_secs(15),
+                "the writes never blocked"
+            );
+            for _ in 0..64 {
+                k = k.wrapping_add(1);
+                r.hid.push(
+                    HidFrame::Keyboard {
+                        modifiers: 0,
+                        keys: [4 + k % 20, 0, 0, 0, 0],
+                    },
+                    false,
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            if sent() != n {
+                (n, at) = (sent(), std::time::Instant::now());
+            } else if at.elapsed() >= Duration::from_millis(200) {
+                return;
+            }
+        }
+    }
+
+    /// The most HID reports an abandoned websocket may still deliver: the
+    /// connection is reset (I2), so only what already sat in kvm-sim's
+    /// 4 KiB receive buffer (8 KiB as Linux books it) and what its TLS and
+    /// websocket layers had read ahead can arrive — each report is ≥ 12
+    /// bytes. A FIN close delivers the bridge's whole send backlog instead
+    /// (tens of thousands, XP6/XP7).
+    const STALE_MAX: usize = 500;
+
+    /// After a websocket was abandoned with its writes blocked: reads
+    /// resume, the old connection ends having delivered at most
+    /// `STALE_MAX` more reports, then (`start` true) the next session
+    /// starts — and kvm-sim reads nothing on the old websocket after the
+    /// new one's first report, the new one's session-start sequence is
+    /// the last thing it reads, and the two never overlapped.
+    async fn the_old_websocket_is_gone(r: &Rig, old: u64, read_before: usize, start: Option<Gen>) {
+        r.sim.set_policy(|p| p.pause_ws_reads = false);
+        r.sim
+            .wait_for(T, |e| e.contains(&SimEvent::WsClose { conn: old }))
+            .await
+            .expect("the old websocket never ended");
+        let stale = hid_at(&r.sim.events(), old).len() - read_before;
+        assert!(
+            stale <= STALE_MAX,
+            "{stale} stale reports arrived after the websocket was abandoned"
+        );
+        if let Some(generation) = start {
+            r.tx.send(KvmCommand::Start { generation }).unwrap();
+        }
+        let log = r
+            .sim
+            .wait_for(Duration::from_secs(5), |e| {
+                ws_conns(e).len() == 2 && hid_at(e, ws_conns(e)[1]).len() >= 2
+            })
+            .await
+            .expect("no new websocket with its session-start sequence");
+        let new = ws_conns(&log)[1];
+        let first_new = hid_at(&log, new)[0];
+        assert!(
+            hid_at(&log, old).iter().all(|&i| i < first_new),
+            "an old-websocket report arrived after the new session start"
+        );
+        let open_new = log
+            .iter()
+            .position(|e| *e == SimEvent::WsOpen { conn: new })
+            .unwrap();
+        let close_old = log
+            .iter()
+            .position(|e| *e == SimEvent::WsClose { conn: old })
+            .unwrap();
+        assert!(close_old < open_new, "the two websockets overlapped");
+        assert_eq!(r.sim.stats().ws_max_open, 1);
+        assert_eq!(r.hid_bytes().last().unwrap(), &KBD_ZERO.to_vec());
+        assert_eq!(r.sim.stats().logouts, 0);
+    }
+
+    /// I2 (PC9 fix round 1, XP6) and m3: a Stop while a HID write is
+    /// blocked never sees its `Close` read, so it takes the abort path —
+    /// `CLOSE_WAIT`, then at most `ABORT_WAIT` (the pinned bound, ≤ 600 ms)
+    /// — and the aborted websocket is reset: its backlog is discarded, not
+    /// delivered after the next session's start.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_with_a_blocked_write_resets_the_websocket() {
+        let sim = start_sim_with(|c| c.control_recv_buffer = Some(4096)).await;
+        let (p, pin) = (sim.ports(), sim.spki_sha256().to_owned());
+        let r = rig_on(sim, (p.web, p.video, p.control), &pin, |c| {
+            c.hid_write_timeout = Duration::from_secs(30);
+        });
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        r.input_ready().await;
+        let old = ws_conns(&r.sim.events())[0];
+        r.sim.set_policy(|p| p.pause_ws_reads = true);
+        flood_until_blocked(&r).await;
+        let read_before = hid_at(&r.sim.events(), old).len();
+        let t0 = std::time::Instant::now();
+        r.stop(1).await;
+        let took = t0.elapsed();
+        assert!(
+            took >= CLOSE_WAIT && took < CLOSE_WAIT + ABORT_WAIT + Duration::from_millis(300),
+            "Stop with a blocked write took {took:?}"
+        );
+        the_old_websocket_is_gone(&r, old, read_before, Some(2)).await;
+        r.stop(2).await;
+    }
+
+    /// I2 (XP7): the HID writer's own write timeout (§6.9 transient) gives
+    /// the websocket up and reconnects; the old one is reset, so its
+    /// backlog never follows the new one's session start. The backoff is
+    /// long here so the old connection's end can be seen first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_timeout_reconnects_on_a_reset_websocket() {
+        let sim = start_sim_with(|c| c.control_recv_buffer = Some(4096)).await;
+        let (p, pin) = (sim.ports(), sim.spki_sha256().to_owned());
+        let r = rig_on(sim, (p.web, p.video, p.control), &pin, |c| {
+            c.hid_write_timeout = Duration::from_millis(300);
+            c.backoff.initial = Duration::from_millis(1500);
+            c.backoff.max = Duration::from_millis(1500);
+        });
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        r.input_ready().await;
+        let old = ws_conns(&r.sim.events())[0];
+        r.sim.set_policy(|p| p.pause_ws_reads = true);
+        let read_before = hid_at(&r.sim.events(), old).len();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while r.metrics.upstream_reconnects.get("websocket_write") == 0 {
+                flood_until_blocked(&r).await;
+            }
+        })
+        .await
+        .expect("no write timed out");
+        the_old_websocket_is_gone(&r, old, read_before, None).await;
         r.stop(1).await;
     }
 
