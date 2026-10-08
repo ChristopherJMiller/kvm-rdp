@@ -218,15 +218,24 @@ impl Client {
         }
     }
 
-    /// `pred` never holds for `d`.
+    /// `pred` never holds for `d`: over every event recorded before `d`
+    /// ends. The last check's snapshot is taken once the deadline has
+    /// passed — read before it — and polls never sleep past the deadline,
+    /// so an event in the last poll interval is judged too (PC16 re-review:
+    /// the loop used to stop at its first wake-up past `d`, unchecked).
     pub async fn never(&self, d: Duration, pred: impl Fn(&[Ev]) -> bool) {
         let t0 = Instant::now();
         let mut snap = Vec::new();
-        while t0.elapsed() < d {
+        loop {
+            let last = t0.elapsed() >= d;
             self.catch_up(&mut snap);
             let took = Instant::now();
             assert!(!pred(&snap), "it happened; timeline: {:?}", timeline(&snap));
-            tokio::time::sleep(poll_after(POLL * 2, took.elapsed())).await;
+            if last {
+                return;
+            }
+            let left = d.saturating_sub(t0.elapsed());
+            tokio::time::sleep(poll_after(POLL * 2, took.elapsed()).min(left)).await;
         }
     }
 
@@ -686,4 +695,49 @@ pub fn description(cause: Cause) -> String {
 pub fn takeover() -> String {
     ErrorInfo::ProtocolIndependentCode(ProtocolIndependentCode::DisconnectedByOtherconnection)
         .description()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A client with no connection behind it: its log is the test's.
+    fn detached() -> (Client, Log) {
+        let log: Log = Arc::default();
+        let (ctl, _) = mpsc::unbounded_channel();
+        let client = Client {
+            log: log.clone(),
+            ack: Arc::new(Mutex::new(Ack::Normal)),
+            ctl,
+        };
+        (client, log)
+    }
+
+    /// PC16 re-review: `never(d, ..)` must judge every event recorded
+    /// before `d` ends, including one that lands after its last poll
+    /// inside the window. The predicate records the event itself on its
+    /// first call and then takes 300 ms, so the next poll is due 600 ms
+    /// later — past the 500 ms window: only a check at the deadline sees
+    /// an event that was recorded at the window's start.
+    #[tokio::test]
+    async fn never_judges_an_event_in_the_last_poll_of_its_window() {
+        let (client, log) = detached();
+        let pushed = Arc::new(AtomicBool::new(false));
+        let p = pushed.clone();
+        let pred = move |e: &[Ev]| {
+            if !p.swap(true, Ordering::SeqCst) {
+                push(&log, Ev::Closed("forbidden".to_owned()));
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            e.iter().any(|x| matches!(x, Ev::Closed(_)))
+        };
+        let r =
+            tokio::spawn(async move { client.never(Duration::from_millis(500), pred).await }).await;
+        assert!(pushed.load(Ordering::SeqCst), "the predicate never ran");
+        assert!(
+            r.is_err_and(|e| e.is_panic()),
+            "never() missed an event recorded inside its window"
+        );
+    }
 }
