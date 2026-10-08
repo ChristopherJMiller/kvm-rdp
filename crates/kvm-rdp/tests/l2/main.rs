@@ -8,7 +8,9 @@
 )]
 
 mod client;
+mod faults;
 mod harness;
 mod lifecycle;
+mod resize;
 mod sessions;
 mod video;
