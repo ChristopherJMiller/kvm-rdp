@@ -52,3 +52,16 @@ pub(crate) fn passes_in_a_child(path: &str) -> ChildOutput {
     );
     ChildOutput { stdout, stderr }
 }
+
+/// A loopback address no other test binds — 127.64-127.x.y, from this
+/// process's id and a counter — for a listener whose closing a test checks
+/// by connecting. On 127.0.0.1 a freed ephemeral port can be rebound by a
+/// concurrent test's `bind(0)` (seen once in 80 runs of the bridge suite),
+/// so a successful connect there does not prove the listener still open.
+pub(crate) fn private_loopback() -> std::net::IpAddr {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed) % 250;
+    let [_, _, hi, lo] = std::process::id().to_be_bytes();
+    std::net::Ipv4Addr::new(127, 64 | (hi & 0x3f), lo, u8::try_from(n + 2).unwrap()).into()
+}

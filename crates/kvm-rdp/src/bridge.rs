@@ -789,7 +789,7 @@ mod tests {
         clippy::indexing_slicing
     )]
     use super::*;
-    use crate::testkit::{is_child, passes_in_a_child};
+    use crate::testkit::{is_child, passes_in_a_child, private_loopback};
     use ironrdp_pdu::nego::{ConnectionConfirm, ConnectionRequest, RequestFlags, SecurityProtocol};
     use ironrdp_pdu::x224::X224;
     use kvm_sim::{KvmSim, SimConfig, Source};
@@ -898,7 +898,11 @@ mod tests {
     async fn spawn_binds_reports_ready_and_shuts_down_promptly() {
         let sim = sim().await;
         let d = tempfile::tempdir().unwrap();
-        let h = start(config_for(&sim, d.path(), |_| {})).await.unwrap();
+        // A private address: the closing is checked by connecting.
+        let listen = SocketAddr::new(private_loopback(), 0);
+        let h = start(config_for(&sim, d.path(), |c| c.rdp.listen = listen))
+            .await
+            .unwrap();
         let (rdp, admin) = (h.rdp_addr, h.admin_addr);
         assert_eq!(get(admin, "/readyz").await, 200);
         assert_eq!(get(admin, "/livez").await, 200);
@@ -1834,7 +1838,11 @@ mod tests {
     async fn dies_and_stops_the_bridge(task: &str, kill: impl FnOnce(&BridgeHandle)) {
         let sim = sim().await;
         let d = tempfile::tempdir().unwrap();
-        let h = start(config_for(&sim, d.path(), |_| {})).await.unwrap();
+        // A private address: the closing is checked by connecting.
+        let listen = SocketAddr::new(private_loopback(), 0);
+        let h = start(config_for(&sim, d.path(), |c| c.rdp.listen = listen))
+            .await
+            .unwrap();
         kill(&h);
         let mut done = h.ctl.rdp_done.clone();
         tokio::time::timeout(T, done.wait_for(|v| *v))
