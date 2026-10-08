@@ -36,6 +36,21 @@ use tokio::sync::mpsc;
 type Upgraded = ironrdp_tokio::TokioFramed<ironrdp_tls::TlsStream<TcpStream>>;
 type Log = Arc<Mutex<Vec<Ev>>>;
 
+/// The connect's own bound (TCP, TLS, CredSSP, finalization), under `T`:
+/// `connected()` and `refused()` wait `T` for its outcome, so a hung
+/// connect is a `ConnectFailed("timeout")` they report, never their own
+/// timeout with an empty timeline.
+pub const CONNECT_BOUND: Duration = T.saturating_sub(Duration::from_secs(1));
+/// How often `wait_for` re-checks its predicate.
+const POLL: Duration = Duration::from_millis(10);
+
+/// The next poll's delay: `base`, or twice what the predicate took, so a
+/// slow predicate (a timeline over hundreds of pictures) gets at most a
+/// third of the test thread.
+fn poll_after(base: Duration, took: Duration) -> Duration {
+    base.max(took.saturating_mul(2))
+}
+
 fn lock<X>(m: &Mutex<X>) -> MutexGuard<'_, X> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -160,6 +175,10 @@ impl Client {
         Client { log, ack, ctl }
     }
 
+    /// `f` over the log, under the lock the client thread takes for every
+    /// event it records (and before it sends the acks): keep `f` cheap. A
+    /// predicate that decodes pictures (`timeline`, `nal_types`) belongs in
+    /// `wait_for`/`never`, which run it on a snapshot.
     pub fn with_log<R>(&self, f: impl FnOnce(&[Ev]) -> R) -> R {
         f(&lock(&self.log))
     }
@@ -168,33 +187,46 @@ impl Client {
         lock(&self.log).clone()
     }
 
+    /// Extend `snap` with what the client recorded since: only the new
+    /// events are copied under the lock. The log only grows, so `snap` is
+    /// always a prefix of it — a consistent view, read with no lock held.
+    fn catch_up(&self, snap: &mut Vec<Ev>) {
+        let log = lock(&self.log);
+        if let Some(new) = log.get(snap.len()..) {
+            snap.extend_from_slice(new);
+        }
+    }
+
     /// Wait until `pred` holds over the log; panic with the timeline if not.
+    /// Returns the snapshot `pred` held on.
     pub async fn wait_for(&self, timeout: Duration, pred: impl Fn(&[Ev]) -> bool) -> Vec<Ev> {
         let t0 = Instant::now();
+        let mut snap = Vec::new();
         loop {
-            if self.with_log(&pred) {
-                return self.events();
+            self.catch_up(&mut snap);
+            let took = Instant::now();
+            if pred(&snap) {
+                return snap;
             }
             if t0.elapsed() > timeout {
                 panic!(
                     "no match within {timeout:?}; timeline: {:?}",
-                    self.with_log(timeline)
+                    timeline(&snap)
                 );
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(poll_after(POLL, took.elapsed())).await;
         }
     }
 
     /// `pred` never holds for `d`.
     pub async fn never(&self, d: Duration, pred: impl Fn(&[Ev]) -> bool) {
         let t0 = Instant::now();
+        let mut snap = Vec::new();
         while t0.elapsed() < d {
-            assert!(
-                !self.with_log(&pred),
-                "it happened; timeline: {:?}",
-                self.with_log(timeline)
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            self.catch_up(&mut snap);
+            let took = Instant::now();
+            assert!(!pred(&snap), "it happened; timeline: {:?}", timeline(&snap));
+            tokio::time::sleep(poll_after(POLL * 2, took.elapsed())).await;
         }
     }
 
@@ -425,7 +457,7 @@ fn run(
         .unwrap();
     rt.block_on(async move {
         let (mut framed, result) =
-            match tokio::time::timeout(Duration::from_secs(15), connect(server, &opts, &log, &ack)).await {
+            match tokio::time::timeout(CONNECT_BOUND, connect(server, &opts, &log, &ack)).await {
                 Ok(Ok(v)) => v,
                 Ok(Err(e)) => return push(&log, Ev::ConnectFailed(e)),
                 Err(_) => return push(&log, Ev::ConnectFailed("timeout".to_owned())),
