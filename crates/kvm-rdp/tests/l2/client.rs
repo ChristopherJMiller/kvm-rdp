@@ -676,6 +676,18 @@ pub fn timeline(evs: &[Ev]) -> Vec<String> {
         .collect()
 }
 
+/// The index in `e` of the first `CapabilitiesConfirm` at or after `n`: the
+/// server's answer to a re-advertise sent once the log held `n` events. It
+/// is queued ahead of everything the Setup sends, so the first picture
+/// after it is the first after the Setup — a frame in flight before the
+/// server read the re-advertise can still be logged after `n` (P8).
+pub fn confirmed(e: &[Ev], n: usize) -> Option<usize> {
+    e.iter()
+        .skip(n)
+        .position(|x| matches!(x, Ev::Gfx(GfxPdu::CapabilitiesConfirm(_))))
+        .map(|k| n + k)
+}
+
 pub fn terminated(evs: &[Ev]) -> Option<String> {
     evs.iter().find_map(|e| {
         if let Ev::Terminated(s) = e {
@@ -720,6 +732,9 @@ mod tests {
     /// first call and then takes 300 ms, so the next poll is due 600 ms
     /// later — past the 500 ms window: only a check at the deadline sees
     /// an event that was recorded at the window's start.
+    /// (The `.min(left)` cap on the sleep is not pinned here: without it
+    /// this still passes, in 0.90 s instead of 0.50 s. It bounds only how
+    /// far a check may run past the window.)
     #[tokio::test]
     async fn never_judges_an_event_in_the_last_poll_of_its_window() {
         let (client, log) = detached();

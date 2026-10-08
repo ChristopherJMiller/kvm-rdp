@@ -1,5 +1,5 @@
 //! §11.3 Auth and pre-auth, Preemption, Generations.
-use crate::client::{CONNECT_BOUND, Opts, pictures, takeover, terminated, timeline};
+use crate::client::{CONNECT_BOUND, Ev, Opts, confirmed, pictures, takeover, terminated, timeline};
 use crate::harness::{
     ES3_FIXTURE, KBD_ZERO, SET_MODE, T, assert_run, barcodes, env, es3, flv_opens, hid_on,
     index_of, ms, sent_on, sized, until, ws_opens,
@@ -173,7 +173,17 @@ async fn a_quick_reconnect_sees_nothing_of_the_previous_generation() {
     .await;
     let a = env.client(Opts::new(2));
     a.wait_for(T, |e| pictures(e).len() >= 10).await;
-    a.readvertise(); // a Setup cause: an IDR request, deferred or in flight
+    // A Setup cause: an IDR request, deferred inside the setup window. The
+    // re-advertise's confirm, then its Setup's MapSurfaceToOutput, show the
+    // pump ran that Setup — so the request is in flight — before the close
+    // (I3: without the wait, IronRDP read the re-advertise after the
+    // teardown in 28 of 30 runs, and the shell skips it since 9b8b1f3).
+    let n = a.with_log(<[Ev]>::len);
+    a.readvertise();
+    a.wait_for(T, |e| {
+        confirmed(e, n).is_some_and(|k| timeline(&e[k..]).iter().any(|l| l == "map"))
+    })
+    .await;
     a.close();
     let b = env.client(Opts::new(3));
     let evs = b.wait_for(T, |e| pictures(e).len() >= 30).await;

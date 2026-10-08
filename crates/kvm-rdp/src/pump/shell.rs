@@ -457,6 +457,10 @@ impl PumpShell {
                 // its `SessionStop` not yet stepped) already released all
                 // (SessionEnd). The watchdog's release is always current:
                 // it fires only while `on_disconnected` has not come.
+                // Since PC17 an ended link runs no Setup (`OnReady` and
+                // `Updates` are skipped, `link_ended`), so the display and
+                // surface gates are a second line, unreachable from those
+                // inputs; the release gate still serves `Shutdown`.
                 Command::DisplayResize { width, height } => {
                     if current {
                         self.d.display.set_size((width, height));

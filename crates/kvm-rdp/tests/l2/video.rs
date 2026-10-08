@@ -13,28 +13,15 @@
 //! that second IDR and after the 1 s setup window, so the next periodic IDR
 //! is about 9 s away and the only IDR in the window is the one the side FLV
 //! (or the fallback's new FLV) forces (P2).
-use crate::client::{Client, Ev, Opts, Picture, nal_types, pictures, terminated};
+use crate::client::{Client, Ev, Opts, Picture, confirmed, nal_types, pictures, terminated};
 use crate::harness::{
     ES3_FIXTURE, Env, LONGGOP, T, assert_run, barcodes, env, es3, flv_opens, index_of, ms, sent_on,
     sized, source, until, within,
 };
-use ironrdp_egfx::pdu::GfxPdu;
 use kvm_proto::h264::{parse_sps, split_annex_b};
 use kvm_rdp::config::IdrPolicy;
 use kvm_sim::{Pacing, SimConfig, SimEvent, Timestamps};
 use std::time::{Duration, Instant};
-
-/// The index in `e` of the first `CapabilitiesConfirm` at or after `n`: the
-/// server's answer to a re-advertise sent once the log held `n` events. It
-/// is queued ahead of everything the Setup sends, so the first picture
-/// after it is the first after the Setup — a frame in flight before the
-/// server read the re-advertise can still be logged after `n` (P8).
-fn confirmed(e: &[Ev], n: usize) -> Option<usize> {
-    e.iter()
-        .skip(n)
-        .position(|x| matches!(x, Ev::Gfx(GfxPdu::CapabilitiesConfirm(_))))
-        .map(|k| n + k)
-}
 
 /// §11.3, once per `idr_policy` (P9): a re-advertise once the session is
 /// past the FLV's 1 s setup window is a Setup cause each policy serves its
@@ -49,6 +36,10 @@ fn confirmed(e: &[Ev], n: usize) -> Option<usize> {
 /// resize): there, a reactivation that completes before the FLV's first
 /// IDR lets that IDR resolve the NeedIdr and cancel the deferred request,
 /// so no policy ran in 3 of 10 runs (`side` and `reconnect` saw one FLV).
+/// How long the oracle waits for kvm-sim's log to catch up with what the
+/// client already shows.
+const CATCH_UP: Duration = Duration::from_secs(2);
+
 async fn oracle(policy: IdrPolicy) {
     let env = env(es3(), move |c| {
         sized(c);
@@ -74,19 +65,25 @@ async fn oracle(policy: IdrPolicy) {
     for w in pics.windows(2) {
         assert_eq!(w[1].frame_id, w[0].frame_id.wrapping_add(1), "{policy:?}");
     }
+    // The policy acted within milliseconds of the confirm, 60 pictures ago:
+    // short bounded waits, then asserts that name the policy (m3), so a
+    // policy served the wrong way fails fast and says which.
     let expected = if policy == IdrPolicy::Wait { 1 } else { 2 };
     let log = env
         .sim
-        .wait_for(T, |l| flv_opens(l).len() >= expected)
+        .wait_for(CATCH_UP, |l| flv_opens(l).len() >= expected)
         .await
-        .unwrap();
+        .unwrap_or_else(|l| l);
     let opens = flv_opens(&log);
     assert_eq!(opens.len(), expected, "{policy:?}: FLV opens");
     if policy == IdrPolicy::Side {
-        env.sim
-            .wait_for(T, |l| l.contains(&SimEvent::FlvClose { conn: opens[1] }))
-            .await
-            .unwrap();
+        let closed = env
+            .sim
+            .wait_for(CATCH_UP, |l| {
+                l.contains(&SimEvent::FlvClose { conn: opens[1] })
+            })
+            .await;
+        assert!(closed.is_ok(), "{policy:?}: the side FLV never closed");
     }
     let main = if policy == IdrPolicy::Reconnect {
         opens[1]
@@ -98,9 +95,9 @@ async fn oracle(policy: IdrPolicy) {
     // kvm-sim logs an AU once its write returned: wait for the last ones.
     let log = env
         .sim
-        .wait_for(T, |l| sent_on(l, main).len() >= got.len())
+        .wait_for(CATCH_UP, |l| sent_on(l, main).len() >= got.len())
         .await
-        .unwrap();
+        .unwrap_or_else(|l| l);
     assert_run(&got, &sent_on(&log, main), &format!("{policy:?}"));
 }
 
@@ -218,9 +215,11 @@ async fn a_readvertise_takes_one_side_flv_and_never_closes_the_main_one() {
     );
     // P43, as the bridge sees it: the side FLV ended `Ok` — the demuxer
     // gave it a tag and the bridge closed it there. Its first tag is the
-    // sequence header kvm-sim writes on open, so it closes before any AU
-    // (kvm-sim logs no `FlvAu` on it); one closed before its first tag, or
-    // left to time out, is a counted side failure.
+    // sequence header kvm-sim writes on open, so it usually closes before
+    // kvm-sim writes it an AU (not asserted: a frame can race the close).
+    // One left to time out is a counted side failure. L2 cannot tell a
+    // close at the first tag from one at the HTTP 200 (m4); L1 pins "reads
+    // to its first tag" (`kvm::video` `a_side_flv_with_no_tag_is_abandoned_at_the_side_timeout`).
     assert_eq!(
         env.metrics().idr_side_failures.total(),
         0,
