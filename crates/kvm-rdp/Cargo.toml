@@ -63,3 +63,10 @@ rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "
 tempfile = "3"
 # raise(3) for the P37 signal-order test (Task 6.1's L2 uses kill(2)).
 libc = "0.2"
+
+# The one integration-test binary (§13): every L2 case links here. `libc`
+# (L2's SIGTERM to the real binary, Task 6.6) is already a dev-dependency
+# above — it must stay in [dev-dependencies], never in this table (P39).
+[[test]]
+name = "l2"
+path = "tests/l2/main.rs"

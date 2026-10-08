@@ -2,6 +2,9 @@
 # Spec §13 / Plan C design decision 8: fail when the shared target dir grows
 # past the budget. The one cleanup that is always safe is `cargo clean`; the
 # next gate rebuilds (jobs = 4, niced).
+# Default: Task 2.1's 8 GiB floor. Task 6.1 re-measured with every
+# IronRDP-linked unit built (the lib tests, the binary and L2): 3.31 GiB,
+# x 1.3 = 4.3 GiB, under the floor, so the floor stands (DC10).
 set -euo pipefail
 budget_gib=${KVM_RDP_TARGET_BUDGET_GIB:-8}
 case "$budget_gib" in
