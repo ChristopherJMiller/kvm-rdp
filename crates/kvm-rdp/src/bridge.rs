@@ -119,6 +119,51 @@ pub struct BridgeHandle {
     kvm_rt: Option<Runtime>,
     // Detached on shutdown: it ends once `RdpServer::run` returns.
     _rdp_thread: std::thread::JoinHandle<()>,
+    /// Test seam (m5): name an essential KVM-runtime task to make it panic.
+    #[cfg(test)]
+    faults: watch::Sender<Option<&'static str>>,
+}
+
+/// Where a test may make an essential task panic (m5): a name it sets on
+/// the bridge's fault channel. Outside tests there is none.
+#[cfg(test)]
+type FaultSeam = watch::Receiver<Option<&'static str>>;
+#[cfg(not(test))]
+type FaultSeam = ();
+
+/// An essential task, as spawned: itself outside tests; in tests, also
+/// panicking when the fault seam names it.
+#[cfg(not(test))]
+fn fault_point<F>(_name: &'static str, task: F, _seam: &FaultSeam) -> F {
+    task
+}
+
+#[cfg(test)]
+fn fault_point<F>(
+    name: &'static str,
+    task: F,
+    seam: &FaultSeam,
+) -> impl std::future::Future<Output = ()> + Send + 'static
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut seam = seam.clone();
+    async move {
+        let injected = async {
+            if seam.wait_for(|f| *f == Some(name)).await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            () = task => {}
+            () = injected => {
+                #[allow(clippy::panic)]
+                {
+                    panic!("injected: the {name} panics");
+                }
+            }
+        }
+    }
 }
 
 /// The shell's dependencies that cross to the RDP thread.
@@ -208,6 +253,10 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
         .local_addr()
         .map_err(|e| BridgeError::AdminBind(e.kind()))?;
 
+    #[cfg(test)]
+    let (faults, seam) = watch::channel(None);
+    #[cfg(not(test))]
+    let seam = ();
     let kvm_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("kvm-rdp-kvm")
@@ -225,29 +274,37 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
             return Err(BridgeError::AdminBind(e.kind()));
         }
     };
-    let admin_task = kvm_rt.spawn(admin::serve(
-        admin_listener,
-        health.clone(),
-        metrics.clone(),
+    let admin_task = kvm_rt.spawn(fault_point(
+        "admin listener",
+        admin::serve(admin_listener, health.clone(), metrics.clone()),
+        &seam,
     ));
-    let actor_task = kvm_rt.spawn(session::run_actor(
-        kvm_cmds,
-        KvmDeps {
-            ep: Arc::new(KvmEndpoint::from_config(&cfg.kvm)),
-            cfg: Arc::new(SessionConfig::from_config(&cfg)),
-            to_pump: kvm_tx,
-            hid: hid.clone(),
-            metrics: metrics.clone(),
-        },
+    let actor_task = kvm_rt.spawn(fault_point(
+        "KVM actor",
+        session::run_actor(
+            kvm_cmds,
+            KvmDeps {
+                ep: Arc::new(KvmEndpoint::from_config(&cfg.kvm)),
+                cfg: Arc::new(SessionConfig::from_config(&cfg)),
+                to_pump: kvm_tx,
+                hid: hid.clone(),
+                metrics: metrics.clone(),
+            },
+        ),
+        &seam,
     ));
-    let watcher_task = kvm_rt.spawn(watch_certificate(
-        cfg.rdp.tls_cert_file.clone(),
-        cfg.rdp.tls_key_file.clone(),
-        first_print,
-        cfg.rdp.cert_poll_interval,
-        gens.clone(),
-        handshakes.clone(),
-        exit_tx,
+    let watcher_task = kvm_rt.spawn(fault_point(
+        "certificate watcher",
+        watch_certificate(
+            cfg.rdp.tls_cert_file.clone(),
+            cfg.rdp.tls_key_file.clone(),
+            first_print,
+            cfg.rdp.cert_poll_interval,
+            gens.clone(),
+            handshakes.clone(),
+            exit_tx,
+        ),
+        &seam,
     ));
 
     let parts = RdpParts {
@@ -341,6 +398,8 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
         exit,
         kvm_rt: Some(kvm_rt),
         _rdp_thread: rdp_thread,
+        #[cfg(test)]
+        faults,
     })
 }
 
@@ -1737,18 +1796,54 @@ mod tests {
     /// binary's loop ends `ServerStopped`, exit 1.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_panicked_pump_shell_stops_the_bridge() {
+        dies_and_stops_the_bridge("pump shell", |h| {
+            h.ctl.to_pump.send(RdpInput::InjectedPanic).unwrap();
+        })
+        .await;
+    }
+
+    /// m5 (PC15 re-review minor): the same for each essential task on the
+    /// KVM runtime — dropping any one from the essential list fails its
+    /// test. The task is made to panic through the test-only fault seam.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_kvm_actor_stops_the_bridge() {
+        dies_and_stops_the_bridge("KVM actor", |h| {
+            h.faults.send_replace(Some("KVM actor"));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_admin_listener_stops_the_bridge() {
+        dies_and_stops_the_bridge("admin listener", |h| {
+            h.faults.send_replace(Some("admin listener"));
+        })
+        .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_certificate_watcher_stops_the_bridge() {
+        dies_and_stops_the_bridge("certificate watcher", |h| {
+            h.faults.send_replace(Some("certificate watcher"));
+        })
+        .await;
+    }
+
+    /// Start a bridge, `kill` one essential task, and require the bridge to
+    /// stop: `rdp_done` within 5 s, the listener closed, `ServerStopped`.
+    async fn dies_and_stops_the_bridge(task: &str, kill: impl FnOnce(&BridgeHandle)) {
         let sim = sim().await;
         let d = tempfile::tempdir().unwrap();
         let h = start(config_for(&sim, d.path(), |_| {})).await.unwrap();
-        h.ctl.to_pump.send(RdpInput::InjectedPanic).unwrap();
+        kill(&h);
         let mut done = h.ctl.rdp_done.clone();
         tokio::time::timeout(T, done.wait_for(|v| *v))
             .await
-            .expect("the bridge kept serving without its pump")
+            .unwrap_or_else(|_| panic!("the bridge kept serving without its {task}"))
             .unwrap();
         assert!(
             tokio::net::TcpStream::connect(h.rdp_addr).await.is_err(),
-            "the RDP listener is still open"
+            "{task}: the RDP listener is still open"
         );
         let why = tokio::time::timeout(
             T,
@@ -1756,7 +1851,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!((why, why.code()), (Exit::ServerStopped, 1));
+        assert_eq!((why, why.code()), (Exit::ServerStopped, 1), "{task}");
         stop(h).await;
     }
 
@@ -1818,6 +1913,7 @@ mod tests {
             exit,
             kvm_rt: Some(rt),
             _rdp_thread: std::thread::spawn(|| {}),
+            faults: watch::channel(None).0,
         }
     }
 
