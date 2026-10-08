@@ -18,6 +18,8 @@ pub const MAX_DURATION: Duration = Duration::from_secs(3600);
 /// §9.1: the NLA password is ≥ 128 random bits — 22 characters of base64.
 pub const MIN_NLA_PASSWORD: usize = 22;
 const MAX_SECRET_FILE: u64 = 4096;
+/// Largest config file read: a real one is a few KiB.
+pub const MAX_CONFIG: u64 = 1 << 20;
 
 /// A secret read from a file. Never `Display`; `Debug` is redacted.
 #[derive(Clone, PartialEq, Eq)]
@@ -254,9 +256,27 @@ impl Config {
     /// Read and validate the config file; secrets resolve against its
     /// directory.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
-        let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Read {
+        let read = |e: std::io::Error| ConfigError::Read {
             path: path.to_owned(),
             kind: e.kind(),
+        };
+        // Through a hard cap (one byte past it is how "over" is seen), so a
+        // wrong path such as /dev/zero cannot exhaust memory.
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .map_err(read)?
+            .take(MAX_CONFIG + 1)
+            .read_to_end(&mut bytes)
+            .map_err(read)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_CONFIG {
+            return Err(ConfigError::Parse {
+                at: None,
+                what: "file too large",
+            });
+        }
+        let text = String::from_utf8(bytes).map_err(|_| ConfigError::Parse {
+            at: None,
+            what: "not UTF-8",
         })?;
         let base = path.parent().unwrap_or_else(|| Path::new("."));
         Config::from_toml(&text, base)
@@ -1249,6 +1269,8 @@ pub(crate) mod tests {
                 .concat(),
                 "a file that is not UTF-8",
             ),
+            // Over the 1 MiB cap: refused before it is parsed.
+            t(s.repeat((2 << 20) / s.len()), "a file over 1 MiB"),
         ]
     }
 
@@ -1281,6 +1303,45 @@ pub(crate) mod tests {
             shapes.len(),
             leaks.join("\n")
         );
+    }
+
+    /// PC15 re-review minor: the config file is read through a 1 MiB cap —
+    /// a bigger one is refused unparsed ("file too large"), so a wrong path
+    /// such as /dev/zero cannot exhaust memory — and one that is not UTF-8
+    /// is named so, with no byte of it shown.
+    #[test]
+    fn the_config_read_is_capped_and_must_be_utf8() {
+        let d = tempfile::tempdir().unwrap();
+        let toml = d.path().join("kvm-rdp.toml");
+        std::fs::write(&toml, "#".repeat(2 << 20)).unwrap();
+        assert!(
+            matches!(
+                Config::load(&toml),
+                Err(ConfigError::Parse {
+                    at: None,
+                    what: "file too large"
+                })
+            ),
+            "a 2 MiB config was read"
+        );
+        // An endless file: the cap ends the read (unbounded, this test
+        // would run out of memory instead of failing).
+        assert!(matches!(
+            Config::load(Path::new("/dev/zero")),
+            Err(ConfigError::Parse {
+                at: None,
+                what: "file too large"
+            })
+        ));
+        assert_eq!(MAX_CONFIG, 1 << 20);
+        std::fs::write(&toml, b"[rdp]\nusername = \"\xff\"\n").unwrap();
+        assert!(matches!(
+            Config::load(&toml),
+            Err(ConfigError::Parse {
+                at: None,
+                what: "not UTF-8"
+            })
+        ));
     }
 
     /// I1: the category is picked from toml's and serde's leading words —
