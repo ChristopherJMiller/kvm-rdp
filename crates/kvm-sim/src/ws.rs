@@ -67,9 +67,13 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 return;
             }
         };
-    shared.record(SimEvent::WsOpen { conn });
     let (tx, mut cmds) = mpsc::unbounded_channel();
+    // Register before announcing (I3): a waiter that wakes on `WsOpen` and
+    // then immediately broadcasts (`close_websockets`, a fault injection)
+    // must never reach zero sockets. `add_ws` first makes that broadcast
+    // land even when it is scheduled between these two statements.
     shared.add_ws(tx);
+    shared.record(SimEvent::WsOpen { conn });
     loop {
         if shared.policy().pause_ws_reads {
             tokio::select! {
