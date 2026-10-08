@@ -33,6 +33,9 @@ pub struct Pump {
     return_to_paused: bool,
     /// An AVC420 `on_ready` was seen this session.
     ready_seen: bool,
+    /// Any `on_ready` was seen this session: only the first negotiation
+    /// without AVC420 waits for a better one (§6.7, m5).
+    negotiated: bool,
     first_setup_done: bool,
     avc420_deadline: Option<Instant>,
     params: Option<ParamSets>,
@@ -75,6 +78,7 @@ impl Pump {
             pending_size: None,
             return_to_paused: false,
             ready_seen: false,
+            negotiated: false,
             first_setup_done: false,
             avc420_deadline: None,
             params: None,
@@ -160,12 +164,12 @@ impl Pump {
                 self.close(now, cause, self.cfg.disconnect_watchdog, out)
             }
             Input::Shutdown { watchdog } => {
-                self.close(
-                    now,
-                    Cause::Shutdown,
-                    watchdog.min(self.cfg.disconnect_watchdog),
-                    out,
-                );
+                let watchdog = watchdog.min(self.cfg.disconnect_watchdog);
+                if self.state == State::Closing {
+                    self.shorten_watchdog(now, watchdog);
+                } else {
+                    self.close(now, Cause::Shutdown, watchdog, out);
+                }
             }
             Input::FrameAck {
                 frame_id,
@@ -232,9 +236,32 @@ impl Pump {
         self.state = new;
     }
 
+    /// Setup, or close when IronRDP refuses it (m7). IronRDP fails
+    /// `create_surface` only outside Ready and Resizing: its EGFX channel was
+    /// closed under us, so no picture can follow on this connection. The
+    /// session must not wait in NeedIdr without the first Setup's `OpenFlv`
+    /// and with nothing to time it out; no EGFX is §6.7's outcome,
+    /// `no_avc420`. False when it closed.
+    #[must_use]
+    fn setup_or_close(
+        &mut self,
+        gfx: &mut GraphicsPipelineServer,
+        now: Instant,
+        out: &mut Vec<Command>,
+    ) -> bool {
+        if self.setup(gfx, now, out) {
+            return true;
+        }
+        tracing::warn!("EGFX Setup refused: the channel is not ready; closing as no_avc420");
+        self.close(now, Cause::NoAvc420, self.cfg.disconnect_watchdog, out);
+        false
+    }
+
     /// Setup (§6.4): ResetGraphics with one PRIMARY monitor (inclusive
     /// bounds), CreateSurface, MapSurfaceToOutput, the hard cap; the slate
-    /// and `OpenFlv` on the connection's first Setup.
+    /// and `OpenFlv` on the connection's first Setup. False when IronRDP
+    /// refused it (callers go through `setup_or_close`).
+    #[must_use]
     fn setup(
         &mut self,
         gfx: &mut GraphicsPipelineServer,
@@ -377,6 +404,19 @@ impl Pump {
         self.idr.flow_cause(now);
     }
 
+    /// A Shutdown during an earlier close (m6, §5.2, DC13): the close keeps
+    /// its cause and its one disconnect, but its watchdog fires no later
+    /// than the shutdown's own — the 5 s exit budget — and never later than
+    /// it already would.
+    fn shorten_watchdog(&mut self, now: Instant, watchdog: Duration) {
+        if let Some((since, running)) = self.closing {
+            let remaining = running.saturating_sub(now.saturating_duration_since(since));
+            if watchdog < remaining {
+                self.closing = Some((now, watchdog));
+            }
+        }
+    }
+
     fn close(&mut self, now: Instant, cause: Cause, watchdog: Duration, out: &mut Vec<Command>) {
         if self.state == State::Closing {
             return;
@@ -401,8 +441,10 @@ impl Pump {
         avc420: bool,
         out: &mut Vec<Command>,
     ) {
+        let first_negotiation = !self.negotiated;
+        self.negotiated = true;
         if !avc420 {
-            if self.state == State::WaitReady && !self.ready_seen {
+            if self.state == State::WaitReady && first_negotiation {
                 // First negotiation: wait `avc420_timeout` for a better one (§6.7).
                 tracing::info!(
                     "EGFX negotiated without AVC420; waiting for a better capability set"
@@ -416,21 +458,26 @@ impl Pump {
             State::WaitReady => {
                 self.ready_seen = true;
                 self.avc420_deadline = None;
-                self.setup(gfx, now, out);
+                if !self.setup_or_close(gfx, now, out) {
+                    return;
+                }
                 match self.pending_size.take() {
                     Some(size) if size != self.size => self.start_resize(now, size, false, out),
                     _ => self.set_state(now, State::NeedIdr, out),
                 }
             }
             State::NeedIdr | State::Live => {
-                self.setup(gfx, now, out);
+                if !self.setup_or_close(gfx, now, out) {
+                    return;
+                }
                 self.set_state(now, State::NeedIdr, out);
                 self.setup_cause(now, out);
             }
             // Merged: the Setup runs at ReactivationComplete.
             State::WaitReactivation => self.ready_seen = true,
             State::Paused => {
-                self.setup(gfx, now, out);
+                // Stays Paused either way; a refusal has closed the session.
+                let _set_up = self.setup_or_close(gfx, now, out);
             }
             State::Idle | State::Closing => {}
         }
@@ -449,6 +496,12 @@ impl Pump {
         self.size = size;
         self.pending_size = None;
         self.return_to_paused = return_to_paused;
+        // step() already flushed any pending chunk: every caller (OnReady,
+        // ReactivationComplete, SpsChanged) is neither a sample nor a burst
+        // AU (m8). A chunk dropped here would leave its bytes in the backlog
+        // for the session (`add_handed` counted them at drain). Nothing is
+        // encoded again before the reactivation's Setup.
+        debug_assert!(self.batch.is_none(), "step() flushes before a resize");
         self.batch = None;
         out.push(Command::DisplayResize {
             width: size.0,
@@ -465,8 +518,8 @@ impl Pump {
         if self.state != State::WaitReactivation {
             return;
         }
-        if self.ready_seen {
-            self.setup(gfx, now, out);
+        if self.ready_seen && !self.setup_or_close(gfx, now, out) {
+            return;
         }
         if let Some(size) = self.pending_size.take()
             && size != self.size
@@ -1334,5 +1387,130 @@ mod tests {
         assert_eq!(r.metrics.frames_dropped.get("awaiting_idr"), 1150);
         assert_eq!(requests(&kinds(&out)), (0, 0), "{:?}", kinds(&out));
         assert_eq!(r.pump.state(), State::NeedIdr);
+    }
+
+    fn disconnects(out: &[Command]) -> Vec<Cause> {
+        out.iter()
+            .filter_map(|c| {
+                if let Command::Disconnect(c) = c {
+                    Some(*c)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// m5 (§6.7): only a connection's first negotiation without AVC420
+    /// waits `avc420_timeout` for a better one; a second one in WaitReady
+    /// gives up at once.
+    #[test]
+    fn a_second_negotiation_without_avc420_gives_up_at_once() {
+        let mut r = Rig::new(cfg());
+        r.start((640, 360));
+        assert!(r.negotiate(v8_only()).is_empty());
+        assert_eq!(r.pump.state(), State::WaitReady);
+        r.at(2000);
+        assert_eq!(disconnects(&r.negotiate(v8_only())), [Cause::NoAvc420]);
+        assert_eq!(r.pump.state(), State::Closing);
+    }
+
+    /// m6 (§5.2, DC13): a Shutdown during an earlier close brings its abort
+    /// forward to the shutdown's own watchdog (the 5 s exit budget) — and
+    /// never pushes it later. The close keeps its cause and disconnects once.
+    #[test]
+    fn a_shutdown_during_a_close_shortens_its_watchdog_never_lengthens_it() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        assert_eq!(
+            kinds(&r.step(Input::UpstreamFatal(Cause::KvmUnreachable))),
+            ["ReleaseAll", "Disconnect"]
+        );
+        r.at(100);
+        assert!(
+            r.step(Input::Shutdown {
+                watchdog: Duration::from_secs(2)
+            })
+            .is_empty()
+        );
+        assert!(!kinds(&ticks(&mut r, 100, 2000)).contains(&"Abort"));
+        assert_eq!(
+            kinds(&ticks(&mut r, 2000, 2100)),
+            ["ReleaseAll", "Abort"],
+            "2.1 s, not 5 s"
+        );
+        assert!(ticks(&mut r, 2100, 6000).is_empty(), "aborts once");
+        assert_eq!(r.metrics.disconnects.total(), 1);
+
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.step(Input::UpstreamFatal(Cause::KvmUnreachable));
+        r.at(4000);
+        r.step(Input::Shutdown {
+            watchdog: Duration::from_secs(2),
+        });
+        assert!(!kinds(&ticks(&mut r, 4000, 4900)).contains(&"Abort"));
+        assert_eq!(
+            kinds(&ticks(&mut r, 4900, 5000)),
+            ["ReleaseAll", "Abort"],
+            "1 s was left: kept"
+        );
+    }
+
+    /// m7: a Setup IronRDP refuses — its EGFX channel closed between the
+    /// negotiation and the step (`create_surface` fails outside Ready and
+    /// Resizing) — closes the session at every Setup site, never leaves a
+    /// NeedIdr with no FLV and nothing to time it out.
+    #[test]
+    fn a_refused_setup_closes_the_session_at_every_site() {
+        use ironrdp_dvc::DvcProcessor as _;
+        for site in ["first", "readvertise", "paused", "reactivation"] {
+            let mut r = Rig::new(cfg());
+            let input = match site {
+                "first" => {
+                    r.start((640, 360));
+                    r.advertise(census_caps());
+                    Input::OnReady { avc420: true }
+                }
+                "readvertise" => {
+                    r.live();
+                    Input::OnReady { avc420: true }
+                }
+                "paused" => {
+                    r.live();
+                    r.hold_suppress(true);
+                    assert_eq!(r.pump.state(), State::Paused);
+                    Input::OnReady { avc420: true }
+                }
+                _ => {
+                    r.live();
+                    r.step(sps(ParamClass::Resize, P480));
+                    Input::ReactivationComplete
+                }
+            };
+            r.gfx.close(CHAN);
+            let out = r.step(input);
+            assert_eq!(r.pump.state(), State::Closing, "{site}: {:?}", kinds(&out));
+            assert_eq!(disconnects(&out), [Cause::NoAvc420], "{site}");
+            assert!(!kinds(&out).contains(&"OpenFlv"), "{site}");
+        }
+    }
+
+    /// m8: a resize never discards a half-filled burst chunk. `step()`
+    /// flushes it before the SPS (its bytes already count in the backlog),
+    /// so `start_resize` never finds one.
+    #[test]
+    fn a_resize_sends_a_half_filled_burst_chunk_first() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        for _ in 0..3 {
+            assert!(r.step(au(false, true)).is_empty(), "the chunk fills");
+        }
+        let out = r.step(sps(ParamClass::Resize, P480));
+        assert_eq!(kinds(&out), ["SendDvc", "DisplayResize"]);
+        let Command::SendDvc(b) = &out[0] else {
+            panic!("{:?}", kinds(&out))
+        };
+        assert_eq!((b.frames, b.yield_after), (3, true));
     }
 }
