@@ -163,6 +163,11 @@ impl Drop for Background {
 
 /// Start the bridge; returns once the RDP listener is bound (blocking).
 pub fn spawn(cfg: Config) -> Result<BridgeHandle, BridgeError> {
+    spawn_with_grace(cfg, HANDSHAKE_GRACE)
+}
+
+/// `spawn`, with the handshake grace scaled (only tests change it).
+fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHandle, BridgeError> {
     tls::install_crypto_provider();
     // P7: the certificate watcher's baseline, taken before the pair is read
     // — so a renewal racing the load counts as a change, and none between
@@ -180,7 +185,7 @@ pub fn spawn(cfg: Config) -> Result<BridgeHandle, BridgeError> {
     let health = Arc::new(Health::new(cfg.admin.liveness_timeout));
     health.set_tls_loaded();
     let gens = Arc::new(Generations::default());
-    let handshakes = Arc::new(Handshakes::new(HANDSHAKE_GRACE));
+    let handshakes = Arc::new(Handshakes::new(handshake_grace));
     let hid = Arc::new(HidControl::new(cfg.input.queue, metrics.clone()));
     let display = DisplayShared::new(cfg.video.default_size);
     let accepting = Arc::new(AtomicBool::new(true));
@@ -460,14 +465,20 @@ async fn heartbeat(health: Arc<Health>, every: Duration) {
 /// the orchestrator starts it again with the new pair — but never under a
 /// live session: once the change is seen, the exit waits until no client is
 /// connected (the companion deployment spec's decision 8: an LE renewal
-/// must not cut the operator off). "Connected" is a live generation or a
-/// connection between `on_accept` and its session's start — a fresh
-/// client's TLS and CredSSP, a Preempt winner after the old session's end
-/// (`Handshakes`, PC15 review m4; one never reported finished stops
-/// counting after `HANDSHAKE_GRACE`). Polled at most every second
-/// meanwhile; a client admitted in the gap before §5.2 stops accepting is
-/// ended with cause `shutdown` like any other. `first` is the fingerprint
-/// `spawn` took before loading the pair (P7), never one taken here.
+/// must not cut the operator off). A live generation holds the exit off
+/// indefinitely. Handshakes in flight — a fresh client's TLS and CredSSP, a
+/// Preempt winner after the old session's end (`Handshakes`, PC15 review
+/// m4) — hold it off too, but for at most one grace (`Handshakes::grace`,
+/// `HANDSHAKE_GRACE`) from when the renewal became pending or the last
+/// session ended, whichever is later, however many arrive: they need no
+/// authentication, so a peer that keeps one in flight (a silent socket and
+/// a failing candidate every few seconds) cannot hold the old certificate
+/// until it expires (re-review). A client still negotiating at that point
+/// is ended by the restart and reconnects to the new bridge; no session is
+/// cut. Polled at most every second meanwhile; a client admitted in the
+/// gap before §5.2 stops accepting is ended with cause `shutdown` like any
+/// other. `first` is the fingerprint `spawn` took before loading the pair
+/// (P7), never one taken here.
 async fn watch_certificate(
     cert: PathBuf,
     key: PathBuf,
@@ -485,14 +496,27 @@ async fn watch_certificate(
         }
     }
     tracing::info!("the TLS certificate changed; restarting once no client is connected");
+    let pending = Instant::now();
+    let mut last_session: Option<Instant> = None;
     let mut idle = tokio::time::interval(every.min(Duration::from_secs(1)));
     loop {
         idle.tick().await;
+        let now = Instant::now();
         // Handshakes first: `on_connection_info` begins the generation
         // before it finishes the handshake, so read in this order a client
         // is always in one or the other (m4).
-        if handshakes.in_flight(Instant::now()) == 0 && gens.current().is_none() {
-            tracing::info!("no client connected; exiting to load the new certificate");
+        let handshaking = handshakes.in_flight(now) > 0;
+        if gens.current().is_some() {
+            last_session = Some(now); // DC21: no limit while a session lives
+            continue;
+        }
+        let since = last_session.map_or(pending, |t| t.max(pending));
+        let waited_out = now.saturating_duration_since(since) >= handshakes.grace();
+        if !handshaking || waited_out {
+            tracing::info!(
+                handshaking,
+                "no session; exiting to load the new certificate"
+            );
             exit.send_replace(true);
             return;
         }
@@ -1031,6 +1055,145 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), h.exit_requested())
             .await
             .expect("no exit once the client went");
+        stop(h).await;
+    }
+
+    /// A handshake admitted every `every` until the task is aborted — what
+    /// failing Preempt candidates look like to the tracker.
+    fn spray(handshakes: Arc<Handshakes>, every: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                handshakes.admit(Instant::now());
+                tokio::time::sleep(every).await;
+            }
+        })
+    }
+
+    /// m4 (PC15 re-review): handshakes alone hold a pending renewal off at
+    /// most one grace — under a spray that keeps one always in flight (an
+    /// unauthenticated peer's failing candidates), the exit still comes,
+    /// after about one grace and not much before it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handshake_spray_holds_a_renewal_off_one_grace_at_most() {
+        let d = tempfile::tempdir().unwrap();
+        let (cert, key) = pair_in(d.path());
+        let first = tls::fingerprint(&cert, &key);
+        let grace = Duration::from_millis(600);
+        let poll = Duration::from_millis(50);
+        let handshakes = Arc::new(Handshakes::new(grace));
+        let sprayer = spray(handshakes.clone(), poll);
+        let (tx, mut rx) = watch::channel(false);
+        tokio::spawn(watch_certificate(
+            cert.clone(),
+            key,
+            first,
+            poll,
+            Arc::new(Generations::default()),
+            handshakes,
+            tx,
+        ));
+        let t0 = Instant::now();
+        renew(&cert);
+        let exited =
+            tokio::time::timeout(grace + Duration::from_secs(2), rx.wait_for(|v| *v)).await;
+        let took = t0.elapsed();
+        sprayer.abort();
+        assert!(
+            exited.is_ok_and(|r| r.is_ok()),
+            "a spray of handshakes held the renewal off past its grace"
+        );
+        assert!(took >= grace / 2, "exited in {took:?}, before the grace");
+    }
+
+    /// m4 with DC21: a live session still holds the renewal off
+    /// indefinitely, spray or no spray; once it ends, handshakes hold it at
+    /// most one grace more.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_session_still_holds_a_renewal_off_under_a_spray() {
+        let d = tempfile::tempdir().unwrap();
+        let (cert, key) = pair_in(d.path());
+        let first = tls::fingerprint(&cert, &key);
+        let grace = Duration::from_millis(300);
+        let poll = Duration::from_millis(50);
+        let gens = Arc::new(Generations::default());
+        let generation = gens.begin(); // a client is connected
+        let handshakes = Arc::new(Handshakes::new(grace));
+        let sprayer = spray(handshakes.clone(), poll);
+        let (tx, mut rx) = watch::channel(false);
+        tokio::spawn(watch_certificate(
+            cert.clone(),
+            key,
+            first,
+            poll,
+            gens.clone(),
+            handshakes,
+            tx,
+        ));
+        renew(&cert);
+        assert!(
+            tokio::time::timeout(grace * 6, rx.wait_for(|v| *v))
+                .await
+                .is_err(),
+            "the renewal cut a live session"
+        );
+        let t0 = Instant::now();
+        assert_eq!(gens.end(), Some(generation)); // the client leaves
+        let exited =
+            tokio::time::timeout(grace + Duration::from_secs(2), rx.wait_for(|v| *v)).await;
+        let took = t0.elapsed();
+        sprayer.abort();
+        assert!(
+            exited.is_ok_and(|r| r.is_ok()),
+            "no exit within a grace of the session's end"
+        );
+        assert!(
+            took >= grace / 2,
+            "exited {took:?} after the session ended, before the grace"
+        );
+    }
+
+    /// m4 end to end, the review's attack on the real listener: one silent
+    /// TCP connection held open, and a Preempt candidate that sends its
+    /// X.224 request and drops at TLS every 150 ms (IronRDP reports neither
+    /// one finished). With a 1 s grace, the renewal's exit still comes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reviews_candidate_spray_cannot_hold_a_renewal_off() {
+        let sim = sim().await;
+        let d = tempfile::tempdir().unwrap();
+        let cfg = config_for(&sim, d.path(), |c| c.security.accept_rate = 10_000);
+        let grace = Duration::from_secs(1);
+        let mut h = tokio::time::timeout(
+            STARTUP_WAIT * 2,
+            tokio::task::spawn_blocking(move || spawn_with_grace(cfg, grace)),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let rdp = h.rdp_addr;
+        let _silent = tokio::time::timeout(T, tokio::net::TcpStream::connect(rdp))
+            .await
+            .unwrap()
+            .unwrap();
+        let sprayer = tokio::spawn(async move {
+            loop {
+                // Whatever the server answers, the candidate fails at TLS.
+                let _ =
+                    negotiate(rdp, SecurityProtocol::HYBRID | SecurityProtocol::HYBRID_EX).await;
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await; // the spray is on
+        let t0 = Instant::now();
+        renew(&d.path().join("cert.pem"));
+        let exited = tokio::time::timeout(grace + Duration::from_secs(3), h.exit_requested()).await;
+        let took = t0.elapsed();
+        sprayer.abort();
+        assert!(
+            exited.is_ok(),
+            "the spray held the renewal off past its grace"
+        );
+        assert!(took >= grace / 2, "exited in {took:?}, before the grace");
         stop(h).await;
     }
 

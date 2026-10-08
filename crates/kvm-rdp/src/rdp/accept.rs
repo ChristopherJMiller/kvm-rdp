@@ -101,6 +101,13 @@ impl Handshakes {
         }
     }
 
+    /// How long an unfinished handshake counts, and the longest handshakes
+    /// alone may hold a pending renewal off (m4).
+    #[must_use]
+    pub fn grace(&self) -> Duration {
+        self.grace
+    }
+
     /// `on_accept` admitted a connection at `now`.
     pub fn admit(&self, now: Instant) {
         let mut q = self.admitted.lock().unwrap_or_else(PoisonError::into_inner);
