@@ -496,4 +496,246 @@ mod tests {
         assert!(closed_channel_input(&r.gens, generation).is_none());
         assert!(closed_channel_input(&r.gens, generation + 1).is_some());
     }
+
+    /// m2: the two `abort()` calls in `on_connection_info`, observed through
+    /// a real connection. `ConnectionInfo::new`'s handle is inert, so these
+    /// drive a real IronRDP client through TLS and NLA into a real
+    /// `RdpServer` built as the bridge builds it (`with_hybrid` and our
+    /// `TlsIdentity`). Loopback only; every wait is bounded.
+    mod real_client {
+        use super::*;
+        use crate::rdp::display::{BridgeDisplay, DisplayShared};
+        use crate::rdp::input::InputStub;
+        use crate::rdp::tls;
+        use ironrdp_pdu::gcc;
+        use ironrdp_pdu::rdp::capability_sets::{MajorPlatformType, RailSupportLevel};
+        use ironrdp_server::{Credentials, RdpServer, ServerResult};
+        use std::future::Future;
+        use tokio::net::{TcpListener, TcpStream};
+
+        const USER: &str = "kvm";
+        /// Test-only, never a deployed secret (≥ 22 characters, §9.1).
+        const PASSWORD: &str = "l1-test-only-nla-password";
+        /// A served connection that outlives this is not being aborted.
+        const SERVE_BOUND: Duration = Duration::from_secs(5);
+
+        fn client_config() -> ironrdp_connector::Config {
+            ironrdp_connector::Config {
+                desktop_size: ironrdp_connector::DesktopSize {
+                    width: 1024,
+                    height: 768,
+                },
+                monitor_layout: None,
+                desktop_scale_factor: 0,
+                enable_tls: true,
+                enable_credssp: true,
+                enable_standard_rdp_security: false,
+                credentials: ironrdp_connector::Credentials::UsernamePassword {
+                    username: USER.into(),
+                    password: PASSWORD.into(),
+                },
+                domain: None,
+                client_build: 0,
+                client_name: "kvm-rdp-l1".into(),
+                keyboard_type: gcc::KeyboardType::IBM_ENHANCED,
+                keyboard_subtype: 0,
+                keyboard_functional_keys_count: 12,
+                keyboard_layout: 0,
+                connection_type: gcc::ConnectionType::Lan,
+                ime_file_name: String::new(),
+                bitmap: None,
+                dig_product_id: String::new(),
+                client_dir: String::new(),
+                alternate_shell: String::new(),
+                work_dir: String::new(),
+                remote_application_mode: false,
+                rail_support_level: RailSupportLevel::SUPPORTED,
+                platform: MajorPlatformType::UNIX,
+                hardware_id: None,
+                request_data: None,
+                autologon: false,
+                enable_audio_playback: false,
+                enable_audio_capture: false,
+                performance_flags: Default::default(),
+                license_cache: None,
+                timezone_info: Default::default(),
+                compression_type: None,
+                enable_server_pointer: false,
+                pointer_software_rendering: true,
+                multitransport_flags: None,
+                support_dyn_vc_gfx_protocol: false,
+            }
+        }
+
+        /// Connect through TLS and NLA and hold the transport open whatever
+        /// the outcome: an aborted connection fails `connect_finalize`, but
+        /// the server must not be able to end by the client leaving.
+        async fn connect_and_hold(
+            addr: std::net::SocketAddr,
+        ) -> Option<ironrdp_tokio::TokioFramed<ironrdp_tls::TlsStream<TcpStream>>> {
+            let tcp = TcpStream::connect(addr).await.ok()?;
+            let client_addr = tcp.local_addr().ok()?;
+            let mut framed = ironrdp_tokio::TokioFramed::new(tcp);
+            let mut connector =
+                ironrdp_connector::ClientConnector::new(client_config(), client_addr);
+            let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector)
+                .await
+                .ok()?;
+            let (tls, cert) = ironrdp_tls::upgrade_with_certificate_validation(
+                framed.into_inner_no_leftover(),
+                "localhost",
+                ironrdp_tls::CertificateValidation::DangerouslyAcceptInvalidCertificate,
+            )
+            .await
+            .ok()?;
+            let upgraded = ironrdp_async::mark_as_upgraded(should_upgrade, &mut connector);
+            let mut framed = ironrdp_tokio::TokioFramed::new(tls);
+            let key = ironrdp_tls::extract_tls_server_public_key(&cert)?.to_owned();
+            let _ = ironrdp_async::connect_finalize(
+                upgraded,
+                connector,
+                &mut framed,
+                &mut ironrdp_tokio::reqwest::ReqwestNetworkClient::new(),
+                "localhost".into(),
+                key,
+                None,
+            )
+            .await;
+            Some(framed)
+        }
+
+        /// Serve one real client with `lifecycle` (and `gfx`, if any) while
+        /// `watch` runs. `Some(result)` when the server ended within
+        /// `SERVE_BOUND` although the client held the connection open — an
+        /// abort — and `None` when it was still serving.
+        async fn serve_one(
+            lifecycle: Lifecycle,
+            gfx: Option<GfxFactory>,
+            watch: impl Future<Output = ()>,
+        ) -> Option<ServerResult<()>> {
+            tls::install_crypto_provider();
+            let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+            let id = tls::from_pem(
+                ck.cert.pem().as_bytes(),
+                ck.key_pair.serialize_pem().as_bytes(),
+            )
+            .unwrap();
+            let (display_tx, _display_rx) = mpsc::unbounded_channel();
+            let metrics = lifecycle.metrics.clone();
+            let mut server = RdpServer::builder()
+                .with_addr(([127, 0, 0, 1], 0))
+                .with_hybrid(id.acceptor, id.public_key)
+                .with_input_handler(InputStub::new(metrics))
+                .with_display_handler(BridgeDisplay::new(
+                    DisplayShared::new((1024, 768)),
+                    display_tx,
+                ))
+                .with_connection_handler(Some(Box::new(lifecycle)))
+                .with_gfx_factory(
+                    gfx.map(|g| -> Box<dyn ironrdp_server::GfxServerFactory> { Box::new(g) }),
+                )
+                .build();
+            server.set_credentials(Some(Credentials {
+                username: USER.into(),
+                password: PASSWORD.into(),
+                domain: None,
+            }));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let serve = async {
+                let (stream, _) = tokio::time::timeout(SERVE_BOUND, listener.accept())
+                    .await
+                    .expect("the client never connected")
+                    .unwrap();
+                // `run_connection` skips `on_accept` (only `run()`'s accept
+                // loop calls it): the connection was admitted before.
+                tokio::time::timeout(SERVE_BOUND, server.run_connection(stream))
+                    .await
+                    .ok()
+            };
+            let client = tokio::time::timeout(SERVE_BOUND, connect_and_hold(addr));
+            let (served, held, ()) = tokio::join!(serve, client, watch);
+            drop(held);
+            served
+        }
+
+        /// The lifecycle under test, its receivers, and the shared state.
+        fn lifecycle() -> (
+            Lifecycle,
+            mpsc::UnboundedReceiver<RdpInput>,
+            mpsc::UnboundedReceiver<KvmCommand>,
+            Arc<Generations>,
+        ) {
+            let r = rig(30);
+            (r.h, r.pump, r.kvm, r.gens)
+        }
+
+        /// K8 / P32: a connection that finishes NLA after stop-accepting is
+        /// aborted, and nothing starts. Without the abort it would sit with
+        /// no KVM side and need its own `Quit`.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_connection_finishing_nla_after_stop_accepting_is_aborted() {
+            let (h, mut pump, mut kvm, gens) = lifecycle();
+            h.accepting.store(false, Ordering::SeqCst);
+            let gfx = GfxFactory::new(h.gfx.clone(), h.to_pump.clone(), 60, h.metrics.clone());
+            let served = serve_one(h, Some(gfx), async {}).await;
+            assert!(
+                matches!(served, Some(Ok(()))),
+                "the connection was not aborted (still served after {SERVE_BOUND:?}, or failed before NLA)"
+            );
+            assert!(pump.try_recv().is_err() && kvm.try_recv().is_err());
+            assert_eq!(gens.current(), None);
+        }
+
+        /// K9: a connection for which no EGFX handle was built is aborted
+        /// rather than left with no pump.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_connection_without_an_egfx_handle_is_aborted() {
+            let (h, mut pump, mut kvm, gens) = lifecycle();
+            let served = serve_one(h, None, async {}).await;
+            assert!(
+                matches!(served, Some(Ok(()))),
+                "the connection was not aborted (still served after {SERVE_BOUND:?}, or failed before NLA)"
+            );
+            assert!(pump.try_recv().is_err() && kvm.try_recv().is_err());
+            assert_eq!(gens.current(), None);
+        }
+
+        /// The control: the same rig with a GFX factory and `accepting`
+        /// starts a session after NLA (§5.1) — so the two cases above reach
+        /// `on_connection_info` — and its `SessionStart` carries this
+        /// connection's real abort handle, which ends it.
+        #[tokio::test(flavor = "current_thread")]
+        async fn a_real_client_through_nla_starts_a_session_with_a_live_abort_handle() {
+            let (h, mut pump, mut kvm, gens) = lifecycle();
+            let gfx = GfxFactory::new(h.gfx.clone(), h.to_pump.clone(), 60, h.metrics.clone());
+            let mut started = None;
+            let watch = async {
+                if let Ok(Some(RdpInput::SessionStart {
+                    generation,
+                    slot,
+                    abort,
+                    ..
+                })) = tokio::time::timeout(SERVE_BOUND, pump.recv()).await
+                {
+                    started = Some((generation, slot, gens.current()));
+                    abort.abort();
+                }
+            };
+            let served = serve_one(h, Some(gfx), watch).await;
+            assert_eq!(
+                started,
+                Some((1, 1, Some(1))),
+                "no session started after NLA"
+            );
+            assert!(
+                matches!(served, Some(Ok(()))),
+                "the session's abort handle did not end it"
+            );
+            assert!(matches!(
+                kvm.try_recv(),
+                Ok(KvmCommand::Start { generation: 1 })
+            ));
+        }
+    }
 }
