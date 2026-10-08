@@ -48,9 +48,10 @@ impl ConnectionHandler for Lifecycle {
     fn on_connection_info(&mut self, info: &ConnectionInfo) {
         let abort = info.abort_handle();
         if !self.accepting.load(Ordering::SeqCst) {
-            // Won a takeover after shutdown began: never start the KVM side.
-            // Dropped without ErrorInfo (P32, DC13): the exiting bridge
-            // cannot serve its auto-reconnect; the restarted one can.
+            // Finished NLA after shutdown began — a Preempt winner, or a
+            // fresh connection accepted just before: never start the KVM
+            // side. Dropped without ErrorInfo (P32, DC13): the exiting
+            // bridge cannot serve its auto-reconnect; the restarted one can.
             abort.abort();
             return;
         }
@@ -185,8 +186,13 @@ mod tests {
     }
 
     /// §5.1, DC4: the generation is minted, bound to the GFX handle built
-    /// for this connection (the latest), and reaches the pump before the
-    /// KVM side hears `Start`; release-all runs first (session start).
+    /// for this connection (the latest), and handed to the pump
+    /// (`SessionStart`, with that handle) and to the KVM side (`Start`);
+    /// release-all runs first (session start). The order of the two sends
+    /// is not observable here — they are two channels (m3). The code sends
+    /// `SessionStart` first; that no KVM event overtakes its session's
+    /// start rests on the shell's `biased` select and its sharing the RDP
+    /// thread with this callback (DC4, Task 5.3).
     #[test]
     fn connection_info_begins_a_generation_bound_to_the_latest_gfx_handle() {
         let mut r = rig(30);
@@ -335,6 +341,18 @@ mod tests {
             Ok(RdpInput::GfxClosed { slot: 1 })
         ));
         assert_eq!(r.metrics.qoe_decode.count(), 1, "QoE decode time (§10.4)");
+        // The decode-and-render field (`time_diff_dr`, 4 ms), not the
+        // encode one (`time_diff_se`, 1 ms) (m7).
+        let text = r.metrics.render();
+        assert!(
+            text.lines()
+                .any(|l| l == "kvm_rdp_egfx_qoe_decode_seconds_sum 0.004"),
+            "{}",
+            text.lines()
+                .filter(|l| l.contains("qoe"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     /// PC11 n2: a client that closes its EGFX channel mid-session reaches
@@ -401,9 +419,10 @@ mod tests {
     }
 
     /// IronRDP drops a connection's channels — running `on_close` — just
-    /// before `on_disconnected`, with no await between (`RdpServer::run`,
-    /// `run_connection_with`). That close is every session's, not a cause:
-    /// by the time the pump reads it the generation has ended.
+    /// before `on_disconnected`, with no await between on its normal paths
+    /// (`RdpServer::run`, `run_connection_with`; the one accepted window is
+    /// on `closed_channel_input`). That close is every session's, not a
+    /// cause: by the time the pump reads it the generation has ended.
     #[test]
     fn the_close_every_teardown_runs_is_not_a_cause() {
         let mut r = rig(30);

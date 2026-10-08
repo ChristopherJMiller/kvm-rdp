@@ -76,11 +76,23 @@ pub fn take_latest(slot: &GfxSlot) -> Option<(u64, GfxServerHandle)> {
 /// once with m7's cause, `no_avc420`, through the core input that closes a
 /// session with a given cause (`UpstreamFatal`; no new core input).
 ///
-/// `None` once the generation has ended: IronRDP drops every connection's
-/// channels — which runs `on_close` — just before `on_disconnected`, with
-/// no await between (`RdpServer::run`, `run_connection_with`), and the
-/// shell shares that thread. So a teardown's close always reads as stale
-/// here, and a mid-session close as current.
+/// `None` once the generation has ended. On its normal paths IronRDP drops
+/// a connection's channels — which runs `on_close` — just before
+/// `on_disconnected`, with no await between (`RdpServer::run`,
+/// server.rs:2985 → 2988; `run_connection_with`, :2430), and the shell
+/// shares that thread, so a teardown's close reads as stale here and a
+/// mid-session close as current.
+///
+/// One window is accepted (PC13 review m1). A session that ends during a
+/// Deactivation-Reactivation has its channels in the reactivation acceptor
+/// (server.rs:5020-5024), dropped as the connection future completes; if a
+/// Preempt candidate is negotiating, `run()` then awaits up to
+/// `CANDIDATE_HANDOFF_GRACE` (750 ms, server.rs:2771-2777) before :2985 and
+/// :2988. The shell can read that close while the generation is still
+/// current and close an already-ending session as `no_avc420`: one
+/// miscounted `disconnects{no_avc420}` and a log line. IronRDP discards
+/// the stale `Disconnect` event before the next connection, and the late
+/// abort reaches a per-connection `Notify` nobody waits on.
 #[must_use]
 pub fn closed_channel_input(gens: &Generations, generation: Gen) -> Option<Input> {
     gens.is_current(generation)
@@ -179,5 +191,33 @@ impl GraphicsPipelineHandler for GfxCallbacks {
 
     fn max_frames_in_flight(&self) -> u32 {
         self.hard_cap
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::*;
+    use ironrdp_egfx::pdu::{CapabilityVersion, RawCapabilitySet};
+
+    /// m4: the client chooses the advertise, and `caps_hex` feeds a log
+    /// line, so the notation is bounded: at most 32 sets, each at most 64
+    /// data bytes (`version:` — 9 characters — plus 128 hex digits).
+    #[test]
+    fn caps_hex_is_bounded_however_much_the_client_advertises() {
+        let sets = (0..40u32)
+            .map(|i| RawCapabilitySet::new(CapabilityVersion(0x8_0000 + i), vec![0xAB; 100]))
+            .collect();
+        let hex = caps_hex(&CapabilitiesAdvertisePdu(sets));
+        assert_eq!(hex.len(), 32);
+        for (i, s) in (0u32..).zip(&hex) {
+            assert_eq!(s.len(), 9 + 128, "{s}");
+            assert!(s.starts_with(&format!("{:08x}:abab", 0x8_0000 + i)), "{s}");
+        }
     }
 }
