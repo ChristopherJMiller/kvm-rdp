@@ -14,6 +14,14 @@
 //! has a fatal cause nothing opens an FLV or starts a login: `Video::reconnect`
 //! and `want` would reopen a closed `Video`, so the commands are dropped
 //! here (PC8 n2), and a later auth refusal is ignored (P24).
+//!
+//! A re-login is "successful" only once the KVM accepts its token — the
+//! websocket upgrades with it, or an FLV opened with it reaches its first
+//! tag (§6.9, rev 6.2; `AuthGate::proven`). The first re-login of a session
+//! is immediate (a global logout costs no extra wait); every later one
+//! waits on `login_backoff`, which only a proven token resets — so a KVM
+//! that accepts a token on one path and refuses it on the other is logged
+//! into at most once per backoff, never as fast as it answers (I1).
 use crate::config::{BackoffConfig, Config, Secret};
 use crate::hid::HidControl;
 use crate::hid::writer::{WsCtl, WsEvent, WsTask};
@@ -137,6 +145,8 @@ struct Session<'d> {
     login_backoff: Backoff,
     login: Option<BoxFuture<'static, Result<Token, KvmError>>>,
     login_retry_at: Option<Instant>,
+    /// A re-login has run: every later one waits on `login_backoff` (I1).
+    relogged: bool,
     token: watch::Sender<Option<(u64, Token)>>,
     deadline: Deadline,
     ws_ctl: mpsc::UnboundedSender<WsCtl>,
@@ -188,6 +198,7 @@ impl<'d> Session<'d> {
             login_backoff: Backoff::new(cfg.backoff, Jitter::from_clock()),
             login: None,
             login_retry_at: None,
+            relogged: false,
             token: token_tx,
             deadline: Deadline::new(cfg.upstream_deadline),
             ws_ctl: ctl_tx,
@@ -227,7 +238,11 @@ impl<'d> Session<'d> {
                 // `on_ready` runs to completion in the arm's body (it is not
                 // cancel-safe), and every `Ready` reaches it.
                 r = self.video.ready() => {
-                    if let Some(o) = self.video.on_ready(r, Instant::now()).await {
+                    let o = self.video.on_ready(r, Instant::now()).await;
+                    if let Some(seq) = self.video.take_proven() {
+                        self.proven(seq);
+                    }
+                    if let Some(o) = o {
                         self.outcome(o).await;
                     }
                 }
@@ -308,7 +323,6 @@ impl<'d> Session<'d> {
                 self.deps.metrics.logins.inc();
                 self.auth.login_ok();
                 self.deadline.logged_in();
-                self.login_backoff.reset();
                 let current = (self.auth.seq(), token);
                 self.video.token_ready(&current);
                 self.token.send_replace(Some(current));
@@ -330,7 +344,8 @@ impl<'d> Session<'d> {
         match ev {
             Some(WsEvent::AuthRefused { seq }) => self.refused(seq).await,
             Some(WsEvent::CertMismatch) => self.fatal(Cause::KvmCertMismatch).await,
-            Some(WsEvent::Up | WsEvent::Down) => {}
+            Some(WsEvent::Up { seq }) => self.proven(seq),
+            Some(WsEvent::Down) => {}
             None => self.ws_alive = false,
         }
     }
@@ -343,11 +358,7 @@ impl<'d> Session<'d> {
             return;
         }
         match self.auth.refused(seq) {
-            AuthStep::Relogin => {
-                if self.login.is_none() {
-                    self.start_login();
-                }
-            }
+            AuthStep::Relogin => self.relogin(),
             AuthStep::Wait => {
                 // A token newer than the refused one may already be here:
                 // hand it to the FLV (never the refused one again).
@@ -359,6 +370,30 @@ impl<'d> Session<'d> {
                 }
             }
             AuthStep::Fatal => self.fatal(Cause::KvmAuthFailed).await,
+        }
+    }
+
+    /// The gate's `Relogin` (I1, option B): the session's first re-login
+    /// runs at once; every later one waits `login_backoff`, which only a
+    /// proven token resets. One login at a time, and none while one is
+    /// already scheduled.
+    fn relogin(&mut self) {
+        if self.login.is_some() || self.login_retry_at.is_some() {
+            return;
+        }
+        if self.relogged {
+            self.login_retry_at = Some(Instant::now() + self.login_backoff.next_delay());
+        } else {
+            self.relogged = true;
+            self.start_login();
+        }
+    }
+
+    /// The KVM accepted token `seq`: the websocket upgraded with it, or an
+    /// FLV opened with it reached its first tag (§6.9, rev 6.2).
+    fn proven(&mut self, seq: u64) {
+        if self.auth.proven(seq) {
+            self.login_backoff.reset();
         }
     }
 
@@ -844,6 +879,134 @@ mod tests {
         r.stop(1).await;
     }
 
+    /// No login past `logins_ok == n` within 1 s (a loop shows in ms).
+    async fn no_more_logins(r: &Rig, n: u64) {
+        let more = r
+            .sim
+            .wait_for(Duration::from_secs(1), |_| {
+                let s = r.sim.stats();
+                s.logins_ok + s.logins_failed > n
+            })
+            .await;
+        assert!(more.is_err(), "logged in again: {:?}", r.sim.stats());
+    }
+
+    /// I1 (PC9 fix round 1, XP1): a KVM that accepts logins but refuses
+    /// every fresh token on the websocket. A token that never worked does
+    /// not make its re-login "successful" (§6.9, rev 6.2): the second
+    /// refusal is fatal — two logins, not hundreds a second.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_websocket_refusing_every_fresh_token_fails_after_two_logins() {
+        let mut r = rig(None, |_| {}).await;
+        r.streaming(1).await;
+        r.sim.set_policy(|p| p.ws_status = Some(403));
+        r.sim.close_websockets();
+        assert_eq!(r.fatal().await, Cause::KvmAuthFailed);
+        no_more_logins(&r, 2).await;
+        assert_eq!(r.sim.stats().logins_ok, 2);
+        r.stop(1).await;
+    }
+
+    /// I1: a token the FLV proves (its reopen reached a first tag) makes
+    /// the re-login successful, so a second expiry re-logs in again rather
+    /// than being fatal — with the websocket still up on the first token,
+    /// the FLV's proof is the only one (§11.3 "token expiry", twice).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_flv_proven_token_allows_the_next_relogin() {
+        let mut r = rig(None, |_| {}).await;
+        r.streaming(1).await;
+        for round in 1..=2u64 {
+            r.sim.expire_tokens();
+            r.sim.inject(Fault::Close);
+            r.wait(|e| opened(e, FlvOrigin::Transient)).await;
+            // The reopen's first tag, on the new token.
+            r.wait(|e| matches!(e, KvmEvent::Au { .. })).await;
+            assert_eq!(r.sim.stats().logins_ok, round + 1, "round {round}");
+        }
+        assert_eq!(r.metrics.relogins.get(), 2);
+        assert_eq!(r.sim.stats().ws_open, 1);
+        r.no_fatal_queued();
+        r.stop(1).await;
+    }
+
+    /// I1 (XP2): the same with the FLV refusing every token — the websocket
+    /// stays up on the first token, so no fresh token is ever accepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_flv_refusing_every_fresh_token_fails_after_two_logins() {
+        let mut r = rig(None, |c| c.upstream_deadline = Duration::from_secs(20)).await;
+        r.sim.set_policy(|p| p.flv_status = Some(403));
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        r.tx.send(KvmCommand::OpenFlv { generation: 1 }).unwrap();
+        assert_eq!(r.fatal().await, Cause::KvmAuthFailed);
+        no_more_logins(&r, 2).await;
+        assert_eq!(r.sim.stats().logins_ok, 2);
+        r.stop(1).await;
+    }
+
+    /// I1 residual (option B): the websocket accepts every fresh token —
+    /// it is dropped after each login, so it reopens with the new one and
+    /// proves it — while the FLV refuses every token. The gate never sees
+    /// two unproven refusals in a row, so only `login_backoff` bounds the
+    /// re-logins: the first is immediate, every later one starts at least
+    /// the backoff after the refusal that caused it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_logins_while_only_the_flv_refuses_are_paced_by_the_backoff() {
+        let backoff = Duration::from_millis(200);
+        let sim = start_sim().await;
+        sim.set_policy(|p| p.flv_status = Some(403));
+        let p = sim.ports();
+        // Each FLV refusal comes 500 ms after its open, well after the
+        // websocket (reopened 200 ms after a drop) proved the token.
+        let video = proxy_delayed(p.video, Duration::from_millis(500)).await;
+        let pin = sim.spki_sha256().to_owned();
+        let mut r = rig_on(sim, (p.web, video.port, p.control), &pin, |c| {
+            c.backoff = BackoffConfig {
+                initial: backoff,
+                factor: 2,
+                max: backoff * 4,
+                jitter_percent: 0,
+            };
+            c.upstream_deadline = Duration::from_secs(20);
+        });
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        r.tx.send(KvmCommand::OpenFlv { generation: 1 }).unwrap();
+        let t0 = std::time::Instant::now();
+        let mut seen = 0;
+        while t0.elapsed() < Duration::from_secs(3) {
+            let n = r.sim.stats().logins_ok;
+            if n > seen {
+                seen = n;
+                r.sim.close_websockets();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        r.no_fatal_queued();
+        let log = r.sim.stamped_events();
+        let at = |f: fn(&SimEvent) -> bool| -> Vec<std::time::Instant> {
+            log.iter().filter(|(_, e)| f(e)).map(|(t, _)| *t).collect()
+        };
+        let logins = at(|e| matches!(e, SimEvent::Login { ok: true }));
+        let refusals = at(|e| matches!(e, SimEvent::FlvRefused { .. }));
+        assert!(
+            logins.len() >= 3,
+            "the loop never ran: {} logins",
+            logins.len()
+        );
+        for (k, login) in logins.iter().enumerate().skip(1) {
+            let cause = refusals.iter().filter(|t| *t < login).max().unwrap();
+            let gap = login.saturating_duration_since(*cause);
+            if k == 1 {
+                assert!(gap < backoff / 2, "the first re-login waited {gap:?}");
+            } else {
+                assert!(
+                    gap >= backoff / 2,
+                    "re-login {k} came {gap:?} after the refusal that caused it"
+                );
+            }
+        }
+        r.stop(1).await;
+    }
+
     /// §6.5: `RequestIdr` → one side FLV; a refused one is counted and
     /// neither retried nor answered with a re-login.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -946,6 +1109,12 @@ mod tests {
     }
 
     async fn proxy(to: u16) -> Proxy {
+        proxy_delayed(to, Duration::ZERO).await
+    }
+
+    /// A proxy that holds each new connection for `delay` before it
+    /// connects upstream: every answer on it comes at least that late.
+    async fn proxy_delayed(to: u16, delay: Duration) -> Proxy {
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         let to = Arc::new(AtomicU16::new(to));
@@ -954,6 +1123,7 @@ mod tests {
             while let Ok((mut a, _)) = l.accept().await {
                 let up = target.load(Ordering::SeqCst);
                 tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
                     if let Ok(mut b) = tokio::net::TcpStream::connect(("127.0.0.1", up)).await {
                         let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
                     }

@@ -61,6 +61,8 @@ struct Stream {
     conn: FlvConn,
     demux: FlvDemuxer,
     got_tag: bool,
+    /// The sequence number of the token it was opened with.
+    seq: u64,
     /// When the connection opened: a `ReconnectFlv` candidate with no tag
     /// `connect_timeout` after this is abandoned (see `Video::tick`).
     since: Instant,
@@ -95,6 +97,9 @@ pub struct Video {
     /// The previous AU on this connection (§10.4 inter-arrival).
     last_au: Option<Instant>,
     fps: FpsMeter,
+    /// The token a new main FLV proved by reaching its first tag, until
+    /// the session takes it (`take_proven`).
+    proven: Option<u64>,
 }
 
 /// §10.4 fps: AUs admitted over the last whole second, published once a
@@ -202,6 +207,7 @@ impl Video {
             dropped: false,
             last_au: None,
             fps: FpsMeter::default(),
+            proven: None,
         }
     }
 
@@ -265,6 +271,14 @@ impl Video {
         self.wanted = false;
         self.retry_at = None;
         self.waiting_token = false;
+        self.proven = None;
+    }
+
+    /// The sequence number of the token a new main FLV proved by reaching
+    /// its first tag since the last call (§6.9, rev 6.2: the KVM accepted
+    /// it), for the session's `AuthGate`. Call after every `on_ready`.
+    pub fn take_proven(&mut self) -> Option<u64> {
+        self.proven.take()
     }
 
     fn start_open(&mut self, token: &(u64, Token), origin: FlvOrigin) {
@@ -307,7 +321,7 @@ impl Video {
                     return None;
                 }
                 match res {
-                    Ok(conn) => self.opened(conn, origin, now).await,
+                    Ok(conn) => self.opened(conn, origin, seq, now).await,
                     Err(e) => self.open_failed(e, origin, seq, now),
                 }
             }
@@ -358,11 +372,18 @@ impl Video {
         None
     }
 
-    async fn opened(&mut self, conn: FlvConn, origin: FlvOrigin, now: Instant) -> Option<Outcome> {
+    async fn opened(
+        &mut self,
+        conn: FlvConn,
+        origin: FlvOrigin,
+        seq: u64,
+        now: Instant,
+    ) -> Option<Outcome> {
         let stream = Stream {
             conn,
             demux: FlvDemuxer::new(FlvLimits::default()),
             got_tag: false,
+            seq,
             since: now,
         };
         if origin == FlvOrigin::Commanded && self.main.is_some() {
@@ -516,6 +537,7 @@ impl Video {
             && !s.got_tag
         {
             s.got_tag = true;
+            self.proven = Some(s.seq);
             self.backoff.reset();
         }
         match self.admission.admit(tag, now) {
@@ -901,6 +923,36 @@ mod tests {
         let (evs, out) = r.run_until(Duration::from_secs(5), |e| e.len() >= 2).await;
         assert_eq!(out, None);
         assert!(kinds(&evs).starts_with(&["open:transient".to_owned(), "sps:Initial".to_owned()]));
+    }
+
+    /// I1 (PC9 fix round 1): an FLV that reaches its first tag proves the
+    /// token it was opened with — once per connection — so the session's
+    /// gate counts that token's re-login as successful (§6.9, rev 6.2). A
+    /// refused open proves nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_first_tag_proves_the_token_the_flv_was_opened_with() {
+        let mut r = rig(64, |_| {}, |_| {}).await;
+        assert_eq!(r.video.take_proven(), None);
+        r.video.want(Instant::now(), Some(&r.token));
+        r.run_until(Duration::from_secs(5), |e| {
+            kinds(e).contains(&"idr".to_owned())
+        })
+        .await;
+        assert_eq!(r.video.take_proven(), Some(1));
+        r.run(Duration::from_millis(200), true).await;
+        assert_eq!(r.video.take_proven(), None, "later tags prove nothing");
+        r.sim.expire_tokens();
+        r.sim.inject(Fault::Close);
+        let (_, out) = r.run(Duration::from_secs(2), true).await;
+        assert_eq!(out, Some(Outcome::Refused { seq: 1 }));
+        assert_eq!(r.video.take_proven(), None, "a refused open proves nothing");
+        r.relogin().await;
+        r.run_until(Duration::from_secs(5), |e| {
+            kinds(e).contains(&"open:transient".to_owned())
+        })
+        .await;
+        r.run(Duration::from_millis(200), true).await;
+        assert_eq!(r.video.take_proven(), Some(2));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

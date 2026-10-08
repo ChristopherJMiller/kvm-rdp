@@ -81,6 +81,13 @@ pub enum AuthStep {
 /// with no successful re-login in between is fatal. Tokens are numbered so
 /// a refusal of an already-replaced token (the websocket and the FLV both
 /// hitting a global logout) counts once.
+///
+/// A re-login is "successful" only once its token is accepted (§6.9, rev
+/// 6.2; PC9 fix round 1, I1): `login_ok` issues a token, `proven` — the
+/// websocket upgraded with it, or an FLV opened with it reached its first
+/// tag — clears the count. A KVM that answers logins but refuses every
+/// fresh token is fatal at the second refusal instead of being logged into
+/// as fast as it answers.
 #[derive(Debug, Default)]
 pub struct AuthGate {
     consecutive: u8,
@@ -94,10 +101,23 @@ impl AuthGate {
         self.seq
     }
 
+    /// A login answered with a token: it becomes the current one (`seq`).
+    /// Not yet a success — see `proven`.
     pub fn login_ok(&mut self) {
-        self.consecutive = 0;
         self.seq = self.seq.saturating_add(1);
         self.pending = false;
+    }
+
+    /// The KVM accepted the token with sequence number `seq`. Only the
+    /// current token counts, and not while its own refusal is being
+    /// answered (a late acceptance of a token already refused somewhere
+    /// proves nothing). True if the count was cleared.
+    pub fn proven(&mut self, seq: u64) -> bool {
+        if seq == 0 || seq != self.seq || self.pending {
+            return false;
+        }
+        self.consecutive = 0;
+        true
     }
 
     pub fn login_rejected(&mut self) -> AuthStep {
@@ -244,7 +264,8 @@ mod tests {
     }
 
     /// §6.9: re-login once; a second consecutive failure with no successful
-    /// re-login in between is fatal; a success resets the count.
+    /// re-login in between is fatal; a success — the new token accepted —
+    /// resets the count.
     #[test]
     fn the_auth_gate_allows_one_relogin_per_failure_run() {
         let mut g = AuthGate::default();
@@ -274,6 +295,7 @@ mod tests {
             AuthStep::Wait,
             "an older token's refusal after the re-login"
         );
+        assert!(g.proven(g.seq()), "the new token was accepted");
         assert_eq!(
             g.refused(g.seq()),
             AuthStep::Relogin,
@@ -283,6 +305,47 @@ mod tests {
             g.login_rejected(),
             AuthStep::Fatal,
             "then the re-login is rejected"
+        );
+    }
+
+    /// I1 (PC9 fix round 1): a re-login is "successful" (§6.9, rev 6.2)
+    /// only once its token is accepted — by the websocket or by an FLV's
+    /// first tag — not when the login itself answers. A KVM that logs in
+    /// fine but refuses every fresh token is therefore fatal at the second
+    /// refusal, however fast it answers logins.
+    #[test]
+    fn a_re_login_succeeds_only_once_its_token_is_accepted() {
+        let mut g = AuthGate::default();
+        g.login_ok();
+        assert!(g.proven(1), "the first token works");
+        assert_eq!(g.refused(1), AuthStep::Relogin);
+        g.login_ok();
+        assert_eq!(
+            g.refused(2),
+            AuthStep::Fatal,
+            "a fresh token refused before anything accepted it"
+        );
+
+        // A proof of a replaced token, or one arriving while its own
+        // refusal is being answered, resets nothing.
+        let mut g = AuthGate::default();
+        g.login_ok();
+        assert_eq!(g.refused(1), AuthStep::Relogin);
+        assert!(!g.proven(1), "accepted after it was refused: still pending");
+        g.login_ok();
+        assert!(!g.proven(1), "an older token");
+        assert_eq!(g.refused(2), AuthStep::Fatal);
+
+        // Accepted, then refused: one re-login per proven token, for ever.
+        let mut g = AuthGate::default();
+        for seq in 1..=5 {
+            g.login_ok();
+            assert!(g.proven(seq));
+            assert_eq!(g.refused(seq), AuthStep::Relogin, "token {seq}");
+        }
+        assert!(
+            !AuthGate::default().proven(0),
+            "nothing to prove before the first login"
         );
     }
 

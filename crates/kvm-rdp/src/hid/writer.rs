@@ -40,7 +40,11 @@ pub enum WsCtl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsEvent {
-    Up,
+    /// The websocket upgraded with the token with this sequence number:
+    /// the KVM accepted that token (§6.9, rev 6.2; `AuthGate::proven`).
+    Up {
+        seq: u64,
+    },
     Down,
     /// The upgrade was refused for the token with this sequence number.
     AuthRefused {
@@ -107,7 +111,7 @@ impl WsTask {
             };
             match opened {
                 Ok(ws) => {
-                    let _ = self.events.send(WsEvent::Up);
+                    let _ = self.events.send(WsEvent::Up { seq });
                     let (sink, stream) = ws.split();
                     if self.drive(sink, stream).await == Exit::Closed {
                         return;
@@ -807,7 +811,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
         };
-        assert_eq!(next(&mut ev).await, WsEvent::Up);
+        assert_eq!(next(&mut ev).await, WsEvent::Up { seq: 1 });
         sim.wait_for(Duration::from_secs(3), |e| frames(e).len() >= 2)
             .await
             .unwrap();
@@ -819,7 +823,7 @@ mod tests {
         // The writer saw the loss, released, and is backing off.
         assert_eq!(next(&mut ev).await, WsEvent::Down);
         hid.push(kbd(5), false); // made while the websocket is down
-        assert_eq!(next(&mut ev).await, WsEvent::Up);
+        assert_eq!(next(&mut ev).await, WsEvent::Up { seq: 1 });
         sim.wait_for(Duration::from_secs(3), |e| frames(e).len() >= 5)
             .await
             .unwrap();
