@@ -408,7 +408,20 @@ impl Video {
         };
         let p = self.pending.as_mut()?;
         let (tags, err) = drain(&mut p.demux, &bytes);
-        if tags.is_empty() && err.is_none() {
+        if tags.is_empty() {
+            // No first tag: a header-only chunk waits (`?`); an error means
+            // the candidate failed and the old FLV keeps flowing (§6.5).
+            // It is still the KVM's framing violation (§6.9): counted, and
+            // toward the 3-in-60 s `stream_corrupt` rule.
+            let e = err?;
+            self.pending = None;
+            self.metrics.upstream_reconnects.inc("commanded_failed");
+            let e = AdmissionError::from(e);
+            self.metrics.parse_errors.inc(e.kind());
+            if matches!(self.violations.record(now), ViolationVerdict::Fatal) {
+                self.close();
+                return Some(Outcome::Fatal(Cause::StreamCorrupt));
+            }
             return None;
         }
         // Its first tag: the old FLV closes now (make-before-break, §6.5).
@@ -1080,6 +1093,87 @@ mod tests {
             t0.elapsed()
         );
         assert_eq!(flv_opens(&r.sim).len(), 3);
+    }
+
+    /// I1 (PC8 fix round 1): a candidate whose first chunk is a framing
+    /// error, with no tag yet, has not delivered its first tag (§6.5): it
+    /// is dropped and the healthy main keeps flowing — no `FlvOpened`, no
+    /// third FLV.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_candidate_failing_before_its_first_tag_keeps_the_main() {
+        let mut r = rig(64, |_| {}, |s| s.idle_timeout = Duration::from_secs(30)).await;
+        r.video.want(Instant::now(), Some(&r.token));
+        r.run_until(Duration::from_secs(5), |e| {
+            kinds(e).contains(&"idr".to_owned())
+        })
+        .await;
+        let main = flv_opens(&r.sim)[0];
+        r.sim.set_policy(|p| p.skip_sequence_header = true);
+        r.video.reconnect(Instant::now(), Some(&r.token));
+        let t0 = Instant::now();
+        let mut evs = Vec::new();
+        while r.metrics.parse_errors.get("nal_before_sequence_header") == 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "no framing error: {:?}",
+                kinds(&evs)
+            );
+            evs.extend(r.run(Duration::from_millis(20), true).await.0);
+        }
+        r.sim.set_policy(|p| p.skip_sequence_header = false);
+        evs.extend(r.run(Duration::from_millis(600), true).await.0);
+        assert!(
+            !r.sim.events().contains(&SimEvent::FlvClose { conn: main }),
+            "the healthy main closed"
+        );
+        assert!(
+            !kinds(&evs).iter().any(|k| k.starts_with("open:")),
+            "{:?}",
+            kinds(&evs)
+        );
+        assert_eq!(flv_opens(&r.sim).len(), 2);
+        assert_eq!(r.metrics.upstream_reconnects.get("commanded_failed"), 1);
+    }
+
+    /// I1: the candidate's framing error is still the KVM's violation
+    /// (§6.9's table does not distinguish connections), so two more on the
+    /// main FLV within 60 s are `stream_corrupt`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_candidate_framing_error_counts_toward_stream_corrupt() {
+        let mut r = rig(64, |_| {}, |s| s.idle_timeout = Duration::from_secs(30)).await;
+        r.video.want(Instant::now(), Some(&r.token));
+        r.run_until(Duration::from_secs(5), |e| {
+            kinds(e).contains(&"idr".to_owned())
+        })
+        .await;
+        r.sim.set_policy(|p| p.skip_sequence_header = true);
+        r.video.reconnect(Instant::now(), Some(&r.token));
+        let t0 = Instant::now();
+        while r.metrics.parse_errors.get("nal_before_sequence_header") == 0 {
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "no framing error on the candidate"
+            );
+            let (_, out) = r.run(Duration::from_millis(20), true).await;
+            assert_eq!(out, None);
+        }
+        r.sim.set_policy(|p| p.skip_sequence_header = false);
+        r.sim.inject(Fault::BadPrevTagSize);
+        let (evs, out) = r.run_until(Duration::from_secs(5), reopened).await;
+        assert_eq!(out, None, "the second violation is transient");
+        assert!(
+            kinds(&evs).contains(&"open:transient".to_owned()),
+            "{:?}",
+            kinds(&evs)
+        );
+        r.sim.inject(Fault::BadPrevTagSize);
+        let (_, out) = r.run(Duration::from_secs(2), true).await;
+        assert_eq!(
+            out,
+            Some(Outcome::Fatal(Cause::StreamCorrupt)),
+            "the candidate's violation was not counted"
+        );
+        assert_eq!(r.metrics.parse_errors.total(), 3);
     }
 
     /// §6.5 `side`: one extra FLV, closed after its first tag; the main FLV
