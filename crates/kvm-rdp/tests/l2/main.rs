@@ -9,7 +9,9 @@
 
 mod client;
 mod faults;
+mod flow;
 mod harness;
+mod hid;
 mod lifecycle;
 mod resize;
 mod sessions;
