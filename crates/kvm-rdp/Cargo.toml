@@ -13,6 +13,14 @@ name = "kvm_rdp"
 path = "src/lib.rs"
 doctest = false
 
+# No unit tests in the binary: a third IronRDP-linked test executable would
+# cost a link and its disk (§13). L2's secrets case runs it as a subprocess.
+[[bin]]
+name = "kvm-rdp"
+path = "src/main.rs"
+test = false
+bench = false
+
 [dependencies]
 kvm-proto = { path = "../kvm-proto" }
 ironrdp-server = { workspace = true }
@@ -53,3 +61,5 @@ ironrdp-session = { workspace = true }
 # default features would pull in ring (rcgen 0.13's default backend, §4.2)
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
 tempfile = "3"
+# raise(3) for the P37 signal-order test (Task 6.1's L2 uses kill(2)).
+libc = "0.2"

@@ -1,0 +1,43 @@
+//! `kvm-rdp` (spec §4.4, §5.2): read the config named by `--config` or
+//! `KVM_RDP_CONFIG` — the only environment variable read — start the
+//! bridge, and run until SIGTERM, SIGINT or a certificate change; exit 0
+//! after §5.2's shutdown. Exit 1 if startup failed or the RDP server
+//! stopped on its own, 2 on a config or logging error.
+use kvm_rdp::bridge::{self, Exit};
+use kvm_rdp::config::{Config, config_path};
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let path = match config_path(
+        std::env::args_os().skip(1),
+        std::env::var_os("KVM_RDP_CONFIG"),
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("kvm-rdp: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let cfg = match Config::load(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("kvm-rdp: {}: {e}", path.display());
+            return ExitCode::from(2);
+        }
+    };
+    if let Err(e) = kvm_rdp::logging::init(&cfg.log.filter) {
+        eprintln!("kvm-rdp: {e}");
+        return ExitCode::from(2);
+    }
+    let handle = match bridge::spawn(cfg) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "startup failed");
+            return ExitCode::FAILURE;
+        }
+    };
+    match handle.run_until_signal() {
+        Exit::Signal | Exit::CertificateChanged => ExitCode::SUCCESS,
+        Exit::ServerStopped => ExitCode::FAILURE,
+    }
+}

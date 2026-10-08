@@ -14,6 +14,7 @@
 )]
 
 pub mod admin;
+pub mod bridge;
 pub mod config;
 pub mod hid;
 pub mod kvm;

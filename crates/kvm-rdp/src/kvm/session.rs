@@ -53,6 +53,9 @@ const CLOSE_WAIT: Duration = Duration::from_millis(500);
 /// it the Stop goes on, with a warning; the reset follows when the task is
 /// dropped. A Stop therefore takes at most `CLOSE_WAIT + ABORT_WAIT`.
 const ABORT_WAIT: Duration = Duration::from_millis(100);
+/// The longest a `Stop` or `Shutdown` keeps the actor (`close()`): §5.2's
+/// KVM step in `bridge` must cover it.
+pub const STOP_BOUND: Duration = CLOSE_WAIT.saturating_add(ABORT_WAIT);
 
 pub struct SessionConfig {
     pub password: Secret,

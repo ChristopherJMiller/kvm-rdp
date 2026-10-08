@@ -1954,6 +1954,7 @@ dependencies = [
  "ironrdp-tokio",
  "kvm-proto",
  "kvm-sim",
+ "libc",
  "rcgen",
  "rustls",
  "serde",

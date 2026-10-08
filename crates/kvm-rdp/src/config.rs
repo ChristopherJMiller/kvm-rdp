@@ -245,6 +245,33 @@ impl Config {
     }
 }
 
+/// `--config <file>` or `--config=<file>`, else `KVM_RDP_CONFIG` (§4.4) —
+/// the only environment variable the bridge reads. `args` excludes argv[0].
+pub fn config_path(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+    env: Option<std::ffi::OsString>,
+) -> Result<PathBuf, ConfigError> {
+    let mut args = args.into_iter();
+    let mut found = None;
+    while let Some(a) = args.next() {
+        if a == "--config" {
+            found = Some(PathBuf::from(
+                args.next()
+                    .ok_or_else(|| invalid("--config needs a file"))?,
+            ));
+        } else if let Some(v) = a.to_str().and_then(|s| s.strip_prefix("--config=")) {
+            found = Some(PathBuf::from(v));
+        } else {
+            return Err(invalid(format!(
+                "unknown argument {a:?} (usage: kvm-rdp --config <file>)"
+            )));
+        }
+    }
+    found
+        .or_else(|| env.map(PathBuf::from))
+        .ok_or_else(|| invalid("no config: pass --config <file> or set KVM_RDP_CONFIG"))
+}
+
 /// `"250ms"`, `"1.6s"`, `"10s"`: a non-negative number of ms or s, ≤ 1 h.
 #[must_use]
 pub fn parse_duration(s: &str) -> Option<Duration> {
@@ -978,5 +1005,27 @@ mod tests {
         for bad in ["3601s", "-1s", "1h", "s", "", "NaNs", "infs"] {
             assert_eq!(parse_duration(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn the_config_path_comes_from_the_flag_or_the_variable() {
+        use std::ffi::OsString;
+        let os = |v: &[&str]| v.iter().map(OsString::from).collect::<Vec<_>>();
+        let p = PathBuf::from;
+        assert_eq!(
+            config_path(os(&["--config", "/a.toml"]), Some("/b.toml".into())).unwrap(),
+            p("/a.toml")
+        );
+        assert_eq!(
+            config_path(os(&["--config=/a.toml"]), None).unwrap(),
+            p("/a.toml")
+        );
+        assert_eq!(
+            config_path(os(&[]), Some("/b.toml".into())).unwrap(),
+            p("/b.toml")
+        );
+        assert!(config_path(os(&[]), None).is_err());
+        assert!(config_path(os(&["--config"]), None).is_err());
+        assert!(config_path(os(&["--verbose"]), None).is_err());
     }
 }

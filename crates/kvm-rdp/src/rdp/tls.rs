@@ -53,6 +53,83 @@ pub struct TlsIdentity {
     pub acceptor: TlsAcceptor,
     /// The leaf certificate's subjectPublicKey (BIT STRING contents).
     pub public_key: Vec<u8>,
+    /// The leaf's key type and size, for the startup log (PC13 m10).
+    pub key: KeyKind,
+}
+
+/// The leaf certificate's key (rustls has checked the private key matches
+/// it). Logged at startup, never judged: §9.1 leaves RSA vs ECDSA to the
+/// Windows App acceptance check, and aws-lc-rs refuses what it cannot sign
+/// with (`TlsError::UnsupportedKey`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyKind {
+    /// RSA, modulus bits.
+    Rsa(u32),
+    /// ECDSA, curve bits (P-256, P-384, P-521; 0 for another curve).
+    Ecdsa(u32),
+    Ed25519,
+    Other,
+}
+
+impl KeyKind {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            KeyKind::Rsa(_) => "RSA",
+            KeyKind::Ecdsa(_) => "ECDSA",
+            KeyKind::Ed25519 => "Ed25519",
+            KeyKind::Other => "other",
+        }
+    }
+
+    #[must_use]
+    pub fn bits(self) -> u32 {
+        match self {
+            KeyKind::Rsa(b) | KeyKind::Ecdsa(b) => b,
+            KeyKind::Ed25519 => 256,
+            KeyKind::Other => 0,
+        }
+    }
+
+    fn of(spki: &x509_parser::x509::SubjectPublicKeyInfo<'_>) -> KeyKind {
+        use x509_parser::oid_registry::{
+            OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY, OID_NIST_EC_P384, OID_NIST_EC_P521,
+            OID_PKCS1_RSAENCRYPTION, OID_SIG_ED25519,
+        };
+        use x509_parser::public_key::PublicKey;
+        let alg = &spki.algorithm;
+        if alg.algorithm == OID_PKCS1_RSAENCRYPTION {
+            match spki.parsed() {
+                Ok(PublicKey::RSA(rsa)) => KeyKind::Rsa(bit_length(rsa.modulus)),
+                _ => KeyKind::Other,
+            }
+        } else if alg.algorithm == OID_KEY_TYPE_EC_PUBLIC_KEY {
+            let curve = alg.parameters.as_ref().and_then(|p| p.as_oid().ok());
+            KeyKind::Ecdsa(match curve {
+                Some(c) if c == OID_EC_P256 => 256,
+                Some(c) if c == OID_NIST_EC_P384 => 384,
+                Some(c) if c == OID_NIST_EC_P521 => 521,
+                _ => 0,
+            })
+        } else if alg.algorithm == OID_SIG_ED25519 {
+            KeyKind::Ed25519
+        } else {
+            KeyKind::Other
+        }
+    }
+}
+
+/// The bit length of a big-endian unsigned integer (leading zeros skipped).
+fn bit_length(be: &[u8]) -> u32 {
+    let digits = match be.iter().position(|&b| b != 0) {
+        Some(i) => be.get(i..).unwrap_or(&[]),
+        None => return 0,
+    };
+    let top = digits.first().map_or(0, |&b| 8 - b.leading_zeros());
+    let rest = u32::try_from(digits.len().saturating_sub(1))
+        .unwrap_or(u32::MAX / 8)
+        .saturating_mul(8);
+    rest.saturating_add(top)
 }
 
 /// §4.2: aws-lc-rs is the one provider, installed idempotently.
@@ -70,12 +147,13 @@ pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsIdentity, TlsError
     let certs = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| TlsError::BadCertificate)?;
-    let public_key = subject_public_key(certs.first().ok_or(TlsError::NoCertificate)?)?;
+    let (public_key, kind) = subject_public_key(certs.first().ok_or(TlsError::NoCertificate)?)?;
     let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|_| TlsError::NoKey)?;
     let config = server_config(certs, key)?;
     Ok(TlsIdentity {
         acceptor: TlsAcceptor::from(Arc::new(config)),
         public_key,
+        key: kind,
     })
 }
 
@@ -105,14 +183,16 @@ fn server_config(
         })
 }
 
-fn subject_public_key(cert: &CertificateDer<'_>) -> Result<Vec<u8>, TlsError> {
+/// The leaf's subjectPublicKey (what CredSSP binds to) and its key kind.
+fn subject_public_key(cert: &CertificateDer<'_>) -> Result<(Vec<u8>, KeyKind), TlsError> {
     let (_, parsed) =
         x509_parser::parse_x509_certificate(cert.as_ref()).map_err(|_| TlsError::BadCertificate)?;
-    let spk = &parsed.public_key().subject_public_key;
+    let spki = parsed.public_key();
+    let spk = &spki.subject_public_key;
     if spk.unused_bits != 0 {
         return Err(TlsError::BadCertificate);
     }
-    Ok(spk.data.to_vec())
+    Ok((spk.data.to_vec(), KeyKind::of(spki)))
 }
 
 fn read_capped(path: &Path, what: &'static str) -> Result<Vec<u8>, TlsError> {
@@ -252,6 +332,45 @@ mod tests {
         let id = from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes()).unwrap();
         assert_eq!(id.public_key, leaf_key.public_key_raw());
         assert_ne!(id.public_key, ca_key.public_key_raw());
+    }
+
+    /// PC13 m10: the identity names its key's type and size for the startup
+    /// log — RSA and ECDSA alike, neither refused nor preferred (§9.1 leaves
+    /// the choice to the Windows App acceptance check).
+    #[test]
+    fn the_identity_names_its_key_type_and_size() {
+        install_crypto_provider();
+        let kind = |alg: &'static rcgen::SignatureAlgorithm| {
+            let key = rcgen::KeyPair::generate_for(alg).unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["kvm-rdp.test".to_owned()])
+                .unwrap()
+                .self_signed(&key)
+                .unwrap();
+            from_pem(cert.pem().as_bytes(), key.serialize_pem().as_bytes())
+                .unwrap()
+                .key
+        };
+        assert_eq!(kind(&rcgen::PKCS_ECDSA_P256_SHA256), KeyKind::Ecdsa(256));
+        assert_eq!(kind(&rcgen::PKCS_ECDSA_P384_SHA384), KeyKind::Ecdsa(384));
+        assert_eq!(kind(&rcgen::PKCS_RSA_SHA256), KeyKind::Rsa(2048));
+        assert_eq!(kind(&rcgen::PKCS_ED25519), KeyKind::Ed25519);
+        assert_eq!(
+            (KeyKind::Rsa(2048).label(), KeyKind::Rsa(2048).bits()),
+            ("RSA", 2048)
+        );
+        assert_eq!(
+            (KeyKind::Ecdsa(256).label(), KeyKind::Ecdsa(256).bits()),
+            ("ECDSA", 256)
+        );
+        assert_eq!(
+            (KeyKind::Ed25519.label(), KeyKind::Ed25519.bits()),
+            ("Ed25519", 256)
+        );
+        // DER's leading zero before a high bit is not a modulus bit.
+        assert_eq!(bit_length(&[0x00, 0x80, 0x00]), 16);
+        assert_eq!(bit_length(&[0x00, 0x01]), 1);
+        assert_eq!(bit_length(&[0x00, 0x00]), 0);
+        assert_eq!(bit_length(&[]), 0);
     }
 
     /// A SEC1 key on secp256k1, built here (the scalar is 1..=32, no
