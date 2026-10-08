@@ -487,6 +487,12 @@ fn run(
         // EGFX only: no bitmap ever reaches this image.
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1920, 1080);
         let mut reading = true;
+        // A response write that failed. The server may have closed right
+        // after a PDU this client has received but not yet processed — an
+        // ErrorInfo above all (a fatal cause at session start, while the
+        // client still answers the DVC set-up): it is still read and
+        // reported, and the read side reports the end.
+        let mut write_failed: Option<String> = None;
         loop {
             tokio::select! {
                 c = ctl.recv() => match c {
@@ -521,7 +527,13 @@ fn run(
                 pdu = framed.read_pdu(), if reading => {
                     let (action, frame) = match pdu {
                         Ok(v) => v,
-                        Err(e) => return push(&log, Ev::Closed(format!("read: {e}"))),
+                        Err(e) => {
+                            let why = match &write_failed {
+                                Some(w) => format!("write: {w}; read: {e}"),
+                                None => format!("read: {e}"),
+                            };
+                            return push(&log, Ev::Closed(why));
+                        }
                     };
                     let outputs = match stage.process(&mut image, action, &frame) {
                         Ok(o) => o,
@@ -530,8 +542,10 @@ fn run(
                     for o in outputs {
                         match o {
                             ActiveStageOutput::ResponseFrame(f) => {
-                                if framed.write_all(&f).await.is_err() {
-                                    return push(&log, Ev::Closed("write".to_owned()));
+                                if write_failed.is_none()
+                                    && let Err(e) = framed.write_all(&f).await
+                                {
+                                    write_failed = Some(e.to_string());
                                 }
                             }
                             ActiveStageOutput::DeactivateAll => {
