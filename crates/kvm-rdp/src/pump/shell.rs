@@ -44,6 +44,8 @@ pub const TICK: Duration = Duration::from_millis(50);
 pub const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(2);
 /// The `Stall` test hook never blocks longer than this.
 const MAX_STALL: Duration = Duration::from_secs(30);
+/// How often a held resize re-reads IronRDP's write counter (PC17 I4).
+const RESIZE_POLL: Duration = Duration::from_millis(5);
 
 pub struct ShellDeps {
     pub cfg: PumpConfig,
@@ -71,6 +73,11 @@ struct Link {
     /// The client closed its EGFX channel mid-session (the `no_avc420`
     /// close is then not about its capability sets).
     egfx_closed: bool,
+    /// The weight of every EGFX batch sent on this link: once `counter`
+    /// reaches it, IronRDP has written them all (PC17 I4).
+    sent: u64,
+    /// A `DisplayResize` waiting for the EGFX sent before it to be written.
+    held_resize: Option<(u16, u16)>,
 }
 
 pub struct PumpShell {
@@ -170,7 +177,13 @@ impl PumpShell {
                     Some(e) => self.kvm_event(e).await,
                     None => kvm_open = false,
                 },
+                // PC17 I4: IronRDP's write counter moves without waking this
+                // loop; re-read it while a resize is held.
+                () = tokio::time::sleep(RESIZE_POLL), if self.resize_held() => {}
             }
+            // Whatever woke the loop, a held resize goes once IronRDP has
+            // written the EGFX sent before it.
+            self.release_resize();
             if !had_link && self.link.is_some() {
                 // A session began: the next tick is a full period away, not
                 // the one overdue since the shell went to sleep.
@@ -233,6 +246,8 @@ impl PumpShell {
                     abort,
                     caps: Vec::new(),
                     egfx_closed: false,
+                    sent: 0,
+                    held_resize: None,
                 });
                 let mut inputs = vec![Input::SessionStart {
                     generation,
@@ -445,9 +460,14 @@ impl PumpShell {
                 Command::DisplayResize { width, height } => {
                     if current {
                         self.d.display.set_size((width, height));
-                        if !self.d.display.resize(width, height) {
-                            tracing::warn!(width, height, "no display stream for a resize");
+                        // PC17 I4: IronRDP writes EGFX and display updates
+                        // from two futures it runs concurrently, so the
+                        // DeactivateAll could overtake EGFX sent before it
+                        // (a first Setup's slate). Held until written.
+                        if let Some(l) = self.link.as_mut() {
+                            l.held_resize = Some((width, height));
                         }
+                        self.release_resize();
                     }
                 }
                 Command::SurfaceSize { width, height } => {
@@ -503,6 +523,29 @@ impl PumpShell {
         }
     }
 
+    fn resize_held(&self) -> bool {
+        self.link.as_ref().is_some_and(|l| l.held_resize.is_some())
+    }
+
+    /// The held resize, once the counter shows every EGFX batch sent before
+    /// it written (IronRDP adds a batch's weight after its `write_all`). One
+    /// held for an ended generation is dropped.
+    fn release_resize(&mut self) {
+        let Some(l) = self.link.as_mut() else {
+            return;
+        };
+        let Some((width, height)) = l.held_resize else {
+            return;
+        };
+        if self.d.gens.is_current(l.generation) && l.counter.load(Ordering::Relaxed) < l.sent {
+            return;
+        }
+        l.held_resize = None;
+        if self.d.gens.is_current(l.generation) && !self.d.display.resize(width, height) {
+            tracing::warn!(width, height, "no display stream for a resize");
+        }
+    }
+
     async fn send_dvc(&mut self, b: DvcBatch) {
         let Some(counter) = self.link.as_ref().map(|l| l.counter.clone()) else {
             return;
@@ -527,6 +570,10 @@ impl PumpShell {
                 counter.fetch_add(weight, Ordering::Relaxed);
                 tracing::warn!(error = %e, "EGFX batch encoding failed");
             }
+        }
+        // Either way `weight` reaches the counter: written, or never to be.
+        if let Some(l) = self.link.as_mut() {
+            l.sent = l.sent.saturating_add(weight);
         }
         if let Some(t) = received {
             self.d.metrics.enqueue_latency.observe(t.elapsed());
@@ -596,7 +643,8 @@ mod tests {
     use ironrdp_pdu::gcc::KeyboardType;
     use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode as P};
     use ironrdp_server::{
-        ConnectionHandler as _, ConnectionInfo, GfxDvcBridge, GfxServerFactory as _,
+        ConnectionHandler as _, ConnectionInfo, DisplayUpdate, GfxDvcBridge, GfxServerFactory as _,
+        RdpServerDisplay as _,
     };
     use ironrdp_svc::SvcProcessor as _;
     use kvm_proto::video::ParamClass;
@@ -1889,6 +1937,64 @@ mod tests {
                     "a reactivation read after the teardown was counted as no_avc420"
                 );
                 assert_eq!(w.metrics.disconnects.total(), 0);
+            })
+            .await;
+    }
+
+    /// PC17 I4: IronRDP writes EGFX events and display updates from two
+    /// futures it runs concurrently (`dispatch_events`, `dispatch_display`),
+    /// so a `DisplayUpdate::Resize` could overtake EGFX the pump sent
+    /// before it — on a first Setup, the slate after its DeactivateAll.
+    /// The resize waits until IronRDP's write counter shows every batch
+    /// sent before it written; here the test is IronRDP. The tick is slowed
+    /// to an hour: only the held resize's own re-read releases it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resize_waits_until_the_egfx_sent_before_it_is_written() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = spawn(|_| {}, |s| s.with_tick(Duration::from_secs(3600)));
+                let (dtx, _drx) = mpsc::unbounded_channel();
+                let mut updates = crate::rdp::display::BridgeDisplay::new(t.display.clone(), dtx)
+                    .updates()
+                    .await
+                    .unwrap();
+                let generation = t.start();
+                let mut sent = egfx(&t.event().await).unwrap().1; // the Setup
+                t.first_idr(generation).await;
+                sent += egfx(&t.event().await).unwrap().1; // the IDR
+                let Input::SpsChanged { class, params } = rig::sps(ParamClass::Resize, P480) else {
+                    unreachable!()
+                };
+                t.kvm
+                    .send(KvmEvent::SpsChanged {
+                        generation,
+                        class,
+                        params,
+                    })
+                    .await
+                    .unwrap();
+                let early =
+                    tokio::time::timeout(Duration::from_millis(300), updates.next_update()).await;
+                assert!(
+                    early.is_err(),
+                    "the resize went out before the EGFX sent ahead of it was written"
+                );
+                t.counter.store(sent - 1, Ordering::SeqCst); // all but the last byte
+                let early =
+                    tokio::time::timeout(Duration::from_millis(100), updates.next_update()).await;
+                assert!(early.is_err(), "the resize went out a byte early");
+                t.counter.store(sent, Ordering::SeqCst);
+                match tokio::time::timeout(Duration::from_secs(2), updates.next_update())
+                    .await
+                    .expect("the resize was held after its EGFX was written")
+                    .unwrap()
+                {
+                    Some(DisplayUpdate::Resize(s)) => {
+                        assert_eq!((s.width, s.height), (854, 480));
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert_eq!(t.display.size(), (854, 480));
             })
             .await;
     }
