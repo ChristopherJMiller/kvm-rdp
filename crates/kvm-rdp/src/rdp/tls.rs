@@ -25,6 +25,9 @@ pub enum TlsError {
     BadCertificate,
     NoKey,
     KeyMismatch,
+    /// A key aws-lc-rs will not sign with (RSA under 2048 bits; a curve other
+    /// than P-256, P-384, P-521 or Ed25519) or a malformed key body (m9).
+    UnsupportedKey,
 }
 
 impl std::fmt::Display for TlsError {
@@ -36,6 +39,9 @@ impl std::fmt::Display for TlsError {
             TlsError::BadCertificate => f.write_str("the certificate does not parse"),
             TlsError::NoKey => f.write_str("no private key in the key file"),
             TlsError::KeyMismatch => f.write_str("the key does not match the certificate"),
+            TlsError::UnsupportedKey => f.write_str(
+                "the private key's type or size is not supported (RSA needs at least 2048 bits)",
+            ),
         }
     }
 }
@@ -66,18 +72,37 @@ pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsIdentity, TlsError
         .map_err(|_| TlsError::BadCertificate)?;
     let public_key = subject_public_key(certs.first().ok_or(TlsError::NoCertificate)?)?;
     let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|_| TlsError::NoKey)?;
-    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    // `key_log` stays rustls' default `NoKeyLog` (§9.1: no SSLKEYLOGFILE).
-    let config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|_| TlsError::BadCertificate)?
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|_| TlsError::KeyMismatch)?;
+    let config = server_config(certs, key)?;
     Ok(TlsIdentity {
         acceptor: TlsAcceptor::from(Arc::new(config)),
         public_key,
     })
+}
+
+/// Our own `ServerConfig` on aws-lc-rs. `key_log` stays rustls' default
+/// `NoKeyLog` (§9.1: no SSLKEYLOGFILE). rustls' errors become fixed
+/// variants, so no key byte or rustls text reaches an error (m9).
+fn server_config(
+    certs: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> Result<rustls::ServerConfig, TlsError> {
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        // Unreachable with aws-lc-rs' default provider (it has every version).
+        .map_err(|_| TlsError::BadCertificate)?
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| match e {
+            // The key is valid but is not the leaf certificate's.
+            rustls::Error::InconsistentKeys(_) => TlsError::KeyMismatch,
+            // webpki refused the leaf x509-parser accepted.
+            rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented => {
+                TlsError::BadCertificate
+            }
+            // The provider would not load the key (`Error::General`).
+            _ => TlsError::UnsupportedKey,
+        })
 }
 
 fn subject_public_key(cert: &CertificateDer<'_>) -> Result<Vec<u8>, TlsError> {
@@ -190,6 +215,13 @@ mod tests {
             before,
             "a renewal rewrites the file"
         );
+        let renewed = fingerprint(&c, &k).unwrap();
+        std::fs::write(&k, format!("{key}\n")).unwrap();
+        assert_ne!(
+            fingerprint(&c, &k).unwrap(),
+            renewed,
+            "a renewal that rewrites only the key file is seen too (m6)"
+        );
         assert!(fingerprint(&d.path().join("absent.pem"), &k).is_none());
         assert!(matches!(
             load(&d.path().join("absent.pem"), &k),
@@ -200,5 +232,54 @@ mod tests {
         ));
         std::fs::write(&c, vec![b'A'; 70_000]).unwrap();
         assert_eq!(load(&c, &k).err(), Some(TlsError::TooLarge("certificate")));
+    }
+
+    /// m5: deployment loads a full chain (leaf, then its issuer). CredSSP
+    /// binds to the leaf's key — the one the client's TLS sees — never an
+    /// issuer's, which would fail NLA for every client.
+    #[test]
+    fn the_credssp_key_is_the_leafs_in_a_full_chain() {
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["kvm-rdp.test".to_owned()])
+            .unwrap()
+            .signed_by(&leaf_key, &ca, &ca_key)
+            .unwrap();
+        let chain = format!("{}{}", leaf.pem(), ca.pem());
+        let id = from_pem(chain.as_bytes(), leaf_key.serialize_pem().as_bytes()).unwrap();
+        assert_eq!(id.public_key, leaf_key.public_key_raw());
+        assert_ne!(id.public_key, ca_key.public_key_raw());
+    }
+
+    /// A SEC1 key on secp256k1, built here (the scalar is 1..=32, no
+    /// secret): a curve aws-lc-rs does not sign with.
+    fn secp256k1_key() -> PrivateKeyDer<'static> {
+        let mut der = vec![0x30, 0x2e, 0x02, 0x01, 0x01, 0x04, 0x20];
+        der.extend(1..=32u8);
+        der.extend([0xa0, 0x07, 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x0a]);
+        PrivateKeyDer::Sec1(der.into())
+    }
+
+    /// m9: a key aws-lc-rs will not load — an unsupported curve or a
+    /// malformed body (RSA under 2048 bits takes the same path) — is not
+    /// called a mismatch, and the error carries none of the key's bytes.
+    #[test]
+    fn unsupported_keys_are_not_called_a_mismatch() {
+        let (cert, _, _) = pair();
+        let certs = CertificateDer::pem_slice_iter(cert.as_bytes())
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            server_config(certs, secp256k1_key()).err(),
+            Some(TlsError::UnsupportedKey)
+        );
+        let malformed = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        let e = from_pem(cert.as_bytes(), malformed.as_bytes()).err();
+        assert_eq!(e, Some(TlsError::UnsupportedKey));
+        let shown = e.map(|e| format!("{e:?} {e}")).unwrap();
+        assert!(!shown.contains("AAAA"), "{shown}");
     }
 }
