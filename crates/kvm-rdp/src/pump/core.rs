@@ -1514,3 +1514,529 @@ mod tests {
         assert_eq!((b.frames, b.yield_after), (3, true));
     }
 }
+
+/// §11.2: resize, suppression, stall, suspension, closing and the IDR
+/// policies (Task 4.5). `a_suppression_ending_during_a_resize_from_paused_
+/// lands_in_need_idr` (P5/DC23) already lives in `core::tests` — it is not
+/// duplicated here; the brief's 19 cases plus that one is the planned 20.
+#[cfg(test)]
+mod lifecycle {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+    use super::*;
+    use crate::config::IdrPolicy;
+    use crate::msg::FlvOrigin;
+    use crate::pump::rig::*;
+    use ironrdp_egfx::pdu::{GfxPdu, QueueDepth};
+
+    fn ticks(r: &mut Rig, from_ms: u64, to_ms: u64) -> Vec<Command> {
+        let mut out = Vec::new();
+        for i in from_ms / 100 + 1..=to_ms / 100 {
+            r.at(i * 100);
+            out.extend(r.step(Input::Tick));
+        }
+        out
+    }
+
+    fn disconnects(out: &[Command]) -> Vec<Cause> {
+        out.iter()
+            .filter_map(|c| {
+                if let Command::Disconnect(c) = c {
+                    Some(*c)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn frame_id(out: &[Command]) -> u32 {
+        pdus(out)
+            .iter()
+            .find_map(|p| {
+                if let GfxPdu::StartFrame(s) = p {
+                    Some(s.frame_id)
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    }
+
+    /// §11.2: a second resize SPS during WaitReactivation is carried out
+    /// after the first reactivation; the surface ends at the latest size.
+    #[test]
+    fn a_second_resize_during_wait_reactivation_runs_after_the_first() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        let out = r.step(sps(ParamClass::Resize, P480));
+        assert!(matches!(
+            out.last(),
+            Some(Command::DisplayResize {
+                width: 854,
+                height: 480
+            })
+        ));
+        r.step(sps(ParamClass::Resize, ES3));
+        let out = r.step(Input::ReactivationComplete);
+        assert!(
+            matches!(
+                out.last(),
+                Some(Command::DisplayResize {
+                    width: 640,
+                    height: 360
+                })
+            ),
+            "{:?}",
+            kinds(&out)
+        );
+        assert_eq!(r.pump.state(), State::WaitReactivation);
+        let out = r.step(Input::ReactivationComplete);
+        let reset = pdus(&out).into_iter().find_map(|p| {
+            if let GfxPdu::ResetGraphics(g) = p {
+                Some((g.width, g.height))
+            } else {
+                None
+            }
+        });
+        assert_eq!(reset, Some((640, 360)));
+        assert_eq!(r.pump.state(), State::NeedIdr);
+    }
+
+    /// §11.2: `on_ready` during WaitReactivation is merged into the one
+    /// Setup at ReactivationComplete.
+    #[test]
+    fn on_ready_during_wait_reactivation_is_merged() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.step(sps(ParamClass::Resize, P480));
+        r.advertise(census_caps());
+        assert!(pdus(&r.step(Input::OnReady { avc420: true })).is_empty());
+        let out = r.step(Input::ReactivationComplete);
+        assert_eq!(
+            names(&pdus(&out))
+                .iter()
+                .filter(|n| **n == "ResetGraphics")
+                .count(),
+            1
+        );
+        assert_eq!(r.pump.state(), State::NeedIdr);
+    }
+
+    #[test]
+    fn reactivation_complete_outside_wait_reactivation_is_ignored() {
+        let mut r = Rig::new(cfg());
+        r.need_idr();
+        assert!(r.step(Input::ReactivationComplete).is_empty());
+        r.step(au(true, false));
+        assert!(r.step(Input::ReactivationComplete).is_empty());
+        assert_eq!(r.pump.state(), State::Live);
+    }
+
+    /// §11.2: a resize started from Paused returns to Paused, with no second
+    /// release for the same suppression edge.
+    #[test]
+    fn a_resize_started_from_paused_returns_to_paused() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.hold_suppress(true);
+        assert_eq!(r.pump.state(), State::Paused);
+        r.step(sps(ParamClass::Resize, P480));
+        assert_eq!(r.pump.state(), State::WaitReactivation);
+        let out = r.step(Input::ReactivationComplete);
+        assert_eq!(r.pump.state(), State::Paused);
+        assert!(!kinds(&out).contains(&"ReleaseAll"));
+    }
+
+    /// §11.2 suppression: a short pulse does nothing; a held pulse pauses
+    /// and releases; nothing is sent while Paused; the falling edge is a
+    /// Setup cause.
+    #[test]
+    fn suppression_pauses_on_a_held_pulse_and_resumes_as_a_setup_cause() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.step(Input::Suppress(true));
+        r.at(500);
+        r.step(Input::Suppress(false));
+        r.at(2_000);
+        r.step(Input::Suppress(false));
+        assert_eq!(r.pump.state(), State::Live, "a short pulse does nothing");
+        let out = r.hold_suppress(true);
+        assert_eq!(r.pump.state(), State::Paused);
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::ReleaseAll(ReleaseTrigger::Suppression)))
+        );
+        assert!(pdus(&r.step(au(true, false))).is_empty());
+        r.at(6_000);
+        let out = r.hold_suppress(false);
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        assert!(kinds(&out).contains(&"RequestIdr"), "{:?}", kinds(&out));
+    }
+
+    #[test]
+    fn suppression_before_the_first_kvm_frame_is_ignored() {
+        let mut r = Rig::new(cfg());
+        r.need_idr();
+        let out = r.hold_suppress(true);
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        assert!(!kinds(&out).contains(&"ReleaseAll"));
+    }
+
+    /// §11.2: suppression arriving in WaitReactivation releases at once and
+    /// lands in Paused after reactivation.
+    #[test]
+    fn suppression_in_wait_reactivation_releases_at_once_then_lands_in_paused() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.step(sps(ParamClass::Resize, P480));
+        assert_eq!(kinds(&r.hold_suppress(true)), ["ReleaseAll"]);
+        let out = r.step(Input::ReactivationComplete);
+        assert_eq!(r.pump.state(), State::Paused);
+        assert!(!kinds(&out).contains(&"ReleaseAll"), "one release per edge");
+    }
+
+    /// §11.2 stall: fires at `stall_timeout` after the first closure; any
+    /// ack disarms it; frozen in Paused for longer than the timeout → no
+    /// disconnect.
+    #[test]
+    fn the_stall_fires_disarms_on_an_ack_and_freezes_in_paused() {
+        let mut r = Rig::new(cfg());
+        r.live(); // the IDR (grace 1.6 s) is never acked
+        let out = ticks(&mut r, 0, 12_000);
+        assert_eq!(disconnects(&out), [Cause::ClientStalled]);
+
+        let mut r = Rig::new(cfg());
+        r.live();
+        let mut out = ticks(&mut r, 0, 6_000);
+        out.extend(r.ack(0, QueueDepth::Unavailable));
+        out.extend(ticks(&mut r, 6_000, 14_000));
+        assert_eq!(disconnects(&out), [], "any ack disarms");
+
+        let mut r = Rig::new(cfg());
+        r.live();
+        ticks(&mut r, 0, 2_000); // armed at 1.6 s, NeedIdr
+        r.hold_suppress(true);
+        assert_eq!(r.pump.state(), State::Paused);
+        let out = ticks(&mut r, 3_000, 20_000);
+        assert_eq!(disconnects(&out), [], "frozen in Paused");
+    }
+
+    /// §11.2 suspension: frames keep flowing and are not recorded; the
+    /// suspension survives a server resize and a re-advertise and the
+    /// picture continues (fork patch 1).
+    #[test]
+    fn suspended_acks_keep_frames_flowing_across_a_resize_and_a_readvertise() {
+        let mut c = cfg();
+        c.hard_cap = 4;
+        let mut r = Rig::new(c);
+        r.live();
+        r.ack(0, QueueDepth::Suspend);
+        for _ in 0..10 {
+            assert_eq!(
+                wire(&r.step(au(false, false))).len(),
+                1,
+                "more than the hard cap, all accepted"
+            );
+        }
+        r.step(sps(ParamClass::Resize, P480));
+        r.step(Input::ReactivationComplete);
+        assert!(r.gfx.is_ack_suspended());
+        assert_eq!(wire(&r.step(au(true, false))).len(), 1);
+        for _ in 0..10 {
+            assert_eq!(wire(&r.step(au(false, false))).len(), 1);
+        }
+        r.negotiate(census_caps());
+        assert!(r.gfx.is_ack_suspended());
+        assert_eq!(wire(&r.step(au(true, false))).len(), 1);
+        for _ in 0..10 {
+            assert_eq!(wire(&r.step(au(false, false))).len(), 1);
+        }
+    }
+
+    /// §11.2: suspended, a backlog spike ≥ the limit that drains costs an IDR
+    /// and no disconnect; held ≥ the limit for `stall_timeout` it closes.
+    #[test]
+    fn a_suspended_backlog_spike_costs_an_idr_and_a_held_one_closes() {
+        let mut c = cfg();
+        c.flow.backlog_limit = 1000;
+        let mut r = Rig::new(c);
+        r.live();
+        r.ack(0, QueueDepth::Suspend);
+        r.step(Input::Backlog { written: 0 });
+        for _ in 0..40 {
+            r.step(au(false, false));
+        }
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        assert!(r.metrics.frames_dropped.get("backlog_gate") >= 1);
+        r.step(Input::Backlog { written: u64::MAX });
+        assert_eq!(disconnects(&ticks(&mut r, 0, 1_000)), []);
+        assert_eq!(wire(&r.step(au(true, false))).len(), 1);
+        assert_eq!(r.pump.state(), State::Live);
+        r.step(Input::Backlog { written: 0 });
+        assert_eq!(
+            disconnects(&ticks(&mut r, 1_000, 12_500)),
+            [Cause::ClientStalled]
+        );
+    }
+
+    /// §11.2: a resume ack clears the unacked set and restores normal gating
+    /// without closing the soft gate.
+    #[test]
+    fn a_resume_ack_restores_gating_without_closing_the_soft_gate() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.ack(0, QueueDepth::Suspend);
+        let mut last = 0;
+        for i in 1..=10 {
+            r.at(i * 100);
+            last = frame_id(&r.step(au(false, false)));
+        }
+        r.ack(last, QueueDepth::Unavailable);
+        assert!(!r.gfx.is_ack_suspended());
+        r.at(1_600);
+        assert_eq!(wire(&r.step(au(false, false))).len(), 1);
+        assert_eq!(r.pump.state(), State::Live);
+    }
+
+    /// §11.2 standing delay: a previous connection's samples never affect
+    /// the next (IronRDP's handle is per server). The core owns DC6's
+    /// reference rule: a generation's first sample is only a reference,
+    /// never in the baseline, and the signal is live once the handle moves.
+    #[test]
+    fn a_previous_connections_rtt_never_gates_the_next() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.ack(0, QueueDepth::Unavailable);
+        // 900: the handle's stale value (reference only); then a live 10 ms
+        // baseline and a standing queue: median 650 − 10 = 640 ms ≥ 500.
+        for v in [900, 10, 600, 650, 700, 620, 640, 660, 680] {
+            r.step(Input::Rtt(v));
+        }
+        assert!(
+            wire(&r.step(au(false, false))).is_empty(),
+            "standing delay closes the gate"
+        );
+        assert_eq!(r.metrics.frames_dropped.get("standing_delay"), 1);
+        r.step(Input::SessionStop { generation: 1 });
+        r.new_connection();
+        r.step(Input::SessionStart {
+            generation: 2,
+            size: (640, 360),
+        });
+        r.negotiate(census_caps());
+        r.step(Input::FlvOpened {
+            origin: FlvOrigin::First,
+        });
+        r.step(sps(ParamClass::Initial, ES3));
+        r.step(Input::Rtt(680)); // the handle still holds the old value: a reference only
+        assert_eq!(wire(&r.step(au(true, false))).len(), 1);
+        assert_eq!(r.pump.state(), State::Live);
+    }
+
+    /// §11.2 Closing: EGFX sends stop before `Disconnect`; the watchdog
+    /// releases keys, stops the KVM side and aborts — once.
+    #[test]
+    fn closing_stops_sends_then_the_watchdog_aborts_once() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        let out = r.step(Input::UpstreamFatal(Cause::StreamIncompatible));
+        assert_eq!(kinds(&out), ["ReleaseAll", "Disconnect"]);
+        assert!(r.step(au(true, false)).is_empty());
+        let out = ticks(&mut r, 0, 6_000);
+        assert_eq!(kinds(&out), ["ReleaseAll", "Abort"]);
+        assert!(matches!(
+            out[0],
+            Command::ReleaseAll(ReleaseTrigger::Watchdog)
+        ));
+        assert_eq!(r.metrics.disconnects.get("stream_incompatible"), 1);
+    }
+
+    /// §5.2, DC13: shutdown closes with cause `shutdown` and its own watchdog.
+    #[test]
+    fn shutdown_closes_with_its_own_watchdog() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        let out = r.step(Input::Shutdown {
+            watchdog: Duration::from_secs(2),
+        });
+        assert!(matches!(
+            out.last(),
+            Some(Command::Disconnect(Cause::Shutdown))
+        ));
+        assert_eq!(kinds(&ticks(&mut r, 0, 1_900)), Vec::<&str>::new());
+        assert_eq!(kinds(&ticks(&mut r, 1_900, 2_000)), ["ReleaseAll", "Abort"]);
+    }
+
+    /// Deviation from the brief (§5.2, DC13): a Shutdown that arrives while
+    /// already Closing no longer "ignores" it (the brief's assumption) — a
+    /// later fix round made it shorten the running watchdog to
+    /// `min(remaining, the shutdown's own)`. Assert the earlier Abort, and
+    /// that the earlier close's one cause and one disconnect still stand.
+    #[test]
+    fn shutdown_while_already_closing_shortens_the_watchdog() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        assert_eq!(
+            kinds(&r.step(Input::UpstreamFatal(Cause::KvmUnreachable))),
+            ["ReleaseAll", "Disconnect"]
+        );
+        r.at(100);
+        assert!(
+            r.step(Input::Shutdown {
+                watchdog: Duration::from_secs(2)
+            })
+            .is_empty(),
+            "no second Disconnect"
+        );
+        assert!(!kinds(&ticks(&mut r, 100, 2_000)).contains(&"Abort"));
+        assert_eq!(
+            kinds(&ticks(&mut r, 2_000, 2_100)),
+            ["ReleaseAll", "Abort"],
+            "2.1 s (the shutdown's own watchdog), not 5 s"
+        );
+        assert_eq!(
+            r.metrics.disconnects.total(),
+            1,
+            "one cause, one disconnect"
+        );
+    }
+
+    /// §6.7: a first negotiation without AVC420 waits `avc420_timeout` (and a
+    /// better set before it is taken); a re-advertise without it closes at
+    /// once; a client that never negotiates is `no_avc420` at the timeout.
+    #[test]
+    fn no_avc420_waits_on_first_negotiation_and_closes_on_a_readvertise() {
+        let mut r = Rig::new(cfg());
+        r.start((640, 360));
+        assert!(r.negotiate(v8_only()).is_empty());
+        assert_eq!(r.pump.state(), State::WaitReady);
+        assert_eq!(disconnects(&ticks(&mut r, 0, 9_900)), []);
+        assert_eq!(
+            disconnects(&ticks(&mut r, 9_900, 10_000)),
+            [Cause::NoAvc420]
+        );
+
+        let mut r = Rig::new(cfg());
+        r.start((640, 360));
+        r.negotiate(v8_only());
+        assert!(kinds(&r.negotiate(census_caps())).contains(&"OpenFlv"));
+
+        let mut r = Rig::new(cfg());
+        r.live();
+        assert_eq!(disconnects(&r.negotiate(v8_only())), [Cause::NoAvc420]);
+
+        let mut r = Rig::new(cfg());
+        r.start((640, 360));
+        assert_eq!(disconnects(&ticks(&mut r, 0, 10_000)), [Cause::NoAvc420]);
+    }
+
+    /// §11.2 "Every policy": a later Setup → `RequestIdr` (side),
+    /// `ReconnectFlv` (reconnect), nothing (wait).
+    #[test]
+    fn a_later_setup_requests_per_policy() {
+        for (policy, want) in [
+            (IdrPolicy::Side, Some("RequestIdr")),
+            (IdrPolicy::Reconnect, Some("ReconnectFlv")),
+            (IdrPolicy::Wait, None),
+        ] {
+            let mut c = cfg();
+            c.idr.policy = policy;
+            let mut r = Rig::new(c);
+            r.live();
+            r.ack(0, QueueDepth::Unavailable);
+            r.at(2_000);
+            let k = kinds(&r.negotiate(census_caps()));
+            match want {
+                Some(w) => assert_eq!(
+                    k.iter().filter(|x| **x == w).count(),
+                    1,
+                    "{policy:?}: {k:?}"
+                ),
+                None => assert!(
+                    !k.contains(&"RequestIdr") && !k.contains(&"ReconnectFlv"),
+                    "{k:?}"
+                ),
+            }
+        }
+    }
+
+    /// §11.2: a transient reconnect clears `idr_pending` (a deferred request)
+    /// and restarts both clocks.
+    #[test]
+    fn a_transient_reconnect_cancels_a_deferred_request() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.ack(0, QueueDepth::Unavailable);
+        r.at(200);
+        r.negotiate(census_caps()); // a Setup cause inside the setup window: deferred to 1 s
+        r.at(500);
+        r.step(Input::FlvOpened {
+            origin: FlvOrigin::Transient,
+        });
+        let out = ticks(&mut r, 500, 4_000);
+        assert!(!kinds(&out).contains(&"RequestIdr"), "{:?}", kinds(&out));
+    }
+
+    /// §11.2: a deferred request whose NeedIdr an IDR resolves inside the
+    /// window → `CancelIdrRequest`, counted, and nothing requested later.
+    #[test]
+    fn an_idr_inside_the_window_cancels_the_deferred_request() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.ack(0, QueueDepth::Unavailable);
+        r.at(200);
+        let k = kinds(&r.negotiate(census_caps())); // a Setup cause: deferred to 1 s
+        assert!(!k.contains(&"RequestIdr"), "{k:?}");
+        r.at(300);
+        let out = r.step(au(true, false));
+        assert_eq!(wire(&out).len(), 1);
+        assert!(
+            kinds(&out).contains(&"CancelIdrRequest"),
+            "{:?}",
+            kinds(&out)
+        );
+        assert_eq!(r.metrics.idr_cancelled.get(), 1);
+        r.ack(frame_id(&out), QueueDepth::Unavailable);
+        let later = kinds(&ticks(&mut r, 300, 3_000));
+        assert!(
+            !later.contains(&"RequestIdr") && !later.contains(&"ReconnectFlv"),
+            "{later:?}"
+        );
+    }
+
+    /// §11.2: an IDR dropped at a closed gate counts as a flow cause: the
+    /// request comes after `idr_wait_max` of open gates, deferred to the
+    /// flow clock's window (10 s from the FLV open). `stall_timeout` is set
+    /// past that window: no ack can arrive (nothing was sent), so at the
+    /// default 10 s the stall would close the session at the same tick.
+    #[test]
+    fn an_idr_dropped_at_a_closed_gate_is_a_flow_cause() {
+        let mut c = cfg();
+        c.flow.backlog_limit = 10;
+        c.flow.stall_timeout = Duration::from_secs(30);
+        let mut r = Rig::new(c);
+        r.need_idr(); // the Setup batch alone is over 10 bytes, none written
+        assert!(pdus(&r.step(au(true, false))).is_empty());
+        assert_eq!(r.metrics.frames_dropped.get("backlog_gate"), 1);
+        r.step(Input::Backlog { written: u64::MAX });
+        let early = ticks(&mut r, 0, 9_900);
+        assert!(
+            !kinds(&early).contains(&"RequestIdr"),
+            "not before the flow window's end: {:?}",
+            kinds(&early)
+        );
+        let out = ticks(&mut r, 9_900, 10_500);
+        assert_eq!(
+            kinds(&out).iter().filter(|k| **k == "RequestIdr").count(),
+            1,
+            "at 10 000 ms, on the flow clock"
+        );
+        assert_eq!(disconnects(&early), []);
+        assert_eq!(disconnects(&out), []);
+    }
+}
