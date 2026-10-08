@@ -1100,6 +1100,62 @@ mod tests {
             .await;
     }
 
+    /// §4.3 (I2): no `ServerEvent` — an RTT probe, a `Disconnect` — goes
+    /// out for a generation `on_disconnected` has ended, though its
+    /// `SessionStop` is not yet stepped: the server's event channel would
+    /// carry it to whichever connection IronRDP serves next.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_rtt_probe_or_disconnect_for_an_ended_generation() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = shell(|c| c.rtt_probe_interval = Duration::from_millis(50));
+                let generation = t.start();
+                t.event().await; // the Setup
+                t.first_idr(generation).await;
+                t.event().await; // the IDR
+                t.gens.end(); // on_disconnected ran; its SessionStop not yet stepped
+                assert!(
+                    t.quiet(Duration::from_millis(300)).await,
+                    "an RTT probe went out for an ended generation"
+                );
+                let (done, _rx) = oneshot::channel();
+                t.rdp.send(RdpInput::Shutdown { done }).unwrap();
+                assert!(
+                    t.quiet(Duration::from_millis(300)).await,
+                    "a Disconnect went out for an ended generation"
+                );
+                t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
+            })
+            .await;
+    }
+
+    /// DC6, §4.2 patch 2 (I3): the shell feeds IronRDP's write counter to
+    /// the core, so written bytes leave the backlog. Without it the backlog
+    /// only grows, and the backlog gate shuts for good once `backlog_limit`
+    /// bytes have been handed over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_write_counter_drains_the_backlog() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = shell(|_| {});
+                let generation = t.start();
+                let w1 = egfx(&t.event().await).unwrap().1;
+                t.first_idr(generation).await;
+                let w2 = egfx(&t.event().await).unwrap().1;
+                let handed = i64::try_from(w1 + w2).unwrap();
+                until("the backlog gauge", || {
+                    t.metrics.egfx_backlog_bytes.get() == handed
+                })
+                .await;
+                t.counter.fetch_add(w1 + w2, Ordering::SeqCst); // IronRDP wrote both
+                until("the written bytes to leave the backlog", || {
+                    t.metrics.egfx_backlog_bytes.get() == 0
+                })
+                .await;
+            })
+            .await;
+    }
+
     /// §6.9: a fatal cause → release (closing), then `Disconnect` with the
     /// cause's ErrorInfo.
     #[tokio::test(flavor = "current_thread")]
