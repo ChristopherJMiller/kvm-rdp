@@ -108,6 +108,10 @@ pub struct Policy {
     /// viewers already get the IDR its open forced: a `ReconnectFlv`
     /// candidate whose first tag lags the old FLV (PC17 N1).
     pub delay_flv_header: Option<Duration>,
+    /// A new FLV leaves out its Nth frame, counting from 1 at its first IDR,
+    /// while the other viewers get it: a KVM that drops a frame for one
+    /// viewer (PC17 N2).
+    pub skip_flv_frame: Option<u64>,
 }
 
 /// A command for every open websocket.

@@ -42,6 +42,9 @@ struct Writer<W> {
     shared: Arc<Shared>,
     frames_written: u64,
     seen_idr: bool,
+    /// `Policy::skip_flv_frame` at open, and the frames seen since the first IDR.
+    skip: Option<u64>,
+    frames_seen: u64,
     /// `Fault::Silence`: stop writing, keep the connection open.
     silenced: bool,
     /// A one-shot fault waiting for the next frame it can act on.
@@ -135,6 +138,10 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             return Ok(());
         }
         self.seen_idr = true;
+        self.frames_seen += 1;
+        if self.skip == Some(self.frames_seen) {
+            return Ok(());
+        }
         if matches!(self.pending, Some(Fault::TwoPictures)) && self.held.is_none() {
             self.held = Some(f);
             return Ok(());
@@ -286,6 +293,8 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         shared: shared.clone(),
         frames_written: 0,
         seen_idr: false,
+        skip: policy.skip_flv_frame,
+        frames_seen: 0,
         silenced: false,
         pending: None,
         held: None,

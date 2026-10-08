@@ -168,6 +168,69 @@ async fn a_lagging_candidate_never_repeats_an_au_across_the_swap() {
     );
 }
 
+/// PC17 N2: a lagging candidate that also leaves out a frame the old FLV
+/// delivered — a KVM dropping a frame for one viewer — diverges from the
+/// ring mid-replay. The client still gets every AU once, and every P frame
+/// right after the picture it predicts from (the ES3 has one reference
+/// frame): the replay resyncs to the ring entry the candidate skipped to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_candidate_skipping_a_frame_mid_replay_keeps_the_sequence() {
+    let env = env(es3(), |c| {
+        sized(c);
+        c.video.idr_policy = IdrPolicy::Reconnect;
+    })
+    .await;
+    let c = env.client(Opts::new(2));
+    c.wait_for(T, |e| pictures(e).len() >= 45).await;
+    env.sim.set_policy(|p| {
+        p.delay_flv_header = Some(ms(200));
+        p.skip_flv_frame = Some(3);
+    });
+    let n = c.with_log(<[Ev]>::len);
+    c.readvertise();
+    let evs = c
+        .wait_for(T, |e| {
+            confirmed(e, n).is_some_and(|k| pictures(&e[k..]).len() >= 30)
+        })
+        .await;
+    let map = barcodes(ES3_FIXTURE);
+    let pics = pictures(&evs[confirmed(&evs, n).unwrap()..]);
+    let got: Vec<(usize, bool)> = pics
+        .iter()
+        .map(|p| (index_of(&map, &p.annex_b), nal_types(&p.annex_b) == [1]))
+        .collect();
+    let log = env
+        .sim
+        .wait_for(CATCH_UP, |l| flv_opens(l).len() >= 2)
+        .await
+        .unwrap_or_else(|l| l);
+    let candidate = *flv_opens(&log).get(1).expect("no ReconnectFlv candidate");
+    let sent = sent_on(&env.sim.events(), candidate);
+    assert_eq!(
+        sent.get(2).copied(),
+        sent.get(1).map(|i| i + 2),
+        "the candidate did not leave out its third frame: {sent:?}"
+    );
+    let mut seen = std::collections::HashSet::new();
+    let twice: Vec<usize> = got
+        .iter()
+        .map(|g| g.0)
+        .filter(|i| !seen.insert(*i))
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "AUs the client got twice: {twice:?} in {got:?}"
+    );
+    for w in got.windows(2) {
+        let ((prev, _), (cur, p)) = (w[0], w[1]);
+        assert!(!p || cur == prev + 1, "P frame {cur} after {prev}: {got:?}");
+    }
+    assert!(
+        env.metrics().frames_dropped.get("repeat") >= 3,
+        "no replay to drop: the candidate did not lag ({got:?})"
+    );
+}
+
 /// The long-GOP fixture at the ES3's pacing, sized, `idr_side_timeout` set,
 /// streaming past the wrap-around IDR (the 31st picture) and the 1 s setup
 /// window: the next periodic IDR is ≈9 s away and a re-advertise is not

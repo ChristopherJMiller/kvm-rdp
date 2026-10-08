@@ -103,6 +103,14 @@ impl Handed {
         }
         self.ring.get(i).copied()
     }
+
+    /// The first entry from `i` on that is `key`.
+    fn find_from(&self, i: usize, key: (usize, u64)) -> Option<usize> {
+        if self.overflowed {
+            return None;
+        }
+        (i..self.len).find(|j| self.ring.get(*j) == Some(&key))
+    }
 }
 
 /// An AU's identity as written: its length and a fast 64-bit hash.
@@ -764,18 +772,33 @@ impl Pump {
         // match what the client got since that IDR, in order, they are not
         // sent again — a repeated P frame would predict from the wrong
         // picture until the next IDR — and the IDR's match ends the swap's
-        // NeedIdr. From the first AU that does not match, all goes out.
+        // NeedIdr. A candidate that left out an AU the client has resyncs to
+        // the later entry it matches (PC17 N2). Past the ring, or from an AU
+        // the ring never had at its first place, all goes out.
         if let Some(i) = self.replay_at {
-            if self.replays(i, &a) {
-                self.replay_at = Some(i.saturating_add(1));
+            if let Some(j) = self.replayed_at(i, &a) {
+                self.replay_at = Some(j.saturating_add(1));
                 self.metrics.frames_dropped.inc("repeat");
-                if i == 0 && self.state == State::NeedIdr {
+                if j == 0 && self.state == State::NeedIdr {
                     let _ = self.flow.take_grace(true);
                     self.set_state(now, State::Live, out);
                 }
                 return;
             }
             self.replay_at = None;
+            // PC17 N2: a P frame that diverges mid-replay predicts from the
+            // candidate's previous picture, but the client's is the ring's
+            // last: like a lost reference, it is dropped, and NeedIdr with a
+            // flow cause asks for a clean IDR (§6.5's policy and clocks). An
+            // IDR needs no reference and goes on as usual.
+            if i > 0 && self.handed.at(i).is_some() && !a.au.idr {
+                self.metrics.frames_dropped.inc("replay_diverged");
+                if self.state == State::Live {
+                    self.set_state(now, State::NeedIdr, out);
+                }
+                self.flow_cause(now);
+                return;
+            }
         }
         let suspended = gfx.is_ack_suspended();
         let gate = self
@@ -857,19 +880,20 @@ impl Pump {
         }
     }
 
-    /// `a`, as it would go out (§6.3, its SPS rewritten; FLV timestamps,
-    /// which differ per connection, are not part of it), is the `i`th AU
-    /// handed to the client since its last IDR.
-    fn replays(&mut self, i: usize, a: &KvmAu) -> bool {
-        let Some(key) = self.handed.at(i) else {
-            return false;
-        };
-        let Some(params) = self.params.as_ref() else {
-            return false;
-        };
+    /// Where in the ring `a`, as it would go out (§6.3, its SPS rewritten;
+    /// FLV timestamps, which differ per connection, are not part of it), was
+    /// handed: at `i` for the replay's first AU (the IDR), else the first
+    /// entry from `i` on — a candidate may have left some out (PC17 N2).
+    fn replayed_at(&mut self, i: usize, a: &KvmAu) -> Option<usize> {
+        let at_i = self.handed.at(i)?;
+        let params = self.params.as_ref()?;
         self.annexb.clear();
         a.au.write_annex_b(params, &mut self.annexb);
-        au_key(&self.annexb) == key
+        let key = au_key(&self.annexb);
+        if i == 0 {
+            return (at_i == key).then_some(0);
+        }
+        self.handed.find_from(i, key)
     }
 
     fn on_tick(&mut self, gfx: &mut GraphicsPipelineServer, now: Instant, out: &mut Vec<Command>) {
@@ -1464,18 +1488,89 @@ mod tests {
         assert_eq!(r.metrics.frames_dropped.get("repeat"), 2);
     }
 
-    /// PC17 N1: the replay ends at the first AU that differs from the ring
-    /// at its place; that AU and everything after it go out, even one that
-    /// equals a later ring entry.
+    /// PC17 N2: a candidate that left out an AU the client has (a KVM that
+    /// dropped a frame for that viewer) differs from the ring at its place
+    /// but equals a later entry: the replay moves to that entry and goes on
+    /// dropping; the first AU past the ring goes out.
     #[test]
-    fn a_mismatch_mid_replay_ends_it() {
+    fn a_replay_resyncs_to_a_later_entry_the_candidate_skipped_to() {
+        let mut r = Rig::new(cfg());
+        r.need_idr();
+        feed(&mut r, &[(true, 0), (false, 1), (false, 2), (false, 3)]);
+        r.step(commanded());
+        let out = feed(&mut r, &[(true, 0), (false, 1), (false, 3), (false, 4)]);
+        assert_eq!(sent_ns(&out), [4]);
+        assert_eq!(r.metrics.frames_dropped.get("repeat"), 3);
+        assert_eq!(r.pump.state(), State::Live);
+    }
+
+    /// PC17 N2: a P frame that differs from the ring mid-replay and from
+    /// every later entry would predict from a picture the client does not
+    /// have (its reference is the ring's last, not the candidate's): it is
+    /// dropped, the pump goes to NeedIdr with a flow cause — idr-wait, then
+    /// a request under the usual policy and rate limit — and nothing goes
+    /// out until an IDR.
+    #[test]
+    fn a_p_frame_diverging_mid_replay_is_held_until_an_idr() {
+        let mut r = Rig::new(cfg());
+        r.need_idr();
+        feed(&mut r, &[(true, 0), (false, 1), (false, 2)]);
+        for id in 0..3 {
+            r.ack(id, QueueDepth::Unavailable);
+        }
+        r.step(commanded()); // at 0: the flow clock restarts
+        let mut out = feed(&mut r, &[(true, 0), (false, 1), (false, 9), (false, 2)]);
+        assert!(sent_ns(&out).is_empty(), "{:?}", sent_ns(&out));
+        assert_eq!(r.metrics.frames_dropped.get("repeat"), 2);
+        assert_eq!(r.metrics.frames_dropped.get("replay_diverged"), 1);
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        let mut requested_at = Vec::new();
+        for i in 1..=105 {
+            r.at(i * 100);
+            let step = r.step(Input::Tick);
+            if kinds(&step).contains(&"RequestIdr") {
+                requested_at.push(i * 100);
+            }
+            out.extend(step);
+        }
+        assert_eq!(
+            requested_at,
+            [10_000],
+            "idr-wait, then the flow window the swap's open started"
+        );
+        out.extend(feed(&mut r, &[(false, 3)]));
+        assert!(sent_ns(&out).is_empty(), "a P frame before the IDR");
+        assert_eq!(sent_ns(&feed(&mut r, &[(true, 60), (false, 61)])), [60, 61]);
+        assert_eq!(r.pump.state(), State::Live);
+    }
+
+    /// PC17 N2: off the ring at its first place the candidate is no replay
+    /// (as before): a P frame there waits for the swap's IDR like any
+    /// other, with no divergence and no flow cause.
+    #[test]
+    fn a_first_candidate_au_off_the_ring_is_not_a_divergence() {
+        let mut r = Rig::new(cfg());
+        r.need_idr();
+        feed(&mut r, &[(true, 0), (false, 1)]);
+        r.step(commanded());
+        assert!(sent_ns(&feed(&mut r, &[(false, 7)])).is_empty());
+        assert_eq!(r.metrics.frames_dropped.get("awaiting_idr"), 1);
+        assert_eq!(r.metrics.frames_dropped.get("replay_diverged"), 0);
+        assert_eq!(sent_ns(&feed(&mut r, &[(true, 8)])), [8]);
+    }
+
+    /// PC17 N2: an IDR that differs from the ring mid-replay ends the replay
+    /// and goes out (it needs no reference); so does what follows it.
+    #[test]
+    fn an_idr_mid_replay_ends_it_and_goes_out() {
         let mut r = Rig::new(cfg());
         r.need_idr();
         feed(&mut r, &[(true, 0), (false, 1), (false, 2)]);
         r.step(commanded());
-        let out = feed(&mut r, &[(true, 0), (false, 1), (false, 9), (false, 2)]);
-        assert_eq!(sent_ns(&out), [9, 2]);
+        let out = feed(&mut r, &[(true, 0), (false, 1), (true, 5), (false, 6)]);
+        assert_eq!(sent_ns(&out), [5, 6]);
         assert_eq!(r.metrics.frames_dropped.get("repeat"), 2);
+        assert_eq!(r.metrics.frames_dropped.get("replay_diverged"), 0);
     }
 
     /// PC17 N1: the ring is bounded (64 entries; a GOP is 60 at 30 fps).
@@ -1494,15 +1589,16 @@ mod tests {
         let out = feed(&mut r, &[(true, 0), (false, 1)]);
         assert_eq!(sent_ns(&out), [0, 1]);
         assert_eq!(r.metrics.frames_dropped.get("repeat"), 0);
-        // At the cap exactly, the replay is still matched.
+        // At the cap exactly, the whole replay is matched; the next goes out.
         let mut r = Rig::new(c);
         r.need_idr();
         let old: Vec<(bool, u8)> = (0..64).map(|n| (n == 0, n)).collect();
         assert_eq!(sent_ns(&feed(&mut r, &old)).len(), 64);
         r.step(commanded());
-        let out = feed(&mut r, &[(true, 0), (false, 1), (false, 64)]);
-        assert_eq!(sent_ns(&out), [64]);
-        assert_eq!(r.metrics.frames_dropped.get("repeat"), 2);
+        let mut replay = old.clone();
+        replay.push((false, 64));
+        assert_eq!(sent_ns(&feed(&mut r, &replay)), [64]);
+        assert_eq!(r.metrics.frames_dropped.get("repeat"), 64);
     }
 
     /// PC17 I2: only a repeat is dropped. A different first IDR from the
