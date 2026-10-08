@@ -83,6 +83,9 @@ pub struct PumpShell {
     shutdown_watchdog: Duration,
     /// `TICK`; slowed down only by tests.
     tick_every: Duration,
+    /// The run loop's turns, counted only by tests.
+    #[cfg(test)]
+    turns: Option<Arc<AtomicU64>>,
 }
 
 fn lock(gfx: &GfxServerHandle) -> MutexGuard<'_, GraphicsPipelineServer> {
@@ -106,6 +109,8 @@ impl PumpShell {
             shutting_down: false,
             shutdown_watchdog: SHUTDOWN_WATCHDOG,
             tick_every: TICK,
+            #[cfg(test)]
+            turns: None,
         }
     }
 
@@ -123,6 +128,14 @@ impl PumpShell {
         self
     }
 
+    /// Counts the run loop's turns (one per input, tick or KVM event), so a
+    /// test can see an idle shell sleep.
+    #[cfg(test)]
+    fn with_turns(mut self, turns: Arc<AtomicU64>) -> PumpShell {
+        self.turns = Some(turns);
+        self
+    }
+
     /// Runs until `rdp` closes. A due tick is taken within one step of its
     /// deadline whatever the KVM stream does; only a backlog of RDP-side
     /// inputs (IronRDP's, on this same thread) goes ahead of it. Inside an
@@ -136,6 +149,7 @@ impl PumpShell {
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut kvm_open = true;
         loop {
+            let had_link = self.link.is_some();
             tokio::select! {
                 // RDP, then the tick, then KVM. DC4: a session's start (and
                 // an ended one's stop) is stepped before any tick or KVM
@@ -146,11 +160,25 @@ impl PumpShell {
                     Some(i) => self.rdp_input(i).await,
                     None => return,
                 },
-                _ = tick.tick() => self.tick().await,
+                // PC15 review m2: only while a session lives, so an idle
+                // bridge sleeps. Without a link the tick did nothing (the
+                // core is Idle), and every timer that ends a close — the
+                // disconnect watchdog, §5.2's — runs while its session's
+                // link is still here: it goes only with `SessionStop`.
+                _ = tick.tick(), if self.link.is_some() => self.tick().await,
                 ev = kvm.recv(), if kvm_open => match ev {
                     Some(e) => self.kvm_event(e).await,
                     None => kvm_open = false,
                 },
+            }
+            if !had_link && self.link.is_some() {
+                // A session began: the next tick is a full period away, not
+                // the one overdue since the shell went to sleep.
+                tick.reset();
+            }
+            #[cfg(test)]
+            if let Some(t) = &self.turns {
+                t.fetch_add(1, Ordering::SeqCst);
             }
         }
     }
@@ -1758,6 +1786,87 @@ mod tests {
                     "the teardown counted the close again"
                 );
                 assert_eq!(w.metrics.disconnects.total(), 1);
+            })
+            .await;
+    }
+    /// PC15 review m2: with no session the shell sleeps — no tick and no
+    /// loop turn (the 50 ms tick was 354 RDP-thread wakeups in 10 s idle) —
+    /// ticks while a session lives, and sleeps again once it stopped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_shell_ticks_only_while_a_session_lives() {
+        LocalSet::new()
+            .run_until(async {
+                let turns = Arc::new(AtomicU64::new(0));
+                let c = turns.clone();
+                let mut t = spawn(|_| {}, move |s| s.with_turns(c));
+                let n = || turns.load(Ordering::SeqCst);
+                tokio::time::sleep(TICK * 8).await;
+                assert_eq!(n(), 0, "the shell woke with no session");
+                let generation = t.start();
+                t.event().await; // the Setup
+                let at_start = n();
+                tokio::time::sleep(TICK * 6).await;
+                assert!(
+                    n() >= at_start + 2,
+                    "no ticks while a session lived: {}",
+                    n() - at_start
+                );
+                t.gens.end();
+                t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
+                tokio::time::sleep(TICK * 2).await;
+                let stopped = n();
+                tokio::time::sleep(TICK * 8).await;
+                assert_eq!(n(), stopped, "the shell kept waking after the session");
+            })
+            .await;
+    }
+
+    /// PC15 review m2: gating the tick leaves every close tick-driven to its
+    /// end. After an idle spell (no ticks), a session closed for shutdown
+    /// whose client never answers is still aborted by the watchdog — a tick
+    /// — which stops the KVM side; once the client is gone the shutdown is
+    /// answered, and the shell sleeps again.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_close_after_an_idle_spell_still_runs_to_its_end() {
+        LocalSet::new()
+            .run_until(async {
+                let wd = Duration::from_millis(300);
+                let turns = Arc::new(AtomicU64::new(0));
+                let c = turns.clone();
+                let mut t = spawn(|_| {}, move |s| s.with_shutdown_watchdog(wd).with_turns(c));
+                let n = || turns.load(Ordering::SeqCst);
+                tokio::time::sleep(TICK * 6).await;
+                assert_eq!(n(), 0, "the shell woke with no session");
+                let generation = t.start();
+                t.event().await; // the Setup
+                assert!(matches!(t.cmd().await, KvmCommand::OpenFlv { .. }));
+                let (done, mut rx) = oneshot::channel();
+                t.rdp.send(RdpInput::Shutdown { done }).unwrap();
+                loop {
+                    if matches!(t.event().await, ServerEvent::Disconnect(_)) {
+                        break;
+                    }
+                }
+                let t0 = Instant::now();
+                // The client never answers: the watchdog (a tick) aborts.
+                assert!(matches!(
+                    t.cmd().await,
+                    KvmCommand::Stop { generation: g, done: None } if g == generation
+                ));
+                let took = t0.elapsed();
+                assert!(took >= wd / 2 && took <= wd * 5, "{took:?}");
+                assert!(rx.try_recv().is_err(), "answered before the session ended");
+                // The client is gone: IronRDP's `on_disconnected`.
+                t.gens.end();
+                t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), &mut rx)
+                    .await
+                    .expect("the shutdown was never answered")
+                    .unwrap();
+                tokio::time::sleep(TICK * 2).await;
+                let ended = n();
+                tokio::time::sleep(TICK * 8).await;
+                assert_eq!(n(), ended, "the shell kept waking after the close");
             })
             .await;
     }
