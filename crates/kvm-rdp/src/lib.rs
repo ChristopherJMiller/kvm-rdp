@@ -20,6 +20,7 @@ pub mod kvm;
 pub mod logging;
 pub mod metrics;
 pub mod msg;
+pub mod pump;
 
 #[cfg(test)]
 mod pin_goldens;
