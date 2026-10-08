@@ -5,7 +5,7 @@
 //! the dispatch below (every cell is a case in Task 4.6).
 use crate::hid::ReleaseTrigger;
 use crate::metrics::Metrics;
-use crate::msg::{Cause, Gen, KvmAu};
+use crate::msg::{Cause, FlvOrigin, Gen, KvmAu};
 use crate::pump::debounce::{Debounce, Edge};
 use crate::pump::flow::{Flow, Gate};
 use crate::pump::idr::{IdrAction, IdrCore};
@@ -53,6 +53,11 @@ pub struct Pump {
     batch: Option<DvcBatch>,
     /// The one reused Annex-B buffer (§6.2 ownership).
     annexb: Vec<u8>,
+    /// The Annex-B of the last IDR handed to IronRDP on the current surface
+    /// (empty after a Setup), and whether a `ReconnectFlv` swap has happened
+    /// since that the candidate's first IDR has not yet answered (PC17 I2).
+    last_idr: Vec<u8>,
+    repeat_check: bool,
 }
 
 impl Pump {
@@ -90,6 +95,8 @@ impl Pump {
             next_probe: None,
             batch: None,
             annexb: Vec::new(),
+            last_idr: Vec::new(),
+            repeat_check: false,
         }
     }
 
@@ -199,7 +206,7 @@ impl Pump {
             Input::ReactivationComplete => self.on_reactivated(gfx, now, out),
             Input::Suppress(raw) => self.on_suppress(now, raw, out),
             Input::SpsChanged { class, params } => self.on_sps(now, class, params, out),
-            Input::FlvOpened { .. } => self.on_flv_opened(now, out),
+            Input::FlvOpened { origin } => self.on_flv_opened(now, origin, out),
             Input::Au(au) => self.on_au(gfx, now, au, out),
             Input::SessionStart { .. } | Input::SessionStop { .. } => {}
         }
@@ -219,8 +226,11 @@ impl Pump {
     fn reset(&mut self) {
         let (cfg, metrics, slate) = (self.cfg.clone(), self.metrics.clone(), self.slate.take());
         let annexb = std::mem::take(&mut self.annexb);
+        let mut last_idr = std::mem::take(&mut self.last_idr);
         *self = Pump::with_slate(cfg, metrics, slate);
         self.annexb = annexb;
+        last_idr.clear();
+        self.last_idr = last_idr;
     }
 
     fn set_state(&mut self, now: Instant, new: State, out: &mut Vec<Command>) {
@@ -286,6 +296,8 @@ impl Pump {
         }
         gfx.set_max_frames_in_flight(self.cfg.hard_cap);
         self.surface = Some((sid, w, h));
+        // A new surface has no picture: no IDR is a repeat on it.
+        self.last_idr.clear();
         self.flow.on_setup();
         out.push(Command::SurfaceSize {
             width: w,
@@ -636,7 +648,9 @@ impl Pump {
         }
     }
 
-    fn on_flv_opened(&mut self, now: Instant, out: &mut Vec<Command>) {
+    fn on_flv_opened(&mut self, now: Instant, origin: FlvOrigin, out: &mut Vec<Command>) {
+        // PC17 I2: the candidate's first IDR may repeat the last one sent.
+        self.repeat_check = origin == FlvOrigin::Commanded;
         match self.state {
             State::Live | State::NeedIdr | State::Paused => {
                 if self.state == State::Live {
@@ -711,6 +725,17 @@ impl Pump {
                 self.flow_cause(now);
                 return;
             }
+            // PC17 I2 (§6.5 `reconnect`): the shared encoder sends the IDR a
+            // candidate's open forces into the old FLV too, and that copy may
+            // have ended NeedIdr before the swap. The candidate's own copy —
+            // byte for byte the last IDR the client got — is not sent twice:
+            // NeedIdr ends on it, and the candidate's next frames follow it.
+            if std::mem::take(&mut self.repeat_check) && self.repeats_last_idr(&a) {
+                self.metrics.frames_dropped.inc("repeat_idr");
+                let _ = self.flow.take_grace(true);
+                self.set_state(now, State::Live, out);
+                return;
+            }
             if self.send_au(gfx, now, &a, out) {
                 self.set_state(now, State::Live, out);
             } else {
@@ -755,6 +780,10 @@ impl Pump {
         let ts = self.timestamp(now);
         match gfx.send_avc420_frame(sid, &self.annexb, &[region], ts) {
             Some(id) => {
+                if a.au.idr {
+                    self.last_idr.clear();
+                    self.last_idr.extend_from_slice(&self.annexb);
+                }
                 let grace = self.flow.take_grace(a.au.idr);
                 self.flow.record(id, now, a.au.burst, grace, suspended);
                 self.kvm_frame_delivered = true;
@@ -767,6 +796,21 @@ impl Pump {
                 false
             }
         }
+    }
+
+    /// `a` as it would go out (its SPS rewritten, §6.3) is byte for byte
+    /// the last IDR handed to IronRDP on this surface. FLV timestamps are
+    /// not compared: they differ per connection.
+    fn repeats_last_idr(&mut self, a: &KvmAu) -> bool {
+        let Some(params) = self.params.as_ref() else {
+            return false;
+        };
+        if self.last_idr.is_empty() {
+            return false;
+        }
+        self.annexb.clear();
+        a.au.write_annex_b(params, &mut self.annexb);
+        self.annexb == self.last_idr
     }
 
     fn on_tick(&mut self, gfx: &mut GraphicsPipelineServer, now: Instant, out: &mut Vec<Command>) {
@@ -1279,6 +1323,81 @@ mod tests {
         assert_eq!(r.pump.state(), State::NeedIdr);
         r.step(au(true, false));
         assert_eq!(r.pump.state(), State::Live);
+    }
+
+    /// An IDR AU whose one slice NAL is `nal`.
+    fn idr_au(nal: &'static [u8]) -> Input {
+        let Input::Au(mut a) = au(true, false) else {
+            unreachable!()
+        };
+        a.au.vcl = vec![kvm_proto::flv::Nal {
+            bytes: bytes::Bytes::from_static(nal),
+        }];
+        Input::Au(a)
+    }
+
+    /// PC17 I2 (§6.5 `reconnect`): the shared encoder sends the IDR a
+    /// `ReconnectFlv` candidate's open forces into the old FLV as well. That
+    /// copy resolves NeedIdr and goes out; the swap's `FlvOpened` then
+    /// waits for the candidate's first IDR — the same picture. Byte for
+    /// byte the same as the last IDR handed to the client, it is dropped
+    /// (counted), NeedIdr ends, and the candidate's next frames follow it.
+    #[test]
+    fn a_swapped_in_candidates_repeat_of_the_last_idr_is_dropped() {
+        let mut r = Rig::new(cfg());
+        r.live(); // the old FLV's copy of the IDR, frame 0
+        let out = r.step(Input::FlvOpened {
+            origin: FlvOrigin::Commanded,
+        });
+        assert!(wire(&out).is_empty());
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        let out = r.step(au(true, false)); // the candidate's copy
+        assert!(wire(&out).is_empty(), "the repeated IDR went out again");
+        assert_eq!(r.metrics.frames_dropped.get("repeat_idr"), 1);
+        assert_eq!(r.pump.state(), State::Live);
+        let out = r.step(au(false, false));
+        assert_eq!(nal_types(&wire(&out)[0].0), [1], "the candidate's P frame");
+        assert_eq!(r.metrics.frames_sent.get(), 2);
+    }
+
+    /// PC17 I2: only a byte-identical repeat is dropped. A different first
+    /// IDR from the candidate goes out; so does an identical one after a
+    /// Setup (a new surface that has no picture yet), and one after an FLV
+    /// open that no `ReconnectFlv` made.
+    #[test]
+    fn a_candidates_idr_that_is_not_a_repeat_is_forwarded() {
+        let commanded = || Input::FlvOpened {
+            origin: FlvOrigin::Commanded,
+        };
+        // A different picture.
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.step(commanded());
+        let out = r.step(idr_au(&[0x65, 0x88, 0x84, 0x22]));
+        assert_eq!(nal_types(&wire(&out)[0].0), [7, 8, 5], "a different IDR");
+        assert_eq!(r.pump.state(), State::Live);
+        // The same bytes, but the client's surface is new since.
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.ack(0, QueueDepth::Unavailable);
+        r.at(1500);
+        r.negotiate(census_caps()); // a re-advertise: Setup, a new surface
+        r.step(commanded());
+        let out = r.step(au(true, false));
+        assert_eq!(wire(&out).len(), 1, "an identical IDR after a Setup");
+        // The same bytes after a transient reopen (not a make-before-break).
+        let mut r = Rig::new(cfg());
+        r.live();
+        r.step(Input::FlvOpened {
+            origin: FlvOrigin::Transient,
+        });
+        let out = r.step(au(true, false));
+        assert_eq!(
+            wire(&out).len(),
+            1,
+            "an identical IDR after a transient open"
+        );
+        assert_eq!(r.metrics.frames_dropped.get("repeat_idr"), 0);
     }
 
     /// Ticks every 100 ms over (from, to].
