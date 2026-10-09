@@ -7,6 +7,7 @@
     clippy::indexing_slicing
 )]
 
+mod admin;
 mod client;
 mod faults;
 mod flow;
