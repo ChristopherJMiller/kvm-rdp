@@ -2,17 +2,68 @@
 
 | | |
 |---|---|
-| Status | Draft rev 6.1 — Plan B's deviations recorded (2026-10-06); rev 6: census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
+| Status | Draft rev 6.2 — Plan C's deviations recorded (2026-10-08); rev 6.1: Plan B's (2026-10-06); rev 6: census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
 | Repo | `github.com/ChristopherJMiller/kvm-rdp` (public, MIT OR Apache-2.0) |
 | First target | Angeet/Yeeso ES3 "ONE KVM" wired to a Mac Studio |
 | Client | Microsoft Windows App on macOS, through an rdpgw RD Gateway on 443 |
 | Companion spec | Deployment, gateway, edge gating and KVM isolation live in `luma-homeops` (separate spec, written after Milestone 0). §9.4 lists what this spec requires of it |
 
-**Rev 6.2 — Plan C (in progress, 2026-10-07).** Burst marking uses a
-sliding median baseline (§6.2; Plan B's final review I3); kvm-sim's
-`wait_for` returns every event its predicate could have seen, and §11.5's
-source-burst wording is fixed (N1, N2). Plan C's last task completes this
-revision.
+**Rev 6.2 — Plan C (2026-10-07 to 2026-10-08).** Records what building
+Milestone 3a settled, against the code as built. DC*n* are Plan C's recorded
+deviations (`docs/superpowers/plans/2026-10-07-kvm-rdp-plan-c.md`); every
+amended passage below is marked "rev 6.2". One line per change:
+
+- DC1 (§6.2): burst marking uses a sliding 1 s **median** delivery-delay baseline, so neither a late first tag nor one late tag mid-stream marks the on-time AUs after it (Plan B's final review I3).
+- Plan B N1, N2 (§11.5): kvm-sim's `wait_for` returns every event its predicate could have seen; the source-burst wording is fixed.
+- DC2 (§4.2): `ironrdp-server` uses only the `egfx` feature — `helper` holds nothing but the `TlsIdentityCtx` §9.1 forbids; PEM loading uses `rustls-pki-types`, the CredSSP key comes from x509-parser.
+- DC3 (§4.2, §4.3, §6.4, §6.6, §6.9, §11.2, §12): the fork carries three patches; patch 1 is pinned and its no-fork fallback (the shadow suspension flag and the suspend-ack injection) is not built; §6.9's "patch 4" is patch 3, `ConnectionInfo::abort_handle()`.
+- DC4 (§4.3): `SessionStart`/`SessionStop` reach the pump from the RDP side with the GFX handle; the shell's `biased` select takes the RDP side, then the 50 ms tick, then the KVM stream.
+- §4.3: the pump's input and command lists are the real enums (`Shutdown`, `Backlog`, `Rtt`, `SurfaceSize`, `Abort`; no slate, max-frames or suspend-ack command — Setup and the slate run inside `step`).
+- DC5, P31 (§4.4): the secret files are `kvm.password_file` and `rdp.nla_password_file` (≤ 4 KiB, one trailing line ending trimmed) and `rdp.tls_cert_file`/`rdp.tls_key_file` (PEM, ≤ 64 KiB, untrimmed); new keys `admin.liveness_timeout`, `rdp.cert_poll_interval`, `security.accept_window`; durations are strings ≤ 1 h; the NLA password has ≥ 22 characters.
+- §4.4 (PC15 I1): a config error is the path, a line and column and a fixed category — never the file's text; the file is read through a 1 MiB cap; exit 2.
+- DC6 (§4.3, §6.6): the shell samples suppression and the write counter per tick and per AU and feeds every RTT read; the core alone treats a generation's first read as its reference.
+- DC7 (§7, §11.3): Plan C's input handler is a counting stub; L2 drives the HID writer through `HidControl`.
+- DC8 (§11.2, §12): the FreeRDP 11-set capability fixture moves to Plan E's L3.
+- DC9, P48 (§11.3): the secrets-hygiene case runs without the keystroke sentinel and paste canary, spawns the binary itself, and sets `SSLKEYLOGFILE` and `RUST_LOG=off` in its cleared environment.
+- DC10, P49 (§13): the target budget is gated by `scripts/target-budget.sh` at 8 GiB; measured 2.4 GiB after Task 2.1, 3.31 GiB once the binary and L2 existed, 3.42 GiB at the end of Plan C.
+- DC11, P34 (§4.3, §6.5): `CancelIdrRequest` is pump-internal; the core counts `idr_cancelled`, the shell ignores the command.
+- DC12 (§4.3, §6.5): an AU dropped on a full KVM → pump channel marks the next delivered AU `after_drop`, a flow cause carried in order.
+- DC13, P32 (§5.2): stop-accepting is `on_accept` refusing; the shutdown's disconnect watchdog is 2 s; a Preempt winner that completes NLA after that is aborted without ErrorInfo and never starts the KVM side.
+- DC14 (§4.3): the KVM → pump channel holds the hard cap + 8.
+- DC15 (§4.4, §9.1): `security.accept_rate` counts admitted attempts only; refusals are logged once, then at most once per 10 s with a count.
+- DC16 (§4.5): `/readyz` means "TLS identity loaded and `GetLocalAddr` answered".
+- §4.5 (P17, PC4 M1): the admin listener serves at most 32 connections at once and drops the rest unanswered.
+- DC17 (§11.2): the L1 rig decodes `GraphicsPipelineServer`'s output with IronRDP's own PDU types, not `GraphicsPipelineClient`.
+- DC18 (§5.2, §8, §9.3, §11.6, §12, §15): §11.6's five L4 hardware checks move to Plan D's first task; Plan C adds four more to that list (§11.6).
+- DC19 (§12): CI gains a job timeout and a tracked-secrets gate ahead of Plan E.
+- DC20 (§6.8): a `video.sps_rewrite` lacking any of the three rewrites is refused at load.
+- §6.8 (Task 6.3): the POC-type-0 stranding re-check Leg B handed on ran in Plan C's L2 — the last AU shipped reaches the client with no further input, its SPS rewritten.
+- DC21 (§4.4): a renewed certificate restarts the bridge only once no client is connected; a client still handshaking holds it off for at most 45 s.
+- DC22 (§13): disposable scratch worktrees use their own target dir.
+- DC23, P5 (§6.4): an Off edge recorded during `WaitReactivation` clears `return_to_paused`, so a resize started from Paused whose client un-minimises meanwhile ends in NeedIdr, not frozen in Paused.
+- DC24, P46 (§11.3): the 64 MiB websocket message's "RSS bounded" is shown by the 4 KiB limit test and measured on the real binary: peak RSS (`VmHWM`) ≈ 30.5 MiB, +8 KiB through the message.
+- §5.2: the KVM step's `Stop`/`Shutdown` takes at most 600 ms (`session::STOP_BOUND`) within its 1 s; the ready line follows the signal handlers; a panicked essential task stops the server in every build.
+- §6.4 (PC11 m1): `FlvOpened` in `WaitReady` and `WaitReactivation` restarts both §6.5 clocks.
+- §6.4 (PC11 m6): a shutdown during `Closing` shortens the running watchdog to the shutdown's 2 s if that is sooner.
+- §6.4 (PC11 m5, m7): a second negotiation without AVC420 closes at once; a Setup IronRDP refuses (its EGFX channel closed) closes with `no_avc420`.
+- §6.4 (PC17 I4): a `DisplayUpdate::Resize` is held until IronRDP has written the EGFX sent before it.
+- §6.4 (ruling 1): `WaitReactivation` has no deadline — a known limitation.
+- §6.5 (PC11 m2, m3): idr-wait open time is sampled on ticks only.
+- §6.5 (PC17 I2, N1, N2): after a `ReconnectFlv` swap the candidate's replay of what the client already has is dropped (a ring of 64), resyncing past a skipped AU; a diverging P frame is dropped with a flow cause.
+- §6.5 (PC8 I1): a `ReconnectFlv` candidate swaps in only at its first tag; one that fails first is dropped and the old FLV kept.
+- §6.6 (PC10 m5, m6): the resume-clear rule can drop about one RTT of frames IronRDP still tracks; an ack for an id never issued still disarms the stall.
+- §6.9 (PC9 I1): a "successful re-login" is one whose token the KVM then accepted; every re-login after a session's first waits on a backoff.
+- §6.9 (PC8 m1, m7): a refused `ReconnectFlv` candidate is in the auth class; a pin mismatch on a candidate or side FLV is fatal.
+- §6.9 (PC11, PC13): `no_avc420` also covers a client closing its EGFX channel mid-session.
+- §6.9 (PC18 m5, ruling 3): the ErrorInfo of a fatal cause at session start may not reach Windows App; a lingering close in IronRDP's teardown (a candidate fork patch 4) is the remedy if acceptance item 11 shows it lost.
+- §3.2, §7.3 (PC9 I2): a websocket whose writes did not all complete is reset (`SO_LINGER` 0), never closed with a FIN; only a close the KVM answered is a FIN.
+- §7.3 (PC7 I1): a report is stamped with the epoch before the queue lock and dropped whole (`hid_epoch_discards`) if a release came between.
+- §9.1 (PC13, PC15): Hybrid is the only mode built; a client without CredSSP gets a plain disconnect; the TLS key type is logged at startup, never judged.
+- §10.4 (ruling 2, ruling 6): a registry table of every metric and label as built, with `frames_dropped{reason="repeat"}` and `{reason="replay_diverged"}`; only a frame a gate drops counts the gate (§11.3's stalled-client case notes what that asks of a test).
+- §11.3 (Task 6.6, PC7 W10): the admin case floods past the connection cap; SIGTERM and secrets hygiene run on the real binary; a mid-session KVM certificate change is left for Plan D to exercise.
+- §11.6 (DC18): the L4 list moves to Plan D and gains the ES3's refusal forms, same-token FLV refusal, its websocket close form and the forced-IDR → candidate lag.
+- §12: planning unit C names the three pinned patches; unit D starts with the L4 checks; owner acceptance item 11 asks whether a fatal cause at session start shows.
+- §13: one shared target dir except disposable scratch worktrees; the budget is the measured one.
 
 **Rev 6.1 — Plan B (2026-10-06).** Records what building Milestones 1 and 2
 settled: POC type 1 is refused (§6.1); trailing zero bytes are trimmed from
@@ -171,7 +222,14 @@ item the census did not measure is marked *open*.
   default features off). `TCP_NODELAY` on every KVM socket.
 - Websocket limits: max message and frame 4 KiB, small write buffer; inbound
   data messages are read and discarded; an oversize message closes the socket
-  without buffering it.
+  without buffering it. Rev 6.2: the bridge ends a websocket with a FIN only
+  after a close the KVM answered with its own close frame; every other end —
+  a failed or blocked write, a lost read side, a close never answered, the
+  task aborted — resets the connection (`SO_LINGER` 0), so HID reports the
+  KVM had not yet read are discarded with it, never delivered after the next
+  websocket's session-start sequence. What already sits in the KVM's own
+  receive buffer it may still read: Plan D re-asserts the full HID state
+  once a reconnect settles (§7.4, §9.3).
 - **The bridge never calls logout.** Because logout is global, it would end
   the operator's break-glass web-UI session (and any `kvm-probe` run).
   Teardown closes the websocket and the FLV and lets the token lapse (§5.1).
@@ -267,7 +325,7 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
      frames; wrongly cleared wedges video for good. (c)
      `GraphicsPipelineServer::is_ack_suspended()`. Test: suspend, resize,
      re-advertise, send more than `max_frames_in_flight` frames — all `Some`.
-     *No-fork fallback*: the pump keeps a shadow suspension flag from
+     *No-fork fallback* (rev 6.2: not built — Plan C pins patch 1): the pump keeps a shadow suspension flag from
      `on_frame_ack` (set on `queue_depth == 0xFFFFFFFF`, cleared on any other
      value, its own synthetic acks excluded) and uses it wherever §6.6 reads
      `is_ack_suspended()`; after each Setup while suspended it re-arms
@@ -298,10 +356,11 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   opened only when the owner says so). Patch 1 alone can be replaced by its
   fallback; Leg B gave no reason to prefer either, because FreeRDP never
   suspended acks (§6.6, `census.md` Leg B), and Windows App's suspension
-  behaviour is an acceptance item (§12).
+  behaviour is an acceptance item (§12). Rev 6.2: Plan C pins patch 1 and
+  builds no fallback (DC3).
 - CI fails if `cargo tree -d` shows a duplicate `ironrdp-*` crate. A pin bump
   is its own PR, reviewed monthly, and must pass the IronRDP golden tests (§11.2).
-- `ironrdp-server` with `default-features = false, features = ["egfx", "helper"]`.
+- `ironrdp-server` with `default-features = false, features = ["egfx"]` (**rev 6.2**: not `helper`, whose only item is the `TlsIdentityCtx` §9.1 forbids).
   Never the `ironrdp` meta-crate. `ironrdp-egfx` without `openh264`.
 - **One crypto provider, aws-lc-rs**, installed idempotently at startup
   (`let _ = install_default()`). Nothing may pull in `ring`.
@@ -317,17 +376,22 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   acquisition, watchdogs, stall and negotiation timeouts, backoff, suppression
   debounce, paste pacing — lives in a synchronous core that takes
   `now: Instant` and returns commands. The EGFX pump's core is
-  `Pump::step(&mut GraphicsPipelineServer, Input) -> Vec<Command>`, driven by
-  the state × input table of §6.4. Its inputs include `SessionStart{gen}`,
-  `SessionStop{gen}`, `Au{gen, bytes, idr, burst}`, `OnReady{avc420}`,
-  `ReactivationComplete`, `FrameAck{id, queue_depth}`, `Tick`,
-  `SuppressSample`, `SpsChanged{class: initial | resize | other, sps, pps}`,
-  `FlvOpened{gen, origin: first | transient | commanded}`,
-  `UpstreamFatal(Cause)`, `BacklogSample` and `RttSample`; its commands include
-  `SendDvc`, `SendSlate`, `DisplayResize`, `ReleaseAll`, `OpenFlv`,
-  `RequestIdr`, `ReconnectFlv`, `CancelIdrRequest`, `SetMaxFramesInFlight`,
-  `InjectSuspendAck`,
-  `ProbeRtt` and `Disconnect(Cause)`. The
+  `Pump::step(&mut GraphicsPipelineServer, now, Input) -> Vec<Command>`, driven by
+  the state × input table of §6.4. Its inputs (rev 6.2: the enums as built)
+  are `SessionStart{generation, size}`, `SessionStop{generation}`,
+  `OnReady{avc420}`, `ReactivationComplete`, `FrameAck{frame_id,
+  queue_depth}`, `Tick`, `Suppress(bool)`, `SpsChanged{class: initial |
+  resize | other, params}`, `FlvOpened{origin: first | transient |
+  commanded}`, `Au(KvmAu)` (the AU with its `idr`, `burst`, `after_drop` and
+  receive time), `UpstreamFatal(Cause)`, `Shutdown{watchdog}`,
+  `Backlog{written}` and `Rtt(u32)` — the shell drops other generations'
+  events before it steps, so only the session inputs carry one; its
+  commands are `SendDvc` (one drained EGFX batch, the slate included),
+  `DisplayResize`, `SurfaceSize`, `ReleaseAll`, `OpenFlv`, `RequestIdr`,
+  `ReconnectFlv`, `CancelIdrRequest`, `ProbeRtt`, `Disconnect(Cause)` and
+  `Abort` (rev 6.2; Setup, the slate and `set_max_frames_in_flight` run inside
+  `step` under the lock, and there is no suspend-ack injection — patch 1 is
+  pinned). The
   lists are the minimum; the implementation may add variants but not fold
   decisions back into the async shells, which only take locks, call `step`,
   and carry out commands.
@@ -345,12 +409,17 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   watchdog). All KVM work runs in one `KvmSession` actor that processes
   `Start{gen}` and `Stop{gen}` strictly in order; a `Stop` completes
   (release-all flushed, websocket, FLV and any side FLV closed; never a
-  logout, §3.2) before the next `Start` begins. Every `ServerEvent` send,
+  logout, §3.2) before the next `Start` begins (rev 6.2: within
+  `session::STOP_BOUND`, 600 ms — the websocket flushes and closes within
+  500 ms, or its task is aborted and its socket reset within 100 ms more —
+  and the FLV sockets are closed, not only their tasks aborted, so an old
+  FLV's close is on the wire before the next login). Every `ServerEvent` send,
   including `Disconnect`, is only made for the current generation. Events
   already queued in IronRDP when a connection ends are dropped by IronRDP
   (§4.2 patch 3), not by the bridge.
-- **KVM → pump: one ordered stream.** Control messages (`SessionStart/Stop`,
-  `SpsChanged`, `FlvOpened`, `UpstreamFatal`) and AUs share one channel, so
+- **KVM → pump: one ordered stream.** Control messages (`SpsChanged`,
+  `FlvOpened`, `UpstreamFatal`; rev 6.2: `SessionStart/Stop` come from the
+  RDP side, below) and AUs share one channel, so
   they never reorder. AUs are sent with `try_send` and dropped when the channel
   is full (a flow cause, §6.5; metric); control messages are sent with
   `send().await` and are never dropped (the KVM actor briefly pauses FLV
@@ -360,20 +429,28 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   only from this stream. Capacity: ≥ the hard cap (§6.6). The FLV is
   otherwise drained at line rate; the KVM never sees back-pressure.
 - **Input path** (§7.3) and the **HID writer** never block the RDP runtime.
+- **Rev 6.2 (Plan C).** `SessionStart`/`SessionStop` come from the RDP side with the GFX handle (DC4): every `KvmEvent` carries its generation, and the shell's `biased` select takes the RDP side first, then the 50 ms tick, then the KVM stream — so no KVM event overtakes its session's start, and a KVM stream that never empties cannot stop the tick-driven watchdog, stall, IDR and probe timers. The tick runs only while a session (or a closing pump) needs it. The shell samples suppression and the write counter per tick and per AU and feeds every RTT read; the core alone treats a generation's first read as its reference (DC6). A dropped AU marks the next one `after_drop` (DC12); the KVM → pump channel holds the hard cap + 8 (DC14).
 
 ### 4.4 Configuration
 
 One TOML file, path from `--config` or `KVM_RDP_CONFIG`. Environment variables
 other than that path (including `RUST_LOG`) are not read. Secrets come only
 from files named in the config — `kvm_password_file`, `nla_password_file`,
-`tls_cert_file`, `tls_key_file` — and are never logged. The file is validated
-at startup; any error exits non-zero before binding. The TLS identity is loaded
-once. The bridge polls the certificate file's mtime every 60 s and, on change,
+`tls_cert_file`, `tls_key_file` (rev 6.2: `kvm.password_file` and `rdp.nla_password_file` — at most 4 KiB, exactly one trailing line ending (`\n` or `\r\n`) trimmed, not empty; `rdp.tls_cert_file` and `rdp.tls_key_file` — PEM, at most 64 KiB (`rdp::tls::MAX_PEM`), read untrimmed by `rdp::tls::load` before anything binds; all relative to the config's directory) — and are never logged. The file is validated
+at startup; any error exits non-zero before binding (rev 6.2: exit 2; the
+file is read through a 1 MiB cap, and the error names only the path, a line
+and column, and a fixed category — unknown key, wrong value type, missing
+required key, duplicate key, syntax error, file too large, not UTF-8 — never
+any of the file's text, which may be a secret pointed at by mistake or an
+inline password). The TLS identity is loaded
+once. The bridge polls the certificate file's mtime every 60 s and, on change — once no client is connected (rev 6.2: a renewal must never cut a live session; the companion deployment spec's decision 8; a client still in TLS or CredSSP holds it off for at most `HANDSHAKE_GRACE`, 45 s, once no session is live, so an unauthenticated peer cannot pin the old certificate) —
 runs graceful shutdown (§5.2) and exits 0 so its supervisor (Kubernetes, or
 systemd on a dedicated host) restarts it — CredSSP binds to the public key read
 at startup.
 
-Defaults (every duration is configurable). Census-derived values cite
+Defaults (every duration is configurable; rev 6.2: durations are strings such
+as `"250ms"` or `"1.6s"`, at most 1 h, unknown keys are refused, and the NLA
+password has at least 22 characters — 128 bits as base64). Census-derived values cite
 `census.md`; values marked *acceptance* are safe defaults that the owner's
 Windows App run retunes (§12):
 
@@ -417,16 +494,26 @@ Windows App run retunes (§12):
 | `paste.pace` | 15 ms between HID reports | §8 |
 | `paste.max_chars` / `max_bytes` / `modifier_wait` | 4096 / 64 KiB / 5 s | |
 | `paste.multiline` | `enter` | or `refuse` |
-| `security.accept_rate` | 30 connection attempts per sliding 60 s, global | §9.1 |
+| `security.accept_rate` | 30 admitted connection attempts per sliding `security.accept_window`, global; refusals do not count (rev 6.2) | §9.1 |
+| `security.accept_window` | 60 s (rev 6.2) | |
+| `rdp.cert_poll_interval` | 60 s (rev 6.2) | A changed certificate or key runs §5.2 and exits 0, once no client is connected |
+| `admin.liveness_timeout` | 10 s (rev 6.2) | §4.5's heartbeat age, configurable for L2 |
 | `log.filter` | `info` | EnvFilter syntax; capped (§4.5) |
 
 ### 4.5 Admin endpoints and logging
 
 - An admin listener on the KVM runtime serves `/metrics`, `/livez` and
   `/readyz`. `/livez` fails when the RDP runtime's heartbeat (a `LocalSet` task
-  bumping an `AtomicU64` each second) is more than 10 s old. `/readyz` succeeds
-  once the TLS identity is loaded and the RDP listener is bound; it never
-  checks the KVM.
+  bumping an `AtomicU64` each second) is more than 10 s old (rev 6.2:
+  `admin.liveness_timeout`; the heartbeat beats every quarter of it, capped
+  at 1 s). `/readyz` succeeds
+  once the TLS identity is loaded and the RDP listener is bound (rev 6.2: `ServerEvent::GetLocalAddr` answered); it never
+  checks the KVM. Each request head is bounded (rev 6.2): over 2 KiB is
+  answered 431, one not complete within 2 s is dropped, and at most 32
+  connections are served at once — past that a connection is dropped
+  unanswered rather than queued, so a scanner on 9464 cannot grow work on the
+  KVM runtime the listener shares with the session actor; `/livez` answers
+  again once the held connections time out.
 - Logs are `tracing` JSON lines on stdout. `log.filter` is one filter; a
   **second, independent `Targets` filter** holds `ironrdp_*`, `sspi`,
   `tungstenite`, `tokio_tungstenite`, `hyper` and `rustls` at INFO (everything
@@ -479,16 +566,33 @@ Windows App run retunes (§12):
 
 ### 5.2 Shutdown
 
-On SIGTERM or SIGINT: stop accepting; release-all and wait for the websocket
+On SIGTERM or SIGINT: stop accepting (`on_accept` refuses, rev 6.2); release-all and wait for the websocket
 flush (≤ 500 ms); disconnect the client with cause `shutdown`; close FLV and
 websocket (no logout, §5.1); exit within 5 s. A `ServerEvent::Quit` sent
 while a client is connected ends only that connection — IronRDP's
 connection loop returns `Disconnect` and `run` goes back to accepting — so
 stopping the server takes a second `Quit` after that connection has
-drained (rev 6.1). Release builds use
+drained (rev 6.1). The shutdown's disconnect watchdog is 2 s, not `video.disconnect_watchdog`, to fit the 5 s (rev 6.2). Release builds use
 `panic = "abort"`. A crash cannot release keys: what the Mac does when the
-websocket TCP connection dies with a key held moved from Leg A to Plan C's L4
+websocket TCP connection dies with a key held moved from Leg A to Plan D's L4 (rev 6.2; Plan C has no HID input path)
 hardware checks (§12), and the answer goes in §9.3.
+
+Rev 6.2 (Plan C), as built (DC13): the steps are bounded at 500 ms (flush),
+2.2 s (the 2 s watchdog plus a tick), 1 s (the KVM actor's `Stop`/`Shutdown`,
+itself at most 600 ms, `session::STOP_BOUND`) and 2 × 500 ms (the two
+`Quit`s, spaced because a live connection drops whatever shares a batch
+with the `Quit` it consumes), then 200 ms of runtime teardown — 4.9 s at
+worst. A Preempt winner that completes NLA after stop-accepting is aborted
+through its `ConnectionAbortHandle` without ErrorInfo and never starts the
+KVM side: the exiting bridge cannot serve its auto-reconnect, and the
+restarted one can. A changed certificate runs the same sequence (§4.4). The
+binary logs `kvm-rdp ready` only after its SIGTERM and SIGINT handlers are
+registered, so a signal sent the moment the line appears still runs this
+sequence. A panic in a task the bridge cannot run without (the pump shell,
+the KVM actor, the admin listener, the certificate watcher) stops the RDP
+server in every build, not only under `panic = "abort"`. Exit codes: 0
+after a signal or a certificate change, 1 if startup failed or the RDP
+server stopped on its own, 2 on a config or logging error.
 
 ## 6. Video: EGFX AVC420 passthrough
 
@@ -650,9 +754,12 @@ resync scanning.
 `resize_with_monitors(w, h, [Monitor{left: 0, top: 0, right: w-1, bottom: h-1,
 flags: PRIMARY}])` (inclusive bounds, unlike `Avc420Region`; never an empty
 list), `create_surface`, `map_surface_to_output`, `SetMaxFramesInFlight(hard)`,
-and — if suspended without upstream patch 1 — `InjectSuspendAck`. The first
+and nothing more for suspension: patch 1 keeps it across Setup (rev 6.2; the fallback's re-arm is not built). The first
 Setup of a connection also issues `OpenFlv`; every Setup is a Setup cause
-(§6.5). Surface ids from before an `on_ready` are invalid; Setup always uses
+(§6.5). A Setup IronRDP refuses — `create_surface` fails only once its EGFX
+channel has closed under the pump — closes with `no_avc420` (rev 6.2): no
+picture can follow on that connection, and a NeedIdr without the first
+Setup's `OpenFlv` would wait on nothing. Surface ids from before an `on_ready` are invalid; Setup always uses
 the latest `create_surface` id. Mouse scaling switches to the new surface here.
 
 **Slate**: on the first Setup of a connection, if the surface equals the
@@ -678,17 +785,22 @@ the same suppression edge.**
 
 | State ↓ / Input → | `OnReady` (AVC420) | `OnReady` (no AVC420) | `SpsChanged` initial/resize needing a resize | `SpsChanged` initial (same size) / other | `FlvOpened` | `ReactivationComplete` | Suppress on (debounced) | Suppress off (debounced) | IDR AU | P AU | Gate closes | Fatal / timeout |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **WaitReady** | Setup (+ slate, `OpenFlv` if first); if `pending_size`: start resize; else → NeedIdr | first negotiation: wait `avc420_timeout`, then → Closing(`no_avc420`) | set `pending_size` | update cache | ignore | ignore | ignore | ignore | drop | drop | — | → Closing |
+| **WaitReady** | Setup (+ slate, `OpenFlv` if first); if `pending_size`: start resize; else → NeedIdr | first negotiation: wait `avc420_timeout`, then → Closing(`no_avc420`); a later one: → Closing(`no_avc420`) at once (rev 6.2, §6.7) | set `pending_size` | update cache | restart both §6.5 clocks (rev 6.2) | ignore | ignore | ignore | drop | drop | — | → Closing |
 | **NeedIdr** | Setup → NeedIdr (Setup cause) | → Closing(`no_avc420`) | start resize | update cache; `other` is a flow cause | satisfies `idr_pending`, resets idr-wait | ignore | → Paused | — | gates open: send → Live; closed: drop, flow cause | drop | flow cause | → Closing |
 | **Live** | Setup → NeedIdr (Setup cause) | → Closing(`no_avc420`) | start resize | update cache; `other` → NeedIdr (flow cause) | → NeedIdr (await this connection's first IDR) | ignore | → Paused | — | send if gates open, else → NeedIdr (flow cause) | send if gates open, else → NeedIdr (flow cause) | → NeedIdr (flow cause) | → Closing |
-| **WaitReactivation** | record (merged) | → Closing(`no_avc420`) | set `pending_size` (latest wins) | update cache | ignore | Setup at the reactivated size; if `pending_size` is set and differs: clear it, start resize again; else if suppressed or `return_to_paused` → Paused; else if `on_ready` was never seen → WaitReady; else → NeedIdr (Setup cause) | ReleaseAll; record | record | drop | drop | — | → Closing |
+| **WaitReactivation** | record (merged) | → Closing(`no_avc420`) | set `pending_size` (latest wins) | update cache | restart both §6.5 clocks (rev 6.2) | Setup at the reactivated size; if `pending_size` is set and differs: clear it, start resize again; else if suppressed or `return_to_paused` → Paused; else if `on_ready` was never seen → WaitReady; else → NeedIdr (Setup cause) | ReleaseAll; record | record; an Off edge clears `return_to_paused` (rev 6.2, DC23) | drop | drop | — | → Closing |
 | **Paused** | Setup; stay Paused | → Closing(`no_avc420`) | start resize with `return_to_paused` | update cache | stay Paused | ignore | — | → NeedIdr (Setup cause) | drop | drop | — | → Closing |
-| **Closing** | ignore | ignore | ignore | ignore | ignore | ignore | ignore | ignore | drop | drop | ignore | ignore |
+| **Closing** | ignore | ignore | ignore | ignore | ignore | ignore | ignore | ignore | drop | drop | ignore | ignore; a shutdown (§5.2) shortens the running watchdog to its own 2 s if that is sooner, keeping the first cause (rev 6.2) |
 
 *Start resize*: stop sends (→ `WaitReactivation`); update the size used by
 `size()` and `request_initial_size()`; emit `DisplayUpdate::Resize` on the
 current updates stream; continue per the `ReactivationComplete` cell. AUs
-arriving during `WaitReactivation` are dropped. **This is the only resize
+arriving during `WaitReactivation` are dropped. (Rev 6.2: EGFX and the
+`Resize` travel on two IronRDP channels that are written concurrently, so
+the shell holds the `Resize` until the generation's write counter shows
+every EGFX batch sent before it written — the slate before its
+DeactivateAll — re-reading the counter each loop turn and on a timer that
+backs off from 5 ms to 250 ms while it is held.) **This is the only resize
 path.** Leg B measured it on FreeRDP: `DisplayUpdate::Resize` → reactivation
 → Setup → new-size IDR brought the picture back in 34 ms (37 ms through
 rdpgw, Leg C). A channel-only surface swap is never used: it blinks on
@@ -707,6 +819,15 @@ header or in-band SPS on a live FLV is classified `resize`. With the preset
 pinned (§6.1), this is a rare, operator-driven event.
 
 The stall timer (§6.6) is frozen in `Paused` and `WaitReactivation`.
+
+**Known limitation (rev 6.2): `WaitReactivation` has no deadline.** Neither
+this table nor the pump times a reactivation out, so a client that never
+completes one (it stopped reading mid-resize, or never answers the
+Deactivation-Reactivation) holds its session — and the KVM connections —
+until it disconnects. Two things bound it: Preempt (a new authenticated
+client takes over) and TCP liveness (the connection's eventual failure ends
+the session through `on_disconnected`). The held `Resize`'s re-read backs
+off to 250 ms, so such a session costs next to nothing meanwhile.
 
 ### 6.5 Getting an IDR
 
@@ -730,7 +851,10 @@ Under `side` and `reconnect`, a Setup cause sets `idr_pending`, except for
 the first Setup, whose `OpenFlv` already serves; a flow cause starts idr-wait
 accounting, and once the gates have been open for a cumulative
 `idr_wait_max` (flapping does not reset it) it sets `idr_pending` — usually
-the 2 s GOP answers first. `video.idr_policy` says how `idr_pending` is
+the 2 s GOP answers first. (Rev 6.2: the open time is sampled on the pump's
+50 ms ticks only, never on an AU — so a burst AU's soft-gate exemption never
+counts as open time, and the AU that resolves a NeedIdr never also requests
+the IDR it brings; the cost is up to one tick of resolution.) `video.idr_policy` says how `idr_pending` is
 served:
 
 - `side` (default, from Leg A) — `RequestIdr`: the KVM actor opens a short
@@ -750,7 +874,33 @@ served:
 - `reconnect` — `ReconnectFlv`, make-before-break: Leg A shows the new
   connection forces an IDR, so the old FLV closes once the new one delivers
   its first tag. It is `side`'s fallback, and a policy of its own for a
-  source whose encoder is not shared.
+  source whose encoder is not shared. Rev 6.2, as built:
+  - The candidate swaps in only at its first tag, emitting
+    `FlvOpened{Commanded}` then. One whose first chunk is a framing error,
+    or that has no tag `kvm.connect_timeout` after it opened, is dropped
+    (`upstream_reconnects{reason="commanded_failed"}`; a framing error also
+    counts toward `stream_corrupt`) and the old FLV keeps flowing — so from
+    `ReconnectFlv` to giving up takes at most 3 × `connect_timeout`
+    (connect, response, first tag) plus one 100 ms actor tick, 9.1 s at the
+    defaults, inside `upstream_deadline`. (kvm-sim logs an FLV open when it
+    subscribes the viewer, so its log cannot tell a swap at open from a swap
+    at the first tag; the L1 candidate cases do.)
+  - **Replays are not sent twice.** The shared encoder forces the
+    candidate's IDR into the old FLV too, and the old FLV may deliver it —
+    and P frames after it — before the candidate's first tag; the candidate
+    then replays them. A repeated P frame would predict from the wrong
+    reference with a backwards `frame_num`, corrupting the picture until the
+    next IDR. So the pump keeps the (length, hash) of each AU handed to
+    IronRDP since the last IDR, as it went out (SPS rewritten; FLV
+    timestamps excluded), in a ring of 64 (≈ 2 s), and after a commanded
+    swap drops the candidate's AUs while they match it in order
+    (`frames_dropped{reason="repeat"}`); the IDR's match ends the swap's
+    NeedIdr. An AU the candidate left out is skipped by resyncing to the
+    later entry it matches. A P frame that matches nothing mid-replay is
+    dropped and the pump enters NeedIdr with a flow cause
+    (`frames_dropped{reason="replay_diverged"}`) — its reference is not the
+    client's; an IDR always ends the replay and goes out. A replay longer
+    than the ring is forwarded from the candidate's IDR, a decodable rewind.
 - `wait` — `idr_pending` is never set; every NeedIdr waits for the next
   periodic IDR.
 
@@ -804,7 +954,11 @@ granularity.
   tracker: the set is cleared at every Setup, re-advertise and suspend ack;
   **while acks are suspended nothing is recorded**; the first non-suspend ack
   clears the set before removing its own id; an ack for an id not in the set is
-  ignored. Arithmetic is saturating.
+  ignored. Arithmetic is saturating. (Rev 6.2: IronRDP's own tracker does not
+  clear on a resume ack, so a frame sent after IronRDP has processed the
+  resume ack but before the pump has is tracked there and dropped here —
+  at most about one RTT of frames escapes the soft gate; IronRDP's own
+  back-pressure still bounds them.)
 - **Grace frames**: the slate and the first IDR after each Setup or FLV open
   are exempt from the soft gate until acked or until `first_ack_grace` has
   elapsed, so a slow first ack (large IDR, decoder start-up) does not freeze
@@ -838,13 +992,17 @@ granularity.
   - `should_backpressure()`.
 - **Stall.** The stall timer arms at the first gate closure after the most
   recent ack (or after Setup, if no ack has arrived since), is disarmed by any
-  ack (including a suspend ack), is frozen in `Paused` and `WaitReactivation`,
+  ack (including a suspend ack — rev 6.2: and an ack for an id never issued,
+  which IronRDP forwards after a warning, so a client that acks a stale id
+  more often than `stall_timeout` keeps a closed gate and a frozen picture
+  rather than ending as `client_stalled`; only that authenticated client is
+  affected), is frozen in `Paused` and `WaitReactivation`,
   and is disabled while acks are suspended. If it reaches `stall_timeout` →
   Closing(`client_stalled`).
 - **Ack suspension** (`on_frame_ack` with `queue_depth == 0xFFFFFFFF`):
   **sending never stops** — a client resumes only by acknowledging an EndFrame
-  it received. Suspension is read from `is_ack_suspended()` (§4.2 patch 1), or
-  from the pump's shadow flag under the fallback, and survives Setup and
+  it received. Suspension is read from `is_ack_suspended()` (§4.2 patch 1) only
+  (rev 6.2: patch 1 is pinned; the fallback's own flag is not built), and survives Setup and
   re-advertise. While suspended: the soft gate and
   `should_backpressure()` are bypassed, the stall timer is disabled, and the
   bounds are the backlog gate and standing delay (flow causes); backlog
@@ -881,7 +1039,7 @@ Leg A's results (`census.md`, Leg A — stream and colour) and Leg B's
 | Level below the coded size. **Found**: 1920×1080 labelled `level_idc` 31, but 8160 MBs > level 3.1's MaxFS 3600 | h264-reader — so `kvm-proto`'s `parse_sps` — refuses the SPS as sent (`FieldValueTooLarge { pic_size_in_map_units: 8160 }`); a strict client decoder may too. FreeRDP does not care: an ES3-shaped x264 stream decodes the same at level 31 and 40 (Leg B) | Rewrite (a), below — required for `kvm-proto`'s own checks whatever the client does. Whether Windows App decodes the stream as labelled is an acceptance item (§12) |
 | Limited-range or BT.601 samples. **Found**: the pixels are limited-range BT.709 (decoded Y: black 16, white 233–236; pure red Y 63, where BT.601 would give ≈ 81), but the VUI claims full range (`video_full_range_flag` 1) and BT.601 (primaries 5, matrix 5) | MS-RDPEGFX fixes AVC420 to full-range BT.709. A client that applies that fixed conversion ignores the VUI and shows limited-range pixels **mildly washed out**: black → 16, white → 235 (~14 % contrast loss). **FreeRDP does exactly this**: Y 16 / 235 render as RGB 16,16,16 / 235,235,235 whether the VUI says full or limited (Leg B). A decoder that honours the VUI as sent shows washed-out, slightly mis-tinted colour | Measured on **decoded** samples, not flags. Rewrite (b), below, makes the VUI true — right for a client that honours it, but it cannot change a client that applies the fixed conversion. **Known limitation**, below |
 | POC type 0 without `bitstream_restriction`. **Found** | Client decoders may hold frames | Rewrite (c), below, **always** — decided in Plan A's Task 9.1 instead of a POC-0 presentation-hold experiment: the SPS is re-serialised for (b) anyway, and the structure is valid for Baseline. Safe because §6.1 already refuses B-slices and non-increasing POC. Leg B's stranding test passed on FreeRDP, but with x264 fixtures, not a POC-0 stream; whether Windows App holds frames on the rewritten stream is an acceptance item (§12) |
-| Encoder stops sending on a static screen. **Not found**: one tag every 33 ms whether the screen is static or moving | Some clients hold the last ~2 frames, so the last keystroke never appears | Cannot strand a keystroke on the ES3 at 30 fps. Leg B's barcode stranding test on FreeRDP showed a stable picture while stranded (screens 3 s apart byte-identical; no blank, no partial frame) — not confirmed as the last frame shipped, and run on x264 streams with POC type 2 and `bitstream_restriction`, which cannot fail the presentation-hold gate a real POC-0, no-restriction stream could; that check moves to Plan C's L2 with Plan B's ES3-shaped POC-type-0 fixture (§11.5, Task 6.1). `flv_idle_timeout` (10 s) sits far above the 33 ms cadence |
+| Encoder stops sending on a static screen. **Not found**: one tag every 33 ms whether the screen is static or moving | Some clients hold the last ~2 frames, so the last keystroke never appears | Cannot strand a keystroke on the ES3 at 30 fps. Leg B's barcode stranding test on FreeRDP showed a stable picture while stranded (screens 3 s apart byte-identical; no blank, no partial frame) — not confirmed as the last frame shipped, and run on x264 streams with POC type 2 and `bitstream_restriction`, which cannot fail the presentation-hold gate a real POC-0, no-restriction stream could; that check moves to Plan C's L2 with Plan B's ES3-shaped POC-type-0 fixture (§11.5, Task 6.1) — rev 6.2: done, `the_last_au_shipped_reaches_the_client_and_its_sps_is_rewritten`, which shows the last AU kvm-sim ships reaching the in-process client with no further input and carrying the rewritten SPS; whether a real decoder holds frames stays acceptance item 3 and L5. `flv_idle_timeout` (10 s) sits far above the 33 ms cadence |
 
 **Known limitation: mild wash-out on fixed-conversion clients.** The ES3's
 pixels are limited-range, and a client that follows MS-RDPEGFX's fixed
@@ -908,7 +1066,7 @@ h264-reader parses only its output, and the rewritten SPS is what is
 admitted, classified, cached and sent to IronRDP (§6.1, §6.3). `kvm-proto`
 reads the input with its own bounded bit reader (h264-reader refuses it), and
 Plan B builds the rewriter, with the POC-type-0 fixture (§11.5, §12).
-`video.sps_rewrite` is `["level", "vui", "restriction"]`.
+`video.sps_rewrite` is `["level", "vui", "restriction"]`; a set lacking any of the three is refused at load (rev 6.2).
 
 - (a) `"level"`: `level_idc` is raised to the lowest level whose MaxFS and
   MaxMBPS (H.264 Table A-1) admit the coded size at `video.max_fps` — with
@@ -960,8 +1118,8 @@ rewrite the ES3's stream cannot be admitted at all.
 |---|---|---|
 | Transient (FLV) | connect refused or timeout; FLV EOF (including a KVM preset change, §6.4); end of sequence; HTTP 5xx; FLV open but silent for `flv_idle_timeout` | Reconnect with `kvm.backoff`, keep the last picture; the new FLV's `FlvOpened` puts the pump in NeedIdr for its first IDR (§6.4) |
 | Transient (websocket) | websocket close or oversize message; a write exceeding `hid_write_timeout` | Reconnect with `kvm.backoff`; the session-start sequence; no NeedIdr |
-| Auth | login rejected; HTTP 401/403 or `result: 403` on FLV/WS — e.g. after any session's logout, which is global (§3.2). Side FLVs are excluded (§6.5) | Re-login once (the only time the bridge logs in again within a session, §5.1). A second consecutive failure, with no successful re-login in between, is fatal: `kvm_auth_failed` |
-| Certificate | SPKI mismatch | Fatal immediately, no login sent: `kvm_cert_mismatch` |
+| Auth | login rejected; HTTP 401/403 or `result: 403` on FLV/WS — e.g. after any session's logout, which is global (§3.2). Side FLVs are excluded (§6.5) | Re-login once (the only time the bridge logs in again within a session, §5.1). A second consecutive failure, with no successful re-login in between, is fatal: `kvm_auth_failed`. Rev 6.2: a re-login is *successful* only once the KVM accepts its token — the websocket upgrades with it, or an FLV opened with it reaches its first tag — so a KVM that answers logins but refuses every fresh token is fatal at the second refusal rather than logged into as fast as it answers; the first re-login of a session is immediate, every later one waits on a backoff that only an accepted token resets; a `ReconnectFlv` candidate refused for its token is in this class (a KVM refusing every new FLV is fatal at the second refused candidate) |
+| Certificate | SPKI mismatch | Fatal immediately, no login sent: `kvm_cert_mismatch` (rev 6.2: on any connection — a side FLV or a `ReconnectFlv` candidate included) |
 | Stream-incompatible | HEVC; B-frames (including a `CompositionTime` change); outside §6.1 limits; a pinned field changes; a slice, PPS or AUD check fails; an SPS the rewriter cannot read or verify (§6.8) | Fatal immediately: `stream_incompatible` |
 | Framing violation | bad header, encrypted tag, `StreamID ≠ 0`, bad `PrevTagSize`, oversize tag, start code in a NAL, NAL limits, NALU before any sequence header, a tag that is not one picture (§6.2) | Transient (FLV reconnect, `parse_errors{kind}`); three within 60 s is fatal: `stream_corrupt` |
 | Deadline | No successful login within `upstream_deadline` of `on_connection_info`; or no FLV tag within `upstream_deadline` of the first FLV open, or since the FLV connection was lost, despite reconnecting | Fatal: `kvm_unreachable` |
@@ -974,8 +1132,16 @@ EGFX sends, then sends `Disconnect(ErrorInfo)` through
 `ErrorInfoDisconnectHandle`, and arms `disconnect_watchdog`. If
 `on_disconnected` has not fired when the watchdog expires, the bridge
 releases all keys, sends `Stop{gen}` to the KVM side anyway, and aborts the
-connection (§4.2 patch 4) — so a client that has stopped reading cannot hold
+connection (§4.2 patch 3; rev 6.2) — so a client that has stopped reading cannot hold
 the session or the KVM connections open.
+
+Rev 6.2: `no_avc420` also ends a session whose client closes its EGFX
+channel mid-session (a DVC Close while its generation is current), and one
+whose Setup IronRDP refuses because the channel is gone (§6.4): no picture
+can follow either way. IronRDP also runs the channel's close at every
+connection's teardown, just before `on_disconnected`; that one belongs to an
+ended generation and is filtered out, so a plain disconnect is never a
+cause.
 
 Codes are explicit server-initiated ErrorInfo values (MS-RDPBCGR 2.2.5.1.1),
 so the client does not auto-reconnect into a loop; the log line names the
@@ -985,6 +1151,18 @@ directly and through rdpgw (`census.md`, Leg B and Leg C). The table stands
 as written; Windows App's dialog and reconnect behaviour for each code
 (0x1, 0x5, 0x7, 0x9), and whether `0x19` SERVER_SHUTDOWN suits `shutdown`
 better, are an acceptance item (§12) that may revise it.
+
+**A fatal cause at session start** (rev 6.2; e.g. `kvm_auth_failed`,
+`kvm_cert_mismatch` or `no_avc420` before the first picture): IronRDP writes
+the ErrorInfo and closes at once, with the client's DVC answers still
+unread, so the close can become a reset that destroys an ErrorInfo the
+client has not read yet — L2's client reports it only because it keeps
+reading after a failed write, and Windows App may show a plain connection
+loss instead. Owner acceptance item 11 checks it.
+If it is lost, the remedy is a lingering close in IronRDP's teardown
+(`finalize_and_shutdown`: after `shutdown()`, read and discard until EOF,
+bounded by its `DISCONNECT_STEP_GRACE`) — a candidate fourth fork patch
+(§4.2); Plan C changes nothing here.
 
 | Cause | ErrorInfo |
 |---|---|
@@ -1038,7 +1216,12 @@ better, are an acceptance item (§12) that may revise it.
 - **Release-all** bumps the epoch and sets an atomic flag plus a `Notify`. The
   writer services it before anything else and **discards every queued report
   (keyboard, mouse or Typist) stamped with an older epoch**, so nothing queued
-  before a release can re-press a key after it.
+  before a release can re-press a key after it. (Rev 6.2: a report is
+  stamped before the queue lock is taken, and dropped whole under it —
+  neither queued nor kept as resync state, `Push::Discarded`, counted in
+  `hid_epoch_discards` — if a release came in between; so a push racing a
+  release can never land after the zeros. A fresh press that loses that
+  race is lost, never stuck.)
 - While the websocket is down, reports are discarded; reconnect sends the
   session-start sequence.
 - A websocket write that takes longer than `hid_write_timeout` closes and
@@ -1098,7 +1281,7 @@ release report; a shifted character carries Shift in the press report's
 modifier byte. `paste.pace` separates every report (so ~30 ms per character).
 `paste.pace` is provisional: in Leg A an 842-character URL sent at one report
 per 20 ms took ~60–90 s to land in Edge's address bar (the omnibox's
-per-keystroke work is mixed in), so Plan C measures the KVM's own HID report
+per-keystroke work is mixed in), so Plan D (rev 6.2; was Plan C) measures the KVM's own HID report
 rate (L4) before the pace is fixed (`census.md`, Derived decisions).
 
 While typing:
@@ -1134,7 +1317,7 @@ Limits and hygiene:
   **`Caps.EnableClipboard: true`**. Without it rdpgw sends
   `HTTP_TUNNEL_REDIR_DISABLE_CLIPBOARD` and FreeRDP leaves `cliprdr` out of
   its channel list; with it, `cliprdr` is requested and given an MCS channel
-  (`census.md`, Leg C; clipboard data itself is Plan C's to test).
+  (`census.md`, Leg C; clipboard data itself is Plan D's to test, rev 6.2).
   `redirectclipboard:i:1` is rdpgw's own default, so rdpgw leaves it out of
   the `.rdp` (it writes no field equal to its default) and the client's
   default applies. Whether Windows App obeys rdpgw's redirect flags is an
@@ -1164,6 +1347,11 @@ Limits and hygiene:
      behind a `test-insecure` cargo feature that is excluded from the container
      build and refuses to start without a credential validator; no-security is
      never compiled in. CI checks the published image rejects any other mode.
+     (Rev 6.2: Plan C builds no `test-insecure` feature at all — Hybrid is
+     the only mode in any build, L2 included. A client that does not offer
+     CredSSP is refused at the X.224 negotiation with a plain disconnect, not
+     a "CredSSP required" reply — IronRDP's acceptor sends none — so such a
+     client reports a generic connection failure.)
    - One static username and password via `set_credentials`. The username
      compare is exact and case-sensitive; it must equal what rdpgw pre-fills.
      A client may add its own host name as the NTLM domain: through rdpgw,
@@ -1175,8 +1363,16 @@ Limits and hygiene:
      which honours `SSLKEYLOGFILE`), with our own RSA certificate for the name
      in the `.rdp` — never the edge wildcard. (FreeRDP also completes NLA
      with an ECDSA certificate, `census.md` Leg B; RSA stays because Windows
-     App has not been tried with one.)
-   - `on_accept` rate-limits attempts (`security.accept_rate`).
+     App has not been tried with one.) Rev 6.2: nothing enforces RSA — the
+     key's type and size are logged at INFO when the identity loads (`TLS
+     identity loaded`, `key_type`, `key_bits`) and left to acceptance item 9;
+     aws-lc-rs refuses a key it cannot sign with (RSA under 2048 bits, an
+     unsupported curve) at startup, `TlsError::UnsupportedKey`, with no key
+     bytes in the error.
+   - `on_accept` rate-limits attempts (`security.accept_rate`; rev 6.2:
+     admitted attempts only, DC15, and a refusal is logged once, then at most
+     one line per 10 s with a count, `REFUSAL_LOG_INTERVAL`, so a TCP flood
+     does not become a log flood; `kvm_rdp_accept_refused` counts every one).
 
 ### 9.2 Secrets and logging
 
@@ -1196,7 +1392,7 @@ pasted text are never logged (§4.5). Secrets come only from files (§4.4).
 | A gateway token is replayed (a leaked `.rdp`) | Tokens are bound to the bridge's host; **`VerifyClientIp: true`** with `Server.TrustedProxies` = the edge and the edge stamping `X-Forwarded-For`, so a token works only from the address that fetched it — Leg C: a token minted for another address is refused (`E_PROXY_RAP_ACCESSDENIED`); NLA still applies (§9.4) | A token is reusable — Leg C opened two tunnels with one — until `exp` + 60 s (about 6 min) from the pinned address. Pinning refuses legitimate connections if `/connect` and the tunnel reach rdpgw from different addresses (split routing, NAT) |
 | rdpgw's session cookie bypasses its trusted-proxy check | **The edge strips `Set-Cookie: RDPGWSESSION`** from `/connect` responses, and `/connect` is reachable only through the auth proxy (§9.4). Leg C: the cookie from a proxied `/connect`, sent directly from an untrusted address with no identity header, got 200 and a fresh token, because rdpgw accepts an authenticated session before it checks `TrustedProxies`; IP pinning does not help, since that token carries the caller's own address | If a cookie escapes anyway, it mints tokens for its 120 s lifetime (`Max-Age=120`) |
 | A client that stops reading pins the session | `Closing` + disconnect watchdog + hard abort (§6.9) | — |
-| Bridge crash with a key held | `panic = "abort"`; release on every orderly path | Depends on the KVM's behaviour on websocket loss (Plan C L4, §12) |
+| Bridge crash with a key held | `panic = "abort"`; release on every orderly path | Depends on the KVM's behaviour on websocket loss (Plan D's L4, §12; rev 6.2) |
 | Census capture leaks or attacks the dev host | Sandbox (§12) | — |
 
 ### 9.4 Requirements on the companion spec
@@ -1356,6 +1552,48 @@ reports sent, coalesced, resyncs and epoch discards; release-all by trigger;
 paste events and skipped characters; disconnects by cause; allocations per
 frame (`alloc-stats` builds).
 
+**The registry as built** (rev 6.2, Plan C's `kvm_rdp::metrics`). Counters
+and labelled families are exposed with `_total`; label values are fixed
+strings from bridge code, never device or client text. Paste events and
+skipped characters are Plan D's, allocations per frame Plan E's.
+
+| Metric | Kind | Labels (values) |
+|---|---|---|
+| `kvm_rdp_flv_bytes_total`, `kvm_rdp_flv_tags_total` | counter | — (main stream only) |
+| `kvm_rdp_kvm_frames_total` | counter | `type`: `idr`, `p` |
+| `kvm_rdp_kvm_frame_bytes` | histogram (bytes) | — (VCL bytes per admitted AU) |
+| `kvm_rdp_kvm_inter_arrival_seconds` | histogram | — |
+| `kvm_rdp_kvm_fps` | gauge | — |
+| `kvm_rdp_parse_errors_total` | counter | `kind`: the framing violation (`kvm_proto::video::AdmissionError::kind`), e.g. `oversize_tag`, `bad_prev_tag_size`, `encrypted_tag`, `bad_stream_id`, `nal_before_sequence_header`, `start_code_in_nal`, `not_one_picture`, `unknown_tag_type`, `too_many_nals` |
+| `kvm_rdp_upstream_reconnects_total` | counter | `reason`: FLV — `eof`, `idle`, `end_of_sequence`, `framing`, `commanded_failed`, or a failed open's or read's `KvmError` kind (`timeout`, `connect`, `tls`, `http`, `protocol`); websocket — `websocket_open`, `websocket`, `websocket_write` |
+| `kvm_rdp_kvm_logins_total`, `kvm_rdp_kvm_relogins_total` | counter | — |
+| `kvm_rdp_idr_requests_total` | counter | `kind`: `side`, `reconnect` |
+| `kvm_rdp_idr_side_failures_total` | counter | `kind`: `busy`, `no_token`, `cert`, `task`, or the `KvmError` kind (`auth`, `timeout`, `connect`, `tls`, `http`, `protocol`, `eof`) |
+| `kvm_rdp_idr_side_fallbacks_total`, `kvm_rdp_idr_cancelled_total` | counter | — |
+| `kvm_rdp_sps_rewrites_total` | counter | `field`: `level`, `vui`, `restriction` |
+| `kvm_rdp_sps_changes_total` | counter | `class`: `initial`, `resize`, `other` |
+| `kvm_rdp_burst_frames_total` | counter | — |
+| `kvm_rdp_egfx_frames_sent_total`, `kvm_rdp_egfx_frames_acked_total` | counter | — |
+| `kvm_rdp_frames_dropped_total` | counter | `reason`: `soft_gate`, `backlog_gate`, `standing_delay`, `backpressure`, `burst_truncated`, `send_none`, `awaiting_idr`, `not_ready`, `channel_full`, `paused`, `wait_reactivation`, `closing`, `repeat`, `replay_diverged` |
+| `kvm_rdp_enqueue_latency_seconds` | histogram | — |
+| `kvm_rdp_egfx_ack_rtt_seconds` | histogram | — |
+| `kvm_rdp_egfx_qoe_decode_seconds` | histogram | — (QoE, V10+ clients) |
+| `kvm_rdp_egfx_in_flight`, `kvm_rdp_egfx_backlog_bytes`, `kvm_rdp_egfx_ack_suspended`, `kvm_rdp_egfx_oldest_unacked_ms`, `kvm_rdp_autodetect_rtt_ms`, `kvm_rdp_standing_delay_ms`, `kvm_rdp_egfx_capability_version` | gauge | — |
+| `kvm_rdp_hid_reports_sent_total`, `kvm_rdp_hid_reports_coalesced_total`, `kvm_rdp_hid_resyncs_total`, `kvm_rdp_hid_epoch_discards_total` | counter | — |
+| `kvm_rdp_release_all_total` | counter | `trigger`: `session_start`, `session_end`, `closing`, `watchdog`, `shutdown`, `websocket_reconnect`, `suppression` (Plan D adds `Synchronize` and the timers) |
+| `kvm_rdp_sessions_total` | counter | — |
+| `kvm_rdp_disconnects_total` | counter | `cause`: §6.9's causes (`shutdown`, `kvm_unreachable`, `stream_corrupt`, `stream_incompatible`, `no_avc420`, `client_stalled`, `clipboard_oversize`, `kvm_auth_failed`, `kvm_cert_mismatch`) — bridge-initiated only |
+| `kvm_rdp_accept_refused_total` | counter | — |
+| `kvm_rdp_input_events_ignored_total` | counter | — (Plan C's input stub; Plan D replaces it) |
+
+`frames_dropped` counts frames, not gate events (rev 6.2): a frame a gate
+drops counts that gate's reason — `burst_truncated` for a burst AU dropped
+at the backpressure gate — and a gate closure the 50 ms tick notices first
+drops no frame and counts nothing. A P frame dropped while in NeedIdr
+counts `awaiting_idr` whatever the gates say, so `soft_gate` counts only an
+IDR (or a live AU that beats the tick) that meets the closed gate. `repeat`
+and `replay_diverged` are §6.5's replay rule after a `ReconnectFlv` swap.
+
 ## 11. Testing
 
 ### 11.1 Principles
@@ -1380,7 +1618,7 @@ frame (`alloc-stats` builds).
 |---|---|---|
 | L0 unit | `kvm-proto` | Goldens (HID encoders, scancode table, AVCC→Annex-B, SPS fields); SPS rewriter goldens: the ES3's SPS (`census.md` `sps_hex`) → `level_idc` 40, VUI full-range 0, colour 1/1/1 and `bitstream_restriction` added (`max_num_reorder_frames` 0, `max_dec_frame_buffering` 1), emulation prevention re-applied, and the output accepted by h264-reader; a level that already admits the size is never lowered; an SPS already labelled BT.709 limited, at an adequate level and carrying `bitstream_restriction` is byte-identical; a re-serialisation that produces `00 00 0[0-3]` gains an emulation-prevention byte; with `"restriction"`, `bitstream_restriction` already present is kept; an unreadable SPS → `stream_incompatible`; `CompositionTime` constant (16) is admitted and a change refused; FLV mux→demux round-trip property tests; parse of a committed ffmpeg-muxed FLV; burst marking; mouse scaling at the edges; **one hostile vector per §6.1/§6.2 rule, each asserting its specific error kind**; SPS-change classification per §6.1's table; a pre-buffer test (`DataSize = 0xFFFFFF` rejected after ≤ 11 bytes, nothing reserved); sans-IO cores with injected clock (release epoch and released-by-bridge rule, both key timers including two keys held with repeats of the second only → no release, backoff, paste pacing and text handling, debounce) |
 | L0 fuzz | `fuzz/` | FLV demux, AVCC, sanitiser, SPS/PPS/slice checks, SPS rewriter, login response; a differential mux→demux target. Output invariants in every target: emitted NAL types ∈ {1,5,7,8,9}; no emitted NAL contains `00 00 0[0-2]`; re-splitting the Annex-B yields exactly the emitted NALs; any emitted SPS is byte-identical to the last admitted (after rewrite) SPS and its pinned fields equal the first SPS's; any emitted AUD is two bytes; every admitted slice header re-parses, from the whole NAL and with no bound, to lists within §6.1's ceilings (rev 6.1, final review). Rewriter: the output re-parses with every field equal to the input except `level_idc` (never lower than the input's), the VUI's video-signal-type and colour-description fields, with `"restriction"`, `max_num_reorder_frames`, `max_dec_frame_buffering` and `bitstream_restriction_flag`, and, on any level raise of a profile 66/77/88 SPS, `constraint_set3_flag` (`constraint_flags & 0x10`), which the rewriter clears (§6.8 (a); rev 6.1, Plan B D12). 5 s per target per PR, longer nightly. CI-only |
-| L1 sans-IO | `kvm-rdp` | `Pump::step` and `GraphicsPipelineServer` ↔ `GraphicsPipelineClient` in memory (cases below). IronRDP goldens: `encode_avc420_bitmap_stream(full_frame(640,360,22))` bytes and the ResetGraphics monitor bytes — required on every pin bump |
+| L1 sans-IO | `kvm-rdp` | `Pump::step` and `GraphicsPipelineServer` in memory, its output decoded with IronRDP's own PDU types (rev 6.2: not `GraphicsPipelineClient`, whose handler consumes the PDUs the cases assert; every `WireToSurface1` is checked to be AVC420) (cases below). IronRDP goldens: `encode_avc420_bitmap_stream(full_frame(640,360,22))` bytes and the ResetGraphics monitor bytes — required on every pin bump |
 | L2 full stack | `kvm-rdp` (one test binary) | Bridge + kvm-sim + in-process IronRDP client over loopback (§11.3) |
 | L3 interop | CI, `#[ignore]` test | FreeRDP 3 from the flake (§11.4) |
 | L4 hardware | opt-in | `kvm-probe` and `--features hil` tests against the real ES3 (§11.6) |
@@ -1394,7 +1632,7 @@ L1 cases:
   ever sent. FreeRDP's are recorded (Leg B): with `/gfx:AVC420`, `V8`
   `02000000` and `V8_1` `12000000` → `V8_1`; without it, an 11-set ladder
   `V8`…`V10_7` → `V10_7` (`census.md` names these sets but not their bytes,
-  so Plan C captures them from the flake's FreeRDP); byte-identical through
+  so they are captured from the flake's FreeRDP — by Plan E's L3 since rev 6.2); byte-identical through
   rdpgw (Leg C), and FreeRDP never re-advertised. Windows App's (direct,
   through rdpgw, any re-advertise) are added from the owner's acceptance run
   (§12). A re-advertise whose confirmed set lacks AVC420 →
@@ -1434,7 +1672,7 @@ L1 cases:
   `stall_timeout` → no disconnect), fires at `stall_timeout`; any ack disarms.
 - Ack suspension: frames keep flowing and are not recorded; suspension survives
   a server resize and a re-advertise and the picture continues (with patch 1,
-  and separately with the shadow flag and `InjectSuspendAck` fallback); backlog
+  which `pin_goldens.rs` pins; rev 6.2: the fallback is not built); backlog
   spikes ≥ limit then drains → NeedIdr, no disconnect; backlog held ≥ limit for
   `stall_timeout` → Closing; a resume ack clears the unacked set and restores
   normal gating without closing the soft gate.
@@ -1513,14 +1751,24 @@ time is budgeted for the harness itself. The video cases run once per
   invalidates every token: the open FLV continues, the next reopen re-logs in
   once, no disconnect), a second consecutive auth failure (fatal), websocket
   drop (reconnect + session-start, no NeedIdr), a 64 MiB websocket message
-  (closed at the 4 KiB limit without buffering, reconnect, RSS bounded), KVM
+  (closed at the 4 KiB limit without buffering, reconnect, RSS bounded —
+  rev 6.2, DC24: shown by construction, Task 3.3's unit test erroring at the
+  4 KiB frame limit with nothing buffered and the L2 reconnect, because the
+  in-process bridge shares the test process's RSS; and measured once on the
+  real binary as a subprocess, where kvm-sim declares 64 MiB and sends 4 KiB
+  of it: peak RSS (`VmHWM`) ≈ 30.5 MiB before and +8 KiB after), KVM
   unreachable (disconnect at the deadline), wrong KVM certificate (no login
-  request; `kvm_cert_mismatch`).
+  request; `kvm_cert_mismatch`). Rev 6.2: a certificate that changes
+  mid-session, after a good login, on the websocket — fatal at once, its
+  writer idling rather than reconnecting — is not exercised until kvm-sim
+  can swap its certificate; Plan D's (PC7 W10).
 - **Stalled client** (asserted on `/metrics`, not timing): withheld acks →
   after the bridge's first soft-gate drop (`frames_dropped{reason="soft_gate"}`
   > 0) its sent-frame counter does not advance again before Closing,
   `egfx_in_flight` ≤ hard throughout, and the session closes with
-  `client_stalled`; a client that **stops reading** → the session still ends
+  `client_stalled` (rev 6.2: a `soft_gate` drop needs an IDR — or a live AU
+  that beats the tick — to meet the closed gate, §10.4, so the case's
+  `stall_timeout` must exceed the source's IDR interval); a client that **stops reading** → the session still ends
   (Closing + watchdog + abort) and kvm-sim sees the websocket and FLV close
   (and no logout); a client that
   suspends acks but keeps reading is never disconnected.
@@ -1545,7 +1793,13 @@ time is budgeted for the harness itself. The video cases run once per
   dropped, nothing typed; 64 KiB − 2 bytes → typed up to `max_chars`; an 8 MiB
   payload, fully sent → `clipboard_oversize`, nothing typed.
 - **Admin**: `/livez` goes stale when the `LocalSet` is blocked; `/readyz`
-  succeeds without a KVM.
+  succeeds without a KVM. Rev 6.2 adds: a flood past the 32-connection cap —
+  each connection past it is dropped unanswered although it sends a full
+  `/livez` request, the session keeps streaming, and `/livez` answers again
+  once the server has timed the held ones out; SIGTERM to the real binary
+  with a client connected and the KVM unreachable → ErrorInfo 0x1 and exit 0
+  within 5 s; a `Quit` a live connection consumes ends only it, and a second
+  stops the server.
 - **Secrets hygiene** (subprocess, reusing kvm-bench's spawn harness), with
   `SSLKEYLOGFILE=<tmp>` set only in the bridge subprocess's environment (`Command::env`; the test process, kvm-sim and the in-process IronRDP client — whose `ironrdp-tls` config honours the variable — run without it), two runs: `log.filter = "trace"`,
   and `log.filter = "kvm_rdp=trace,ironrdp_acceptor::credssp=trace,sspi::ntlm=trace"`.
@@ -1554,7 +1808,13 @@ time is budgeted for the harness itself. The video cases run once per
   neither canary, nor the sentinel, nor the hex of its 12-byte HID frames
   appears; no `NTLMSSP` or `TlRMTVNTUA`; no DEBUG/TRACE lines from `ironrdp_*`
   or `sspi`; at least one TRACE line from bridge code appears (the filter took
-  effect); `<tmp>` is never created.
+  effect); `<tmp>` is never created. Rev 6.2 (DC9, P10, P48): Plan C's case
+  runs without the keystroke sentinel and paste canary (Plan D adds them)
+  and spawns the binary itself through `CARGO_BIN_EXE_kvm-rdp`, with its
+  environment cleared and then given `SSLKEYLOGFILE` and `RUST_LOG=off` — a
+  bridge that read `RUST_LOG` would log nothing and never report ready; the
+  log is checked only once both pipe readers have drained, and must hold the
+  shutdown's own last lines.
 
 ### 11.4 L3 interop
 
@@ -1657,11 +1917,19 @@ questions belong to L5.
   bridge's network identity with the bridge scaled to 0, or on the dedicated
   host with the bridge service stopped (§9.4). L5 "direct" becomes a
   `kubectl port-forward` or an SSH local forward to the bridge.
-- Plan C's L4 also carries what Leg A handed on (§12, §15): the Mac's
+- Plan D's L4 (rev 6.2: moved from Plan C, which has no HID input path; Plan D's first task, before its `paste.pace` and stuck-key work) also carries what Leg A handed on (§12, §15): the Mac's
   behaviour when the websocket dies with a key held, side request → main-FLV
   IDR latency over 20 trials (one-token concurrency seen once in Leg A), how a preset
   change is signalled, how long an abandoned token stays valid, and the KVM's
-  HID report rate.
+  HID report rate. Plan C adds (rev 6.2): the ES3's refusal forms for an FLV
+  and a websocket after a global logout (status, Content-Type, body — they
+  confirm §6.9's auth classifier, which treats a 200 whose body is JSON
+  rather than FLV as a refusal); whether the ES3 refuses a second FLV on the
+  same token (a KVM that does is `kvm_auth_failed` at the second refused
+  `ReconnectFlv`); how the ES3 closes a websocket — a close frame or a bare
+  EOF (the bridge treats only a close frame as an answered close, §3.2);
+  and the lag between the old FLV's forced IDR and a `ReconnectFlv`
+  candidate's first tag (§6.5's replay ring holds 64 AUs, about 2 s).
 - L5 checklist (pass/fail, recorded): key matrix; Mac remap profile; paste
   (including newline handling); reconnect and a takeover of a stale session;
   resize; display sleep/wake; each fatal cause's dialog (no auto-reconnect);
@@ -1693,7 +1961,7 @@ the lists below:
 
 - Leg A: the pin is recorded by the `kvm-probe fingerprint` subcommand, not
   `--print-fingerprint`; what the Mac sees when the websocket dies with a key
-  held moved to Plan C's L4 (it needs HID input, which the probe never
+  held moved to Plan C's L4 — Plan D's since rev 6.2 — (it needs HID input, which the probe never
   sends); "every open TCP port" became the KVM's documented service ports
   (so §9.4 adds a full scan); "HID round trip" became control-websocket open
   latency (`kvm-probe ws-open`); only the 1920×1080 / 30 fps preset was
@@ -1717,7 +1985,7 @@ the lists below:
   §6.8 had already planned to ship with documented contrast loss). Only the
   `/gfx:AVC420` two-set capability pair's bytes are recorded in
   `census.md`; the 11-set ladder (no `/gfx`, Leg C) is named but not
-  committed with its bytes as a separate fixture file (Plan C captures them
+  committed with its bytes as a separate fixture file (captured, since rev 6.2 by Plan E's L3,
   from the flake's FreeRDP, §11.2). Windows App's capability and key-matrix
   fixtures wait for the acceptance run.
 - Leg C: everything ran on loopback, so the stand-in proxy's source address
@@ -1809,9 +2077,9 @@ before `census.md` is committed):
 |---|---|
 | A | Milestone 0 (with the `kvm-proto` subset, fixtures, `kvm-probe`, spikes, the IronRDP fork patches) → `census.md` + spec revision |
 | B | M1 + M2, including the SPS rewriter — required: level patch, VUI re-serialisation and `bitstream_restriction` (§6.8), with the POC-type-0 fixture (§11.5) — and kvm-sim's ES3 profile. No AU assembler and no GOP cache: Leg A needs neither (§6.2, §6.5) |
-| C | M3a: config, logging, admin endpoints, metrics, shutdown, lifecycle, NLA, EGFX pump and state machine, the websocket, the HID writer skeleton and release epoch, L1 and video/lifecycle L2. Requires the four IronRDP patches, git-pinned from the fork branch (§4.2), or their fallbacks |
-| D | M3b + M4: keyboard and mouse mapping, stuck-key timers and the released-by-bridge rule, the Typist, and their L2 cases |
-| E | M5 + M6: L3, CI, image, perf pass |
+| C | M3a: config, logging, admin endpoints, metrics, shutdown, lifecycle, NLA, EGFX pump and state machine, the websocket, the HID writer skeleton and release epoch, L1 and video/lifecycle L2. Requires the three IronRDP patches of `kvm-rdp-egfx-patches-v2` @ `c99eece2`, git-pinned (§4.2; rev 6.2: the patch-1 fallback is not built) |
+| D | M3b + M4: first §11.6's L4 hardware checks (rev 6.2, moved from C); keyboard and mouse mapping, stuck-key timers and the released-by-bridge rule, the Typist, and their L2 cases |
+| E | M5 + M6: L3, CI, image, perf pass (rev 6.2: CI's job timeout, tracked-secrets gate and target-budget step landed with Plan C, DC19) |
 
 The companion `luma-homeops` spec is written once Milestone 0 passes. It has
 passed (verdict below), so the companion spec can be written now; it takes
@@ -1906,6 +2174,14 @@ marked *acceptance* in §4.4 are retuned from it. In priority order:
     FreeRDP. Leg B/C measured this on FreeRDP (34 ms direct, 37 ms through
     rdpgw); Windows App's own deactivation/reactivation handling on this
     path is untested. **Gate N ≤ 3 s** (§6.5).
+11. **A fatal cause at session start** (rev 6.2, Plan C). Does Windows App
+    show the cause when the session ends before its first picture — e.g.
+    `kvm_auth_failed` (0x9: a wrong `kvm.password_file`), `kvm_cert_mismatch`
+    (0x9: a wrong `kvm.spki_sha256`) or `no_avc420` (0x7) — and stay
+    without auto-reconnecting, direct and through rdpgw? IronRDP writes the
+    ErrorInfo and closes at once, so a real client may lose it to a reset
+    (§6.9). Lost: carry the lingering-close patch to the fork (a candidate
+    patch 4, §4.2, §6.9) and re-check.
 
 ## 13. Development resource budget
 
@@ -1917,7 +2193,7 @@ The host is shared and loaded (16 cores, ~12 GiB free RAM, 143 GB free disk at
 - The devshell wraps `cargo` as `systemd-run --user --scope -p CPUWeight=20
   -p IOWeight=20 -p MemoryMax=8G nice -n 19 cargo …`, falling back to `nice`
   without user systemd.
-- One shared `CARGO_TARGET_DIR` across any worktrees, never one per worktree.
+- One shared `CARGO_TARGET_DIR` across long-lived worktrees, never one per worktree — except disposable scratch worktrees, which set their own and delete it when done (rev 6.2: a shared-target test binary bakes in its worktree's path and breaks once that worktree is deleted).
 - Committed rust-analyzer settings: `check.extraArgs = ["--jobs=2"]` and the
   same target dir.
 - Profiles: `[profile.dev] debug = "line-tables-only"`, dependencies
@@ -1926,7 +2202,7 @@ The host is shared and loaded (16 cores, ~12 GiB free RAM, 143 GB free disk at
   release; no fat-LTO profile. One integration-test binary
   (`autotests = false`); `CARGO_INCREMENTAL=0` in CI.
 - ffmpeg runs under `nice -n 19` with `-threads 4`.
-- Budget: ~1.5 GB of target for debug + tests; ~3–4 GB with release and clippy.
+- Budget (**rev 6.2**): IronRDP's graph puts debug + tests far past the ~1.5 GB once estimated; `scripts/target-budget.sh` fails the gate above `KVM_RDP_TARGET_BUDGET_GIB` — default: 8 GiB, Task 2.1's floor, which stands: 3.31 GiB measured once Plan C's binary and L2 executable existed (2.4 GiB after Task 2.1) × 1.3 is 4.3 GiB, under it; 3.42 GiB at Plan C's end — and names the one safe cleanup, `cargo clean`; `[build] incremental = false` is committed. CI runs the same script after its tests (DC19).
 - Fuzzing and the 1-hour soak run in CI only; bench streams live in `target/`;
   census captures (15–60 MB each) are wiped after each session.
 
@@ -1986,14 +2262,16 @@ group and no ASO); the key matrix and typematic (`key_repeat_timeout`,
 suspension, auto-detect and QoE; its re-advertise behaviour and capability
 ladder.
 
-Open for Plan C's L4 (§11.6): what the Mac sees when the websocket dies with
+Open for Plan D's L4 (§11.6; rev 6.2): what the Mac sees when the websocket dies with
 a key held (moved from Leg A); side request → main-FLV IDR latency over 20
 trials (Leg A saw it once, on one token: the ES3 serves two concurrent FLVs
 on the same token); how a preset change is
 signalled (Leg A: n = 1, tentative); how long an abandoned token stays valid
 and whether the ES3 caps concurrent sessions (the bridge never logs out, so
 every RDP connection leaves one token to lapse); the KVM's HID report rate
-before `paste.pace` is fixed (§8). Still to be recorded in `census.md`: the
+before `paste.pace` is fixed (§8); and the four checks Plan C added (§11.6,
+rev 6.2): the refusal forms after a global logout, same-token FLV refusal,
+the websocket close form, and the forced-IDR → candidate lag. Still to be recorded in `census.md`: the
 firmware version (from the UI's about page).
 
 Watched: the IronRDP fork branch `kvm-rdp-egfx-patches-v2` and, once the owner

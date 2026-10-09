@@ -5,14 +5,24 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push to the same PR supersedes the run in flight: IronRDP's graph
+# is too heavy to build twice for nothing (§13). Runs on main always finish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # ubuntu-latest has 4 vCPUs; .cargo/config.toml's RUST_TEST_THREADS = 4
+  # matches it, and L2's one-sided timing asserts are sized for that.
   CARGO_BUILD_JOBS: "4"
 
 jobs:
   check:
     runs-on: ubuntu-latest
+    # IronRDP's graph plus L2 (§13): a hung L2 case must not hold a runner.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -20,12 +30,24 @@ jobs:
           toolchain: 1.94.1
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # One dependency cache (~/.cargo and target/, workspace crates
+          # cleaned out), written by main only: pull requests restore it and
+          # never save their own, so the IronRDP-sized target is cached once
+          # rather than once per branch.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The cheap gates first: none of them compiles anything.
       - name: Format
         run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - name: Test
-        run: cargo test --workspace --all-features
+      - name: No secrets or captures tracked (owner rule; spec §9.2, §11.5)
+        run: |
+          bad=$(git ls-files | grep -E '\.(pem|key|pass|p12|der|pcap|pcapng|rdp)$|^captures/' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::secret-shaped or capture files are tracked:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "no secrets or captures tracked"
       - name: No duplicate ironrdp-* crate (spec §4.2)
         run: |
           set +e
@@ -70,7 +92,7 @@ jobs:
       - name: kvm-proto/fuzzing stays out of the workspace graph (Plan B D8)
         run: |
           # kvm_proto::fuzzing panics by design; only fuzz/ (its own
-          # workspace) may enable the feature. --all-features above compiles
+          # workspace) may enable the feature. --all-features below compiles
           # it for clippy and the seed tests; this checks no crate asks for
           # it, on any platform (--target all catches a target-specific
           # dependency a host-only tree misses), and fails outright if
@@ -90,6 +112,15 @@ jobs:
             echo "$tree"
             exit 1
           fi
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        # Unit, L1 and L2 (the bridge, kvm-sim and an IronRDP client on
+        # private loopback addresses in 127.128.0.0/10 — Linux routes all of
+        # 127/8 to lo) and the real binary under SIGTERM.
+        run: cargo test --workspace --all-features
+      - name: Target budget (spec §13, DC10)
+        run: scripts/target-budget.sh
 
   fuzz:
     # Bounded fuzzing of kvm-proto (spec §11.2, §13 — CI only): every target
@@ -106,6 +137,8 @@ jobs:
         with:
           toolchain: 1.94.1
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
       - name: Seeds, on stable (rust-toolchain.toml)
