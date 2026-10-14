@@ -61,9 +61,10 @@ The design, and every decision behind it, is
   environment variable but `KVM_RDP_CONFIG` — not even `RUST_LOG`; the
   libraries that log credentials or payloads at debug level are capped at
   INFO whatever `log.filter` says.
-- **A config error never echoes the file.** It names the path, a line and
-  column, and a fixed category such as `unknown key` or `wrong value type`
-  — on purpose: pointed at a secret by mistake (`--config nla.pass`), or
+- **A config error never echoes the file.** It names the path and either a
+  line and column with a fixed category such as `unknown key` or `wrong value
+  type`, or — for a value that parses but breaks a rule — the key and the
+  rule. That is on purpose: pointed at a secret by mistake (`--config nla.pass`), or
   given a config with an inline password, the bridge must not print it.
   Open the file at the reported position.
 - **One session at a time.** A new authenticated client takes the session
