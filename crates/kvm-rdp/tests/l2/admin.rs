@@ -89,36 +89,77 @@ async fn livez(addr: SocketAddr) -> Option<u16> {
 /// `/livez` answers again once the server has timed the silent ones out
 /// (`REQUEST_TIMEOUT`), while the flood still holds them open: the cap
 /// frees its own permits.
+///
+/// The judgement rests on FIFO accept order: the holders are accepted
+/// before the extras, and hold their permits until `REQUEST_TIMEOUT`. A
+/// runtime starved for longer than that between the two would let a holder
+/// time out and an extra be served legitimately, so the extras must all
+/// have answered within `REQUEST_TIMEOUT / 2` of the first holder's
+/// connect; otherwise the round proves nothing and runs once more (PC19
+/// review m8). Two such rounds fail the case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_admin_flood_past_the_cap_is_dropped_and_livez_recovers() {
     let (env, c) = streaming(|_| {}).await;
-    let t0 = Instant::now();
-    let mut held = Vec::new();
-    for _ in 0..MAX_CONNECTIONS {
-        held.push(admin_connect(env.admin).await);
-    }
-    let n = pictures(&c.events()).len();
-    for i in 1..=16 {
-        assert_eq!(
-            livez(env.admin).await,
-            None,
-            "connection {} past the cap of {MAX_CONNECTIONS} was served",
-            MAX_CONNECTIONS + i
-        );
-    }
-    c.wait_for(T, |e| pictures(e).len() >= n + 10).await;
-    let mut answered = None;
-    while answered.is_none() && t0.elapsed() < REQUEST_TIMEOUT + T {
-        if livez(env.admin).await == Some(200) {
-            answered = Some(t0.elapsed());
-        } else {
-            tokio::time::sleep(ms(50)).await;
+    let mut round = 1;
+    let (t0, held) = loop {
+        let t0 = Instant::now();
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS {
+            held.push(admin_connect(env.admin).await);
         }
-    }
-    let answered = answered.expect("/livez never answered again: the flood's permits leaked");
+        let mut served = None;
+        for i in 1..=16 {
+            if livez(env.admin).await.is_some() && served.is_none() {
+                served = Some(MAX_CONNECTIONS + i);
+            }
+        }
+        let took = t0.elapsed();
+        if took <= REQUEST_TIMEOUT / 2 {
+            assert_eq!(
+                served, None,
+                "a connection past the cap of {MAX_CONNECTIONS} was served"
+            );
+            break (t0, held);
+        }
+        assert!(
+            round < 2,
+            "the extras took {took:?} (> REQUEST_TIMEOUT / 2) in two rounds, so FIFO \
+             accept order cannot be relied on; connection {served:?} was served — the cap \
+             queues instead of dropping, or the runtime was starved twice"
+        );
+        eprintln!("admin flood: round {round}'s extras took {took:?}; running it once more");
+        drop(held);
+        assert!(
+            livez_within(env.admin, REQUEST_TIMEOUT + T).await.is_some(),
+            "/livez never answered between the rounds"
+        );
+        round += 1;
+    };
+    let n = pictures(&c.events()).len();
+    c.wait_for(T, |e| pictures(e).len() >= n + 10).await;
+    let left = (REQUEST_TIMEOUT + T).saturating_sub(t0.elapsed());
+    livez_within(env.admin, left)
+        .await
+        .expect("/livez never answered again: the flood's permits leaked");
+    let answered = t0.elapsed();
     eprintln!("admin flood: /livez answered again {answered:?} after the flood began");
     assert!(terminated(&c.events()).is_none());
     drop(held);
+}
+
+/// Poll `/livez` every 50 ms until it answers 200 (`Some(when)`) or `limit`
+/// passes (`None`).
+async fn livez_within(addr: SocketAddr, limit: Duration) -> Option<Duration> {
+    let t0 = Instant::now();
+    loop {
+        if livez(addr).await == Some(200) {
+            return Some(t0.elapsed());
+        }
+        if t0.elapsed() >= limit {
+            return None;
+        }
+        tokio::time::sleep(ms(50)).await;
+    }
 }
 
 /// The real binary on `dir`'s config; stdout and stderr captured by line.
@@ -383,11 +424,16 @@ async fn ws_started(sim: &KvmSim, after: usize) -> u64 {
 /// DC24 (P46, ruling 4): §11.3's "RSS bounded" for the 64 MiB websocket
 /// message, measured on the real binary — its own process, so its RSS is
 /// not shared with concurrent cases as the in-process bridge's is. kvm-sim
-/// declares a 64 MiB binary frame and sends 4 KiB of it: a bridge that
-/// sized a buffer from the declared length, or waited for the message,
-/// would grow or never reconnect; this one closes at the 4 KiB limit
-/// (Task 3.3) and reconnects (Task 6.4), and its peak RSS (`VmHWM`) stays
-/// where the streaming session had it.
+/// declares a 64 MiB binary frame and sends 4 KiB of it. What bounds the
+/// bridge's memory is the 4 KiB websocket cap (Task 3.3's unit test); this
+/// case's teeth are the reconnect: a bridge that waited for the declared
+/// message would never reopen the websocket. The peak RSS (`VmHWM`) shows
+/// less than it seems: pages a bridge allocates but never touches are not
+/// resident (`Vec::with_capacity(64 MiB)` moves `VmHWM` by ~72 KiB), and 4
+/// KiB of payload cannot fill a buffer, so a flat `VmHWM` shows only that
+/// nothing sized from the declared length was touched — not that a fully
+/// delivered 64 MiB message would go unbuffered (a kvm-sim knob that
+/// streams the whole message would make it decisive).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_64_mib_websocket_message_leaves_the_binarys_peak_rss_flat() {
     let sim = KvmSim::start(es3()).await.unwrap();
