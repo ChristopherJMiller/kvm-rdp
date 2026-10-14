@@ -5,6 +5,11 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
+# Read-only token: the job writes nothing back and uses no secret.
+# dtolnay/rust-toolchain@master is that action's documented usage.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"

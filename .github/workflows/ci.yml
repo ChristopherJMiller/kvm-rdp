@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only token: no job writes to the repo or uses a secret. Actions stay on
+# their major tags; dtolnay/rust-toolchain@master (with an explicit
+# `toolchain:`) is that action's documented usage and predates these gates.
+permissions:
+  contents: read
+
 # A newer push to the same PR supersedes the run in flight: IronRDP's graph
 # is too heavy to build twice for nothing (§13). Runs on main always finish.
 concurrency:
@@ -40,8 +46,16 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: No secrets or captures tracked (owner rule; spec §9.2, §11.5)
+        # A backstop, not a guarantee: it gates on names only, so a secret
+        # under an innocent name (`nla.password`, `key.pem.bak`) still
+        # passes. -z and quotePath=false keep non-ASCII paths unquoted (or
+        # `$` never meets the extension); -i catches `tls.PEM`; captures/
+        # is refused at any depth, and .superpowers/ (excluded only by a
+        # local .git/info/exclude) if anyone force-adds it.
         run: |
-          bad=$(git ls-files | grep -E '\.(pem|key|pass|p12|der|pcap|pcapng|rdp)$|^captures/' || true)
+          bad=$(git -c core.quotePath=false ls-files -z \
+            | grep -zEi '\.(pem|key|pass|p12|pfx|der|pcap|pcapng|rdp)$|(^|/)captures/|^\.superpowers/' \
+            | tr '\0' '\n' || true)
           if [ -n "$bad" ]; then
             echo "::error::secret-shaped or capture files are tracked:"
             echo "$bad"
