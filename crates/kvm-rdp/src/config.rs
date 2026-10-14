@@ -57,8 +57,16 @@ pub const PARSE_CATEGORIES: [&str; 7] = [
 
 #[derive(Debug)]
 pub enum ConfigError {
+    /// The config file itself (the path the command line named).
     Read {
         path: PathBuf,
+        kind: std::io::ErrorKind,
+    },
+    /// A file a `*_file` key names: the key and the I/O kind only — never
+    /// the value, which may be the secret itself written where the file
+    /// name goes (C1, final review; §4.4).
+    File {
+        key: &'static str,
         kind: std::io::ErrorKind,
     },
     /// Where (1-based line and column, when toml says) and a category from
@@ -74,6 +82,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::Read { path, kind } => write!(f, "cannot read {}: {kind}", path.display()),
+            ConfigError::File { key, kind } => write!(f, "{key}: cannot read the file: {kind}"),
             ConfigError::Parse {
                 at: Some((line, column)),
                 what,
@@ -126,7 +135,7 @@ pub struct SpsRewrite {
     pub restriction: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RdpConfig {
     pub listen: SocketAddr,
     pub username: String,
@@ -134,6 +143,21 @@ pub struct RdpConfig {
     pub tls_cert_file: PathBuf,
     pub tls_key_file: PathBuf,
     pub cert_poll_interval: Duration,
+}
+
+/// The TLS paths are redacted like the secrets: a `*_file` value may be a
+/// secret or a pasted PEM written where the file name goes (C1).
+impl fmt::Debug for RdpConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RdpConfig")
+            .field("listen", &self.listen)
+            .field("username", &self.username)
+            .field("nla_password", &self.nla_password)
+            .field("tls_cert_file", &format_args!("<path>"))
+            .field("tls_key_file", &format_args!("<path>"))
+            .field("cert_poll_interval", &self.cert_poll_interval)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -578,24 +602,23 @@ fn required_path(v: Option<PathBuf>, key: &str) -> Result<PathBuf, ConfigError> 
 /// A secret file: ≤ 4 KiB, UTF-8, exactly one trailing `\n` or `\r\n`
 /// removed, not empty after that. Read through a hard cap (one byte past
 /// the limit) rather than trusting `metadata().len()`, which a FIFO or a
-/// file growing underneath us would not bound (P16).
-fn read_secret(base: &Path, rel: &Path, key: &str) -> Result<Secret, ConfigError> {
-    let path = base.join(rel);
-    let mut text = String::new();
-    std::fs::File::open(&path)
-        .map_err(|e| ConfigError::Read {
-            path: path.clone(),
-            kind: e.kind(),
-        })?
+/// file growing underneath us would not bound (P16). An error names `key`,
+/// never the path (C1): the value may be the secret itself.
+fn read_secret(base: &Path, rel: &Path, key: &'static str) -> Result<Secret, ConfigError> {
+    let unreadable = |e: std::io::Error| ConfigError::File {
+        key,
+        kind: e.kind(),
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(base.join(rel))
+        .map_err(unreadable)?
         .take(MAX_SECRET_FILE + 1)
-        .read_to_string(&mut text)
-        .map_err(|e| ConfigError::Read {
-            path: path.clone(),
-            kind: e.kind(),
-        })?;
-    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_SECRET_FILE {
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_SECRET_FILE {
         return Err(invalid(format!("{key}: larger than 4 KiB")));
     }
+    let text = String::from_utf8(bytes).map_err(|_| invalid(format!("{key}: not UTF-8")))?;
     let text = text
         .strip_suffix("\r\n")
         .or_else(|| text.strip_suffix('\n'))
@@ -1127,8 +1150,44 @@ pub(crate) mod tests {
         let kvm = |line: String| base.replace("[kvm]\n", &format!("[kvm]\n{line}\n"));
         let admin = |line: String| format!("{base}[admin]\n{line}\n");
         let video = |line: String| format!("{base}[video]\n{line}\n");
+        // A `*_file` key's own line rewritten in place: a second one would be
+        // a duplicate-key error that never reaches the read.
+        let file = |line: &str, value: String| {
+            let (key, _) = line.split_once(" = ").unwrap();
+            assert!(base.contains(line), "minimal() has no {line}");
+            base.replace(line, &format!("{key} = {value}"))
+        };
         let t = |text: String, what: &'static str| (text.into_bytes(), what);
         vec![
+            // C1 (final review): a secret written where a file name goes —
+            // every `*_file` key; a TLS key path may be a pasted PEM. The
+            // TLS pair is read at startup, not by the loader (§4.4), so
+            // those three shapes load and fail in `tls::load`.
+            t(
+                file("nla_password_file = \"nla.pass\"", format!("\"{s}\"")),
+                "an inline NLA password as rdp.nla_password_file",
+            ),
+            t(
+                file("password_file = \"kvm.pass\"", format!("\"{s}\"")),
+                "an inline KVM password as kvm.password_file",
+            ),
+            t(
+                file("tls_cert_file = \"cert.pem\"", format!("\"{s}\"")),
+                "a secret as rdp.tls_cert_file",
+            ),
+            t(
+                file("tls_key_file = \"key.pem\"", format!("\"{s}\"")),
+                "a secret as rdp.tls_key_file",
+            ),
+            t(
+                file(
+                    "tls_key_file = \"key.pem\"",
+                    format!(
+                        "\"\"\"-----BEGIN PRIVATE KEY-----\n{s}\n-----END PRIVATE KEY-----\n\"\"\""
+                    ),
+                ),
+                "a pasted PEM key as rdp.tls_key_file",
+            ),
             // The seven the re-review found leaking through fix round 1.
             t(admin(format!("\"a`b {s}\" = 1")), "a key with a backtick"),
             t(
@@ -1274,10 +1333,16 @@ pub(crate) mod tests {
         ]
     }
 
+    /// How many of `leak_shapes` load: the TLS file shapes, whose error
+    /// comes from `tls::load` at startup.
+    pub(crate) const STARTUP_SHAPES: usize = 3;
+
     /// I1 (PC15 review and re-review; §4.4, §9.2): a config error never
     /// echoes the file. For every shape above, no sentinel reaches the
-    /// error's `Display` or `Debug` (the binary's stderr is pinned through
-    /// the binary's own body in `cli`).
+    /// error's `Display` or `Debug` — nor, for a shape that loads (a TLS
+    /// file key, C1), the config's `Debug` and the startup error the bridge
+    /// stops on (the binary's stderr and log are pinned through the
+    /// binary's own body in `cli`).
     #[test]
     fn config_errors_never_echo_the_file() {
         let d = tempfile::tempdir().unwrap();
@@ -1285,15 +1350,27 @@ pub(crate) mod tests {
         assert!(shapes.len() >= 40, "{} shapes", shapes.len());
         let toml = d.path().join("kvm-rdp.toml");
         let mut leaks = Vec::new();
+        let mut loaded = 0;
         for (bytes, what) in &shapes {
             std::fs::write(&toml, bytes).unwrap();
-            let e = Config::load(&toml).expect_err(what);
-            let shown = format!("{e} | {e:?}");
+            let shown = match Config::load(&toml) {
+                Err(e) => {
+                    if let ConfigError::Parse { what: category, .. } = e {
+                        assert!(PARSE_CATEGORIES.contains(&category), "{what}: {category}");
+                    }
+                    format!("{e} | {e:?}")
+                }
+                Ok(c) => {
+                    loaded += 1;
+                    let e = crate::rdp::tls::load(&c.rdp.tls_cert_file, &c.rdp.tls_key_file)
+                        .err()
+                        .expect(what);
+                    let e = crate::bridge::BridgeError::Tls(e);
+                    format!("{c:?} | {e} | {e:?}")
+                }
+            };
             if SENTINELS.iter().any(|s| shown.contains(s)) {
                 leaks.push(format!("{what}: {shown}"));
-            }
-            if let ConfigError::Parse { what: category, .. } = e {
-                assert!(PARSE_CATEGORIES.contains(&category), "{what}: {category}");
             }
         }
         assert!(
@@ -1302,6 +1379,34 @@ pub(crate) mod tests {
             leaks.len(),
             shapes.len(),
             leaks.join("\n")
+        );
+        assert_eq!(loaded, STARTUP_SHAPES, "only the TLS file shapes load");
+    }
+
+    /// C1 (final review; §4.4, §9.2): a secret file that cannot be read is
+    /// named by its key, with the I/O kind — never by its value, which may
+    /// be the secret itself written where the file name goes. One that is
+    /// not UTF-8 is named so.
+    #[test]
+    fn an_unreadable_secret_file_is_named_by_its_key() {
+        let d = tempfile::tempdir().unwrap();
+        let base = minimal(d.path());
+        for (from, key) in [
+            ("\"nla.pass\"", "rdp.nla_password_file"),
+            ("\"kvm.pass\"", "kvm.password_file"),
+        ] {
+            let e = load(d.path(), &base.replace(from, "\"absent.pass\"")).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("{key}: cannot read the file: entity not found")
+            );
+            assert!(!format!("{e:?}").contains("absent"), "{e:?}");
+        }
+        std::fs::write(d.path().join("kvm.pass"), b"\xff\xfe-not-utf8\n").unwrap();
+        let e = load(d.path(), &base).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "invalid config: kvm.password_file: not UTF-8"
         );
     }
 

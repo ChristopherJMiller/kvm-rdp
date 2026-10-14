@@ -2,7 +2,9 @@
 //! aws-lc-rs — never `TlsIdentityCtx` (DC2), never a key log — and the
 //! certificate's subjectPublicKey, which CredSSP binds the NLA exchange to.
 //! The key file's bytes never reach an error, a `Debug` or a log line: every
-//! failure is one of `TlsError`'s fixed variants.
+//! failure is one of `TlsError`'s fixed variants. Nor does either file's
+//! path, which may be a secret or a pasted PEM written where the file name
+//! goes: a read error names the config key (C1).
 use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::io::Read as _;
@@ -14,12 +16,20 @@ use tokio_rustls::TlsAcceptor;
 /// Largest PEM file read (a chain of a few certificates fits easily).
 pub const MAX_PEM: u64 = 64 * 1024;
 
+/// The config keys naming the two PEM files: what a read error names —
+/// never the path, which may be a secret or a pasted PEM (C1).
+pub const CERT_FILE_KEY: &str = "rdp.tls_cert_file";
+pub const KEY_FILE_KEY: &str = "rdp.tls_key_file";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TlsError {
+    /// The file's config key (`CERT_FILE_KEY` or `KEY_FILE_KEY`) and the
+    /// I/O kind.
     Read {
-        what: &'static str,
+        key: &'static str,
         kind: std::io::ErrorKind,
     },
+    /// The file's config key.
     TooLarge(&'static str),
     NoCertificate,
     BadCertificate,
@@ -33,8 +43,8 @@ pub enum TlsError {
 impl std::fmt::Display for TlsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TlsError::Read { what, kind } => write!(f, "cannot read the {what} file: {kind}"),
-            TlsError::TooLarge(what) => write!(f, "the {what} file is over {MAX_PEM} bytes"),
+            TlsError::Read { key, kind } => write!(f, "{key}: cannot read the file: {kind}"),
+            TlsError::TooLarge(key) => write!(f, "{key}: the file is over {MAX_PEM} bytes"),
             TlsError::NoCertificate => f.write_str("no certificate in the certificate file"),
             TlsError::BadCertificate => f.write_str("the certificate does not parse"),
             TlsError::NoKey => f.write_str("no private key in the key file"),
@@ -138,8 +148,8 @@ pub fn install_crypto_provider() {
 }
 
 pub fn load(cert_file: &Path, key_file: &Path) -> Result<TlsIdentity, TlsError> {
-    let cert = read_capped(cert_file, "certificate")?;
-    let key = read_capped(key_file, "key")?;
+    let cert = read_capped(cert_file, CERT_FILE_KEY)?;
+    let key = read_capped(key_file, KEY_FILE_KEY)?;
     from_pem(&cert, &key)
 }
 
@@ -195,20 +205,20 @@ fn subject_public_key(cert: &CertificateDer<'_>) -> Result<(Vec<u8>, KeyKind), T
     Ok((spk.data.to_vec(), KeyKind::of(spki)))
 }
 
-fn read_capped(path: &Path, what: &'static str) -> Result<Vec<u8>, TlsError> {
+fn read_capped(path: &Path, key: &'static str) -> Result<Vec<u8>, TlsError> {
     let file = std::fs::File::open(path).map_err(|e| TlsError::Read {
-        what,
+        key,
         kind: e.kind(),
     })?;
     let mut buf = Vec::new();
     file.take(MAX_PEM + 1)
         .read_to_end(&mut buf)
         .map_err(|e| TlsError::Read {
-            what,
+            key,
             kind: e.kind(),
         })?;
     if u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_PEM {
-        return Err(TlsError::TooLarge(what));
+        return Err(TlsError::TooLarge(key));
     }
     Ok(buf)
 }
@@ -306,12 +316,44 @@ mod tests {
         assert!(matches!(
             load(&d.path().join("absent.pem"), &k),
             Err(TlsError::Read {
-                what: "certificate",
+                key: CERT_FILE_KEY,
                 ..
             })
         ));
         std::fs::write(&c, vec![b'A'; 70_000]).unwrap();
-        assert_eq!(load(&c, &k).err(), Some(TlsError::TooLarge("certificate")));
+        assert_eq!(load(&c, &k).err(), Some(TlsError::TooLarge(CERT_FILE_KEY)));
+    }
+
+    /// C1 (final review; §4.4, §9.2): a PEM file that cannot be read is
+    /// named by its config key, with the I/O kind — never by its path,
+    /// which may be a secret or a pasted PEM written where the file name
+    /// goes.
+    #[test]
+    fn an_unreadable_pem_file_is_named_by_its_config_key() {
+        let d = tempfile::tempdir().unwrap();
+        let (cert, _, _) = pair();
+        let (c, absent) = (d.path().join("cert.pem"), d.path().join("absent.pem"));
+        std::fs::write(&c, &cert).unwrap();
+        let shown = |e: TlsError| (e.to_string(), format!("{e:?}"));
+        for (e, want) in [
+            (
+                load(&absent, &c).err().unwrap(),
+                "rdp.tls_cert_file: cannot read the file: entity not found",
+            ),
+            (
+                load(&c, &absent).err().unwrap(),
+                "rdp.tls_key_file: cannot read the file: entity not found",
+            ),
+        ] {
+            let (display, debug) = shown(e);
+            assert_eq!(display, want);
+            assert!(!debug.contains("absent"), "{debug}");
+        }
+        std::fs::write(&c, vec![b'A'; 70_000]).unwrap();
+        assert_eq!(
+            load(&c, &absent).err().unwrap().to_string(),
+            "rdp.tls_cert_file: the file is over 65536 bytes"
+        );
     }
 
     /// m5: deployment loads a full chain (leaf, then its issuer). CredSSP

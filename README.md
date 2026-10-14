@@ -66,7 +66,11 @@ The design, and every decision behind it, is
   type`, or — for a value that parses but breaks a rule — the key and the
   rule. That is on purpose: pointed at a secret by mistake (`--config nla.pass`), or
   given a config with an inline password, the bridge must not print it.
-  Open the file at the reported position.
+  Open the file at the reported position. Nor does any error, log line or
+  debug output show a `*_file` key's value — a password written where the
+  file name goes, or a pasted PEM, stays unprinted: a file that cannot be
+  read is named by its key (`rdp.nla_password_file: cannot read the file:
+  entity not found`).
 - **One session at a time.** A new authenticated client takes the session
   over; connection attempts are rate-limited (30 admitted per 60 s by
   default).

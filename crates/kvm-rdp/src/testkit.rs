@@ -22,9 +22,16 @@ pub(crate) struct ChildOutput {
 /// own stderr); require that it passed and return what it printed. The
 /// child is killed with SIGKILL if it outlives 30 s.
 pub(crate) fn passes_in_a_child(path: &str) -> ChildOutput {
+    passes_in_a_child_with(path, &[])
+}
+
+/// `passes_in_a_child`, with `env` also set in the child (how a parent
+/// tells one child which case to run).
+pub(crate) fn passes_in_a_child_with(path: &str, env: &[(&str, &str)]) -> ChildOutput {
     let child = std::process::Command::new(std::env::current_exe().unwrap())
         .args([path, "--exact", "--nocapture", "--test-threads=1"])
         .env(CHILD, "1")
+        .envs(env.iter().copied())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()

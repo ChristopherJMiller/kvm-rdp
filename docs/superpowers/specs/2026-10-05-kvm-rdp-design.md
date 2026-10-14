@@ -21,6 +21,7 @@ amended passage below is marked "rev 6.2". One line per change:
 - §4.3: the pump's input and command lists are the real enums (`Shutdown`, `Backlog`, `Rtt`, `SurfaceSize`, `Abort`; no slate, max-frames or suspend-ack command — Setup and the slate run inside `step`).
 - DC5, P31 (§4.4): the secret files are `kvm.password_file` and `rdp.nla_password_file` (≤ 4 KiB, one trailing line ending trimmed) and `rdp.tls_cert_file`/`rdp.tls_key_file` (PEM, ≤ 64 KiB, untrimmed); new keys `admin.liveness_timeout`, `rdp.cert_poll_interval`, `security.accept_window`; durations are strings ≤ 1 h; the NLA password has ≥ 22 characters.
 - §4.4 (PC15 I1): a config error is the path and either a line, a column and a fixed category (a TOML error) or the key and the rule (a value that parses but is invalid) — never the file's text; the file is read through a 1 MiB cap; exit 2.
+- §4.4, §9.2 (final review C1): no `*_file` key's value is ever shown in an error, a log line or a `Debug` — it may be a secret, or a pasted PEM, written where the file name goes; a file that cannot be read is its key and the I/O kind.
 - DC6 (§4.3, §6.6): the shell samples suppression and the write counter per tick and per AU and feeds every RTT read; the core alone treats a generation's first read as its reference.
 - DC7 (§7, §11.3): Plan C's input handler is a counting stub; L2 drives the HID writer through `HidControl`.
 - DC8 (§11.2, §12): the FreeRDP 11-set capability fixture moves to Plan E's L3.
@@ -444,7 +445,13 @@ and column, and a fixed category — unknown key, wrong value type, missing
 required key, duplicate key, syntax error, file too large, not UTF-8 — and a
 value that parses but breaks a rule names the path, the key and the rule,
 with no position; neither ever echoes any of the file's text, which may be a
-secret pointed at by mistake or an inline password). The TLS identity is loaded
+secret pointed at by mistake or an inline password. Nor is any `*_file`
+key's value ever shown — in an error, a log line or a `Debug` — since it may
+be the secret itself written where the file name goes, or a pasted PEM: a
+file that cannot be read, a secret file at load or the TLS pair at startup,
+is named by its key and the I/O kind only, e.g. `rdp.nla_password_file:
+cannot read the file: entity not found`, and a secret file that is not UTF-8
+says so; final review C1). The TLS identity is loaded
 once. The bridge polls the certificate file's mtime every 60 s and, on change — once no client is connected (rev 6.2: a renewal must never cut a live session; the companion deployment spec's decision 8; a client still in TLS or CredSSP holds it off for at most `HANDSHAKE_GRACE`, 45 s, once no session is live, so an unauthenticated peer cannot pin the old certificate) —
 runs graceful shutdown (§5.2) and exits 0 so its supervisor (Kubernetes, or
 systemd on a dedicated host) restarts it — CredSSP binds to the public key read
@@ -1407,6 +1414,9 @@ Limits and hygiene:
 
 KVM password, NLA password, TLS key, the KVM token, keystrokes, HID frames and
 pasted text are never logged (§4.5). Secrets come only from files (§4.4).
+Rev 6.2 (final review C1): nor is any `*_file` key's value, in an error, a
+log line or a `Debug` — an operator may write the secret, or paste the PEM,
+where the file name goes; a file that cannot be read is named by its key.
 
 ### 9.3 Threat model
 
