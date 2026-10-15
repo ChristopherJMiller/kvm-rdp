@@ -2,6 +2,38 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::time::Duration;
 
+/// PD5 ruling (§4.5, §9.2): no rendering of any of `values` — decimal,
+/// hex in either case, `0x`-prefixed or two-digit — appears in `s` (a
+/// `Debug` of key or pointer state). Renderings shorter than two characters
+/// are skipped (a count may show them); the tests' value-invariance checks
+/// cover those.
+pub(crate) fn assert_no_value(s: &str, values: &[u64]) {
+    for v in values {
+        for r in [
+            format!("{v}"),
+            format!("{v:x}"),
+            format!("{v:X}"),
+            format!("{v:#x}"),
+            format!("{v:02x}"),
+            format!("{v:02X}"),
+        ] {
+            assert!(r.len() < 2 || !s.contains(&r), "{r} appears in {s}");
+        }
+    }
+}
+
+/// `{:?}` and `{:#?}` of `a` and `b` — the same shape holding different
+/// keys, buttons or positions — print alike, and show none of `values`.
+pub(crate) fn assert_debug_redacted<T: std::fmt::Debug>(a: &T, b: &T, values: &[u64]) {
+    for (fa, fb) in [
+        (format!("{a:?}"), format!("{b:?}")),
+        (format!("{a:#?}"), format!("{b:#?}")),
+    ] {
+        assert_eq!(fa, fb, "Debug shows what it holds");
+        assert_no_value(&fa, values);
+    }
+}
+
 /// Set in a copy of the test binary re-executed by `passes_in_a_child`: the
 /// test it runs takes its child branch.
 const CHILD: &str = "KVM_RDP_TEST_CHILD";

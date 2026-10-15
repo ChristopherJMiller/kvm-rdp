@@ -20,12 +20,20 @@ impl Button {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PointerReport {
     pub frame: HidFrame,
 }
 
-#[derive(Debug)]
+/// §4.5 (PD5 ruling): the frame only as `HidFrame`'s redacted kind.
+impl std::fmt::Debug for PointerReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PointerReport")
+            .field("frame", &self.frame)
+            .finish()
+    }
+}
+
 pub struct Pointer {
     /// The surface's size (Setup sets it, §6.4); before the first Setup,
     /// the advertised default.
@@ -48,6 +56,18 @@ impl Default for Pointer {
             pos: None,
             wheel_accum: 0,
         }
+    }
+}
+
+/// §4.5 (PD5 ruling): counts and flags only — never a position, a button
+/// or the wheel.
+impl std::fmt::Debug for Pointer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pointer")
+            .field("buttons_down", &self.buttons.count_ones())
+            .field("released_by_bridge", &self.rbb_buttons.count_ones())
+            .field("positioned", &self.pos.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -137,6 +157,12 @@ mod tests {
 
     fn abs(buttons: u8, x: u16, y: u16) -> HidFrame {
         HidFrame::AbsMouse { buttons, x, y }
+    }
+
+    /// A frame's bytes, for failure messages: `HidFrame`'s `Debug` is
+    /// redacted (PD5 ruling), so a test that needs the detail prints these.
+    fn bytes(f: HidFrame) -> String {
+        format!("{:02x?}", f.to_vec())
     }
 
     #[test]
@@ -288,6 +314,24 @@ mod tests {
         );
     }
 
+    /// PD5 ruling (§4.5): the pointer's state and reports print counts and
+    /// flags only — never a position or a button.
+    #[test]
+    fn debug_never_prints_a_position_or_a_button() {
+        let mut a = Pointer::default();
+        let mut b = Pointer::default();
+        a.button(Button::Left, true, 1234, 567).unwrap();
+        let ra = a.button(Button::Middle, true, 1234, 567).unwrap();
+        b.button(Button::Left, true, 89, 1011).unwrap();
+        let rb = b.button(Button::Right, true, 89, 1011).unwrap();
+        let (x, y) = a.last().unwrap();
+        let values = [u64::from(x), u64::from(y), 1234, 567, 0x05];
+        crate::testkit::assert_debug_redacted(&a, &b, &values);
+        crate::testkit::assert_debug_redacted(&ra, &rb, &values);
+        let s = format!("{a:?}");
+        assert!(s.contains("buttons_down: 2"), "{s}");
+    }
+
     /// xorshift64*: a fixed, seedable sequence for the property test.
     struct Rng(u64);
 
@@ -360,21 +404,23 @@ mod tests {
                 for f in frames {
                     let held = match f {
                         HidFrame::AbsMouse { buttons, x, y } => {
-                            assert!(x <= ABS_MAX && y <= ABS_MAX, "{f:?}");
+                            assert!(x <= ABS_MAX && y <= ABS_MAX, "{}", bytes(f));
                             buttons
                         }
                         HidFrame::Wheel { buttons, .. } => buttons,
-                        other => panic!("{other:?}"),
+                        other => panic!("{}", bytes(other)),
                     };
                     assert_eq!(
                         held & !down,
                         0,
-                        "seed {seed}: {f:?} holds what the client does not"
+                        "seed {seed}: {} holds what the client does not",
+                        bytes(f)
                     );
                     assert_eq!(
                         held & owed,
                         0,
-                        "seed {seed}: {f:?} re-pressed a button released by the bridge"
+                        "seed {seed}: {} re-pressed a button released by the bridge",
+                        bytes(f)
                     );
                 }
             }

@@ -36,8 +36,9 @@ pub enum Wheel {
     Down,
 }
 
-/// One HID frame on the control websocket.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// One HID frame on the control websocket. Its `Debug` is redacted: see
+/// the impl.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum HidFrame {
     /// `88 88 01 <0x30 + hid_type>`; type 0 is absolute mouse.
     SetMode { hid_type: u8 },
@@ -47,6 +48,26 @@ pub enum HidFrame {
     AbsMouse { buttons: u8, x: u16, y: u16 },
     /// `AA AA 04 20 btn 00 00 w` (8 bytes), `w` = `01` up / `FF` down.
     Wheel { buttons: u8, wheel: Wheel },
+}
+
+/// §4.5, §9.2 (PD5 ruling): a frame is a keystroke — as sensitive as a
+/// password typed through RDP — or the pointer's state. `Debug` names the
+/// kind and the wire length only, never a key, modifier, button,
+/// coordinate or wheel direction; every type that holds a frame inherits
+/// that. A test that needs the detail prints `to_vec()`.
+impl core::fmt::Debug for HidFrame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let (kind, len): (&str, usize) = match self {
+            HidFrame::SetMode { .. } => ("SetMode", 4),
+            HidFrame::Keyboard { .. } => ("Keyboard", 12),
+            HidFrame::AbsMouse { .. } => ("AbsMouse", 9),
+            HidFrame::Wheel { .. } => ("Wheel", 8),
+        };
+        f.debug_struct("HidFrame")
+            .field("kind", &kind)
+            .field("len", &len)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Why a websocket message is not a §3.3 HID frame.
@@ -207,6 +228,94 @@ mod tests {
         assert_eq!(scale_abs(u16::MAX, u16::MAX), 32_767);
         assert_eq!(scale_abs(u16::MAX, 2), 32_767);
         assert_eq!(scale_abs(u16::MAX, 1), 0);
+    }
+
+    /// PD5 ruling (§4.5, §9.2): no rendering of any of `values` — decimal,
+    /// hex in either case, `0x`-prefixed or two-digit — appears in `s`.
+    /// Renderings shorter than two characters are skipped (a count may
+    /// show them); the value-invariance checks cover those.
+    fn assert_no_value(s: &str, values: &[u64]) {
+        for v in values {
+            for r in [
+                format!("{v}"),
+                format!("{v:x}"),
+                format!("{v:X}"),
+                format!("{v:#x}"),
+                format!("{v:02x}"),
+                format!("{v:02X}"),
+            ] {
+                assert!(r.len() < 2 || !s.contains(&r), "{r} appears in {s}");
+            }
+        }
+    }
+
+    /// PD5 ruling (§4.5, §9.2): a frame is a keystroke or the pointer's
+    /// state. Its `Debug`, `{:?}` and `{:#?}`, names the kind and the wire
+    /// length and nothing else: frames of one kind print alike whatever
+    /// they hold, and no key, modifier, button, coordinate or mode byte
+    /// appears.
+    #[test]
+    fn debug_names_the_kind_and_length_only() {
+        let pairs = [
+            (
+                HidFrame::Keyboard {
+                    modifiers: 0xA7,
+                    keys: [0x1E, 0x2C, 0x3B, 0x5D, 0x6F],
+                },
+                HidFrame::Keyboard {
+                    modifiers: 0,
+                    keys: [0; 5],
+                },
+            ),
+            (
+                HidFrame::AbsMouse {
+                    buttons: 0x06,
+                    x: 12_345,
+                    y: 23_456,
+                },
+                HidFrame::AbsMouse {
+                    buttons: 0,
+                    x: 0,
+                    y: 0,
+                },
+            ),
+            (
+                HidFrame::Wheel {
+                    buttons: 0x05,
+                    wheel: Wheel::Down,
+                },
+                HidFrame::Wheel {
+                    buttons: 0,
+                    wheel: Wheel::Up,
+                },
+            ),
+            (
+                HidFrame::SetMode { hid_type: 0x3C },
+                HidFrame::SetMode { hid_type: 0 },
+            ),
+        ];
+        let values = [0xA7, 0x1E, 0x2C, 0x3B, 0x5D, 0x6F, 12_345, 23_456, 0x3C];
+        for (a, b) in pairs {
+            for (fa, fb) in [
+                (format!("{a:?}"), format!("{b:?}")),
+                (format!("{a:#?}"), format!("{b:#?}")),
+            ] {
+                assert_eq!(fa, fb, "Debug shows what the frame holds");
+                assert_no_value(&fa, &values);
+            }
+        }
+        assert_eq!(
+            format!("{:?}", pairs[0].0),
+            "HidFrame { kind: \"Keyboard\", len: 12, .. }"
+        );
+        assert_eq!(
+            format!("{:?}", pairs[1].0),
+            "HidFrame { kind: \"AbsMouse\", len: 9, .. }"
+        );
+        for (a, _) in pairs {
+            let len = format!("len: {}", a.to_vec().len());
+            assert!(format!("{a:?}").contains(&len), "{a:?}");
+        }
     }
 
     #[test]

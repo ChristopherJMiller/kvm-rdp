@@ -42,12 +42,24 @@ impl ReleaseTrigger {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Report {
     pub epoch: u64,
     pub frame: HidFrame,
     /// Only the pointer moved (no button or key change): coalescable.
     pub motion_only: bool,
+}
+
+/// §4.5 (PD5 ruling): a queued report is a keystroke; `Debug` shows its
+/// epoch and motion flag, and the frame only as `HidFrame`'s redacted kind.
+impl std::fmt::Debug for Report {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Report")
+            .field("epoch", &self.epoch)
+            .field("frame", &self.frame)
+            .field("motion_only", &self.motion_only)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,6 +348,24 @@ mod tests {
     }
     fn drain(c: &HidControl) -> Vec<HidFrame> {
         std::iter::from_fn(|| c.next_frame()).collect()
+    }
+
+    /// PD5 ruling (§4.5): a queued report is a keystroke; its `Debug`
+    /// keeps the epoch and the motion flag, and redacts the frame.
+    #[test]
+    fn a_reports_debug_never_prints_its_frame() {
+        let r = |frame| Report {
+            epoch: 3,
+            frame,
+            motion_only: false,
+        };
+        let a = r(HidFrame::Keyboard {
+            modifiers: 0xA7,
+            keys: [0x1E, 0x2C, 0x3B, 0x5D, 0x6F],
+        });
+        let b = r(kbd(0));
+        crate::testkit::assert_debug_redacted(&a, &b, &[0xA7, 0x1E, 0x2C, 0x3B, 0x5D, 0x6F]);
+        assert!(format!("{a:?}").contains("epoch: 3"), "{a:?}");
     }
 
     #[test]

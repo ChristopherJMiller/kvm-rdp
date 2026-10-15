@@ -21,7 +21,7 @@ const MAX_RBB: usize = 32;
 /// sends GUI in Ctrl's place; every other Ctrl chord is left alone.
 const REMAP_USAGES: [u8; 7] = [0x06, 0x19, 0x1B, 0x04, 0x1D, 0x09, 0x1A]; // c v x a z f w
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct KeyReport {
     /// The full-state keyboard frame after this event.
     pub frame: HidFrame,
@@ -36,7 +36,7 @@ pub struct KeyReport {
     pub dropped: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct Keyboard {
     /// Raw modifier bits as the client holds them; never remapped (§8: the
     /// chord is matched before any remap).
@@ -54,6 +54,33 @@ pub struct Keyboard {
     rbb: Vec<u8>,
     caps_lock: bool,
     mac_remap: bool,
+}
+
+/// §4.5 (PD5 ruling): a report is a keystroke; `Debug` shows its flags and
+/// the frame only as `HidFrame`'s redacted kind.
+impl std::fmt::Debug for KeyReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KeyReport")
+            .field("frame", &self.frame)
+            .field("ignored", &self.ignored)
+            .field("dropped", &self.dropped)
+            .finish()
+    }
+}
+
+/// §4.5 (PD5 ruling: keystrokes are as sensitive as a password typed
+/// through RDP): counts and the remap switch only — never a usage, the
+/// modifier byte, the Unicode Shift or Caps Lock.
+impl std::fmt::Debug for Keyboard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keyboard")
+            .field("keys_down", &self.down.len())
+            .field("unicode_keys_down", &self.unicode_down.len())
+            .field("modifiers_down", &self.modifiers.count_ones())
+            .field("released_by_bridge", &self.rbb.len())
+            .field("mac_remap", &self.mac_remap)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Keyboard {
@@ -272,13 +299,28 @@ mod tests {
     /// The frame of a report that must be sent.
     fn sent(r: Option<KeyReport>) -> HidFrame {
         let r = r.unwrap();
-        assert!(!r.ignored && !r.dropped, "{r:?}");
+        assert!(!r.ignored && !r.dropped, "{}", show(&r));
         r.frame
     }
 
     fn ignored(r: Option<KeyReport>) -> bool {
         let r = r.unwrap();
         r.ignored && !r.dropped
+    }
+
+    /// A frame's bytes, for failure messages: `HidFrame`'s `Debug` is
+    /// redacted (PD5 ruling), so a test that needs the detail prints these.
+    fn bytes(f: HidFrame) -> String {
+        format!("{:02x?}", f.to_vec())
+    }
+
+    fn show(r: &KeyReport) -> String {
+        format!(
+            "ignored={} dropped={} frame={}",
+            r.ignored,
+            r.dropped,
+            bytes(r.frame)
+        )
     }
 
     #[test]
@@ -379,7 +421,7 @@ mod tests {
         for (c, e) in all.iter().copied() {
             assert!(k.is_released_by_bridge(usage_for_scancode(c, e).unwrap()));
             let r = k.press(c, e).unwrap();
-            assert!(r.ignored && !r.dropped, "{c:#x}'s repeat: {r:?}");
+            assert!(r.ignored && !r.dropped, "{c:#x}'s repeat: {}", show(&r));
             assert_eq!(r.frame, one(0, 0), "{c:#x}'s repeat re-pressed it");
         }
         assert_eq!(
@@ -463,12 +505,12 @@ mod tests {
         assert_eq!(sent(k.unicode_release(u16::from(b'a'))), one(0x02, 0));
         for unit in [0xD800u16, 0x00E9] {
             let r = k.unicode_press(unit).unwrap();
-            assert!(r.ignored && r.dropped, "{unit:#x}: {r:?}");
+            assert!(r.ignored && r.dropped, "{unit:#x}: {}", show(&r));
             assert_eq!(r.frame, one(0x02, 0));
             // m5: one keystroke is counted once — its release is ignored,
             // not dropped (and counted in `input_events_ignored`) again.
             let r = k.unicode_release(unit).unwrap();
-            assert!(r.ignored && !r.dropped, "{unit:#x}'s release: {r:?}");
+            assert!(r.ignored && !r.dropped, "{unit:#x}'s release: {}", show(&r));
             assert_eq!(r.frame, one(0x02, 0));
         }
     }
@@ -675,7 +717,7 @@ mod tests {
         // m1: Caps Lock as the 17th key is dropped, and does not toggle —
         // the KVM never saw it.
         let r = k.press(0x3A, false).unwrap();
-        assert!(r.ignored && r.dropped, "{r:?}");
+        assert!(r.ignored && r.dropped, "{}", show(&r));
         assert!(!k.caps_lock_on(), "a dropped Caps press toggled");
         assert_eq!(k.release_all().frame, one(0, 0));
     }
@@ -698,6 +740,42 @@ mod tests {
         assert!(ignored(k.release(0x2F, false)));
         assert_eq!(sent(k.press(0x2F, false)), one(0, 0x19));
         assert!(k.is_down(0x19));
+    }
+
+    /// PD5 ruling (§4.5: keystrokes are as sensitive as a password typed
+    /// through RDP): the keyboard's state and its reports print counts and
+    /// flags only — two keyboards holding different keys, the same number
+    /// of them, print alike, and no usage or modifier byte appears.
+    #[test]
+    fn debug_never_prints_a_key() {
+        let mut a = Keyboard::default();
+        let mut b = Keyboard::default();
+        // a: RGUI, LShift, z ] 7 /; b: LCtrl, LAlt, q w e r.
+        sent(a.press(0x5C, true));
+        sent(a.press(0x2A, false));
+        let mut ra = None;
+        for c in [0x2C, 0x1B, 0x08, 0x35] {
+            ra = Some(sent(a.press(c, false)));
+        }
+        sent(b.press(0x1D, false));
+        sent(b.press(0x38, false));
+        let mut rb = None;
+        for c in [0x10, 0x11, 0x12, 0x13] {
+            rb = Some(sent(b.press(c, false)));
+        }
+        let values = [0x82, 0x1D, 0x30, 0x24, 0x38, 0x2C, 0x1B, 0x35, 0x5C, 0x2A];
+        crate::testkit::assert_debug_redacted(&a, &b, &values);
+        let report = |frame| KeyReport {
+            frame,
+            ignored: false,
+            dropped: false,
+        };
+        crate::testkit::assert_debug_redacted(&report(ra.unwrap()), &report(rb.unwrap()), &values);
+        let s = format!("{a:?}");
+        assert!(
+            s.contains("keys_down: 4") && s.contains("modifiers_down: 2"),
+            "{s}"
+        );
     }
 
     /// xorshift64*: a fixed, seedable sequence for the property test.
@@ -816,7 +894,7 @@ mod tests {
         /// the client's release of it.
         fn check(&self, k: &Keyboard, f: HidFrame) {
             let HidFrame::Keyboard { modifiers, keys } = f else {
-                panic!("{f:?}");
+                panic!("{}", bytes(f));
             };
             let held: Vec<u8> = self
                 .codes
@@ -828,7 +906,8 @@ mod tests {
             for key in keys.iter().filter(|key| **key != 0) {
                 assert!(
                     held.contains(key),
-                    "{key:#x} held in {f:?}, client holds {held:x?}"
+                    "{key:#x} held in {}, client holds {held:x?}",
+                    bytes(f)
                 );
             }
             for i in 0..8u8 {
@@ -840,12 +919,13 @@ mod tests {
                     || (bit == MOD_LSHIFT && typing && self.shift)
                     || (self.remap && bit == MOD_LGUI && held.contains(&0xE0))
                     || (self.remap && bit == MOD_RGUI && held.contains(&0xE4));
-                assert!(ok, "{bit:#x} held in {f:?}, client holds {held:x?}");
+                assert!(ok, "{bit:#x} held in {}, client holds {held:x?}", bytes(f));
             }
             if f != one(0, 0) {
                 assert!(
                     k.held_nonmodifier_usages() > 0 || k.held_modifier_bits() != 0,
-                    "{f:?} is held but no timer would see it"
+                    "{} is held but no timer would see it",
+                    bytes(f)
                 );
             }
             for u in &self.owed {
@@ -972,7 +1052,11 @@ mod tests {
                     }
                 };
                 if let Some(r) = r {
-                    assert!(!r.dropped || r.ignored, "dropped is always ignored: {r:?}");
+                    assert!(
+                        !r.dropped || r.ignored,
+                        "dropped is always ignored: {}",
+                        show(&r)
+                    );
                     m.check(&k, r.frame);
                 }
             }

@@ -193,10 +193,18 @@ pub fn modifier_classes(bits: u8) -> u8 {
 }
 
 /// One key of the US layout: its usage, and whether Shift is needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Stroke {
     pub usage: u8,
     pub shift: bool,
+}
+
+/// §9.2 (PD5 ruling): the Typist types pasted text as strokes, so a
+/// stroke's `Debug` shows nothing of the character.
+impl core::fmt::Debug for Stroke {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Stroke").finish_non_exhaustive()
+    }
 }
 
 /// What the US layout types `c` with: printable ASCII, Tab, and `'\n'` as
@@ -547,6 +555,23 @@ mod tests {
         assert_eq!(typeable, 95 + 2, "printable ASCII, Tab and Return only");
         for c in ['\r', '\u{7f}', '\u{1b}', 'é', '€', '\u{1F600}', '\0'] {
             assert_eq!(us_stroke(c), None, "{c:?}");
+        }
+    }
+
+    /// PD5 ruling (§9.2): the Typist turns pasted text into strokes, so a
+    /// `Stroke`'s `Debug` shows nothing of the character it types.
+    #[test]
+    fn a_strokes_debug_prints_nothing_typed() {
+        let a = us_stroke('}').unwrap(); // usage 0x30, Shift
+        let b = us_stroke('a').unwrap();
+        for (fa, fb) in [
+            (format!("{a:?}"), format!("{b:?}")),
+            (format!("{a:#?}"), format!("{b:#?}")),
+        ] {
+            assert_eq!(fa, fb, "Debug shows the stroke");
+            for leak in ["48", "30", "true", "usage", "shift"] {
+                assert!(!fa.contains(leak), "{leak} in {fa}");
+            }
         }
     }
 
