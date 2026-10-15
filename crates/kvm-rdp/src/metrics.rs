@@ -97,9 +97,12 @@ impl Family {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
     pub fn inc(&self, value: &'static str) {
+        self.add(value, 1);
+    }
+    pub fn add(&self, value: &'static str, n: u64) {
         let mut m = self.map();
         let e = m.entry(value).or_insert(0);
-        *e = e.saturating_add(1);
+        *e = e.saturating_add(n);
     }
     #[must_use]
     pub fn get(&self, value: &str) -> u64 {
@@ -262,6 +265,13 @@ pub struct Metrics {
     pub disconnects: Family,
     pub accept_refused: Counter,
     pub input_events_ignored: Counter,
+    /// §8: every paste's outcome (`started`, `done`, `no_text`,
+    /// `caps_lock`, `multiline`, `oversize`, `aborted`).
+    pub paste_events: Family,
+    pub paste_skipped_chars: Counter,
+    /// PD9 carry 3: clipboard answers no paste took (`late`, `unasked`), or
+    /// that the backend dropped while another was in flight (`in_flight`).
+    pub clipboard_discarded: Family,
 }
 
 impl Default for Metrics {
@@ -402,7 +412,17 @@ impl Default for Metrics {
             ),
             input_events_ignored: Counter::new(
                 "kvm_rdp_input_events_ignored",
-                "Client input events not yet mapped (Plan D)",
+                "Client input events dropped: unmapped, untypeable or past a bound (DD7, DD9)",
+            ),
+            paste_events: Family::new("kvm_rdp_paste_events", "Paste outcomes (§8)", "outcome"),
+            paste_skipped_chars: Counter::new(
+                "kvm_rdp_paste_skipped_chars",
+                "Characters pastes skipped as untypeable (§8)",
+            ),
+            clipboard_discarded: Family::new(
+                "kvm_rdp_clipboard_discarded",
+                "Clipboard answers no paste took, by reason",
+                "reason",
             ),
         }
     }
@@ -430,6 +450,7 @@ impl Metrics {
             &self.sessions,
             &self.accept_refused,
             &self.input_events_ignored,
+            &self.paste_skipped_chars,
         ] {
             c.render(&mut out);
         }
@@ -444,6 +465,8 @@ impl Metrics {
             &self.frames_dropped,
             &self.release_all,
             &self.disconnects,
+            &self.paste_events,
+            &self.clipboard_discarded,
         ] {
             f.render(&mut out);
         }
@@ -549,8 +572,8 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            39,
-            "16 counters, 10 families, 8 gauges, 5 histograms"
+            42,
+            "17 counters, 12 families, 8 gauges, 5 histograms"
         );
         let mut sorted = names.clone();
         sorted.sort_unstable();

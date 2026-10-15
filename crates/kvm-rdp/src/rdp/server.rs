@@ -10,7 +10,7 @@ use crate::rdp::clipboard::ClipFactory;
 use crate::rdp::display::BridgeDisplay;
 use crate::rdp::gfx::GfxFactory;
 use crate::rdp::handler::Lifecycle;
-use crate::rdp::input::InputStub;
+use crate::rdp::input::InputHandler;
 use crate::rdp::tls::TlsIdentity;
 use ironrdp_server::{ConnectionPolicy, Credentials, RdpServer};
 use std::net::SocketAddr;
@@ -22,7 +22,7 @@ pub struct ServerParts {
     pub tls: TlsIdentity,
     pub username: String,
     pub password: Secret,
-    pub input: InputStub,
+    pub input: InputHandler,
     pub display: BridgeDisplay,
     pub gfx: GfxFactory,
     /// Concrete, as `gfx` is: `CliprdrServerFactory` has no `Send`
@@ -75,6 +75,7 @@ mod tests {
     use crate::rdp::clipboard::{ClipSlot, ServerEvents};
     use crate::rdp::display::DisplayShared;
     use crate::rdp::gfx::GfxSlot;
+    use crate::rdp::input::{InputDeps, InputRuntimeConfig, InputShared};
     use crate::rdp::tls;
     use std::sync::atomic::AtomicU64;
     use std::time::Duration;
@@ -100,12 +101,20 @@ mod tests {
         let gfx_slot = GfxSlot::default();
         let clip_slot = ClipSlot::default();
         let events = ServerEvents::default();
+        let input = Arc::new(InputShared::new(InputDeps {
+            hid: Arc::new(HidControl::new(16, metrics.clone())),
+            display: DisplayShared::new((1024, 768)),
+            events: events.clone(),
+            gens: Arc::new(Generations::default()),
+            metrics: metrics.clone(),
+            cfg: InputRuntimeConfig::test(),
+        }));
         let parts = ServerParts {
             listen: ([127, 0, 0, 1], 0).into(),
             tls: identity,
             username: "kvm".to_owned(),
             password: Secret::new("l1-test-only-nla-password"),
-            input: InputStub::new(metrics.clone()),
+            input: InputHandler::new(input.clone()),
             display: BridgeDisplay::new(DisplayShared::new((1024, 768)), to_pump.clone()),
             gfx: GfxFactory::new(gfx_slot.clone(), to_pump.clone(), 60, metrics.clone()),
             cliprdr: ClipFactory::new(
@@ -136,5 +145,12 @@ mod tests {
             .get()
             .expect("server::build left the bridge's ServerEvents cell empty");
         assert!(sender.same_channel(server.event_sender()));
+        // Task 4.1: the input shell sends its paste requests on that cell.
+        assert!(
+            input
+                .events_for_test()
+                .get()
+                .is_some_and(|s| s.same_channel(server.event_sender()))
+        );
     }
 }

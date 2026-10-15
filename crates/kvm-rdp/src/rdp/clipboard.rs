@@ -14,14 +14,26 @@
 //! the session ends (`clipboard_oversize`, through `RdpInput::Fatal`) and
 //! the backend says nothing more. A failed response is `ClipboardFailed`.
 //! A response the bridge never asked for reaches the input core like any
-//! other, which types one only for a pending paste that has no text yet
-//! (DD4). A list that names CF_UNICODETEXT as its file list offers no text
+//! other (the backend cannot tell them apart), which types one only when it
+//! answers the Pending paste's own request, and discards and counts any
+//! other (DD4; PD9 carry 3). A list that names CF_UNICODETEXT as its file list offers no text
 //! (IronRDP would take the answer as a file list, past the cap). The data
 //! is never logged or Debug-formatted (§9.2).
 //!
+//! A backend bounds its own forwarding (PD8 review m2), so a flood of
+//! format lists or responses never depends on IronRDP's pacing to stay
+//! bounded on the unbounded pump channel: at most one availability word
+//! (an `Offer`, which reads the latest list when the shell takes it) and
+//! one answer word (text or a failure, carrying an `Answer`) are in flight
+//! per connection. An answer that comes while one is in flight is dropped
+//! and counted on the word in flight (`Answer::lost`), so the input core's
+//! request count stays true. A word frees its place when dropped —
+//! consumed, or dropped by the shell as another slot's.
+//!
 //! The callbacks run inside IronRDP's channel processing on the RDP
-//! thread: they only push to the pump's channel — no lock, no call into
-//! IronRDP.
+//! thread: they only push to the pump's channel and take the backend's own
+//! `Flow` lock — a leaf, released before any send (a failed send drops its
+//! word, whose `Drop` takes it) — and never call into IronRDP.
 use crate::msg::{Cause, Gen, Generations, RdpInput};
 use crate::pump::Input;
 use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
@@ -49,6 +61,80 @@ pub type ServerEvents = Arc<OnceLock<UnboundedSender<ServerEvent>>>;
 #[must_use]
 pub fn take_latest_clip(slot: &ClipSlot) -> Option<u64> {
     slot.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
+/// One backend's words in flight on the pump channel (PD8 review m2).
+#[derive(Default)]
+struct Flow {
+    /// The latest format list offered Unicode text (D18).
+    text: bool,
+    /// An availability word is on the pump channel.
+    offer_queued: bool,
+    /// An answer word (text or a failure) is on the pump channel.
+    answer_queued: bool,
+    /// Answers dropped while it was (saturating).
+    lost: u32,
+}
+
+type FlowCell = Arc<Mutex<Flow>>;
+
+fn flow(f: &FlowCell) -> std::sync::MutexGuard<'_, Flow> {
+    f.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An availability word's place: `text` reads the latest format list's
+/// offer, so a list that came while the word waited is not lost. Dropping
+/// it frees the place for the next list's word.
+pub struct Offer(FlowCell);
+
+impl Offer {
+    /// Whether the latest format list offers Unicode text.
+    #[must_use]
+    pub fn text(&self) -> bool {
+        flow(&self.0).text
+    }
+
+    /// A word with no backend behind it (the shell's tests).
+    #[cfg(test)]
+    pub(crate) fn detached(text: bool) -> Offer {
+        Offer(Arc::new(Mutex::new(Flow {
+            text,
+            ..Flow::default()
+        })))
+    }
+}
+
+impl Drop for Offer {
+    fn drop(&mut self) {
+        flow(&self.0).offer_queued = false;
+    }
+}
+
+/// An answer word's place: `lost` counts the answers the backend dropped
+/// while this one was in flight — answers all the same, which the input
+/// core must count. Dropping it frees the place and the count.
+pub struct Answer(FlowCell);
+
+impl Answer {
+    /// Answers dropped behind this one, so far.
+    #[must_use]
+    pub fn lost(&self) -> u32 {
+        flow(&self.0).lost
+    }
+
+    /// A word with no backend behind it (the shell's tests).
+    #[cfg(test)]
+    pub(crate) fn detached() -> Answer {
+        Answer(Arc::new(Mutex::new(Flow::default())))
+    }
+}
+
+impl Drop for Answer {
+    fn drop(&mut self) {
+        let mut f = flow(&self.0);
+        f.answer_queued = false;
+        f.lost = 0;
+    }
 }
 
 /// What the pump shell steps for an `RdpInput::Fatal` from its current
@@ -113,6 +199,7 @@ impl CliprdrBackendFactory for ClipFactory {
             to_pump: self.to_pump.clone(),
             max_bytes: self.max_bytes,
             ended: false,
+            flow: FlowCell::default(),
         })
     }
 }
@@ -126,6 +213,24 @@ struct ClipBackend {
     /// It sent its `Fatal`: the session is ending, and nothing more from
     /// this connection's clipboard goes anywhere.
     ended: bool,
+    /// Its words in flight (PD8 review m2).
+    flow: FlowCell,
+}
+
+impl ClipBackend {
+    /// The answer word's place, if it is free; otherwise this answer is
+    /// dropped and counted on the word in flight. The lock is released
+    /// before the caller sends.
+    fn answer_place(&self) -> Option<Answer> {
+        let mut f = flow(&self.flow);
+        if f.answer_queued {
+            f.lost = f.lost.saturating_add(1);
+            return None;
+        }
+        f.answer_queued = true;
+        f.lost = 0;
+        Some(Answer(self.flow.clone()))
+    }
 }
 
 // `CliprdrBackend: AsAny + Debug + Send`, and `AsAny` has no blanket impl
@@ -187,10 +292,19 @@ impl CliprdrBackend for ClipBackend {
             && formats
                 .iter()
                 .any(|f| f.id() == ClipboardFormatId::CF_UNICODETEXT);
-        let _ = self.to_pump.send(RdpInput::ClipboardAvailable {
-            slot: self.slot,
-            text,
-        });
+        // Coalesced (m2): a word already in flight reads this list's offer
+        // when the shell takes it.
+        let queue = {
+            let mut f = flow(&self.flow);
+            f.text = text;
+            !std::mem::replace(&mut f.offer_queued, true)
+        };
+        if queue {
+            let _ = self.to_pump.send(RdpInput::ClipboardAvailable {
+                slot: self.slot,
+                offer: Offer(self.flow.clone()),
+            });
+        }
     }
 
     /// The client asks for the server's clipboard: never answered (§8, one
@@ -204,15 +318,21 @@ impl CliprdrBackend for ClipBackend {
     /// nothing and says nothing more. A CB_RESPONSE_FAIL — the client's, or
     /// IronRDP's own for a request it could not send — types nothing: it
     /// is `ClipboardFailed`, so the paste waiting on it can end at once
-    /// (PD8 review (b)). Never logged.
+    /// (PD8 review (b)). At most one answer is in flight (m2): one that
+    /// comes meanwhile is dropped, before a byte is copied, and counted on
+    /// the word in flight; an oversize one is still the `Fatal`, checked
+    /// first. Never logged.
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
         if self.ended {
             return;
         }
         if response.is_error() {
-            let _ = self
-                .to_pump
-                .send(RdpInput::ClipboardFailed { slot: self.slot });
+            if let Some(answer) = self.answer_place() {
+                let _ = self.to_pump.send(RdpInput::ClipboardFailed {
+                    slot: self.slot,
+                    answer,
+                });
+            }
             return;
         }
         let data = response.data();
@@ -224,10 +344,13 @@ impl CliprdrBackend for ClipBackend {
             });
             return;
         }
-        let _ = self.to_pump.send(RdpInput::ClipboardText {
-            slot: self.slot,
-            bytes: data.to_vec(),
-        });
+        if let Some(answer) = self.answer_place() {
+            let _ = self.to_pump.send(RdpInput::ClipboardText {
+                slot: self.slot,
+                bytes: data.to_vec(),
+                answer,
+            });
+        }
     }
 
     fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
@@ -284,6 +407,15 @@ mod tests {
         (f, slot, rx)
     }
 
+    /// The next word, if it is `slot`'s availability: the offer it reads.
+    /// (The word is dropped here, freeing its place.)
+    fn offered(rx: &mut UnboundedReceiver<RdpInput>, slot: u64) -> Option<bool> {
+        match rx.try_recv() {
+            Ok(RdpInput::ClipboardAvailable { slot: s, offer }) if s == slot => Some(offer.text()),
+            _ => None,
+        }
+    }
+
     fn utf16z(s: &str) -> Vec<u8> {
         let mut b: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
         b.extend([0, 0]);
@@ -308,44 +440,20 @@ mod tests {
         let mut b = f.build_cliprdr_backend();
         assert_eq!(take_latest_clip(&slot), Some(1));
         b.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(RdpInput::ClipboardAvailable {
-                slot: 1,
-                text: true
-            })
-        ));
+        assert_eq!(offered(&mut rx, 1), Some(true));
         b.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_BITMAP)]);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(RdpInput::ClipboardAvailable {
-                slot: 1,
-                text: false
-            })
-        ));
+        assert_eq!(offered(&mut rx, 1), Some(false));
         b.on_remote_copy(&[
             ClipboardFormat::new(ClipboardFormatId::CF_TEXT),
             ClipboardFormat::new(ClipboardFormatId::CF_OEMTEXT),
         ]);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(RdpInput::ClipboardAvailable {
-                slot: 1,
-                text: false
-            })
-        ));
+        assert_eq!(offered(&mut rx, 1), Some(false));
         // A second connection's backend gets the next slot, and is latest.
         let mut b2 = f.build_cliprdr_backend();
         assert_eq!(take_latest_clip(&slot), Some(2));
         assert_eq!(take_latest_clip(&slot), None, "taken once");
         b2.on_remote_copy(&[]);
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(RdpInput::ClipboardAvailable {
-                slot: 2,
-                text: false
-            })
-        ));
+        assert_eq!(offered(&mut rx, 2), Some(false));
     }
 
     /// D9a: IronRDP hands the factory its `ServerEvent` sender; the input
@@ -376,13 +484,13 @@ mod tests {
         let mut b = f.build_cliprdr_backend();
         b.on_format_data_response(FormatDataResponse::new_unicode_string("hi"));
         assert!(
-            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes }) if bytes == utf16z("hi"))
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes, .. }) if bytes == utf16z("hi"))
         );
         // An error response types nothing; it is reported as a failure.
         b.on_format_data_response(FormatDataResponse::new_error());
         assert!(matches!(
             rx.try_recv(),
-            Ok(RdpInput::ClipboardFailed { slot: 1 })
+            Ok(RdpInput::ClipboardFailed { slot: 1, .. })
         ));
         assert!(rx.try_recv().is_err());
         b.on_format_data_response(FormatDataResponse::new_unicode_string("far too long"));
@@ -405,7 +513,7 @@ mod tests {
         let mut b = f.build_cliprdr_backend();
         b.on_format_data_response(FormatDataResponse::new_data(utf16z("hi")));
         assert!(
-            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes }) if bytes == utf16z("hi"))
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes, .. }) if bytes == utf16z("hi"))
         );
         b.on_format_data_response(FormatDataResponse::new_data(vec![0x41; 7]));
         assert!(matches!(
@@ -663,17 +771,11 @@ mod tests {
     fn a_real_client_offers_text_and_answers_the_bridges_request() {
         let (f, _slot, mut rx) = factory();
         let mut w = Wire::start(&f, Some(utf16z("hi")));
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(RdpInput::ClipboardAvailable {
-                slot: 1,
-                text: true
-            })
-        ));
+        assert_eq!(offered(&mut rx, 1), Some(true));
         assert!(rx.try_recv().is_err());
         w.request_text();
         assert!(
-            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes }) if bytes == utf16z("hi"))
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes, .. }) if bytes == utf16z("hi"))
         );
         let s = w.state.lock().unwrap();
         assert_eq!(s.asked, 1);
@@ -709,7 +811,7 @@ mod tests {
         let _ = rx.try_recv();
         w.request_text();
         assert!(
-            matches!(rx.try_recv(), Ok(RdpInput::ClipboardFailed { slot: 2 })),
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardFailed { slot: 2, .. })),
             "a CB_RESPONSE_FAIL answer was not reported as a failure"
         );
         assert!(rx.try_recv().is_err());
@@ -743,7 +845,7 @@ mod tests {
         assert_eq!(w.state.lock().unwrap().asked, 64, "the 65th went out");
         assert!(matches!(
             rx.try_recv(),
-            Ok(RdpInput::ClipboardFailed { slot: 1 })
+            Ok(RdpInput::ClipboardFailed { slot: 1, .. })
         ));
         assert!(rx.try_recv().is_err());
     }
@@ -786,7 +888,7 @@ mod tests {
             let msgs = w.client_does(ClipboardMessage::SendInitiateCopy(formats));
             w.settle(Vec::new(), msgs);
             assert!(
-                matches!(rx.try_recv(), Ok(RdpInput::ClipboardAvailable { slot: 1, text }) if text == want),
+                matches!(rx.try_recv(), Ok(RdpInput::ClipboardAvailable { slot: 1, offer }) if offer.text() == want),
                 "case {i}: want text = {want}"
             );
         }
@@ -796,8 +898,9 @@ mod tests {
     /// What a hostile client may send the server besides its answer — a
     /// Monitor Ready, a request for the server's data, locks, a file
     /// contents request — reaches nothing: no input for the pump, no
-    /// format list or data offered back. Each format list is one bounded
-    /// `ClipboardAvailable` (a bool; nothing of the list is kept).
+    /// format list or data offered back. Format lists are coalesced into
+    /// one `ClipboardAvailable` in flight (a bool; nothing of a list is
+    /// kept).
     #[test]
     fn hostile_cliprdr_traffic_reaches_nothing() {
         let (f, _slot, mut rx) = factory();
@@ -830,12 +933,113 @@ mod tests {
             let msgs = w.client_does(ClipboardMessage::SendInitiateCopy(formats));
             w.settle(Vec::new(), msgs);
         }
-        for i in 0..200u32 {
-            assert!(
-                matches!(rx.try_recv(), Ok(RdpInput::ClipboardAvailable { slot: 1, text }) if text == (i % 2 == 0))
-            );
-        }
+        // Coalesced (PD9 carry 3, m2): one word in flight, reading the
+        // latest list — the 200th, which offered no text.
+        assert_eq!(offered(&mut rx, 1), Some(false));
         assert!(rx.try_recv().is_err());
+    }
+
+    /// PD9 carry 3 (PD8 review m2): a flood of format lists never queues
+    /// more than one availability word, whatever IronRDP's pacing — and
+    /// that word reports the latest list when the shell reads it. Once the
+    /// shell has taken it (or dropped it as another slot's), the next list
+    /// sends a word again.
+    #[test]
+    fn a_format_list_flood_queues_one_word_with_the_latest_offer() {
+        let (f, _slot, mut rx) = factory();
+        let mut b = f.build_cliprdr_backend();
+        for i in 0..10_000u32 {
+            let id = if i % 2 == 0 {
+                ClipboardFormatId::CF_UNICODETEXT
+            } else {
+                ClipboardFormatId::CF_BITMAP
+            };
+            b.on_remote_copy(&[ClipboardFormat::new(id)]);
+        }
+        let Ok(RdpInput::ClipboardAvailable { slot: 1, offer }) = rx.try_recv() else {
+            panic!("no availability word");
+        };
+        assert!(rx.try_recv().is_err(), "more than one word queued");
+        assert!(!offer.text(), "not the latest list (the last had no text)");
+        b.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        assert!(offer.text(), "the queued word reads the latest list");
+        assert!(rx.try_recv().is_err());
+        drop(offer);
+        b.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_BITMAP)]);
+        assert!(
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardAvailable { slot: 1, offer }) if !offer.text())
+        );
+    }
+
+    /// PD9 carry 3 (PD8 review m2): at most one answer — a text response or
+    /// a failure — is in flight on the pump channel per connection; the
+    /// rest are dropped and counted on the word in flight (`lost`), so the
+    /// shell's request count stays true. An oversize response is still the
+    /// session's end, in flight or not (§8).
+    #[test]
+    fn a_response_flood_queues_one_answer_and_counts_the_rest() {
+        let (f, _slot, mut rx, _) = factory_with(64);
+        let mut b = f.build_cliprdr_backend();
+        for _ in 0..1_000 {
+            b.on_format_data_response(FormatDataResponse::new_unicode_string("hi"));
+            b.on_format_data_response(FormatDataResponse::new_error());
+        }
+        let Ok(RdpInput::ClipboardText {
+            slot: 1,
+            bytes,
+            answer,
+        }) = rx.try_recv()
+        else {
+            panic!("no answer word");
+        };
+        assert_eq!(bytes, utf16z("hi"));
+        assert!(rx.try_recv().is_err(), "more than one answer queued");
+        assert_eq!(answer.lost(), 1_999);
+        drop(answer);
+        b.on_format_data_response(FormatDataResponse::new_error());
+        let Ok(RdpInput::ClipboardFailed { slot: 1, answer }) = rx.try_recv() else {
+            panic!("no failure word");
+        };
+        assert_eq!(answer.lost(), 0, "a freed place starts a fresh count");
+        b.on_format_data_response(FormatDataResponse::new_unicode_string("hi"));
+        assert_eq!(answer.lost(), 1);
+        b.on_format_data_response(FormatDataResponse::new_data(vec![0; 65]));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::Fatal {
+                slot: 1,
+                cause: Cause::ClipboardOversize
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(answer.lost(), 1, "the oversize answer is the Fatal");
+    }
+
+    /// The places are per connection: one backend's word in flight never
+    /// holds another's back, and a word dropped with the pump's channel
+    /// (the shell gone) frees its place without a deadlock — `send`'s
+    /// error drops it inside the callback, after the backend's own lock.
+    #[test]
+    fn places_are_per_connection_and_a_closed_channel_frees_them() {
+        let (f, _slot, mut rx) = factory();
+        let mut b1 = f.build_cliprdr_backend();
+        let mut b2 = f.build_cliprdr_backend();
+        b1.on_format_data_response(FormatDataResponse::new_unicode_string("a"));
+        b2.on_format_data_response(FormatDataResponse::new_unicode_string("b"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardText { slot: 1, .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardText { slot: 2, .. })
+        ));
+        drop(rx);
+        for _ in 0..3 {
+            b1.on_format_data_response(FormatDataResponse::new_unicode_string("a"));
+            b1.on_format_data_response(FormatDataResponse::new_error());
+            b1.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        }
     }
 
     fn ctx(now: Instant) -> Ctx {
@@ -860,10 +1064,10 @@ mod tests {
     /// slot's clipboard words only.
     fn as_event(i: RdpInput, slot: u64) -> Option<Event> {
         match i {
-            RdpInput::ClipboardAvailable { slot: s, text } if s == slot => {
-                Some(Event::ClipboardAvailable(text))
+            RdpInput::ClipboardAvailable { slot: s, offer } if s == slot => {
+                Some(Event::ClipboardAvailable(offer.text()))
             }
-            RdpInput::ClipboardText { slot: s, bytes } if s == slot => {
+            RdpInput::ClipboardText { slot: s, bytes, .. } if s == slot => {
                 Some(Event::ClipboardText(bytes))
             }
             _ => None,
@@ -905,7 +1109,7 @@ mod tests {
         let (f, _slot, mut rx) = factory();
         let mut w = Wire::start(&f, Some(utf16z("hi")));
         let mut core = InputCore::new();
-        core.on_generation(1);
+        let _ = core.on_generation(1);
         let mut now = Instant::now();
         let mut out = feed(&mut core, &mut rx, now); // the format list: text
         w.unasked(utf16z("zz"));

@@ -289,6 +289,13 @@ impl HidControl {
         f
     }
 
+    /// Reports queued and not yet taken by the writer: the input shell's
+    /// room for the Typist is `TYPIST_ROOM` less this (DD6, D2b).
+    #[must_use]
+    pub fn queued(&self) -> usize {
+        self.q().len()
+    }
+
     /// Reports made while the websocket was down are discarded (§7.3).
     pub fn discard_queued(&self) {
         self.q().clear();

@@ -29,6 +29,7 @@ use crate::pump::types::{Command, DvcBatch, Input, PumpConfig};
 use crate::rdp::clipboard::fatal_input;
 use crate::rdp::display::DisplayShared;
 use crate::rdp::gfx::closed_channel_input;
+use crate::rdp::input::InputShared;
 use ironrdp_dvc::encode_dvc_messages;
 use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_server::{ConnectionAbortHandle, EgfxServerMessage, GfxServerHandle, ServerEvent};
@@ -65,6 +66,9 @@ pub struct ShellDeps {
     /// `RdpServer`'s auto-detect RTT handle (ms; `u32::MAX` = none).
     pub rtt: Arc<AtomicU32>,
     pub to_kvm: mpsc::UnboundedSender<KvmCommand>,
+    /// The input shell (§7, §8): told of each session's start and end, and
+    /// fed this session's clipboard words.
+    pub input: Arc<InputShared>,
 }
 
 /// The live session: what `SessionStart` brought.
@@ -234,6 +238,15 @@ impl PumpShell {
         self.link.as_ref().filter(|l| l.clip_slot == Some(slot))
     }
 
+    /// A clipboard word from `slot` is this session's to act on: the link's
+    /// own backend, and its generation still current — the gate `Fatal`
+    /// has (§4.3, D17). Another slot's, or an ended session's, is dropped
+    /// (its place on the channel freed with it, PD8 review m2).
+    fn clip_is_current(&self, slot: u64) -> bool {
+        self.link_for_clip(slot)
+            .is_some_and(|l| self.d.gens.is_current(l.generation))
+    }
+
     /// The link's generation has ended: `on_disconnected` ran, and its
     /// `SessionStop` is queued behind the input being read.
     fn link_ended(&self) -> bool {
@@ -258,7 +271,11 @@ impl PumpShell {
                     let cmds = self.step([Input::SessionStop { generation: old }]);
                     self.exec(cmds).await;
                     self.end_link();
+                    self.d.input.set_generation(0);
                 }
+                // The input core follows the live generation itself; this
+                // is the shell's word that one began (D27).
+                self.d.input.set_generation(generation);
                 self.link = Some(Link {
                     generation,
                     slot,
@@ -292,6 +309,9 @@ impl PumpShell {
                     let cmds = self.step([Input::SessionStop { generation }]);
                     self.exec(cmds).await;
                     self.end_link();
+                    // The core resets (D27); the KVM's release was the
+                    // handler's `SessionEnd`.
+                    self.d.input.set_generation(0);
                 }
             }
             RdpInput::CapsAdvertised { slot, sets } => {
@@ -365,16 +385,42 @@ impl PumpShell {
                     return;
                 };
                 if let Some(input) = fatal_input(&self.d.gens, generation, cause) {
+                    // The oversize answer ends the paste that asked for it
+                    // as `oversize`, before the close releases all (§8).
+                    if cause == Cause::ClipboardOversize {
+                        self.d.input.clipboard_oversize();
+                    }
                     let cmds = self.step([input]);
                     self.exec(cmds).await;
                 }
             }
-            // Task 4.1 routes these to the input core, under the same slot
-            // and generation gate as `Fatal` (a failure ends the waiting
-            // paste); until then nothing types them.
-            RdpInput::ClipboardAvailable { .. }
-            | RdpInput::ClipboardText { .. }
-            | RdpInput::ClipboardFailed { .. } => {}
+            // This session's clipboard words reach the input core under
+            // `Fatal`'s gate; any other is dropped, freeing its place.
+            RdpInput::ClipboardAvailable { slot, offer } => {
+                if self.clip_is_current(slot) {
+                    self.d.input.clipboard_available(offer.text());
+                }
+            }
+            RdpInput::ClipboardText {
+                slot,
+                bytes,
+                answer,
+            } => {
+                if self.clip_is_current(slot) {
+                    let lost = answer.lost();
+                    drop(answer); // its place is free before the core runs
+                    self.d.input.clipboard_text(bytes);
+                    self.d.input.clipboard_lost(lost);
+                }
+            }
+            RdpInput::ClipboardFailed { slot, answer } => {
+                if self.clip_is_current(slot) {
+                    let lost = answer.lost();
+                    drop(answer);
+                    self.d.input.clipboard_failed();
+                    self.d.input.clipboard_lost(lost);
+                }
+            }
             RdpInput::Updates => {
                 // PC17: the reactivation's Setup, same window as `OnReady`.
                 if self.link_ended() {
@@ -674,12 +720,14 @@ mod tests {
     use crate::msg::FlvOrigin;
     use crate::pump::rig::{self, CHAN, ES3, Null, P480};
     use crate::rdp::accept::AcceptRate;
-    use crate::rdp::clipboard::{ClipFactory, ClipSlot, ServerEvents};
+    use crate::rdp::clipboard::{Answer, ClipFactory, ClipSlot, Offer, ServerEvents};
     use crate::rdp::gfx::{GfxFactory, GfxSlot};
     use crate::rdp::handler::Lifecycle;
+    use crate::rdp::input::{InputDeps, InputRuntimeConfig};
     use ironrdp_cliprdr::backend::CliprdrBackendFactory as _;
     use ironrdp_cliprdr::pdu::FormatDataResponse;
     use ironrdp_core::encode_vec;
+    use ironrdp_server::KeyboardEvent;
     // `start` and `process` are `DvcProcessor` methods on the GFX server,
     // and `SvcProcessor` methods on IronRDP's DVC server.
     use ironrdp_dvc::DrdynvcServer;
@@ -764,6 +812,8 @@ mod tests {
         rtt: Arc<AtomicU32>,
         counter: Arc<AtomicU64>,
         display: Arc<DisplayShared>,
+        /// The input shell the shell feeds.
+        input: Arc<InputShared>,
     }
 
     /// The shell on the current `LocalSet` over a 640×360 display (the ES3
@@ -787,16 +837,26 @@ mod tests {
         let suppressed = Arc::new(AtomicBool::new(false));
         let rtt = Arc::new(AtomicU32::new(u32::MAX));
         let display = DisplayShared::new((640, 360));
+        let hid = Arc::new(HidControl::new(16, metrics.clone()));
+        let input = Arc::new(InputShared::new(InputDeps {
+            hid: hid.clone(),
+            display: display.clone(),
+            events: ServerEvents::default(),
+            gens: gens.clone(),
+            metrics: metrics.clone(),
+            cfg: InputRuntimeConfig::test(),
+        }));
         let deps = ShellDeps {
             cfg: cfg.clone(),
             metrics: metrics.clone(),
             gens: gens.clone(),
-            hid: Arc::new(HidControl::new(16, metrics.clone())),
+            hid,
             display: display.clone(),
             events: etx,
             suppressed: suppressed.clone(),
             rtt: rtt.clone(),
             to_kvm: ktx,
+            input: input.clone(),
         };
         let pump = Pump::with_slate(cfg, metrics.clone(), None);
         let shell = PumpShell::with_pump(deps, pump);
@@ -821,6 +881,7 @@ mod tests {
             rtt,
             counter,
             display,
+            input,
         }
     }
 
@@ -1097,16 +1158,26 @@ mod tests {
                 crate::rdp::accept::HANDSHAKE_GRACE,
             )),
         };
+        let display = DisplayShared::new((640, 360));
+        let input = Arc::new(InputShared::new(InputDeps {
+            hid: hid.clone(),
+            display: display.clone(),
+            events: ServerEvents::default(),
+            gens: gens.clone(),
+            metrics: metrics.clone(),
+            cfg: InputRuntimeConfig::test(),
+        }));
         let deps = ShellDeps {
             cfg: cfg.clone(),
             metrics: metrics.clone(),
             gens,
             hid,
-            display: DisplayShared::new((640, 360)),
+            display,
             events: etx,
             suppressed: Arc::new(AtomicBool::new(false)),
             rtt: Arc::new(AtomicU32::new(u32::MAX)),
             to_kvm: ktx,
+            input,
         };
         let pump = Pump::with_slate(cfg, metrics.clone(), None);
         tokio::task::spawn_local(PumpShell::with_pump(deps, pump).run(rdp_rx, kvm_rx));
@@ -1986,8 +2057,8 @@ mod tests {
 
     /// §4.3, design decision 8: a `Fatal` from another clip slot (a stale
     /// or rival connection's backend) or for an ended generation (read
-    /// after `on_disconnected`) is dropped, as `GfxClosed` is; and until
-    /// Task 4.1 the clipboard's other words reach nothing.
+    /// after `on_disconnected`) is dropped, as `GfxClosed` is; and the
+    /// clipboard's other words never end the session.
     #[tokio::test(flavor = "current_thread")]
     async fn a_stale_slots_or_an_ended_sessions_clipboard_fatal_is_dropped() {
         LocalSet::new()
@@ -2003,19 +2074,27 @@ mod tests {
                         })
                         .unwrap();
                 }
+                // This session's other clipboard words reach the input core
+                // (Task 4.1), never the session's end.
                 t.rdp
                     .send(RdpInput::ClipboardAvailable {
                         slot: 1,
-                        text: true,
+                        offer: Offer::detached(true),
                     })
                     .unwrap();
                 t.rdp
                     .send(RdpInput::ClipboardText {
                         slot: 1,
                         bytes: vec![0x41, 0],
+                        answer: Answer::detached(),
                     })
                     .unwrap();
-                t.rdp.send(RdpInput::ClipboardFailed { slot: 1 }).unwrap();
+                t.rdp
+                    .send(RdpInput::ClipboardFailed {
+                        slot: 1,
+                        answer: Answer::detached(),
+                    })
+                    .unwrap();
                 assert!(
                     t.quiet(Duration::from_millis(300)).await,
                     "another slot's clipboard closed the session"
@@ -2035,6 +2114,111 @@ mod tests {
                 assert_eq!(t.metrics.disconnects.total(), 0);
                 assert_eq!(t.metrics.release_all.get("closing"), 0);
                 t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
+            })
+            .await;
+    }
+
+    /// Task 4.1: the shell tells the input core of each session and feeds
+    /// it this session's clipboard words — availability, an answer, a
+    /// failure, the answers lost behind one, the oversize answer it closes
+    /// the session for — and drops another slot's (its place freed).
+    #[tokio::test(flavor = "current_thread")]
+    async fn this_sessions_clipboard_words_reach_the_input_core() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = shell(|_| {});
+                t.start();
+                t.event().await; // the Setup
+                let m = t.metrics.clone();
+                let chord = |input: &InputShared, down: bool| {
+                    for code in [0x1D, 0x38, 0x2A, 0x2F] {
+                        input.keyboard(if down {
+                            KeyboardEvent::Pressed {
+                                code,
+                                extended: false,
+                            }
+                        } else {
+                            KeyboardEvent::Released {
+                                code,
+                                extended: false,
+                            }
+                        });
+                    }
+                };
+                let unasked = |n| {
+                    let m = m.clone();
+                    move || m.clipboard_discarded.get("unasked") == n
+                };
+                // Another slot's offer is dropped: the chord finds no text.
+                t.rdp
+                    .send(RdpInput::ClipboardAvailable {
+                        slot: 2,
+                        offer: Offer::detached(true),
+                    })
+                    .unwrap();
+                let marker = || RdpInput::ClipboardText {
+                    slot: 1,
+                    bytes: vec![0x41, 0],
+                    answer: Answer::detached(),
+                };
+                t.rdp.send(marker()).unwrap();
+                until("an unasked answer", unasked(1)).await;
+                chord(&t.input, true);
+                chord(&t.input, false);
+                assert_eq!(m.paste_events.get("no_text"), 1);
+                // This slot's offer is this session's.
+                t.rdp
+                    .send(RdpInput::ClipboardAvailable {
+                        slot: 1,
+                        offer: Offer::detached(true),
+                    })
+                    .unwrap();
+                t.rdp.send(marker()).unwrap();
+                until("an unasked answer", unasked(2)).await;
+                chord(&t.input, true);
+                assert_eq!(m.paste_events.get("started"), 1);
+                // A failure ends the paste at once.
+                t.rdp
+                    .send(RdpInput::ClipboardFailed {
+                        slot: 1,
+                        answer: Answer::detached(),
+                    })
+                    .unwrap();
+                until("the paste's abort", || m.paste_events.get("aborted") == 1).await;
+                chord(&t.input, false);
+                // An answer types; a stale slot's answer is dropped first.
+                chord(&t.input, true);
+                t.rdp
+                    .send(RdpInput::ClipboardText {
+                        slot: 2,
+                        bytes: vec![0x41, 0],
+                        answer: Answer::detached(),
+                    })
+                    .unwrap();
+                t.rdp
+                    .send(RdpInput::ClipboardText {
+                        slot: 1,
+                        bytes: vec![0x68, 0, 0x69, 0],
+                        answer: Answer::detached(),
+                    })
+                    .unwrap();
+                chord(&t.input, false); // typing begins once the text is in
+                until("the answer typed", || m.paste_events.get("done") == 1).await;
+                assert_eq!(m.clipboard_discarded.total(), 2, "the stale answer counted");
+                // The oversize answer ends the paste as `oversize`, then the
+                // session.
+                chord(&t.input, true);
+                t.rdp
+                    .send(RdpInput::Fatal {
+                        slot: 1,
+                        cause: Cause::ClipboardOversize,
+                    })
+                    .unwrap();
+                match t.event().await {
+                    ServerEvent::Disconnect(_) => {}
+                    other => panic!("{other:?}"),
+                }
+                assert_eq!(m.paste_events.get("oversize"), 1);
             })
             .await;
     }

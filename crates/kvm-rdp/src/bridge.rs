@@ -17,7 +17,7 @@ use crate::rdp::clipboard::{ClipFactory, ClipSlot, ServerEvents};
 use crate::rdp::display::{BridgeDisplay, DisplayShared};
 use crate::rdp::gfx::{GfxFactory, GfxSlot};
 use crate::rdp::handler::Lifecycle;
-use crate::rdp::input::InputStub;
+use crate::rdp::input::{InputDeps, InputHandler, InputRuntimeConfig, InputShared};
 use crate::rdp::server::{self, ServerParts};
 use crate::rdp::tls::{self, TlsError};
 use ironrdp_server::ServerEvent;
@@ -123,6 +123,9 @@ pub struct BridgeHandle {
     /// Test seam (m5): name an essential KVM-runtime task to make it panic.
     #[cfg(test)]
     faults: watch::Sender<Option<&'static str>>,
+    /// Test seam (PD9 carry 4): the input shell, to check its wiring.
+    #[cfg(test)]
+    input: Arc<InputShared>,
 }
 
 /// Where a test may make an essential task panic (m5): a name it sets on
@@ -177,6 +180,9 @@ struct ShellParts {
     suppressed: Arc<AtomicBool>,
     rtt: Arc<AtomicU32>,
     to_kvm: mpsc::UnboundedSender<KvmCommand>,
+    /// The input shell (§7, §8): the shell routes the clipboard to it, and
+    /// its driver runs on the RDP `LocalSet`.
+    input: Arc<InputShared>,
 }
 
 struct RdpParts {
@@ -188,6 +194,8 @@ struct RdpParts {
     beat: Duration,
     /// The KVM runtime's essential tasks (m5); the shell joins them.
     essential: Essential,
+    /// The fault seam, for the RDP thread's own essential tasks.
+    seam: FaultSeam,
 }
 
 /// The tasks the bridge cannot work without (PC15 review m5), by name.
@@ -247,9 +255,18 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
     let rtt = Arc::new(AtomicU32::new(u32::MAX));
     let gfx_slot = GfxSlot::default();
     let clip_slot = ClipSlot::default();
-    // IronRDP's `ServerEvent` sender, filled inside `RdpServer::new` (D9a);
-    // Task 4.1 hands a clone to the input shell too.
+    // IronRDP's `ServerEvent` sender, filled inside `RdpServer::new` (D9a):
+    // one cell, shared by the clipboard factory that fills it and the input
+    // shell that sends its paste requests on it (PD9 carry 4).
     let server_events = ServerEvents::default();
+    let input = Arc::new(InputShared::new(InputDeps {
+        hid: hid.clone(),
+        display: display.clone(),
+        events: server_events.clone(),
+        gens: gens.clone(),
+        metrics: metrics.clone(),
+        cfg: InputRuntimeConfig::from_config(&cfg),
+    }));
     let pump_cfg = PumpConfig::from_config(&cfg);
     let (to_kvm, kvm_cmds) = mpsc::unbounded_channel();
     let (kvm_tx, kvm_events) = mpsc::channel(kvm_stream_capacity(pump_cfg.hard_cap));
@@ -326,7 +343,7 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
             tls: identity,
             username: cfg.rdp.username.clone(),
             password: cfg.rdp.nla_password.clone(),
-            input: InputStub::new(metrics.clone()),
+            input: InputHandler::new(input.clone()),
             display: BridgeDisplay::new(display.clone(), to_pump.clone()),
             gfx: GfxFactory::new(
                 gfx_slot.clone(),
@@ -365,6 +382,7 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
             suppressed,
             rtt,
             to_kvm: to_kvm.clone(),
+            input: input.clone(),
         },
         rdp_inputs,
         kvm_events,
@@ -376,6 +394,7 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
         ],
         beat: (cfg.admin.liveness_timeout / 4)
             .clamp(Duration::from_millis(10), Duration::from_secs(1)),
+        seam,
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Ready>();
     let rdp_thread = match std::thread::Builder::new()
@@ -421,6 +440,8 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
         _rdp_thread: rdp_thread,
         #[cfg(test)]
         faults,
+        #[cfg(test)]
+        input,
     })
 }
 
@@ -446,9 +467,19 @@ fn rdp_main(p: RdpParts, ready: std::sync::mpsc::Sender<Ready>, done: watch::Sen
             health,
             beat,
             mut essential,
+            seam,
         } = p;
         let mut server = server::build(parts);
         let events = server.event_sender().clone();
+        // §7.4's timers and the Typist's pace: the input core's driver, on
+        // this `LocalSet` beside the handler and the shell that also feed
+        // it. Essential: without it a held key's timer never fires.
+        let driver = tokio::task::spawn_local(fault_point(
+            "input driver",
+            shell.input.clone().run_driver(),
+            &seam,
+        ));
+        essential.push(("input driver", driver));
         let deps = ShellDeps {
             cfg: shell.cfg,
             metrics: shell.metrics,
@@ -459,6 +490,7 @@ fn rdp_main(p: RdpParts, ready: std::sync::mpsc::Sender<Ready>, done: watch::Sen
             suppressed: shell.suppressed,
             rtt: shell.rtt,
             to_kvm: shell.to_kvm,
+            input: shell.input,
         };
         let shell = tokio::task::spawn_local(PumpShell::new(deps).run(rdp_inputs, kvm_events));
         essential.push(("pump shell", shell));
@@ -1887,6 +1919,34 @@ mod tests {
         .await;
     }
 
+    /// The same for the input core's driver, on the RDP thread: without it
+    /// no §7.4 timer fires, and a held key would stay held.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_input_driver_stops_the_bridge() {
+        dies_and_stops_the_bridge("input driver", |h| {
+            h.faults.send_replace(Some("input driver"));
+        })
+        .await;
+    }
+
+    /// PD9 carry 4 (PD8 ruling (d)): the input shell sends its paste
+    /// requests on the bridge's one `ServerEvents` cell — the one the
+    /// clipboard factory hands IronRDP's sender to — so they reach this
+    /// server, not a cell nobody fills.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_input_shell_sends_on_the_servers_own_event_cell() {
+        let sim = sim().await;
+        let d = tempfile::tempdir().unwrap();
+        let h = start(config_for(&sim, d.path(), |_| {})).await.unwrap();
+        let sender = h
+            .input
+            .events_for_test()
+            .get()
+            .expect("the input shell's ServerEvents cell is empty");
+        assert!(sender.same_channel(&h.ctl.events));
+        stop(h).await;
+    }
+
     /// Start a bridge, `kill` one essential task, and require the bridge to
     /// stop: `rdp_done` within 5 s, the listener closed, `ServerStopped`.
     async fn dies_and_stops_the_bridge(task: &str, kill: impl FnOnce(&BridgeHandle)) {
@@ -1962,6 +2022,7 @@ mod tests {
     /// A handle over `control()`'s channels, with no bridge behind it.
     fn handle_over(ctl: Arc<Control>, metrics: Arc<Metrics>) -> BridgeHandle {
         let (_, exit) = watch::channel(false);
+        let (ctl_hid, input_metrics) = (ctl.hid.clone(), metrics.clone());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .build()
@@ -1976,6 +2037,14 @@ mod tests {
             kvm_rt: Some(rt),
             _rdp_thread: std::thread::spawn(|| {}),
             faults: watch::channel(None).0,
+            input: Arc::new(InputShared::new(InputDeps {
+                hid: ctl_hid,
+                display: DisplayShared::new((640, 360)),
+                events: ServerEvents::default(),
+                gens: Arc::new(Generations::default()),
+                metrics: input_metrics,
+                cfg: InputRuntimeConfig::test(),
+            })),
         }
     }
 

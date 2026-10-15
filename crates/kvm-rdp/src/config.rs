@@ -827,7 +827,15 @@ fn build(raw: Raw, base: &Path) -> Result<Config, ConfigError> {
 
     let ri = &raw.input;
     let input = InputConfig {
-        queue: ranged(ri.queue, 256, 1, 4096, "input.queue")?,
+        // PD9 carry 5 (PD7 m4): room for the Typist's 8 reports a step and
+        // typing's start one more (DD6), or typing overflows into a resync.
+        queue: ranged(
+            ri.queue,
+            256,
+            crate::input::paste::TYPIST_ROOM.saturating_add(1),
+            4096,
+            "input.queue",
+        )?,
         hid_write_timeout: dur(
             ri.hid_write_timeout.as_ref(),
             s(1),
@@ -1124,6 +1132,9 @@ pub(crate) mod tests {
             ("[video]\nsps_rewrite = []\n", "no rewrite"),
             ("[video]\nmax_fps = 0\n", "zero fps"),
             ("[input]\nqueue = 0\n", "empty HID queue"),
+            // PD9 carry 5 (PD7 m4): the Typist takes up to 8 reports a
+            // step and typing's start one more (DD6).
+            ("[input]\nqueue = 8\n", "an HID queue below DD6's 9"),
         ] {
             let r = load(d.path(), &format!("{base}{extra}"));
             assert!(
@@ -1140,6 +1151,20 @@ pub(crate) mod tests {
         assert!(
             swap("[kvm]\n", "[kvm]\nscheme = \"ftp\"\n").is_err(),
             "scheme"
+        );
+        // DD6's least queue loads, and the message names the bound only.
+        assert_eq!(
+            load(d.path(), &format!("{base}[input]\nqueue = 9\n"))
+                .unwrap()
+                .input
+                .queue,
+            9
+        );
+        assert_eq!(
+            load(d.path(), &format!("{base}[input]\nqueue = 8\n"))
+                .unwrap_err()
+                .to_string(),
+            "invalid config: input.queue must be between 9 and 4096"
         );
         write(d.path(), "nla.pass", "short\n");
         assert!(
@@ -1346,6 +1371,11 @@ pub(crate) mod tests {
                 "a bad duration",
             ),
             t(format!("{base}[paste]\npace = \"{s}\"\n"), "a bad pace"),
+            // PD9 carry 5 (C1 rule): `input.queue`'s bound changed.
+            t(
+                format!("{base}[input]\nqueue = {n}\n"),
+                "an input.queue out of range",
+            ),
             // DD11 (PD7, C1 rule): `paste.chord` is a validated value now.
             t(format!("{base}[paste]\nchord = \"{s}\"\n"), "a bad chord"),
             t(

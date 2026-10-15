@@ -628,11 +628,11 @@ mod tests {
     mod real_client {
         use super::*;
         use crate::rdp::display::{BridgeDisplay, DisplayShared};
-        use crate::rdp::input::InputStub;
         use crate::rdp::tls;
         use ironrdp_pdu::gcc;
         use ironrdp_pdu::rdp::capability_sets::{MajorPlatformType, RailSupportLevel};
         use ironrdp_server::{Credentials, RdpServer, ServerResult};
+        use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
         use std::future::Future;
         use tokio::net::{TcpListener, TcpStream};
 
@@ -641,6 +641,14 @@ mod tests {
         const PASSWORD: &str = "l1-test-only-nla-password";
         /// A served connection that outlives this is not being aborted.
         const SERVE_BOUND: Duration = Duration::from_secs(5);
+
+        /// These cases send no input; the lifecycle is under test.
+        struct NoInput;
+
+        impl RdpServerInputHandler for NoInput {
+            fn keyboard(&mut self, _: KeyboardEvent) {}
+            fn mouse(&mut self, _: MouseEvent) {}
+        }
 
         fn client_config() -> ironrdp_connector::Config {
             ironrdp_connector::Config {
@@ -745,11 +753,10 @@ mod tests {
             )
             .unwrap();
             let (display_tx, _display_rx) = mpsc::unbounded_channel();
-            let metrics = lifecycle.metrics.clone();
             let mut server = RdpServer::builder()
                 .with_addr(([127, 0, 0, 1], 0))
                 .with_hybrid(id.acceptor, id.public_key)
-                .with_input_handler(InputStub::new(metrics))
+                .with_input_handler(NoInput)
                 .with_display_handler(BridgeDisplay::new(
                     DisplayShared::new((1024, 768)),
                     display_tx,

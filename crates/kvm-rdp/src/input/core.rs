@@ -21,15 +21,25 @@
 //! the chord (raw scancode, raw held bits, before any remap) starts it;
 //! Pending waits, bounded by `paste.modifier_wait`, for the clipboard text
 //! and for every modifier to release; Typing types through the Typist at
-//! `paste.pace`, never more reports per step than `ctx.queue_room` (DD6).
+//! `paste.pace`, never more reports per step than `ctx.queue_room`, and
+//! never more than `TYPIST_ROOM` whatever the shell says (DD6; PD9 carry 5).
 //! Every key the paste swallows is released by the bridge (D3c).
+//!
+//! Clipboard answers are accounted per generation (PD9 carry 3): CLIPRDR
+//! answers data requests in order and IronRDP forwards every answer, asked
+//! or not, so the core counts the requests it has made and not seen
+//! answered, and an answer — text, a failure, the fatal oversize, or one
+//! the backend dropped in flight — belongs to the oldest of them. Only the
+//! Pending paste whose own request that is takes it; any other is
+//! discarded and counted (`late`, or `unasked` with none outstanding), so a
+//! paste never types the answer to an earlier one that timed out.
 //!
 //! Every type here that holds input (`Event`, `Out`, `InputCore`) has a
 //! redacted `Debug` (PD5 ruling, §4.5): kinds, counts and flags only —
 //! pasted text included (PD7 rule).
 use crate::hid::ReleaseTrigger;
 use crate::input::keys::{KeyReport, Keyboard};
-use crate::input::paste::{PasteOutcome, PasteRefusal, ROOM_POLL, State};
+use crate::input::paste::{PasteOutcome, PasteRefusal, ROOM_POLL, State, TYPIST_ROOM};
 use crate::input::pointer::{Button, Pointer};
 use crate::msg::Gen;
 use kvm_proto::hid::HidFrame;
@@ -59,7 +69,7 @@ pub struct Ctx {
     pub multiline_refuse: bool,
     /// `paste.max_chars`.
     pub max_chars: usize,
-    /// The HID queue's free room, `8 - queued` (DD6, D2b): the most Typist
+    /// The HID queue's free room, `TYPIST_ROOM - queued` (DD6, D2b): the most Typist
     /// reports one step may push.
     pub queue_room: usize,
 }
@@ -96,6 +106,15 @@ pub enum Event {
     },
     /// The reassembled `CF_UNICODETEXT` bytes of a clipboard response.
     ClipboardText(Vec<u8>),
+    /// A clipboard response failed (CB_RESPONSE_FAIL, the client's or
+    /// IronRDP's own): one answer, with no text.
+    ClipboardFailed,
+    /// A clipboard response over `paste.max_bytes`: one answer, and the
+    /// session's end (§8; the shell steps it before the close).
+    ClipboardOversize,
+    /// This many answers came while another was in flight to the shell and
+    /// were dropped by the backend (PD8 review m2): answers with no text.
+    ClipboardLost(u32),
     /// A format list said Unicode text is (or is not) on the clipboard: the
     /// core's only availability signal (D9c).
     ClipboardAvailable(bool),
@@ -116,6 +135,9 @@ pub enum Out {
     RequestClipboard,
     /// A paste outcome, for the shell to count (§8).
     Paste(PasteOutcome),
+    /// A clipboard answer no paste took (PD9 carry 3): `"late"` (an earlier
+    /// request's, after its paste ended) or `"unasked"`; never typed.
+    ClipboardDiscarded(&'static str),
 }
 
 /// §4.5 (PD5 ruling; PD7: pasted text is as sensitive as a password): an
@@ -134,6 +156,9 @@ impl std::fmt::Debug for Event {
             Event::MouseButton { .. } => "MouseButton",
             Event::Wheel { .. } => "Wheel",
             Event::ClipboardText(_) => "ClipboardText",
+            Event::ClipboardFailed => "ClipboardFailed",
+            Event::ClipboardOversize => "ClipboardOversize",
+            Event::ClipboardLost(_) => "ClipboardLost",
             Event::ClipboardAvailable(_) => "ClipboardAvailable",
             Event::Tick => "Tick",
         };
@@ -163,6 +188,7 @@ impl std::fmt::Debug for Out {
             Out::Ignored => f.write_str("Ignored"),
             Out::RequestClipboard => f.write_str("RequestClipboard"),
             Out::Paste(p) => f.debug_tuple("Paste").field(p).finish(),
+            Out::ClipboardDiscarded(why) => f.debug_tuple("ClipboardDiscarded").field(why).finish(),
         }
     }
 }
@@ -186,6 +212,25 @@ pub struct InputCore {
     paste: State,
     /// The last format list offered Unicode text (D9c).
     clipboard_text: bool,
+    /// Clipboard requests made this generation whose answer has not come
+    /// (PD9 carry 3a). Within a generation it cannot drift: a request goes
+    /// only after this session's format list, which put IronRDP's CLIPRDR
+    /// in Ready (lib.rs:741) — the one state in which `initiate_paste`
+    /// refuses without a callback — and IronRDP answers locally, through
+    /// the backend, the requests it will not send (its 64-pending cap). A
+    /// request that strays into another connection dies with this one:
+    /// `on_generation` zeroes the count. Saturating; a chord per request.
+    requests: u32,
+}
+
+/// Whose a clipboard answer is (PD9 carry 3a).
+enum Whose {
+    /// The Pending paste's own: its request was the oldest unanswered.
+    Paste,
+    /// An earlier request's, whose paste has ended (or is not this one).
+    Late,
+    /// No request is outstanding.
+    Unasked,
 }
 
 /// §4.5 (PD5 ruling): the keyboard's, pointer's and paste's redacted
@@ -202,6 +247,7 @@ impl std::fmt::Debug for InputCore {
             .field("modifier_idle_armed", &self.modifier_idle_at.is_some())
             .field("paste", &self.paste)
             .field("clipboard_text", &self.clipboard_text)
+            .field("requests", &self.requests)
             .finish()
     }
 }
@@ -226,6 +272,7 @@ impl InputCore {
             modifier_idle_at: None,
             paste: State::Idle,
             clipboard_text: false,
+            requests: 0,
         }
     }
 
@@ -234,11 +281,40 @@ impl InputCore {
         self.generation
     }
 
-    /// A new session: reset everything (its keys are released by the
-    /// shell's own trigger), the paste and the clipboard's availability
-    /// included (D9c). The release epoch it has seen is kept — it is
-    /// `HidControl`'s, not the session's.
-    pub fn on_generation(&mut self, g: Gen) {
+    /// The release epoch of the core's last step: every report it has
+    /// built since carries it (design decision 6).
+    #[must_use]
+    pub fn seen_epoch(&self) -> u64 {
+        self.seen_epoch
+    }
+
+    /// Whether something the core sent may still be down on the KVM: a
+    /// key, a modifier, a button, or a typing paste's press. (A Pending
+    /// paste sent nothing of its own.)
+    #[must_use]
+    pub fn holds_input(&self) -> bool {
+        self.keys.held_modifier_bits() != 0
+            || self.keys.held_nonmodifier_usages() > 0
+            || self.pointer.held_buttons() != 0
+            || matches!(self.paste, State::Typing { .. })
+    }
+
+    /// A new session: reset everything, the paste, the clipboard's
+    /// availability (D9c) and its outstanding requests included. The
+    /// release epoch it has seen is kept — it is `HidControl`'s, not the
+    /// session's.
+    ///
+    /// Nothing is released here: the caller must make sure the KVM holds
+    /// nothing the core forgets — the handler's `SessionStart`/`SessionEnd`
+    /// release comes with every generation change, and `rdp::input` adds
+    /// one should it ever not have (PD6 m3). An active paste's end is
+    /// returned for the shell to count (PD9 carry 2): `Aborted("session")`.
+    #[must_use]
+    pub fn on_generation(&mut self, g: Gen) -> Option<PasteOutcome> {
+        let ended = self
+            .paste
+            .is_active()
+            .then_some(PasteOutcome::Aborted("session"));
         self.keys = Keyboard::default();
         self.pointer = Pointer::default();
         self.generation = g;
@@ -248,6 +324,8 @@ impl InputCore {
         self.modifier_idle_at = None;
         self.paste = State::Idle;
         self.clipboard_text = false;
+        self.requests = 0;
+        ended
     }
 
     #[must_use]
@@ -451,9 +529,73 @@ impl InputCore {
                 }
             }
             Event::ClipboardAvailable(text) => self.clipboard_text = text,
-            Event::ClipboardText(bytes) => self.clipboard_text_arrived(ctx, &bytes, out),
+            Event::ClipboardText(bytes) => match self.answer() {
+                Whose::Paste => self.clipboard_text_arrived(ctx, &bytes, out),
+                other => Self::discard(&other, out),
+            },
+            // PD8 review (b): the paste that asked ends at once, not after
+            // `paste.modifier_wait`.
+            Event::ClipboardFailed => match self.answer() {
+                Whose::Paste => {
+                    self.end_paste(ctx, PasteOutcome::Aborted("clipboard_failed"), out);
+                }
+                other => Self::discard(&other, out),
+            },
+            // The session is ending (the pump's close follows); the paste
+            // that asked is counted as refused for it. Nothing else to do.
+            Event::ClipboardOversize => {
+                if let Whose::Paste = self.answer() {
+                    self.end_paste(ctx, PasteOutcome::Refused(PasteRefusal::Oversize), out);
+                }
+            }
+            // The shell counted these (`in_flight`); they still answer
+            // requests, oldest first. Bounded by the requests outstanding.
+            Event::ClipboardLost(n) => {
+                for _ in 0..n {
+                    match self.answer() {
+                        Whose::Paste => {
+                            self.end_paste(ctx, PasteOutcome::Aborted("clipboard_lost"), out);
+                        }
+                        Whose::Late => {}
+                        Whose::Unasked => break,
+                    }
+                }
+            }
             Event::Tick => self.timers(ctx, out),
         }
+    }
+
+    /// One clipboard answer, in the order the client sends them: it is the
+    /// oldest outstanding request's (PD9 carry 3a). The Pending paste takes
+    /// it only if that request is its own (`ahead` is 0) and no text has
+    /// come — an answer to an earlier paste that timed out or was aborted
+    /// never reaches the next.
+    fn answer(&mut self) -> Whose {
+        let Some(left) = self.requests.checked_sub(1) else {
+            return Whose::Unasked;
+        };
+        self.requests = left;
+        match &mut self.paste {
+            State::Pending {
+                ahead, text: None, ..
+            } => match ahead.checked_sub(1) {
+                None => Whose::Paste,
+                Some(a) => {
+                    *ahead = a;
+                    Whose::Late
+                }
+            },
+            _ => Whose::Late,
+        }
+    }
+
+    /// PD9 carry 3 (a, c): an answer no paste takes is discarded and
+    /// counted, never kept for a later paste.
+    fn discard(whose: &Whose, out: &mut Vec<Out>) {
+        out.push(Out::ClipboardDiscarded(match whose {
+            Whose::Unasked => "unasked",
+            Whose::Paste | Whose::Late => "late",
+        }));
     }
 
     /// §7.4's two timers, from the state as it is now (an epoch release at
@@ -596,17 +738,21 @@ impl InputCore {
             out.push(Out::Paste(PasteOutcome::Refused(why)));
             return;
         }
+        // Its answer comes after those of the requests still unanswered.
         self.paste = State::Pending {
             deadline: deadline(ctx.now, ctx.modifier_wait),
+            ahead: self.requests,
             text: None,
             skipped: 0,
         };
+        self.requests = self.requests.saturating_add(1);
         out.push(Out::Paste(PasteOutcome::Started));
         out.push(Out::RequestClipboard);
     }
 
     /// DD4: only a paste that is Pending and has no text yet takes a
-    /// response; any other response types nothing. Each ill-formed unit is
+    /// response — `answer` has made sure this one is its own (PD9 carry
+    /// 3a); any other response types nothing. Each ill-formed unit is
     /// one U+FFFD that `prepare` skips and counts, so `prepare`'s count is
     /// the whole skip count (adding `decode_utf16le`'s would count each
     /// twice).
@@ -652,8 +798,10 @@ impl InputCore {
     }
 
     /// Every step's tail: Pending's deadline and its move to Typing, then
-    /// Typing's paced, room-bounded reports (DD6, D2b).
+    /// Typing's paced, room-bounded reports (DD6, D2b). The room is
+    /// clamped to `TYPIST_ROOM` whatever the shell reports (PD9 carry 5).
     fn paste_step(&mut self, ctx: &Ctx, out: &mut Vec<Out>) {
+        let room = ctx.queue_room.min(TYPIST_ROOM);
         self.paste = match std::mem::replace(&mut self.paste, State::Idle) {
             State::Pending {
                 text: Some(chars),
@@ -674,7 +822,7 @@ impl InputCore {
                     out.push(Out::Ignored);
                 }
                 self.last_key_activity = None;
-                let mut room = ctx.queue_room;
+                let mut room = room;
                 if held {
                     out.push(Out::Push {
                         frame: r.frame,
@@ -694,15 +842,7 @@ impl InputCore {
                 typed,
                 skipped,
                 next_report_at,
-            } => Self::type_some(
-                ctx,
-                ctx.queue_room,
-                typist,
-                typed,
-                skipped,
-                next_report_at,
-                out,
-            ),
+            } => Self::type_some(ctx, room, typist, typed, skipped, next_report_at, out),
             other => other,
         };
     }
@@ -896,6 +1036,9 @@ mod tests {
             } => format!("MouseButton({button:?}, pressed={pressed}, {x}, {y})"),
             Event::Wheel { units } => format!("Wheel({units})"),
             Event::ClipboardText(b) => format!("ClipboardText({:02x?})", b),
+            Event::ClipboardFailed => "ClipboardFailed".to_owned(),
+            Event::ClipboardOversize => "ClipboardOversize".to_owned(),
+            Event::ClipboardLost(n) => format!("ClipboardLost({n})"),
             Event::ClipboardAvailable(a) => format!("ClipboardAvailable({a})"),
             Event::Tick => "Tick".to_owned(),
         }
@@ -913,6 +1056,7 @@ mod tests {
                 Out::Ignored => "Ignored".to_owned(),
                 Out::RequestClipboard => "RequestClipboard".to_owned(),
                 Out::Paste(p) => format!("Paste({p:?})"),
+                Out::ClipboardDiscarded(why) => format!("ClipboardDiscarded({why})"),
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -1243,7 +1387,7 @@ mod tests {
             code: 0x1E,
             extended: false,
         });
-        r.core.on_generation(2);
+        assert_eq!(r.core.on_generation(2), None, "no paste to end");
         assert_eq!(r.core.next_deadline(), None);
         assert_eq!(r.core.generation(), 2);
     }
@@ -1727,7 +1871,7 @@ mod tests {
             y: 10,
         });
         assert_eq!(r.core.pointer.held_buttons(), 0x01);
-        r.core.on_generation(7);
+        assert_eq!(r.core.on_generation(7), None);
         assert!(r.holds_nothing());
         assert_eq!(r.core.next_deadline(), None);
         assert_eq!(
@@ -2813,11 +2957,18 @@ mod tests {
     #[test]
     fn only_the_first_response_to_a_pending_paste_is_typed() {
         let mut r = Rig::new();
-        assert!(r.step(Event::ClipboardText(utf16le("unasked"))).is_empty());
+        // PD9 carry 3 (c): discarded and counted, nothing else.
+        assert_eq!(
+            r.step(Event::ClipboardText(utf16le("unasked"))),
+            [Out::ClipboardDiscarded("unasked")]
+        );
         hold_chord(&mut r);
         r.step(chord_event());
         r.step(Event::ClipboardText(utf16le("ab")));
-        r.step(Event::ClipboardText(utf16le("WXYZ")));
+        assert_eq!(
+            r.step(Event::ClipboardText(utf16le("WXYZ"))),
+            [Out::ClipboardDiscarded("unasked")]
+        );
         for code in [0x2F, 0x1D, 0x38, 0x2A] {
             r.step(Event::KeyReleased {
                 code,
@@ -2959,7 +3110,10 @@ mod tests {
     fn a_new_generation_ends_the_paste_and_forgets_the_clipboard() {
         let mut r = Rig::new();
         start_paste(&mut r, "abc");
-        r.core.on_generation(2);
+        assert_eq!(
+            r.core.on_generation(2),
+            Some(PasteOutcome::Aborted("session"))
+        );
         assert_eq!(r.core.next_deadline(), None);
         r.advance(Duration::from_millis(5));
         assert!(r.step(Event::Tick).is_empty(), "nothing more is typed");
@@ -3032,7 +3186,7 @@ mod tests {
                 multiline_refuse: false,
                 outcomes: Vec::new(),
             };
-            w.core.on_generation(1);
+            let _ = w.core.on_generation(1);
             w.step(Event::ClipboardAvailable(true));
             w
         }
@@ -3293,6 +3447,292 @@ mod tests {
         }
     }
 
+    // ---- The PD9 carries: clipboard answers, the session boundary, room.
+
+    fn discards(out: &[Out]) -> Vec<&'static str> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::ClipboardDiscarded(why) => Some(*why),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The chord's keys up; the outs of their steps.
+    fn release_chord(r: &mut Rig) -> Vec<Out> {
+        let mut out = Vec::new();
+        for code in [0x2F, 0x1D, 0x38, 0x2A] {
+            out.extend(r.step(Event::KeyReleased {
+                code,
+                extended: false,
+            }));
+        }
+        out
+    }
+
+    /// A paste that waits out `modifier_wait` unanswered.
+    fn time_out_a_paste(r: &mut Rig) {
+        hold_chord(r);
+        assert!(matches!(
+            outcomes(&r.step(chord_event())).as_slice(),
+            [PasteOutcome::Started]
+        ));
+        r.advance(Duration::from_secs(5));
+        assert!(matches!(
+            outcomes(&r.step(Event::Tick)).as_slice(),
+            [PasteOutcome::Aborted("modifier_wait")]
+        ));
+        let _ = release_chord(r);
+    }
+
+    /// PD9 carry 3 (a): CLIPRDR answers in order, so an answer belongs to
+    /// the oldest request still unanswered. A paste's request queued behind
+    /// a timed-out paste's: the first answer is the old one's — discarded
+    /// and counted `late`, never typed — and the second is the paste's.
+    #[test]
+    fn an_answer_is_the_pastes_only_if_it_asked_for_it() {
+        let mut r = Rig::new();
+        time_out_a_paste(&mut r);
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let out = r.step(Event::ClipboardText(utf16le("old")));
+        assert_eq!(discards(&out), ["late"]);
+        assert!(pushes(&out).is_empty());
+        let out = r.step(Event::ClipboardText(utf16le("ok")));
+        assert!(discards(&out).is_empty(), "{}", show(&out));
+        let mut out = release_chord(&mut r); // typing begins
+        let mut typed = Vec::new();
+        for _ in 0..8 {
+            r.advance(Duration::from_millis(1));
+            out.extend(r.step(Event::Tick));
+        }
+        for (f, _) in pushes(&out) {
+            if let HidFrame::Keyboard { keys, .. } = f
+                && keys[0] != 0
+            {
+                typed.push(keys[0]);
+            }
+        }
+        assert!(
+            r.core.paste.deadline().is_none(),
+            "the paste did not end: {}",
+            show(&out)
+        );
+        // 'o' 'k', and nothing of "old" (whose 'l' and 'd' would show).
+        assert_eq!(typed, [0x12, 0x0E], "{}", show(&out));
+        // Nothing is outstanding now: a further answer is unasked.
+        assert_eq!(
+            discards(&r.step(Event::ClipboardText(utf16le("x")))),
+            ["unasked"]
+        );
+    }
+
+    /// PD9 carry 3 (b): a failed answer to the waiting paste ends it at
+    /// once (`clipboard_failed`), long before `modifier_wait`; a failure
+    /// no paste is waiting on is discarded — `late` while a request is
+    /// outstanding, `unasked` when none is.
+    #[test]
+    fn a_failed_answer_ends_the_paste_that_asked() {
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let out = r.step(Event::ClipboardFailed);
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("clipboard_failed")]
+        ));
+        assert!(pushes(&out).is_empty(), "a Pending paste pushed nothing");
+        assert_eq!(r.core.paste.deadline(), None);
+        assert_eq!(discards(&r.step(Event::ClipboardFailed)), ["unasked"]);
+        let _ = release_chord(&mut r);
+        time_out_a_paste(&mut r);
+        assert_eq!(discards(&r.step(Event::ClipboardFailed)), ["late"]);
+        assert!(r.holds_nothing());
+    }
+
+    /// PD9 carry 3 (c): an answer nobody asked for is discarded and
+    /// counted, and kept for nothing: the next paste waits for its own.
+    #[test]
+    fn an_unasked_answer_is_counted_and_not_kept() {
+        let mut r = Rig::new();
+        assert_eq!(
+            discards(&r.step(Event::ClipboardText(utf16le("zz")))),
+            ["unasked"]
+        );
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let mut out = release_chord(&mut r);
+        r.advance(Duration::from_millis(10));
+        out.extend(r.step(Event::Tick));
+        assert!(
+            !out.iter().any(|o| matches!(o, Out::Push { frame, .. }
+                if matches!(frame, HidFrame::Keyboard { keys, .. } if keys[0] != 0))),
+            "the unasked text was typed: {}",
+            show(&out)
+        );
+        assert!(matches!(r.core.paste, State::Pending { text: None, .. }));
+    }
+
+    /// PD9 carry 3 (m2): answers the backend dropped while one was in
+    /// flight are answers too — the paste one of them answered ends at
+    /// once (`clipboard_lost`), and the count stays true for the next. The
+    /// core counts no discard for them (the shell counts `in_flight`); past
+    /// the outstanding requests they change nothing.
+    #[test]
+    fn answers_lost_in_flight_are_answers() {
+        let mut r = Rig::new();
+        time_out_a_paste(&mut r);
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let out = r.step(Event::ClipboardLost(1));
+        assert!(discards(&out).is_empty());
+        assert!(outcomes(&out).is_empty(), "the old paste's answer");
+        let out = r.step(Event::ClipboardLost(u32::MAX));
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("clipboard_lost")]
+        ));
+        assert!(discards(&out).is_empty());
+        let _ = release_chord(&mut r);
+        hold_chord(&mut r);
+        r.step(chord_event());
+        r.step(Event::ClipboardText(utf16le("k")));
+        let _ = release_chord(&mut r);
+        assert_eq!(
+            finish(&mut r),
+            PasteOutcome::Done {
+                typed: 1,
+                skipped: 0
+            }
+        );
+    }
+
+    /// The fatal oversize answer (§8; the shell steps it before the close)
+    /// ends the paste that asked as `Refused(Oversize)`.
+    #[test]
+    fn an_oversize_answer_ends_the_paste_as_oversize() {
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let out = r.step(Event::ClipboardOversize);
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Refused(PasteRefusal::Oversize)]
+        ));
+        assert!(discards(&r.step(Event::ClipboardOversize)).is_empty());
+        assert_eq!(r.core.paste.deadline(), None);
+    }
+
+    /// PD9 carry 2 (PD7): a new generation reports the paste it ends (the
+    /// shell counts it), Pending or Typing, and forgets the requests the
+    /// old one had outstanding — their answers die with its connection, so
+    /// the new session's first answer is its first paste's.
+    #[test]
+    fn a_new_generation_reports_the_paste_it_ends_and_forgets_the_requests() {
+        let mut r = Rig::new();
+        assert_eq!(r.core.on_generation(2), None, "no paste, no outcome");
+        r.step(Event::ClipboardAvailable(true));
+        time_out_a_paste(&mut r);
+        hold_chord(&mut r);
+        r.step(chord_event());
+        assert_eq!(
+            r.core.on_generation(3),
+            Some(PasteOutcome::Aborted("session"))
+        );
+        r.step(Event::ClipboardAvailable(true));
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let out = r.step(Event::ClipboardText(utf16le("k")));
+        assert!(discards(&out).is_empty(), "{}", show(&out));
+        let _ = release_chord(&mut r);
+        assert_eq!(
+            finish(&mut r),
+            PasteOutcome::Done {
+                typed: 1,
+                skipped: 0
+            }
+        );
+        // Typing, too.
+        start_paste(&mut r, "abcdefghij");
+        assert!(matches!(r.core.paste, State::Typing { .. }));
+        assert!(r.core.holds_input(), "a typing paste may hold a press");
+        assert_eq!(
+            r.core.on_generation(4),
+            Some(PasteOutcome::Aborted("session"))
+        );
+        assert!(!r.core.holds_input());
+    }
+
+    /// `holds_input`: what the core sent may still be down on the KVM — a
+    /// key, a modifier, a button, a typing paste's press — and nothing
+    /// else; `seen_epoch` is the epoch of its last step.
+    #[test]
+    fn holds_input_is_exactly_what_may_be_down() {
+        let mut r = Rig::new();
+        assert!(!r.core.holds_input());
+        for (down, up) in [
+            (
+                Event::KeyPressed {
+                    code: 0x1E,
+                    extended: false,
+                },
+                Event::KeyReleased {
+                    code: 0x1E,
+                    extended: false,
+                },
+            ),
+            (
+                Event::KeyPressed {
+                    code: 0x1D,
+                    extended: false,
+                },
+                Event::KeyReleased {
+                    code: 0x1D,
+                    extended: false,
+                },
+            ),
+            (
+                Event::MouseButton {
+                    button: Button::Middle,
+                    pressed: true,
+                    x: 1,
+                    y: 1,
+                },
+                Event::MouseButton {
+                    button: Button::Middle,
+                    pressed: false,
+                    x: 1,
+                    y: 1,
+                },
+            ),
+        ] {
+            r.step(down);
+            assert!(r.core.holds_input());
+            r.step(up);
+            assert!(!r.core.holds_input());
+        }
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let _ = release_chord(&mut r);
+        assert!(!r.core.holds_input(), "a Pending paste sent nothing");
+        r.epoch = 9;
+        r.step(Event::Tick);
+        assert_eq!(r.core.seen_epoch(), 9);
+    }
+
+    /// PD9 carry 5 (PD7 m3): the Typist takes at most eight reports per
+    /// step (DD6) whatever room the shell reports — a shell bug, or a
+    /// larger `8 - queued`, never lets typing outrun the queue.
+    #[test]
+    fn typing_takes_at_most_eight_reports_a_step() {
+        let mut r = Rig::new();
+        r.room = 1000;
+        let out = start_paste(&mut r, "abcdefghijklmnopqrstuvwxyz");
+        assert_eq!(pushes(&out).len(), TYPIST_ROOM, "{}", show(&out));
+        r.advance(Duration::from_millis(1));
+        assert_eq!(pushes(&r.step(Event::Tick)).len(), TYPIST_ROOM);
+    }
+
     // ---- The property: no event or time sequence ends with a key held.
 
     /// xorshift64*: a fixed, seedable sequence for the property test.
@@ -3386,7 +3826,10 @@ mod tests {
                     let _ = hid.push_at(*stamp, *frame, *motion_only);
                 }
                 Out::Release(t) => hid.release_all(*t),
-                Out::Ignored | Out::RequestClipboard | Out::Paste(_) => {}
+                Out::Ignored
+                | Out::RequestClipboard
+                | Out::Paste(_)
+                | Out::ClipboardDiscarded(_) => {}
             }
         }
     }
@@ -3417,8 +3860,9 @@ mod tests {
         }
     }
 
-    /// Every outcome's label, for the coverage count.
-    const OUTCOMES: [&str; 10] = [
+    /// Every outcome's label, for the coverage count (`session` is
+    /// `on_generation`'s).
+    const OUTCOMES: [&str; 14] = [
         "started",
         "no_text",
         "caps_lock",
@@ -3429,6 +3873,10 @@ mod tests {
         "mouse",
         "release",
         "modifier_wait",
+        "clipboard_failed",
+        "clipboard_lost",
+        "oversize",
+        "session",
     ];
 
     fn label(p: &PasteOutcome) -> &'static str {
@@ -3444,16 +3892,16 @@ mod tests {
     }
 
     /// The oracle's paste bookkeeping: a `Started` is open until exactly
-    /// one end (`Done`, an `Aborted`, `Refused(Multiline)`); a refusal at
-    /// the chord (`NoText`, `CapsLock`) opens nothing; `Started` is followed
-    /// at once by `RequestClipboard`; `Oversize` is never the core's.
+    /// one end (`Done`, an `Aborted`, `Refused(Multiline | Oversize)`); a
+    /// refusal at the chord (`NoText`, `CapsLock`) opens nothing; `Started`
+    /// is followed at once by `RequestClipboard`.
     struct PasteOracle {
         open: bool,
         /// The pending paste's deadline: its chord plus `modifier_wait`.
         pending_deadline: Option<Instant>,
         /// The seed's `paste.max_chars`: no paste types more.
         max_chars: usize,
-        fired: [usize; 10],
+        fired: [usize; 14],
     }
 
     impl PasteOracle {
@@ -3597,7 +4045,7 @@ mod tests {
             open: false,
             pending_deadline: None,
             max_chars: 4096,
-            fired: [0; 10],
+            fired: [0; 14],
         };
         let (mut typing_steps, mut roomless_steps) = (0usize, 0usize);
         for seed in 1..=64u64 {
@@ -3611,7 +4059,7 @@ mod tests {
             let hid = HidControl::new(rng.pick(&[4usize, 64]), Arc::new(Metrics::default()));
             let mut dev = Device::default();
             let mut core = InputCore::new();
-            core.on_generation(1);
+            let _ = core.on_generation(1);
             let mut now = Instant::now();
             let mut seen = hid.epoch();
             let mut generation = 1;
@@ -3680,6 +4128,14 @@ mod tests {
                     }
                 }
                 Event::ClipboardText(b)
+            };
+            // Any answer (PD9 carry 3): mostly text; now and then a failure,
+            // the fatal oversize, or answers lost in flight.
+            let answer = |rng: &mut Rng| match rng.below(16) {
+                0 => Event::ClipboardFailed,
+                1 => Event::ClipboardOversize,
+                2 => Event::ClipboardLost(rng.pick(&[1u32, 2, 1_000])),
+                _ => clipboard(rng),
             };
             for i in 0..2_000 {
                 // Pastes are driven on more often than not once one is
@@ -3778,9 +4234,17 @@ mod tests {
                             !dev.holds_a_key() && dev.buttons == 0,
                             "seed {seed} step {i}: the shell's release left the device holding"
                         );
-                        if rng.below(4) == 0 {
+                        // A new session, more often while a paste is open (its
+                        // `session` outcome, PD9 carry 2).
+                        if rng.below(if paste.open { 2 } else { 4 }) == 0 {
                             generation += 1;
-                            core.on_generation(generation);
+                            // PD9 carry 2: the paste it ends is reported.
+                            let ended = core.on_generation(generation);
+                            assert_eq!(ended.is_some(), paste.open, "seed {seed} step {i}");
+                            if let Some(p) = ended {
+                                assert_eq!(p, PasteOutcome::Aborted("session"));
+                                paste.fired[13] += 1;
+                            }
                             assert_eq!(held(&core), (Vec::new(), 0), "seed {seed} step {i}");
                             assert_eq!(core.next_deadline(), None, "seed {seed} step {i}");
                             assert_eq!(phase(&core), Phase::Idle, "seed {seed} step {i}");
@@ -3831,7 +4295,7 @@ mod tests {
                             press(&mut sent_codes, (0x2F, false))
                         }
                     }
-                    28 => clipboard(&mut rng),
+                    28 => answer(&mut rng),
                     29 => Event::ClipboardAvailable(rng.below(4) != 0),
                     30 => {
                         if sent_codes.contains(&ESC) && rng.below(2) == 0 {
@@ -3848,7 +4312,7 @@ mod tests {
                                 if matches!(core.paste, State::Pending { text: None, .. })
                                     && rng.below(4) != 0 =>
                             {
-                                clipboard(&mut rng)
+                                answer(&mut rng)
                             }
                             Phase::Pending => {
                                 let held_mod = sent_codes.iter().copied().find(|c| {

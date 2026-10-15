@@ -2,6 +2,7 @@
 //! and the generation that tags every word of it: `on_connection_info`
 //! begins one, `on_disconnected` ends it before returning, and anything
 //! carrying another generation is dropped (DC4).
+use crate::rdp::clipboard::{Answer, Offer};
 use ironrdp_pdu::rdp::server_error_info::ProtocolIndependentCode;
 use ironrdp_server::{ConnectionAbortHandle, ErrorInfo, GfxServerHandle};
 use kvm_proto::video::{AccessUnit, ParamClass, ParamSets};
@@ -227,27 +228,31 @@ pub enum RdpInput {
     GfxClosed {
         slot: u64,
     },
-    /// The client's format list said whether CF_UNICODETEXT is on its
+    /// The client's format lists say whether CF_UNICODETEXT is on its
     /// clipboard (§8 step 1, D18): the input core's availability (D9c).
+    /// Coalesced (PD8 review m2): one word in flight per connection, and
+    /// `offer.text()` reads the latest list when the shell takes it.
     ClipboardAvailable {
         slot: u64,
-        text: bool,
+        offer: Offer,
     },
     /// A clipboard response's CF_UNICODETEXT bytes, at most
     /// `paste.max_bytes` (§8). As sensitive as a password: never logged,
     /// never Debug-formatted (§9.2) — this enum's `Debug` names the variant
-    /// only.
+    /// only. `answer.lost()` counts the answers dropped behind it (m2).
     ClipboardText {
         slot: u64,
         bytes: Vec<u8>,
+        answer: Answer,
     },
     /// A clipboard response failed (CB_RESPONSE_FAIL): the client's, or
     /// one IronRDP synthesized (its 64-pending overflow; a file list that
     /// fails to parse is passed through raw instead). No text is coming for
-    /// the request it answers; Task 4.1 ends the waiting paste at once (PD8
-    /// review (b)).
+    /// the request it answers; the input core ends the paste waiting on it
+    /// at once (PD8 review (b)). An answer like `ClipboardText`'s.
     ClipboardFailed {
         slot: u64,
+        answer: Answer,
     },
     /// The slot's session must end with `cause` (`clipboard_oversize`,
     /// §8): the shell steps it as `Input::UpstreamFatal` for its current

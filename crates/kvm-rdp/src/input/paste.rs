@@ -15,6 +15,13 @@ use std::time::{Duration, Instant};
 /// short against any pace, long enough that the driver never spins.
 pub const ROOM_POLL: Duration = Duration::from_millis(2);
 
+/// The most Typist reports one step pushes (DD6, D2b): the shell reports
+/// `TYPIST_ROOM − queued` as `Ctx::queue_room`, and the core clamps to it
+/// whatever it is told (PD9 carry 5), so with `input.queue` ≥ 9 typing —
+/// up to 8 reports, and typing's start one more — never overflows the
+/// queue into a resync that would lose characters.
+pub const TYPIST_ROOM: usize = 8;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasteRefusal {
     NoText,
@@ -32,7 +39,10 @@ pub enum PasteOutcome {
         typed: usize,
         skipped: usize,
     },
-    /// `"esc"`, `"key"`, `"mouse"`, `"release"` or `"modifier_wait"`.
+    /// `"esc"`, `"key"`, `"mouse"`, `"release"`, `"modifier_wait"`; the
+    /// answer the paste waited for failed (`"clipboard_failed"`) or was
+    /// dropped in flight (`"clipboard_lost"`); or its session ended
+    /// (`"session"`, from `InputCore::on_generation`).
     Aborted(&'static str),
 }
 
@@ -42,6 +52,10 @@ pub enum State {
     /// release, until `deadline`.
     Pending {
         deadline: Instant,
+        /// Clipboard answers due before this paste's own (PD9 carry 3a):
+        /// the requests still unanswered when it asked. CLIPRDR answers in
+        /// order, so its answer is the one that comes when this is 0.
+        ahead: u32,
         text: Option<Vec<char>>,
         skipped: usize,
     },
@@ -60,8 +74,14 @@ impl std::fmt::Debug for State {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             State::Idle => f.write_str("Idle"),
-            State::Pending { text, skipped, .. } => f
+            State::Pending {
+                ahead,
+                text,
+                skipped,
+                ..
+            } => f
                 .debug_struct("Pending")
+                .field("ahead", ahead)
                 .field("text_chars", &text.as_ref().map(Vec::len))
                 .field("skipped", skipped)
                 .finish_non_exhaustive(),
