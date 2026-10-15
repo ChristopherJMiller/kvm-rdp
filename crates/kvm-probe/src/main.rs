@@ -67,6 +67,19 @@ async fn session<T>(
     .await
 }
 
+/// A line on stdout that can never panic (PD3 I2): after SIGHUP the
+/// terminal is gone, and a HID command's output must not end it early.
+fn say(line: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "{line}");
+}
+
+/// `say` on stderr.
+fn say_err(line: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr(), "{line}");
+}
+
 /// The warning a check that logs in more than once prints before it starts
 /// (token-life, session-cap); `Cli::validate` has already refused it
 /// without `--owner-consent`.
@@ -331,6 +344,9 @@ async fn run(cli: Cli) -> Result<(), String> {
             snapshot,
             settle_ms,
         } => {
+            if let Some(w) = l4::hid::abort_build_warning() {
+                say_err(format_args!("kvm-probe: {w}"));
+            }
             let pw = password(&conn)?;
             let t = target(&conn.endpoint);
             let (ffmpeg, dir) = match &snapshot {
@@ -351,10 +367,14 @@ async fn run(cli: Cli) -> Result<(), String> {
                 _ => None,
             };
             let plan = l4::hid::TypePlan {
-                chars,
-                paces_ms: &paces,
-                runs,
                 snapshots,
+                // A release refused for a lapsed token logs in again, once
+                // (PD3 m7).
+                relogin: Some(l4::hid::Relogin {
+                    web_pin: conn.pin_for(Port::Web),
+                    password: &pw,
+                }),
+                ..l4::hid::TypePlan::new(chars, &paces, runs)
             };
             // Once for the whole command, before the login, so an
             // interrupt at any point is never lost (D34).
@@ -366,7 +386,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     tok,
                     &plan,
                     &mut irq,
-                    |line| println!("{line}"),
+                    |line| say(format_args!("{line}")),
                 )
                 .await
             })
@@ -376,13 +396,27 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::HidRelease { conn, x, y } => {
             let pw = password(&conn)?;
             let t = target(&conn.endpoint);
-            session(&conn, &pw, async |tok: &str| {
-                l4::hid::ensure_released(&t, conn.pin_for(Port::Control), tok, x.zip(y)).await
+            let done = session(&conn, &pw, async |tok: &str| {
+                l4::hid::release(
+                    &t,
+                    conn.pin_for(Port::Control),
+                    tok,
+                    x.zip(y),
+                    l4::hid::RELEASE_WINDOW,
+                )
+                .await
             })
             .await
             .map_err(|e| kvm::bounded_debug(&e))?
             .map_err(|e| kvm::bounded_debug(&e))?;
-            println!("released");
+            // PD3 I1 (c): "released" only when the KVM answered the close
+            // frame; otherwise the session start went out unconfirmed.
+            match done {
+                l4::hid::Released::Confirmed => say(format_args!("released")),
+                l4::hid::Released::Unconfirmed(why) => say(format_args!(
+                    "release UNCONFIRMED: the session start was sent, but {why}; a snapshot must show `held -`"
+                )),
+            }
         }
         Cmd::Snapshot { conn, name } => {
             let pw = password(&conn)?;
@@ -463,7 +497,7 @@ async fn main() {
         e.exit();
     }
     if let Err(e) = run(cli).await {
-        eprintln!("kvm-probe: {e}");
+        say_err(format_args!("kvm-probe: {e}"));
         std::process::exit(1);
     }
 }

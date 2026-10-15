@@ -91,3 +91,21 @@ async fn ws_close_never_reports_an_unanswered_close_as_a_close_frame() {
     assert!(!matches!(r.tcp, TcpEnd::Timeout), "{r:?}");
     assert_eq!(data_frames, 0, "ws-close sent a data frame");
 }
+
+/// PD3 I1 (c): a release is confirmed only when the KVM answers its close
+/// frame — the stub that answers gives `Confirmed`, the one that drops the
+/// connection gives `Unconfirmed`. Either way it got exactly the session
+/// start's two reports and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_is_confirmed_only_by_an_answered_close_frame() {
+    use kvm_probe::l4::hid::{self, Released};
+    for (answer, want) in [(true, true), (false, false)] {
+        let (port, pin, data_frames) = close_stub(answer).await;
+        let r = hid::release(&target(port), Some(&pin), "0.1", None, T)
+            .await
+            .unwrap();
+        assert_eq!(r == Released::Confirmed, want, "answer={answer}: {r:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(data_frames.load(Ordering::SeqCst), 2, "answer={answer}");
+    }
+}

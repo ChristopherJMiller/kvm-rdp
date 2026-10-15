@@ -84,7 +84,29 @@ impl Cli {
             Cmd::LogoutWatch { conn, .. } => {
                 (&conn.endpoint, &[Port::Web, Port::Video, Port::Control])
             }
-            Cmd::HidType { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Control, Port::Video]),
+            Cmd::HidType { conn, paces, .. } => {
+                // PD3 m3/m4: at most 8 paces, none twice (a repeated pace
+                // would repeat a snapshot name, failing after its run).
+                let max = crate::l4::hid::MAX_PACES;
+                let twice = paces
+                    .iter()
+                    .enumerate()
+                    .find(|&(i, p)| paces.iter().take(i).any(|q| q == p));
+                if paces.len() > max || twice.is_some() {
+                    return Err(Cli::command().error(
+                        clap::error::ErrorKind::ValueValidation,
+                        format!(
+                            "--paces takes 1 to {max} values, none twice (got {})",
+                            paces
+                                .iter()
+                                .map(u64::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    ));
+                }
+                (&conn.endpoint, &[Port::Web, Port::Control, Port::Video])
+            }
             Cmd::HidRelease { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Control]),
             Cmd::Snapshot { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Video]),
             Cmd::Fingerprint { .. }
@@ -134,6 +156,17 @@ fn sample_dimension(s: &str) -> Result<usize, String> {
 fn hid_chars(s: &str) -> Result<usize, String> {
     let v: usize = s.parse().map_err(|e| format!("{e}"))?;
     let max = crate::l4::hid::MAX_CHARS;
+    if (1..=max).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("must be in 1..={max}"))
+    }
+}
+
+/// `hid-type --runs` (PD3 m3): 1..=`l4::hid::MAX_RUNS`.
+fn hid_runs(s: &str) -> Result<u32, String> {
+    let v: u32 = s.parse().map_err(|e| format!("{e}"))?;
+    let max = crate::l4::hid::MAX_RUNS;
     if (1..=max).contains(&v) {
         Ok(v)
     } else {
@@ -371,11 +404,12 @@ pub enum Cmd {
         /// Characters per run, 1..=500 (no burst is unbounded).
         #[arg(long, default_value_t = 200, value_parser = hid_chars)]
         chars: usize,
-        /// Milliseconds after each report, each at most 100 (a key is held
-        /// for one pace).
+        /// Milliseconds after each report: 1 to 8 values, none twice, each at
+        /// most 100 (a key is held for one pace).
         #[arg(long, value_delimiter = ',', default_value = "0,5,10,15", value_parser = hid_pace)]
         paces: Vec<u64>,
-        #[arg(long, default_value_t = 3)]
+        /// Runs per pace, 1..=10 (one command's typing is bounded too).
+        #[arg(long, default_value_t = 3, value_parser = hid_runs)]
         runs: u32,
         /// After each run and --settle-ms, a snapshot named
         /// `<PREFIX><pace>_<run>` (e.g. `type0_1`).
@@ -990,6 +1024,38 @@ mod tests {
                 clap::error::ErrorKind::ValueValidation,
                 "{bad:?}"
             );
+        }
+    }
+
+    /// PD3 m3/m4: one command's total typing is bounded too — `--runs`
+    /// 1..=10, at most 8 `--paces`, none given twice (a repeated pace would
+    /// also repeat a snapshot name, which fails after its run has typed).
+    #[test]
+    fn hid_type_bounds_its_runs_and_paces() {
+        let validate = |extra: &[&str]| Cli::try_parse_from(hid_argv("hid-type", extra));
+        assert!(validate(&["--runs", "10"]).unwrap().validate().is_ok());
+        assert!(
+            validate(&["--paces", "0,1,2,3,4,5,6,7"])
+                .unwrap()
+                .validate()
+                .is_ok()
+        );
+        for bad in [&["--runs", "11"][..], &["--runs", "0"]] {
+            let err = validate(bad).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{bad:?}"
+            );
+        }
+        for bad in [&["--paces", "0,1,2,3,4,5,6,7,8"][..], &["--paces", "0,5,0"]] {
+            let err = validate(bad).unwrap().validate().unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{bad:?}"
+            );
+            assert!(err.to_string().contains("--paces"), "{bad:?}: {err}");
         }
     }
 

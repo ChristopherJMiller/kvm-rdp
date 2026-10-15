@@ -97,6 +97,19 @@ mod tests {
         }
     }
 
+    /// PD3 I4: the `rate` line's count is the characters typed (`t.length`),
+    /// timed from the first character to the last — never the keydown count,
+    /// which also counts each shifted character's Shift keydown and would
+    /// overstate the KVM's report rate (by ~39% on the pattern).
+    #[test]
+    fn the_rate_line_counts_only_typed_characters() {
+        assert!(PAGE.contains(r#""\nrate "+t.length+" "+Math.round(l-f)"#));
+        assert!(!PAGE.contains(r#""\nrate "+n"#));
+        // The first and last instants are taken only when a character is
+        // added to the text.
+        assert!(PAGE.contains("if(c){if(!t)f=performance.now();l=performance.now();t+=c}"));
+    }
+
     /// The page's hash is FNV-1a 32 over UTF-16 code units, as `h()` in
     /// the page computes it.
     #[test]

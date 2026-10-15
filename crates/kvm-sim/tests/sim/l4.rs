@@ -399,6 +399,18 @@ async fn a_hid_websocket_starts_the_session_and_types_press_release_pairs() {
             kbd(0, 0),
         ]
     );
+    // PD3 I3: Esc and the first character are never a key sequence. In
+    // zsh's emacs keymap ESC-a is accept-and-hold, which runs the command
+    // line (zsh waits 0.4 s for the second key; readline 0.5 s), so at least
+    // 1 s separates the Esc pair from the first typed character, as the KVM
+    // reads them.
+    let at: Vec<std::time::Instant> = sim
+        .stamped_events()
+        .into_iter()
+        .filter_map(|(at, e)| matches!(e, SimEvent::Hid { .. }).then_some(at))
+        .collect();
+    let gap = at[4].saturating_duration_since(at[3]);
+    assert!(gap >= Duration::from_secs(1), "Esc pair to 'a': {gap:?}");
     w.end(End::CloseFrame).await;
     no_logout(&sim);
 }
@@ -473,6 +485,10 @@ async fn guarded_releases_after_a_failing_body() {
     .await;
     assert!(r.is_err());
     assert_eq!(hid_count(&sim, 1, 2).await, session_start());
+    // PD3 I1: a body that ran and did not end Ok is released twice, the
+    // second time `SECOND_RELEASE_AFTER` later.
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    assert_eq!(ws_opens(&sim), 3);
 }
 
 /// ...and after a body that succeeded with a key still down (the release
@@ -528,6 +544,304 @@ async fn guarded_releases_after_a_panicking_body() {
     let e = r.unwrap_err();
     assert!(format!("{e:?}").contains("panicked"), "{e:?}");
     assert_eq!(hid_count(&sim, 1, 2).await, session_start());
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    assert_eq!(ws_opens(&sim), 3);
+    no_logout(&sim);
+}
+
+const PRESS_A: HidFrame = HidFrame::Keyboard {
+    modifiers: 0,
+    keys: [0x04, 0, 0, 0, 0],
+};
+
+/// Every HID frame kvm-sim read, in order.
+fn all_hid(sim: &KvmSim) -> Vec<Vec<u8>> {
+    sim.events()
+        .into_iter()
+        .filter_map(|e| match e {
+            SimEvent::Hid { bytes, .. } => Some(bytes),
+            _ => None,
+        })
+        .collect()
+}
+
+/// When each websocket opened, as kvm-sim stamped it.
+fn ws_open_times(sim: &KvmSim) -> Vec<std::time::Instant> {
+    sim.stamped_events()
+        .into_iter()
+        .filter_map(|(at, e)| matches!(e, SimEvent::WsOpen { .. }).then_some(at))
+        .collect()
+}
+
+/// PD3 I1 (a): a websocket dropped without `end` — a body abandoned on an
+/// error, a panic or a signal — is reset (`SO_LINGER` 0), so what is
+/// still queued for it is discarded, never delivered after the release.
+/// With kvm-sim's reads paused the writes back up until one times out;
+/// once reads resume, kvm-sim gets fewer frames than were written — never
+/// the whole backlog, as an ordinary close (a FIN) would deliver it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_abandoned_websocket_is_reset_so_its_queued_tail_is_never_delivered() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let mut w = HidWs::open(&target(&sim), Some(sim.spki_sha256()), &token, T)
+        .await
+        .unwrap();
+    hid_count(&sim, 0, 2).await;
+    sim.set_policy(|p| p.pause_ws_reads = true);
+    let mut written = 2usize;
+    while w.send(PRESS_A).await.is_ok() {
+        written += 1;
+        assert!(written < 1_000_000, "the writes never backed up");
+    }
+    drop(w);
+    sim.set_policy(|p| p.pause_ws_reads = false);
+    all_closed(&sim).await;
+    let got = hid_on_ws(&sim, 0).len();
+    assert!(
+        got < written,
+        "the whole backlog was delivered: {got} of {written}"
+    );
+    no_logout(&sim);
+}
+
+/// PD3 I1 (b): what the KVM had already received from an abandoned body
+/// may still be read after the release (kvm-sim reads it once reads
+/// resume), so a body that ran and did not end Ok is released a second
+/// time `SECOND_RELEASE_AFTER` (5 s) after the first: the last frame the
+/// KVM reads is a zero report, never the body's press. Here the first
+/// release goes unanswered (reads paused), reads resume before the
+/// second, and the backlog of presses lands between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guarded_releases_twice_after_a_failed_body_so_its_tail_never_lands_last() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    let resume = async {
+        sim.wait_for(Duration::from_secs(20), |_| ws_opens(&sim) >= 2)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        sim.set_policy(|p| p.pause_ws_reads = false);
+    };
+    let body = async {
+        let mut w = HidWs::open(&t, pin, &token, T).await?;
+        hid_count(&sim, 0, 2).await;
+        sim.set_policy(|p| p.pause_ws_reads = true);
+        loop {
+            w.send(PRESS_A).await?;
+        }
+    };
+    let (r, ()) = tokio::join!(
+        hid::guarded::<()>(&t, pin, &token, None, &mut irq, body),
+        resume
+    );
+    let e = r.unwrap_err();
+    assert!(format!("{e:?}").contains("longer than"), "{e:?}");
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 3, "{:?}", sim.stats());
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
+    let opens = ws_open_times(&sim);
+    let apart = opens[2].saturating_duration_since(opens[1]);
+    assert!(apart >= Duration::from_millis(4500), "{apart:?}");
+    no_logout(&sim);
+}
+
+/// PD3 I1 (c): a release is confirmed only by the KVM's answer to its
+/// close frame. kvm-sim never answers one (it drops the connection), and
+/// with its reads paused it does not even do that: both are unconfirmed,
+/// never "released". (The confirmed case is proven against a stub that
+/// answers, in kvm-probe's `stubs`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_the_kvm_never_answers_is_unconfirmed() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let r = hid::release(&t, pin, &token, None, T).await.unwrap();
+    assert!(matches!(r, hid::Released::Unconfirmed(_)), "{r:?}");
+    sim.set_policy(|p| p.pause_ws_reads = true);
+    let r = hid::release(&t, pin, &token, None, T).await.unwrap();
+    assert_eq!(r, hid::Released::Unconfirmed("no answer within 2 s"));
+    sim.set_policy(|p| p.pause_ws_reads = false);
+    all_closed(&sim).await;
+    assert_eq!(hid_on_ws(&sim, 0), session_start());
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+    no_logout(&sim);
+}
+
+fn refusals(sim: &KvmSim) -> usize {
+    sim.events()
+        .iter()
+        .filter(|e| matches!(e, SimEvent::WsRefused { .. }))
+        .count()
+}
+
+/// PD3 m1: `hid-type` stops at a failed run. Its typing websocket is
+/// refused; the error is the result, the run's section releases (twice,
+/// since its body ran and failed), and no later run types — though the
+/// KVM would take one by then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn type_runs_stops_after_a_failed_run() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let mut irq = hid::Interrupts::new().unwrap();
+    sim.set_policy(|p| p.ws_status = Some(503));
+    let clear = async {
+        sim.wait_for(T, |_| refusals(&sim) >= 1).await.unwrap();
+        sim.set_policy(|p| p.ws_status = None);
+    };
+    let plan = hid::TypePlan::new(3, &[0], 3);
+    let mut lines = Vec::new();
+    let t = target(&sim);
+    let (r, ()) = tokio::join!(
+        hid::type_runs(&t, Some(sim.spki_sha256()), &token, &plan, &mut irq, |l| {
+            lines.push(l)
+        }),
+        clear
+    );
+    let e = r.unwrap_err();
+    assert!(e.contains("refused"), "{e}");
+    assert!(lines.is_empty(), "{lines:?}");
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 2, "a later run started: {:?}", sim.stats());
+    assert_eq!(hid_on_ws(&sim, 0), session_start());
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+    no_logout(&sim);
+}
+
+/// PD3 m1: ...and at a failed release: the run typed, its release cannot
+/// get through within the window, so the result is KEY MAY BE HELD and no
+/// later run types — even once the KVM would take one again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn type_runs_stops_after_a_failed_release() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let mut irq = hid::Interrupts::new().unwrap();
+    let plan = hid::TypePlan {
+        release_window: Duration::from_millis(600),
+        ..hid::TypePlan::new(3, &[0], 3)
+    };
+    let block = async {
+        sim.wait_for(T, |_| ws_opens(&sim) >= 1).await.unwrap();
+        sim.set_policy(|p| p.ws_status = Some(503));
+        sim.wait_for(T, |_| refusals(&sim) >= 2).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        sim.set_policy(|p| p.ws_status = None);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+    };
+    let mut lines = Vec::new();
+    let t = target(&sim);
+    let (r, ()) = tokio::join!(
+        hid::type_runs(&t, Some(sim.spki_sha256()), &token, &plan, &mut irq, |l| {
+            lines.push(l)
+        }),
+        block
+    );
+    let e = r.unwrap_err();
+    assert!(e.contains("KEY MAY BE HELD"), "{e}");
+    assert!(lines.is_empty(), "{lines:?}");
+    assert_eq!(ws_opens(&sim), 1, "a later run started: {:?}", sim.stats());
+    assert!(refusals(&sim) <= 4, "{}", refusals(&sim));
+    no_logout(&sim);
+}
+
+/// PD3 m3/m4 (and the burst bounds): `type_runs` refuses more than
+/// `MAX_RUNS` runs, more than `MAX_PACES` paces, a pace given twice, more
+/// than `MAX_CHARS` characters and a pace past `MAX_PACE` — before it
+/// connects or types anything.
+#[tokio::test]
+async fn type_runs_refuses_its_bounds_before_anything_types() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let mut irq = hid::Interrupts::new().unwrap();
+    let nine: Vec<u64> = (0..9).collect();
+    for (plan, why) in [
+        (hid::TypePlan::new(3, &[0], hid::MAX_RUNS + 1), "--runs"),
+        (hid::TypePlan::new(3, &[0], 0), "--runs"),
+        (hid::TypePlan::new(3, &nine, 1), "--paces"),
+        (hid::TypePlan::new(3, &[0, 5, 0], 1), "twice"),
+        (hid::TypePlan::new(hid::MAX_CHARS + 1, &[0], 1), "--chars"),
+        (hid::TypePlan::new(3, &[101], 1), "--paces"),
+    ] {
+        let e = hid::type_runs(
+            &target(&sim),
+            Some(sim.spki_sha256()),
+            &token,
+            &plan,
+            &mut irq,
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(e.contains(why), "{why}: {e}");
+    }
+    assert_eq!(ws_opens(&sim), 0);
+    assert_eq!(sim.stats().accepts_control, 0);
+}
+
+/// PD3 m7: a release refused for a token that lapsed mid-command logs in
+/// again — once — and releases with the fresh token; that does not
+/// count as a failed run. Once the one fresh login is spent, a release
+/// that is still refused ends in KEY MAY BE HELD, with no further login.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_refused_for_a_lapsed_token_logs_in_again_once() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    let relogin = || hid::Relogin {
+        web_pin: pin,
+        password: sim.password(),
+    };
+    let plan = hid::TypePlan {
+        relogin: Some(relogin()),
+        ..hid::TypePlan::new(3, &[0], 1)
+    };
+    let lapse = async {
+        sim.wait_for(T, |_| ws_opens(&sim) >= 1).await.unwrap();
+        sim.expire_tokens();
+    };
+    let mut lines = Vec::new();
+    // Bounded, so a release path that never stops logging in fails fast.
+    let (r, ()) = tokio::time::timeout(Duration::from_secs(40), async {
+        tokio::join!(
+            hid::type_runs(&t, pin, &token, &plan, &mut irq, |l| lines.push(l)),
+            lapse
+        )
+    })
+    .await
+    .expect("type_runs never returned");
+    r.unwrap();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(sim.stats().logins_ok, 2);
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 2);
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+
+    // Every upgrade refused: one fresh login, then KEY MAY BE HELD.
+    let token = login(&sim).await;
+    let logins = sim.stats().logins_ok;
+    let plan = hid::TypePlan {
+        relogin: Some(relogin()),
+        release_window: Duration::from_millis(600),
+        ..hid::TypePlan::new(3, &[0], 1)
+    };
+    let refuse = async {
+        sim.wait_for(T, |_| ws_opens(&sim) >= 3).await.unwrap();
+        sim.set_policy(|p| p.ws_status = Some(403));
+    };
+    let (r, ()) = tokio::time::timeout(Duration::from_secs(40), async {
+        tokio::join!(
+            hid::type_runs(&t, pin, &token, &plan, &mut irq, |_| {}),
+            refuse
+        )
+    })
+    .await
+    .expect("type_runs never returned");
+    let e = r.unwrap_err();
+    assert!(e.contains("KEY MAY BE HELD"), "{e}");
+    assert_eq!(sim.stats().logins_ok, logins + 1);
     no_logout(&sim);
 }
 
@@ -583,12 +897,7 @@ async fn hid_type_runs_type_each_run_on_its_own_websocket_and_release_after_each
     let sim = sim_with(|_| {}).await;
     let token = login(&sim).await;
     let mut irq = hid::Interrupts::new().unwrap();
-    let plan = hid::TypePlan {
-        chars: 3,
-        paces_ms: &[0, 1],
-        runs: 2,
-        snapshots: None,
-    };
+    let plan = hid::TypePlan::new(3, &[0, 1], 2);
     let mut lines = Vec::new();
     hid::type_runs(
         &target(&sim),
@@ -697,14 +1006,18 @@ async fn snapshot_decodes_one_idr_to_a_png_in_the_sandbox() {
     no_hid(&sim);
 }
 
-// --- Signals (D6, D34). A signal reaches a whole process, so each case
-// runs in a child: this test binary re-run for that one test, with
-// `CHILD_ENV` naming the case. The child prints READY once its HID
-// section is under way, the parent sends the signal (and then SENT on
-// the child's stdin), and the child asserts against its own kvm-sim and
-// prints CHILD-OK.
+// --- Child processes (D6, D34; PD3 I2). A signal reaches a whole
+// process, and a closed stderr is a process's own, so each such case runs
+// in a child: this test binary re-run for that one test, with `CHILD_ENV`
+// naming the case. A signal case's child prints READY once its HID
+// section is under way; the parent sends the signal (and then SENT on the
+// child's stdin). The child asserts against its own kvm-sim and prints
+// CHILD-OK. Every signal's child runs at once, each in its own process.
 
 const CHILD_ENV: &str = "KVM_PROBE_L4_SIGNAL_CHILD";
+
+/// Every signal `Interrupts` catches, as `kill -s` names it.
+const SIGNALS: [&str; 4] = ["TERM", "HUP", "INT", "QUIT"];
 
 /// The name `Interrupts` gives each signal `kill -s` sends.
 fn irq_name(sig: &str) -> &'static str {
@@ -712,18 +1025,22 @@ fn irq_name(sig: &str) -> &'static str {
         "INT" => "Ctrl-C",
         "TERM" => "SIGTERM",
         "HUP" => "SIGHUP",
+        "QUIT" => "SIGQUIT",
         other => panic!("no such signal {other}"),
     }
 }
 
-/// Run `test` in a child with `CHILD_ENV=<sig>`, send it `sig` after its
-/// READY, and assert it ended with CHILD-OK — every wait bounded.
-fn signal_child(test: &str, sig: &str) {
+/// Run `test` in a child with `CHILD_ENV=<mode>` and assert it ended with
+/// CHILD-OK — every wait bounded. With `signal`, send it once the child
+/// prints READY, then write SENT to its stdin. With `close_stderr`, the
+/// child's stderr is a pipe whose read end is already closed: every write
+/// to it fails (EPIPE), as after a closed terminal or an agent's pipe.
+fn run_child(test: &str, mode: &str, signal: Option<&str>, close_stderr: bool) {
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args([test, "--exact", "--nocapture", "--test-threads=1"])
-        .env(CHILD_ENV, sig)
+        .env(CHILD_ENV, mode)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -740,34 +1057,42 @@ fn signal_child(test: &str, sig: &str) {
         }
     });
     let mut stderr = child.stderr.take().unwrap();
-    let err = std::thread::spawn(move || {
-        let mut s = String::new();
-        let _ = std::io::Read::read_to_string(&mut stderr, &mut s);
-        s
-    });
-    let mut seen = Vec::new();
-    let ready = loop {
-        match rx.recv_timeout(Duration::from_secs(30)) {
-            Ok(l) if l.ends_with("READY") => break true,
-            Ok(l) => seen.push(l),
-            Err(_) => break false,
-        }
+    let err = if close_stderr {
+        drop(stderr);
+        None
+    } else {
+        Some(std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut s);
+            s
+        }))
     };
-    if ready {
-        let sent = Command::new("kill")
-            .args(["-s", sig, &child.id().to_string()])
-            .status()
-            .unwrap();
-        assert!(sent.success(), "kill -s {sig} failed");
-        let mut stdin = child.stdin.take().unwrap();
-        let _ = writeln!(stdin, "SENT");
+    let mut seen = Vec::new();
+    let mut ready = signal.is_none();
+    if let Some(sig) = signal {
+        ready = loop {
+            match rx.recv_timeout(Duration::from_secs(30)) {
+                Ok(l) if l.ends_with("READY") => break true,
+                Ok(l) => seen.push(l),
+                Err(_) => break false,
+            }
+        };
+        if ready {
+            let sent = Command::new("kill")
+                .args(["-s", sig, &child.id().to_string()])
+                .status()
+                .unwrap();
+            assert!(sent.success(), "kill -s {sig} failed");
+            let mut stdin = child.stdin.take().unwrap();
+            let _ = writeln!(stdin, "SENT");
+        }
     }
     let started = std::time::Instant::now();
     let status = loop {
         if let Some(s) = child.try_wait().unwrap() {
             break Some(s);
         }
-        if started.elapsed() > Duration::from_secs(60) {
+        if started.elapsed() > Duration::from_secs(90) {
             let _ = child.kill();
             let _ = child.wait();
             break None;
@@ -776,12 +1101,23 @@ fn signal_child(test: &str, sig: &str) {
     };
     out.join().unwrap();
     seen.extend(rx.try_iter());
-    let stderr = err.join().unwrap();
+    let stderr = err.map(|e| e.join().unwrap()).unwrap_or_default();
     assert!(
         ready && status.is_some_and(|s| s.success()) && seen.iter().any(|l| l.contains("CHILD-OK")),
-        "{sig}: ready={ready} status={status:?}\nstdout:\n{}\nstderr:\n{stderr}",
+        "{mode}: ready={ready} status={status:?}\nstdout:\n{}\nstderr:\n{stderr}",
         seen.join("\n")
     );
+}
+
+/// `test`'s child once per signal, all at once.
+fn each_signal(test: &'static str) {
+    let children: Vec<_> = SIGNALS
+        .into_iter()
+        .map(|sig| std::thread::spawn(move || run_child(test, sig, Some(sig), false)))
+        .collect();
+    for c in children {
+        c.join().unwrap();
+    }
 }
 
 /// The child half: a runtime of its own, as `kvm-probe` has.
@@ -793,18 +1129,17 @@ fn child_runtime() -> tokio::runtime::Runtime {
         .unwrap()
 }
 
-/// Ctrl-C, SIGTERM (an agent's tool timeout) and SIGHUP (a closed
-/// terminal) mid-typing, with a key possibly down: `hid-type`'s loop stops
-/// at once, a fresh websocket releases everything, no later run starts,
-/// and the error names the signal.
+/// Ctrl-C, SIGTERM (an agent's tool timeout), SIGHUP (a closed terminal)
+/// and SIGQUIT (Ctrl-\) mid-typing, with a key possibly down: `hid-type`'s
+/// loop stops at once; a fresh websocket releases everything, and since
+/// the run's body was cut off, a second one does 5 s later (PD3 I1); no
+/// later run starts; the error names the signal.
 #[test]
 fn a_signal_mid_typing_still_ends_released() {
     if let Ok(sig) = std::env::var(CHILD_ENV) {
         return child_runtime().block_on(mid_typing_child(irq_name(&sig)));
     }
-    for sig in ["TERM", "HUP", "INT"] {
-        signal_child("l4::a_signal_mid_typing_still_ends_released", sig);
-    }
+    each_signal("l4::a_signal_mid_typing_still_ends_released");
 }
 
 async fn mid_typing_child(name: &str) {
@@ -814,12 +1149,7 @@ async fn mid_typing_child(name: &str) {
     let mut irq = hid::Interrupts::new().unwrap();
     // 50 characters at 100 ms a report: one run takes 10 s, so the signal
     // lands in the first run's typing.
-    let plan = hid::TypePlan {
-        chars: 50,
-        paces_ms: &[100],
-        runs: 3,
-        snapshots: None,
-    };
+    let plan = hid::TypePlan::new(50, &[100], 3);
     let ready = async {
         // The session start, the Esc pair and the first press are out.
         hid_count(&sim, 0, 5).await;
@@ -833,25 +1163,27 @@ async fn mid_typing_child(name: &str) {
     let e = r.unwrap_err();
     assert!(e.contains(&format!("interrupted ({name})")), "{e}");
     assert!(lines.is_empty(), "a run completed: {lines:?}");
-    assert_eq!(hid_count(&sim, 1, 2).await, session_start());
+    all_closed(&sim).await;
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
     assert!(hid_on_ws(&sim, 0).len() < 102, "the run went on typing");
+    assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(ws_opens(&sim), 2, "a run started after the signal");
+    assert_eq!(ws_opens(&sim), 3, "a run started after the signal");
     no_logout(&sim);
     println!("CHILD-OK");
 }
 
 /// A signal that arrives between `guarded` sections (D34: the settle, a
 /// snapshot) is never lost: `check` sees it, and the next section skips
-/// its body but still releases, and so does every section after it.
+/// its body but still releases, and so does every section after it. A
+/// skipped body never ran, so it left nothing to land late: one release.
 #[test]
 fn a_signal_between_sections_is_never_lost() {
     if let Ok(sig) = std::env::var(CHILD_ENV) {
         return child_runtime().block_on(between_child(irq_name(&sig)));
     }
-    for sig in ["TERM", "HUP", "INT"] {
-        signal_child("l4::a_signal_between_sections_is_never_lost", sig);
-    }
+    each_signal("l4::a_signal_between_sections_is_never_lost");
 }
 
 async fn between_child(name: &str) {
@@ -881,11 +1213,7 @@ async fn between_child(name: &str) {
         let r: Result<(), _> = hid::guarded(&t, pin, &token, None, &mut irq, async {
             ran.store(true, Ordering::SeqCst);
             let mut w = HidWs::open(&t, pin, &token, T).await?;
-            w.send(HidFrame::Keyboard {
-                modifiers: 0,
-                keys: [0x04, 0, 0, 0, 0],
-            })
-            .await?;
+            w.send(PRESS_A).await?;
             Ok(())
         })
         .await;
@@ -904,6 +1232,48 @@ async fn between_child(name: &str) {
     assert!(irq.check().is_err());
     assert!(irq.sleep(Duration::from_secs(30)).await.is_err());
     assert_eq!(ws_opens(&sim), 2);
+    no_logout(&sim);
+    println!("CHILD-OK");
+}
+
+/// PD3 I2: a closed stderr (SIGHUP's closed terminal, an agent's closed
+/// pipe) never stops the release. Every print on the release path cannot
+/// fail loudly: the first attempts are refused, their retry lines go
+/// nowhere, and the retries go on until one releases.
+#[test]
+fn a_closed_stderr_never_stops_the_release_retries() {
+    if std::env::var(CHILD_ENV).is_ok() {
+        return child_runtime().block_on(closed_stderr_child());
+    }
+    run_child(
+        "l4::a_closed_stderr_never_stops_the_release_retries",
+        "closed-stderr",
+        None,
+        true,
+    );
+}
+
+async fn closed_stderr_child() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    sim.set_policy(|p| p.ws_status = Some(503));
+    let open = async {
+        sim.wait_for(T, |_| refusals(&sim) >= 2).await.unwrap();
+        sim.set_policy(|p| p.ws_status = None);
+    };
+    let t = target(&sim);
+    let (r, ()) = tokio::join!(
+        hid::ensure_released_within(
+            &t,
+            Some(sim.spki_sha256()),
+            &token,
+            None,
+            Duration::from_secs(20)
+        ),
+        open
+    );
+    r.unwrap();
+    assert_eq!(hid_count(&sim, 0, 2).await, session_start());
     no_logout(&sim);
     println!("CHILD-OK");
 }

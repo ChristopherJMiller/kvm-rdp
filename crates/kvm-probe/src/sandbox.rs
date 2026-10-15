@@ -1224,8 +1224,11 @@ mod tests {
         assert!(err.to_string().contains("sandboxed ffmpeg failed"), "{err}");
         assert!(!err.to_string().contains('\x1b'), "{err:?}");
 
-        let secret = base.join("secret");
-        std::fs::write(&secret, b"do not read").unwrap();
+        // PD3 m2: the planted link points at a real PNG, so only the
+        // no-follow open (never the signature check) can refuse it.
+        let secret = base.join("secret.png");
+        let secret_bytes = [PNG_MAGIC, b"a host file"].concat();
+        std::fs::write(&secret, &secret_bytes).unwrap();
         let planted = run_snapshot_with(ffmpeg, &dir, "s.flv", |_| {
             std::os::unix::fs::symlink(&secret, root.join("s.flv.png")).unwrap();
             Ok(Output {
@@ -1236,7 +1239,7 @@ mod tests {
         });
         assert!(planted.is_err());
         assert!(std::fs::symlink_metadata(root.join("s.flv.png")).is_err());
-        assert_eq!(std::fs::read(&secret).unwrap(), b"do not read");
+        assert_eq!(std::fs::read(&secret).unwrap(), secret_bytes);
 
         let not_png = run_snapshot_with(ffmpeg, &dir, "s.flv", |_| {
             std::fs::write(root.join("s.flv.png"), b"GIF89a").unwrap();
