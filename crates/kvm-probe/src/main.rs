@@ -72,7 +72,7 @@ async fn session<T>(
 /// without `--owner-consent`.
 fn warn_extra_logins(sub: &str) {
     eprintln!(
-        "kvm-probe: {sub} can end other sessions if the KVM evicts its oldest; run it only with the owner's consent"
+        "kvm-probe: {sub} can end the owner's web-UI session if the KVM evicts its oldest at a cap; run it only with the owner's consent"
     );
 }
 
