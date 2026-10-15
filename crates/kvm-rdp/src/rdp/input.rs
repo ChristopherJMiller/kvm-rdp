@@ -298,6 +298,7 @@ impl InputShared {
             PasteOutcome::Refused(PasteRefusal::CapsLock) => "caps_lock",
             PasteOutcome::Refused(PasteRefusal::Multiline) => "multiline",
             PasteOutcome::Refused(PasteRefusal::Oversize) => "oversize",
+            PasteOutcome::Refused(PasteRefusal::Backlog) => "backlog",
             PasteOutcome::Aborted(_) => "aborted",
         };
         self.metrics.paste_events.inc(label);

@@ -248,9 +248,9 @@ enum Whose {
     Unasked,
 }
 
-/// At most this many clipboard requests are remembered (IronRDP's own cap
-/// on unanswered ones, ironrdp-cliprdr's 64): one past it retires the
-/// oldest (PD9 review I2).
+/// At most this many clipboard requests are outstanding (IronRDP's own cap
+/// on unanswered ones, ironrdp-cliprdr's 64): a paste past it is refused
+/// (`Refused(Backlog)`) and asks nothing (PD9 review I2, re-review m-R2).
 pub const MAX_REQUESTS: usize = 64;
 
 /// The least age at which an unanswered clipboard request is retired.
@@ -806,12 +806,15 @@ impl InputCore {
             out.push(Out::Paste(PasteOutcome::Refused(why)));
             return;
         }
-        // Its answer comes after those of the requests still unanswered —
-        // less any retired now (I2), and at most `MAX_REQUESTS` remembered.
+        // Its answer comes after those of the requests still unanswered,
+        // less any retired now (I2). With `MAX_REQUESTS` of them, the paste
+        // is refused here and sends nothing (m-R2): IronRDP would fail the
+        // request itself, and that failure would be taken for the oldest
+        // request's answer.
         self.retire(ctx, out);
         if self.requests.len() >= MAX_REQUESTS {
-            let _ = self.requests.pop_front();
-            out.push(Out::ClipboardDiscarded("unanswered"));
+            out.push(Out::Paste(PasteOutcome::Refused(PasteRefusal::Backlog)));
+            return;
         }
         self.paste = State::Pending {
             deadline: deadline(ctx.now, ctx.modifier_wait),
@@ -3936,15 +3939,27 @@ mod tests {
         );
     }
 
-    /// I2: at most `MAX_REQUESTS` (64, IronRDP's own cap) are remembered;
-    /// a request past it retires the oldest, counted.
+    /// I2, m-R2 (PD9 re-review): at most `MAX_REQUESTS` (64, IronRDP's own
+    /// cap) are outstanding. A paste past it is refused locally (`backlog`)
+    /// and sends no request — IronRDP would fail a 65th itself, and the
+    /// core would take that failure for its oldest request's answer. Once
+    /// the oldest are retired, pastes ask again.
     #[test]
-    fn the_outstanding_requests_are_bounded() {
+    fn a_paste_past_the_outstanding_requests_cap_is_refused_locally() {
         let mut r = Rig::new();
-        let mut discarded = Vec::new();
+        let (mut discarded, mut refused, mut requests) = (Vec::new(), 0, 0);
         for _ in 0..70 {
             hold_chord(&mut r);
-            discarded.extend(discards(&r.step(chord_event())));
+            let out = r.step(chord_event());
+            discarded.extend(discards(&out));
+            refused += outcomes(&out)
+                .iter()
+                .filter(|p| matches!(p, PasteOutcome::Refused(PasteRefusal::Backlog)))
+                .count();
+            requests += out
+                .iter()
+                .filter(|o| matches!(o, Out::RequestClipboard))
+                .count();
             // Esc ends it at once: 70 pastes well inside `request_retire`.
             r.step(Event::KeyPressed {
                 code: 0x01,
@@ -3958,7 +3973,14 @@ mod tests {
             r.advance(Duration::from_millis(1));
         }
         assert_eq!(r.core.requests.len(), MAX_REQUESTS);
-        assert_eq!(discarded, ["unanswered"; 6]);
+        assert_eq!((requests, refused), (MAX_REQUESTS, 6));
+        assert!(discarded.is_empty(), "{discarded:?}");
+        // Past `request_retire` the 64 retire, and a paste asks again.
+        r.advance(Duration::from_secs(60));
+        hold_chord(&mut r);
+        let out = r.step(chord_event());
+        assert_eq!(discards(&out), ["unanswered"; MAX_REQUESTS]);
+        assert!(matches!(outcomes(&out).as_slice(), [PasteOutcome::Started]));
     }
 
     // ---- The property: no event or time sequence ends with a key held.
@@ -4090,7 +4112,7 @@ mod tests {
 
     /// Every outcome's label, for the coverage count (`session` is
     /// `on_generation`'s).
-    const OUTCOMES: [&str; 14] = [
+    const OUTCOMES: [&str; 15] = [
         "started",
         "no_text",
         "caps_lock",
@@ -4105,6 +4127,7 @@ mod tests {
         "clipboard_lost",
         "oversize",
         "session",
+        "backlog",
     ];
 
     fn label(p: &PasteOutcome) -> &'static str {
@@ -4114,6 +4137,7 @@ mod tests {
             PasteOutcome::Refused(PasteRefusal::CapsLock) => "caps_lock",
             PasteOutcome::Refused(PasteRefusal::Multiline) => "multiline",
             PasteOutcome::Refused(PasteRefusal::Oversize) => "oversize",
+            PasteOutcome::Refused(PasteRefusal::Backlog) => "backlog",
             PasteOutcome::Done { .. } => "done",
             PasteOutcome::Aborted(why) => why,
         }
@@ -4129,7 +4153,7 @@ mod tests {
         pending_deadline: Option<Instant>,
         /// The seed's `paste.max_chars`: no paste types more.
         max_chars: usize,
-        fired: [usize; 14],
+        fired: [usize; 15],
     }
 
     impl PasteOracle {
@@ -4150,7 +4174,9 @@ mod tests {
                         self.open = true;
                         self.pending_deadline = Some(now + modifier_wait);
                     }
-                    PasteOutcome::Refused(PasteRefusal::NoText | PasteRefusal::CapsLock) => {
+                    PasteOutcome::Refused(
+                        PasteRefusal::NoText | PasteRefusal::CapsLock | PasteRefusal::Backlog,
+                    ) => {
                         assert!(!self.open, "{at}: a chord refused while a paste is open");
                     }
                     _ => {
@@ -4273,7 +4299,7 @@ mod tests {
             open: false,
             pending_deadline: None,
             max_chars: 4096,
-            fired: [0; 14],
+            fired: [0; 15],
         };
         let (mut typing_steps, mut roomless_steps) = (0usize, 0usize);
         // 96 seeds: every outcome fires 20 times over with a margin (PD9 fix
@@ -4966,7 +4992,12 @@ mod tests {
             "paste outcomes {:?}, typing steps {typing_steps}, roomless {roomless_steps}",
             OUTCOMES.iter().zip(paste.fired).collect::<Vec<_>>()
         );
-        assert!(paste.fired.iter().all(|n| *n >= 20), "{:?}", paste.fired);
+        // All but `backlog`, which needs 64 unanswered pastes inside 60 s.
+        assert!(
+            paste.fired[..14].iter().all(|n| *n >= 20),
+            "{:?}",
+            paste.fired
+        );
         assert!(
             typing_steps > 1_000 && roomless_steps > 20,
             "{typing_steps} {roomless_steps}"

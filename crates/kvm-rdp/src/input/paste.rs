@@ -27,8 +27,11 @@ pub enum PasteRefusal {
     NoText,
     CapsLock,
     Multiline,
-    /// The shell's (Task 3.3): the core never builds it.
+    /// The answer over `paste.max_bytes` (Task 3.3), the session ending.
     Oversize,
+    /// `MAX_REQUESTS` clipboard requests are unanswered: no request is sent
+    /// (PD9 re-review m-R2) until the oldest are retired.
+    Backlog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

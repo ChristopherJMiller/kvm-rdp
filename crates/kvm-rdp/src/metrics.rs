@@ -268,7 +268,7 @@ pub struct Metrics {
     pub accept_refused: Counter,
     pub input_events_ignored: Counter,
     /// §8: every paste's outcome (`started`, `done`, `no_text`,
-    /// `caps_lock`, `multiline`, `oversize`, `aborted`).
+    /// `caps_lock`, `multiline`, `oversize`, `backlog`, `aborted`).
     pub paste_events: Family,
     pub paste_skipped_chars: Counter,
     /// PD9 carry 3: clipboard answers no paste took (`late`, `unasked`), or
