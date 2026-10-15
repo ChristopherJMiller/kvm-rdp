@@ -37,8 +37,7 @@ impl Cli {
     /// with no `Conn` (`sample-range`, `summarize`).
     ///
     /// Final review I4: the check is on the *effective* pin
-    /// (`Conn::pin_for`) of every port the subcommand touches — web (login,
-    /// logout) plus video for `capture`/`first-idr`, web plus control for
+    /// (`Conn::pin_for`) of every port the subcommand touches — web (login) plus video for `capture`/`first-idr`, web plus control for
     /// `ws-open`.
     pub fn validate(&self) -> Result<(), clap::Error> {
         let (conn, ports): (&Conn, &[Port]) = match &self.cmd {
@@ -86,7 +85,7 @@ pub struct Conn {
     #[arg(long, value_enum, default_value_t = SchemeArg::Https)]
     pub scheme: SchemeArg,
     /// SPKI SHA-256 hex from `fingerprint --port 443` (required for https):
-    /// pins the web port (login, logout), and the video and control ports
+    /// pins the web port (login), and the video and control ports
     /// unless --video-pin / --control-pin override it.
     #[arg(long, required_if_eq("scheme", "https"))]
     pub pin: Option<String>,
@@ -101,20 +100,12 @@ pub struct Conn {
     /// File holding the KVM password (never pass it on the command line).
     #[arg(long)]
     pub password_file: PathBuf,
-    /// Log out when the run ends. Off by default: on this KVM, logout is
-    /// global — one session logging out ends every other open session
-    /// too, including an operator's own vendor web UI session — so only
-    /// pass this when you know no one else could be using the KVM. With
-    /// it, logout is best effort and bounded, and a failed logout never
-    /// fails the run.
-    #[arg(long)]
-    pub logout: bool,
 }
 
 /// Which of the KVM's three services a connection goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Port {
-    /// Web UI: login and logout (https 443, http 80).
+    /// Web UI: login (https 443, http 80).
     Web,
     /// `av.flv` (https 8881, http 8880).
     Video,
@@ -144,7 +135,7 @@ impl Port {
         match self {
             Port::Web => {
                 "--pin is required for https (the default scheme): it pins the web \
-                 port 443 used for login and logout. Run `fingerprint --port 443` \
+                 port 443 used for login. Run `fingerprint --port 443` \
                  and pass its output as --pin, or pass --scheme http"
             }
             Port::Video => {
@@ -170,9 +161,8 @@ pub enum Cmd {
     },
     /// Capture av.flv to captures/<name> plus captures/<name>.jsonl.
     ///
-    /// Logs in, captures until --seconds or --max-mb, then leaves the
-    /// session open unless --logout is given (logout is global on this
-    /// KVM). Each JSONL line also carries the hex of any SPS/PPS in the tag.
+    /// Logs in, captures until --seconds or --max-mb, and leaves the session
+    /// open: it never logs out (logout is global on this KVM). Each JSONL line also carries the hex of any SPS/PPS in the tag.
     Capture {
         #[command(flatten)]
         conn: Conn,
@@ -187,9 +177,7 @@ pub enum Cmd {
     ///
     /// Logs in once; every trial reopens av.flv with that one token (the
     /// bridge's reconnect-on-the-same-session path) and times FLV open →
-    /// first IDR; leaves the session open at the end unless --logout is
-    /// given (logout is global on this KVM), in which case it logs out
-    /// once at the end (best effort), also when trials failed. A failed
+    /// first IDR. It never logs out. A failed
     /// trial (a timeout, or the KVM refusing the token) is printed and
     /// counted, and the run goes on; p50/p95 are over the successful
     /// trials. Exits non-zero if the login fails or no trial succeeded.
@@ -201,8 +189,7 @@ pub enum Cmd {
     },
     /// Open the control websocket with the token cookie, then close (no frames sent).
     ///
-    /// Logs in first, then leaves the session open unless --logout is
-    /// given (logout is global on this KVM).
+    /// Logs in first, and never logs out.
     WsOpen {
         #[command(flatten)]
         conn: Conn,
@@ -380,7 +367,7 @@ mod tests {
 
     /// I4: `--video-pin`/`--control-pin` override `--pin` for their own
     /// port only (the ES3's web UI, video server and control server may be
-    /// separate daemons with separate keys); login/logout keep `--pin`.
+    /// separate daemons with separate keys); login keeps `--pin`.
     #[test]
     fn video_and_control_pins_override_pin_for_their_port_only() {
         let c = Cli::try_parse_from([
@@ -424,7 +411,7 @@ mod tests {
 
     /// I4: the https-needs-a-pin check applies to the effective pin of
     /// every port the subcommand touches. Every logged-in subcommand
-    /// touches the web port (login, logout), so a per-port pin alone is
+    /// touches the web port (login), so a per-port pin alone is
     /// not enough without `--pin`.
     #[test]
     fn https_still_needs_the_web_pin_when_only_port_pins_are_given() {
@@ -481,53 +468,27 @@ mod tests {
         }
     }
 
-    /// `--logout` defaults to `false` (the device's logout is global — see
-    /// `Conn::logout`'s doc) and is settable per the shared `Conn` args on
-    /// every logged-in subcommand.
+    /// §3.2, owner: logout is global on the ES3, so no kvm-probe run may
+    /// log out — there is no flag to ask for it on any subcommand.
     #[test]
-    fn logout_flag_defaults_off_and_is_settable() {
-        let c = Cli::try_parse_from([
-            "kvm-probe",
-            "ws-open",
-            "--host",
-            "h",
-            "--pin",
-            "ab",
-            "--password-file",
-            "/tmp/pw",
-        ])
-        .unwrap();
-        assert!(!conn_of(&c).logout);
-
-        let c = Cli::try_parse_from([
-            "kvm-probe",
-            "capture",
-            "--host",
-            "h",
-            "--pin",
-            "ab",
-            "--password-file",
-            "/tmp/pw",
-            "--name",
-            "c.flv",
-            "--logout",
-        ])
-        .unwrap();
-        assert!(conn_of(&c).logout);
-
-        let c = Cli::try_parse_from([
-            "kvm-probe",
-            "first-idr",
-            "--host",
-            "h",
-            "--pin",
-            "ab",
-            "--password-file",
-            "/tmp/pw",
-            "--logout",
-        ])
-        .unwrap();
-        assert!(conn_of(&c).logout);
+    fn logout_is_never_an_argument() {
+        for sub in [
+            vec!["ws-open"],
+            vec!["capture", "--name", "c.flv"],
+            vec!["first-idr"],
+        ] {
+            let mut argv = vec!["kvm-probe"];
+            argv.extend(&sub);
+            argv.extend(["--host", "h", "--pin", "ab", "--password-file", "/tmp/pw"]);
+            assert!(Cli::try_parse_from(&argv).is_ok(), "{sub:?}");
+            argv.push("--logout");
+            let err = Cli::try_parse_from(&argv).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{sub:?}"
+            );
+        }
     }
 
     #[test]

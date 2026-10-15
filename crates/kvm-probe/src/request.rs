@@ -56,14 +56,6 @@ pub fn flv_url(t: &KvmTarget, token: &str) -> String {
         token
     )
 }
-pub fn logout_url(t: &KvmTarget) -> String {
-    format!(
-        "{}://{}:{}/cgi-bin/login.lua?logout",
-        t.scheme.http(),
-        t.host,
-        t.login_port
-    )
-}
 pub fn websocket_url(t: &KvmTarget) -> String {
     format!(
         "{}://{}:{}/websocket",
@@ -104,10 +96,6 @@ mod tests {
         assert_eq!(
             flv_url(&t, "0.12345"),
             "https://192.168.0.50:8881/av.flv?token=0.12345"
-        );
-        assert_eq!(
-            logout_url(&t),
-            "https://192.168.0.50:443/cgi-bin/login.lua?logout"
         );
         assert_eq!(websocket_url(&t), "wss://192.168.0.50:8889/websocket");
         assert_eq!(token_cookie_header("0.12345"), "token=0.12345");

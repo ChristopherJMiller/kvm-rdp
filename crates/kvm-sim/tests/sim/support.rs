@@ -44,6 +44,25 @@ pub async fn login(sim: &KvmSim) -> String {
     .unwrap()
 }
 
+/// `GET /cgi-bin/login.lua?logout` with `token`'s cookie, raw: kvm-probe
+/// cannot log out (logout is global on the ES3, §3.2), but kvm-sim models
+/// it, and these tests exercise the model.
+pub async fn logout(sim: &KvmSim, token: &str) {
+    let mut io = connect_to(&target(sim), sim.ports().web, Some(sim.spki_sha256()))
+        .await
+        .unwrap();
+    let req = format!(
+        "GET /cgi-bin/login.lua?logout HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: token={token}\r\nConnection: close\r\n\r\n"
+    );
+    io.write_all(req.as_bytes()).await.unwrap();
+    let mut head = [0u8; 12];
+    tokio::time::timeout(T, io.read_exact(&mut head))
+        .await
+        .expect("timed out waiting for the logout's answer")
+        .unwrap();
+    assert_eq!(&head, b"HTTP/1.1 200", "{head:?}");
+}
+
 /// A raw `av.flv` reader: request with the token in the query and the
 /// cookie, as the bridge sends it (§3.2), then kvm-proto's demuxer.
 pub struct FlvClient {

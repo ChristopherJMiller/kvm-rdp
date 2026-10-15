@@ -25,28 +25,27 @@ pub fn strip_one_trailing_newline(mut s: String) -> String {
 /// Read the KVM password from `path` — the only place a password may come
 /// from; it is never accepted as a CLI argument or an environment variable
 /// (§9.2). The read is bounded at `MAX_PASSWORD_FILE_BYTES` (refused, not
-/// truncated, past that) and one trailing newline is stripped. Every error
-/// here names only `path`, never the file's contents, and the password
+/// truncated, past that) and one trailing newline is stripped. No error
+/// names the path — a password written where the path goes would otherwise
+/// be echoed (C1 class) — only `--password-file`, the I/O kind or the rule;
+/// none shows the file's contents, and the password
 /// itself is never logged, printed, or included in any error produced
 /// anywhere in this crate.
 pub fn read_password_file(path: &Path) -> Result<String, String> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|_| format!("cannot read password file {}", path.display()))?;
+    let unreadable =
+        |e: std::io::Error| format!("--password-file: cannot read the file: {}", e.kind());
+    let mut file = std::fs::File::open(path).map_err(unreadable)?;
     let cap = MAX_PASSWORD_FILE_BYTES.saturating_add(1);
     let mut limited = (&mut file).take(cap);
     let mut buf = Vec::new();
-    limited
-        .read_to_end(&mut buf)
-        .map_err(|_| format!("cannot read password file {}", path.display()))?;
+    limited.read_to_end(&mut buf).map_err(unreadable)?;
     let len = u64::try_from(buf.len()).unwrap_or(u64::MAX);
     if len > MAX_PASSWORD_FILE_BYTES {
         return Err(format!(
-            "password file {} exceeds the {MAX_PASSWORD_FILE_BYTES}-byte cap",
-            path.display()
+            "--password-file: over the {MAX_PASSWORD_FILE_BYTES}-byte cap"
         ));
     }
-    let text = String::from_utf8(buf)
-        .map_err(|_| format!("password file {} is not valid UTF-8", path.display()))?;
+    let text = String::from_utf8(buf).map_err(|_| "--password-file: not UTF-8".to_owned())?;
     Ok(strip_one_trailing_newline(text))
 }
 
@@ -73,7 +72,7 @@ mod tests {
     fn exactly_4097_bytes_is_refused() {
         let path = tmp_file("4097", &vec![b'x'; 4097]);
         let err = read_password_file(&path).unwrap_err();
-        assert!(err.contains(&path.display().to_string()));
+        assert!(!err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("4096"));
         // The error must never echo the file's contents (a run of the
         // password-filler byte, as opposed to the incidental 'x' in
@@ -104,11 +103,32 @@ mod tests {
     }
 
     #[test]
-    fn error_names_the_path_never_the_contents() {
+    fn errors_never_name_the_path() {
         let missing =
             std::env::temp_dir().join(format!("kvm-probe-secret-missing-{}", std::process::id()));
         let _ = std::fs::remove_file(&missing);
         let err = read_password_file(&missing).unwrap_err();
-        assert!(err.contains(&missing.display().to_string()));
+        assert!(!err.contains(&missing.display().to_string()), "{err}");
+        assert_eq!(
+            err,
+            "--password-file: cannot read the file: entity not found"
+        );
+    }
+
+    /// C1 class (Plan C final review, d7c6dc9): a password pasted where the
+    /// path goes never reaches the terminal through the error.
+    #[test]
+    fn a_password_passed_as_the_path_is_never_echoed() {
+        let err = read_password_file(Path::new("/nonexistent/SNTL7qZq7vP2")).unwrap_err();
+        assert!(!err.contains("SNTL7qZq7vP2"), "{err}");
+        assert!(err.starts_with("--password-file: "), "{err}");
+    }
+
+    #[test]
+    fn a_non_utf8_file_is_named_by_the_flag_only() {
+        let path = tmp_file("notutf8", b"\xff\xfe");
+        let err = read_password_file(&path).unwrap_err();
+        assert_eq!(err, "--password-file: not UTF-8");
+        let _ = std::fs::remove_file(&path);
     }
 }

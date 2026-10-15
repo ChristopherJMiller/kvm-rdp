@@ -1,4 +1,4 @@
-use crate::support::{T, es3_sim, login, target};
+use crate::support::{T, es3_sim, login, logout, target};
 use kvm_sim::{Pacing, PortKind, SimEvent};
 use std::time::Duration;
 
@@ -56,9 +56,7 @@ async fn a_rejecting_policy_fails_even_the_right_password() {
 async fn a_logout_is_recorded_and_counted() {
     let sim = es3_sim(Pacing::Manual).await;
     let a = login(&sim).await;
-    kvm_probe::kvm::logout(&target(&sim), Some(sim.spki_sha256()), &a)
-        .await
-        .unwrap();
+    logout(&sim, &a).await;
     sim.wait_for(T, |e| e.contains(&SimEvent::Logout))
         .await
         .unwrap();

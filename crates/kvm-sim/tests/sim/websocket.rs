@@ -1,4 +1,4 @@
-use crate::support::{T, es3_sim, login, sim_with, target};
+use crate::support::{T, es3_sim, login, logout, sim_with, target};
 use futures_util::{SinkExt, StreamExt};
 use kvm_proto::hid::HidFrame;
 use kvm_sim::{KvmSim, Pacing, SimEvent};
@@ -191,9 +191,7 @@ async fn logout_is_global_but_an_already_open_websocket_survives() {
     })
     .await
     .unwrap();
-    kvm_probe::kvm::logout(&target(&sim), Some(sim.spki_sha256()), &b)
-        .await
-        .unwrap();
+    logout(&sim, &b).await;
     // (a) every token died, including the one that did not log out: a new
     // upgrade with it is refused.
     assert!(ws(&sim, &a, None).await.is_err());

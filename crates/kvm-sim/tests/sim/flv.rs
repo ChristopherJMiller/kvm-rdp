@@ -1,4 +1,4 @@
-use crate::support::{FlvClient, T, es3_sim, flv_raw_request, login, sim_with, target};
+use crate::support::{FlvClient, T, es3_sim, flv_raw_request, login, logout, sim_with};
 use kvm_proto::flv::{FrameType, TagBody, VideoBody};
 use kvm_proto::video::{AdmissionConfig, ParamClass, VideoAdmission};
 use kvm_sim::{KvmSim, Pacing, Profile, ResizeSignal, SimConfig, SimEvent, Source, Timestamps};
@@ -349,9 +349,7 @@ async fn logout_is_global_but_open_streams_survive() {
     let a = login(&sim).await;
     let b = login(&sim).await;
     let mut open = FlvClient::open(&sim, &a).await.unwrap();
-    kvm_probe::kvm::logout(&target(&sim), Some(sim.spki_sha256()), &b)
-        .await
-        .unwrap();
+    logout(&sim, &b).await;
     // Every token died, including the one that did not log out …
     assert_eq!(FlvClient::open(&sim, &a).await.err(), Some(403));
     // … but the FLV opened before the logout keeps streaming.

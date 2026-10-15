@@ -209,111 +209,24 @@ async fn login_inner(
     Ok(token.into_string())
 }
 
-/// Bound for the whole logout exchange (final review m1). Rev 5.1 reversed
-/// §3.2: **the bridge never calls logout**. This bounds kvm-probe's own
-/// optional, best-effort `--logout` for the census runbook only — connect,
-/// handshake, request and response head.
-const LOGOUT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Log out of the KVM session `token` belongs to: `GET` the path of
-/// `request::logout_url` (`/cgi-bin/login.lua?logout`) on the web port,
-/// with the token cookie (§3.1, §3.2), bounded by `LOGOUT_TIMEOUT`. Any 2xx
-/// or 3xx answer counts as logged out; anything else is an error naming
-/// only the status code — the response body (device text) is never read
-/// into it. Callers treat a failure as best effort: report it, carry on.
-pub async fn logout(target: &KvmTarget, pin: Option<&str>, token: &str) -> Result<(), KvmError> {
-    match tokio::time::timeout(LOGOUT_TIMEOUT, logout_inner(target, pin, token)).await {
-        Ok(result) => result,
-        Err(_) => Err(KvmError::Http(format!(
-            "logout timed out after {LOGOUT_TIMEOUT:?}"
-        ))),
-    }
-}
-
-async fn logout_inner(target: &KvmTarget, pin: Option<&str>, token: &str) -> Result<(), KvmError> {
-    // The request target is the origin-form path of the one logout URL
-    // builder (`request::logout_url`), as `login` sends its own path.
-    let url: hyper::Uri = request::logout_url(target)
-        .parse()
-        .map_err(|e| KvmError::Http(format!("logout url: {e}")))?;
-    let path = url
-        .path_and_query()
-        .map(|p| p.as_str().to_string())
-        .ok_or_else(|| KvmError::Http("logout url has no path".into()))?;
-    let io = connect_to(target, target.login_port, pin).await?;
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(io))
-        .await
-        .map_err(|e| KvmError::Http(e.to_string()))?;
-    tokio::spawn(async move {
-        let _ = conn.await;
-    });
-    let req = Request::builder()
-        .method("GET")
-        .uri(path)
-        .header("Host", &target.host)
-        .header("Cookie", request::token_cookie_header(token))
-        .body(http_body_util::Empty::<hyper::body::Bytes>::new())
-        .map_err(|e| KvmError::Http(e.to_string()))?;
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| KvmError::Http(e.to_string()))?;
-    let status = resp.status();
-    if status.is_success() || status.is_redirection() {
-        Ok(())
-    } else {
-        Err(KvmError::Http(format!(
-            "logout http status {}",
-            status.as_u16()
-        )))
-    }
-}
-
 /// The timezone every kvm-probe login reports (`login.lua`'s `timezone`
 /// field): the probe has no reason to reveal the operator's.
 pub const PROBE_TIMEZONE: &str = "UTC";
 
-/// What a logged-in session produced: the work's output, and how its
-/// logout went (final review m1). `logout` is `None` when the caller did
-/// not ask to log out at all (R21: logout is global on the ES3 — see
-/// `with_session`'s `do_logout`), `Some(Err(_))` for a best-effort logout
-/// that failed, `Some(Ok(()))` otherwise.
-#[derive(Debug)]
-pub struct Session<T> {
-    pub output: T,
-    pub logout: Option<Result<(), KvmError>>,
-}
-
-/// Log in, run `work` with the token, then — only when `do_logout` is
-/// true — log out with it, even when the work itself failed (final review
-/// m1). `do_logout` defaults to `false` at the CLI (R21): this device's
-/// `GET /cgi-bin/login.lua?logout` is **global** — it invalidates every
-/// other open session's token too, including an operator's own vendor web
-/// UI session — so a census run must not log out unless the operator
-/// explicitly opted in knowing no one else is using the KVM. A failed
-/// login is the error (there is no token, so nothing to log out); a
-/// failed logout is reported in `Session::logout`, never turned into the
-/// session's error.
+/// Log in and run `work` with the token. There is no logout: on the ES3
+/// `GET /cgi-bin/login.lua?logout` is global — it would end every other
+/// session, the owner's break-glass web UI included (§3.2) — so the token
+/// is simply left to lapse. A failed login is the error.
 pub async fn with_session<T>(
     target: &KvmTarget,
     pin: Option<&str>,
     password: &str,
     now_unix: i64,
     timezone: &str,
-    do_logout: bool,
     work: impl AsyncFnOnce(&str) -> T,
-) -> Result<Session<T>, KvmError> {
+) -> Result<T, KvmError> {
     let token = login(target, pin, password, now_unix, timezone).await?;
-    let output = work(&token).await;
-    let session_logout = if do_logout {
-        Some(logout(target, pin, &token).await)
-    } else {
-        None
-    };
-    Ok(Session {
-        output,
-        logout: session_logout,
-    })
+    Ok(work(&token).await)
 }
 
 /// §9.2's bound on device-influenced text reaching the terminal.
