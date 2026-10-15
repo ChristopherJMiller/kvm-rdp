@@ -201,6 +201,8 @@ struct Seen {
     /// Read from the kernel, so it is exact whatever the stub's tasks were
     /// doing.
     states_at_open: Vec<u8>,
+    /// When it sent its text frame (`LedgerOpts::talk`).
+    talked: Option<Instant>,
 }
 
 const TCP_ESTABLISHED: u8 = 1;
@@ -233,6 +235,10 @@ struct LedgerOpts {
     stall: Option<(usize, usize, Duration)>,
     /// `SO_RCVBUF` on the listener, inherited by each accepted socket.
     rcvbuf: Option<u32>,
+    /// `(n, after)`: connection `n` sends one text frame once it has read
+    /// `after` frames (before any stall) — a KVM that talks on the control
+    /// websocket (PD4 R-I1).
+    talk: Option<(usize, usize)>,
 }
 
 type Ledger = Arc<std::sync::Mutex<Vec<Seen>>>;
@@ -265,6 +271,7 @@ async fn ledger_stub(opts: LedgerOpts) -> (u16, Ledger) {
                     frames: Vec::new(),
                     ended: None,
                     states_at_open,
+                    talked: None,
                 });
                 l.len() - 1
             };
@@ -275,6 +282,16 @@ async fn ledger_stub(opts: LedgerOpts) -> (u16, Ledger) {
                 };
                 let mut stalled = false;
                 let ended = loop {
+                    let talk_now = opts.talk.is_some_and(|(k, after)| {
+                        let l = log.lock().unwrap();
+                        k == n && l[n].talked.is_none() && l[n].frames.len() >= after
+                    });
+                    if talk_now {
+                        let _ =
+                            futures_util::SinkExt::send(&mut ws, Message::Text("status ok".into()))
+                                .await;
+                        log.lock().unwrap()[n].talked = Some(Instant::now());
+                    }
                     if let Some((k, after, d)) = opts.stall
                         && k == n
                         && !stalled
@@ -639,6 +656,7 @@ async fn hid_stale_never_cuts_a_burst_that_does_not_drain() {
     let (port, ledger) = ledger_stub(LedgerOpts {
         stall: Some((0, 2, Duration::from_secs(4))),
         rcvbuf: Some(1),
+        ..LedgerOpts::default()
     })
     .await;
     let mut irq = Interrupts::new().unwrap();
@@ -809,4 +827,187 @@ async fn web_get_bounds_and_escapes_a_hostile_page() {
     }
     let req = stub.requests.lock().unwrap()[0].clone();
     assert!(req.starts_with("GET /about.html HTTP/1.1\r\n"), "{req}");
+}
+
+/// PD4 R-I1, the review's X3: as `hid_stale_never_cuts_a_burst_that_does_not_drain`,
+/// but the KVM sent a text frame after the session start that the probe
+/// never read. Linux closes a socket with unread receive data by an RST,
+/// which purges the queued burst; the probe reads and drops what is
+/// readable first, so the close is a FIN and the stuck handler still gets
+/// all 130 frames, ending on a zero. The run is still loud.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hid_stale_never_cuts_a_burst_that_does_not_drain_even_after_the_kvm_spoke() {
+    use kvm_probe::l4::hid::{self, Interrupts};
+    let (port, ledger) = ledger_stub(LedgerOpts {
+        stall: Some((0, 2, Duration::from_secs(4))),
+        rcvbuf: Some(1),
+        talk: Some((0, 2)),
+    })
+    .await;
+    let mut irq = Interrupts::new().unwrap();
+    let e = hid::hid_stale(
+        &plain(port),
+        None,
+        "0.1",
+        &hid::StalePlan::new(Duration::from_millis(100)),
+        &mut irq,
+        async |_: &str, _: &str| Ok(()),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
+    let e = format!("{e:?}");
+    assert!(e.contains("KEY MAY BE HELD") && e.contains("drain"), "{e}");
+    let seen = all_ended(&ledger, 3, Duration::from_secs(20)).await;
+    assert!(
+        seen[0].talked.is_some(),
+        "the KVM never spoke: the case is not exercised"
+    );
+    assert_eq!(frames(&seen[0]).len(), 130, "the burst was cut");
+    assert_eq!(frames(&seen[0]), whole_burst());
+    assert_eq!(seen[0].ended.as_ref().unwrap().1, Ended::Fin);
+}
+
+/// PD4 R-I1: `End::Fin` is a FIN even when the KVM has sent something the
+/// probe never read (else Linux would reset the connection) — so
+/// `hid-hold --end fin` measures a FIN, and `hid-stale`'s never-drained
+/// close delivers its whole burst.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fin_end_is_a_fin_even_with_unread_kvm_data() {
+    use kvm_probe::l4::hid::{End, HidWs};
+    let (port, ledger) = ledger_stub(LedgerOpts {
+        talk: Some((0, 2)),
+        ..LedgerOpts::default()
+    })
+    .await;
+    let w = HidWs::open(&plain(port), None, "0.1", T).await.unwrap();
+    let deadline = Instant::now() + T;
+    while ledger
+        .lock()
+        .unwrap()
+        .first()
+        .is_none_or(|s| s.talked.is_none())
+    {
+        assert!(Instant::now() < deadline, "the stub never spoke");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Let the text frame land in the probe's receive buffer.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    w.end(End::Fin).await;
+    let seen = all_ended(&ledger, 1, T).await;
+    assert_eq!(frames(&seen[0]), session_start());
+    assert_eq!(seen[0].ended.as_ref().unwrap().1, Ended::Fin);
+}
+
+const NETEM_CHILD: &str = "KVM_PROBE_NETEM_CHILD";
+
+/// PD4 r-m2 (F5): `hold_then_kill`'s drain, where loopback alone cannot
+/// reach it. The test re-runs itself under `unshare -rn` (a user and
+/// network namespace) with `tc qdisc add dev lo root netem delay 600ms`, so
+/// the RTT (1.2 s) outlasts `DRAIN_WINDOW` (1 s): the held press is never
+/// acknowledged in time, so `hold_then_kill` must say KEY MAY BE HELD and
+/// reset the press away. (Without its drain it returns Ok.)
+///
+/// Opt-in, because it needs unprivileged user namespaces (Ubuntu 24.04
+/// restricts them) and `ip` and `tc` with netem on `PATH`; where those are
+/// missing it prints SKIPPED and passes. Run it with:
+///
+/// `nix develop -c cargo test --workspace --all-features --test stubs -- --ignored l4::a_press_that_never_drains_is_loud_on_a_slow_link`
+#[test]
+#[ignore = "opt-in: needs unprivileged user namespaces, ip and tc with netem (see its doc comment)"]
+fn a_press_that_never_drains_is_loud_on_a_slow_link() {
+    use std::io::BufRead as _;
+    use std::process::{Command, Stdio};
+    if std::env::var_os(NETEM_CHILD).is_some() {
+        return netem_child();
+    }
+    let name = "l4::a_press_that_never_drains_is_loud_on_a_slow_link";
+    let script = format!(
+        "ip link set lo up && tc qdisc add dev lo root netem delay 600ms && exec \"$0\" {name} --exact --include-ignored --nocapture --test-threads=1"
+    );
+    let spawned = Command::new("unshare")
+        .args(["-rn", "sh", "-c", &script])
+        .arg(std::env::current_exe().unwrap())
+        .env(NETEM_CHILD, "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let Ok(mut child) = spawned else {
+        println!("SKIPPED: no unshare");
+        return;
+    };
+    let stdout = child.stdout.take().unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let out = std::thread::spawn(move || {
+        std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+            .collect::<Vec<_>>()
+    });
+    let err = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut s);
+        s
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break Some(s);
+        }
+        if started.elapsed() > Duration::from_secs(90) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let lines = out.join().unwrap();
+    let stderr = err.join().unwrap();
+    if !lines.iter().any(|l| l.contains("NETEM-READY")) {
+        println!("SKIPPED: the namespace or netem could not be set up: {stderr}");
+        return;
+    }
+    assert!(
+        status.is_some_and(|s| s.success()) && lines.iter().any(|l| l.contains("CHILD-OK")),
+        "status={status:?}\nstdout:\n{}\nstderr:\n{stderr}",
+        lines.join("\n")
+    );
+}
+
+/// The child half: inside the namespace, with the slow loopback.
+fn netem_child() {
+    use kvm_probe::l4::hid::End;
+    use kvm_probe::l4::hold;
+    println!("NETEM-READY");
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (port, ledger) = ledger_stub(LedgerOpts::default()).await;
+        let e = hold::hold_then_kill(
+            &plain(port),
+            None,
+            "0.1",
+            hold::HOLD_USAGE,
+            End::Fin,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        let e = format!("{e:?}");
+        assert!(
+            e.contains("never drained") && e.contains("KEY MAY BE HELD"),
+            "{e}"
+        );
+        let seen = all_ended(&ledger, 1, Duration::from_secs(20)).await;
+        assert_eq!(
+            seen[0].ended.as_ref().unwrap().1,
+            Ended::Reset,
+            "the undrained press was not reset away"
+        );
+    });
+    println!("CHILD-OK");
 }

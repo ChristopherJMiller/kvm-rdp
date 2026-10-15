@@ -73,6 +73,12 @@ pub const DRAIN_WINDOW: Duration = Duration::from_secs(1);
 /// IDR wait is 5 s, then the sandboxed decode): a key held through it is
 /// held for a bounded time.
 pub const SHOT_WINDOW: Duration = Duration::from_secs(10);
+/// PD4 R-I1: what `End::Fin` reads and drops before closing, at most: the
+/// websocket messages already readable, within a time bound, then the raw
+/// bytes still in the kernel's receive queue.
+const DISCARD_MESSAGES: usize = 64;
+const DISCARD_WINDOW: Duration = Duration::from_millis(100);
+const DISCARD_BYTES: usize = 64 * 1024;
 
 pub const KBD_ZERO: HidFrame = HidFrame::Keyboard {
     modifiers: 0,
@@ -293,14 +299,49 @@ impl HidWs {
     /// write by `WRITE_TIMEOUT` (a KVM that stopped reading cannot stall
     /// it), the wait for the KVM's close by 2 s. `CloseFrame` and `Fin`
     /// close in order (a FIN delivers what was sent); `Reset` resets.
+    /// `Fin` first drops whatever the KVM sent that is still unread: Linux
+    /// closes a socket with unread receive data by an RST, which would
+    /// purge what is queued (PD4 R-I1).
     pub async fn end(mut self, how: End) {
         match how {
             End::CloseFrame => {
                 let _ = self.close_and_wait().await;
             }
-            End::Fin => self.ended = true,
+            End::Fin => {
+                self.discard_unread();
+                self.ended = true;
+            }
             // Not ended: the drop resets.
             End::Reset => {}
+        }
+    }
+
+    /// PD4 R-I1: read and drop what the KVM sent and the probe never read,
+    /// so that closing sends a FIN. First every websocket message already
+    /// readable — at most `DISCARD_MESSAGES` and `DISCARD_WINDOW`, stopping
+    /// at the first error, the end of the stream, or when none is ready —
+    /// then, from the socket's second descriptor (non-blocking, shared with
+    /// the connection), any bytes still in the kernel's receive queue that
+    /// no message held yet, up to `DISCARD_BYTES`. The connection is closed
+    /// right after, so breaking its TLS framing costs nothing.
+    fn discard_unread(&mut self) {
+        let started = Instant::now();
+        for _ in 0..DISCARD_MESSAGES {
+            if started.elapsed() >= DISCARD_WINDOW {
+                break;
+            }
+            match self.ws.next().now_or_never() {
+                Some(Some(Ok(_))) => {}
+                Some(Some(Err(_)) | None) | None => break,
+            }
+        }
+        let mut buf = [0u8; 4096];
+        let mut left = DISCARD_BYTES;
+        while left > 0 {
+            match std::io::Read::read(&mut &self.sock, &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => left = left.saturating_sub(n),
+            }
         }
     }
 

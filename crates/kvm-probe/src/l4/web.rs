@@ -20,8 +20,8 @@ pub const GET_TIMEOUT: Duration = Duration::from_secs(10);
 /// The most characters after the leading `/` (PD4 m3).
 pub const MAX_PATH: usize = 128;
 
-/// The static files `web-get` fetches, by extension (any case); otherwise
-/// only `/` or a directory (a trailing `/`).
+/// The static files `web-get` fetches, by extension (any case); the only
+/// other path it fetches is `/` itself.
 pub const STATIC_EXTENSIONS: [&str; 7] = [".html", ".htm", ".js", ".css", ".txt", ".json", ".xml"];
 
 #[derive(Debug, Clone)]
@@ -31,19 +31,22 @@ pub struct Page {
     pub snippet: String,
 }
 
-/// PD4 m3: an allowlist. A path passes only if it is `/` followed by at
-/// most `MAX_PATH` characters of `[A-Za-z0-9._/-]` (so no query, fragment,
-/// percent-escape, `;`, space or control byte); has no `..`, `.lua`,
-/// `.cgi`, `cgi-bin`, `login` or `logout` anywhere (any case); has no
-/// empty segment but a trailing one and no segment starting with `.`
-/// (so no `.`, `..` or dotfile); and names a directory (`/`, or a trailing
-/// `/`) or a static file (`STATIC_EXTENSIONS`). Everything else — a
-/// script, an extensionless name, a backup — is refused.
+/// PD4 m3, r-m1: an allowlist. A path passes only if it is `/` itself, or
+/// `/` followed by at most `MAX_PATH` characters of `[A-Za-z0-9._/-]` (so
+/// no query, fragment, percent-escape, `;`, space or control byte) with no
+/// `..`, `.lua`, `.cgi`, `cgi-bin`, `login` or `logout` anywhere (any
+/// case), no empty segment and no segment starting with `.` (so no `.`,
+/// `..` or dotfile), naming a static file (`STATIC_EXTENSIONS`). Everything
+/// else is refused: a script, an extensionless name, a backup, and any
+/// directory but `/` (its index can be a script).
 pub fn check_path(path: &str) -> Result<(), String> {
     let refuse = |why: &str| Err(format!("web-get fetches only a static page's path: {why}"));
     let Some(rest) = path.strip_prefix('/') else {
         return refuse("it must start with /");
     };
+    if rest.is_empty() {
+        return Ok(());
+    }
     if rest.len() > MAX_PATH {
         return refuse("it is too long");
     }
@@ -60,17 +63,11 @@ pub fn check_path(path: &str) -> Result<(), String> {
     {
         return refuse("never .., a script, CGI, login or logout");
     }
-    let mut segments = lower.split('/').peekable();
-    while let Some(s) = segments.next() {
-        let last = segments.peek().is_none();
-        if (s.is_empty() && !last) || s.starts_with('.') {
-            return refuse("no empty segment, . segment or dotfile");
-        }
-        if last && !s.is_empty() && !STATIC_EXTENSIONS.iter().any(|e| s.ends_with(e)) {
-            return refuse(
-                "only a directory (ending in /) or a .html .htm .js .css .txt .json .xml file",
-            );
-        }
+    if lower.split('/').any(|s| s.is_empty() || s.starts_with('.')) {
+        return refuse("no empty segment (so no directory but /), . segment or dotfile");
+    }
+    if !STATIC_EXTENSIONS.iter().any(|e| lower.ends_with(e)) {
+        return refuse("only / or a .html .htm .js .css .txt .json .xml file");
     }
     Ok(())
 }
@@ -141,9 +138,9 @@ async fn get_inner(t: &KvmTarget, pin: Option<&str>, path: &str) -> Result<Page,
 mod tests {
     use super::*;
 
-    /// PD4 m3: an allowlist — `/`, a directory (`…/`) or a static file
-    /// (`.html .htm .js .css .txt .json .xml`, any case) under at most 128
-    /// characters of `[A-Za-z0-9._/-]` — passes.
+    /// PD4 m3, r-m1: an allowlist — `/` itself, or a static file (`.html .htm
+    /// .js .css .txt .json .xml`, any case) under at most 128 characters of
+    /// `[A-Za-z0-9._/-]` — passes.
     #[test]
     fn only_a_static_path_passes() {
         // The ruling's 128, as literals: a bound derived from `MAX_PATH`
@@ -157,7 +154,7 @@ mod tests {
             "/About.HTM",
             "/static/js/app.min.js",
             "/css/site.css",
-            "/a_b-c/",
+            "/a_b-c/d.html",
             "/version.txt",
             "/api/info.json",
             "/sitemap.xml",
@@ -223,6 +220,14 @@ mod tests {
             "/signout",
             "/upload",
             "/x.html.bak",
+            // r-m1: no directory but `/` itself — an index can be a script.
+            "/x/",
+            "/cgi/",
+            "/upload/",
+            "/static/",
+            "/a_b-c/",
+            "/about.html/",
+            "/css/site.css/",
             "x.html",
             "",
             "http://evil/x.html",
