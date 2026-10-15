@@ -41,9 +41,10 @@
 //! text). So each request keeps its instant, and one `request_retire` old
 //! (`max(60 s, 2 × paste.modifier_wait)`: never a waiting paste's own) is
 //! retired, counted `unanswered`, when the next paste starts or the next
-//! answer comes — no timer of its own. An answer later than that may pair
-//! with a newer request: its content is still the client's clipboard, and
-//! a transit stall that long is a stalled session (accepted residual).
+//! answer comes — no timer of its own. Two residuals remain, accepted (PD9
+//! re-review; see `retire`): a never-answering client's drift heals only
+//! after a `request_retire` pause in paste attempts, and an answer later
+//! than that can be typed by a newer paste.
 //!
 //! Every type here that holds input (`Event`, `Out`, `InputCore`) has a
 //! redacted `Debug` (PD5 ruling, §4.5): kinds, counts and flags only —
@@ -640,6 +641,23 @@ impl InputCore {
     /// (at most half that age) with no step since to end it: this step's
     /// `paste_step` ends it (`modifier_wait`), and no answer can reach it —
     /// none is outstanding after its own.
+    ///
+    /// Two residuals, accepted (PD9 re-review m-R1; rev 6.3):
+    /// - Retirement goes by age, so with a client that leaves a request
+    ///   unanswered, a paste made before that request is `request_retire`
+    ///   old takes the phantom's slot with its own prompt answer (discarded,
+    ///   `late`), and its own request becomes the phantom, with a fresh age:
+    ///   retrying within 60 s moves the drift forward, and only a
+    ///   `request_retire` pause in paste attempts heals it. Ending the chain
+    ///   would mean letting a paste take an answer while an older request
+    ///   may still be answered — what carry 3a forbids
+    ///   (`a_late_answer_is_never_typed_by_the_next_paste`).
+    /// - An answer more than `request_retire` late, once its request is
+    ///   retired, pairs with a newer one and can be typed. CLIPRDR's format
+    ///   data responses carry no request id to tell them apart, and with
+    ///   delayed rendering a merely slow answer carries the clipboard as of
+    ///   answering; stale content needs a transport stall over 60 s, which
+    ///   `video.stall_timeout` (10 s) ends as `client_stalled` first.
     fn retire(&mut self, ctx: &Ctx, out: &mut Vec<Out>) {
         let after = request_retire(ctx.modifier_wait);
         while let Some(at) = self.requests.front().copied() {
