@@ -21,5 +21,6 @@ pub mod h264;
 pub mod hid;
 pub mod keymap;
 pub mod login;
+pub mod paste;
 pub mod video;
 pub use login::{LoginError, Token, parse_login_token};

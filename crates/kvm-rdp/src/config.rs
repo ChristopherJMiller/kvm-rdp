@@ -242,10 +242,11 @@ pub struct InputConfig {
     pub mac_remap: bool,
 }
 
-/// `paste.*` — parsed and validated now, consumed by Plan D.
+/// `paste.*` (§8). `chord` is parsed at load (DD11); it is config, not
+/// input, so the derived `Debug` is safe.
 #[derive(Debug, Clone)]
 pub struct PasteConfig {
-    pub chord: String,
+    pub chord: kvm_proto::keymap::Chord,
     pub pace: Duration,
     pub max_chars: usize,
     pub max_bytes: usize,
@@ -845,13 +846,15 @@ fn build(raw: Raw, base: &Path) -> Result<Config, ConfigError> {
         mac_remap: ri.mac_remap.unwrap_or(false),
     };
     let rp = &raw.paste;
-    let chord = rp
-        .chord
-        .clone()
-        .unwrap_or_else(|| "ctrl+option+shift+v".to_owned());
-    if chord.is_empty() {
-        return Err(invalid("paste.chord must not be empty"));
-    }
+    // DD11: one or more distinct modifiers, then one letter or digit. The
+    // message is fixed: it never echoes the value (C1).
+    let chord_text = rp.chord.as_deref().unwrap_or("ctrl+option+shift+v");
+    let chord = kvm_proto::keymap::Chord::parse(chord_text).ok_or_else(|| {
+        invalid(
+            "paste.chord must be one or more modifiers (ctrl/shift/alt/option/cmd/win) \
+             then one letter or digit, e.g. \"ctrl+option+shift+v\"",
+        )
+    })?;
     let paste = PasteConfig {
         chord,
         pace: dur_or_zero(rp.pace.as_ref(), ms(15), "paste.pace")?,
@@ -1002,8 +1005,12 @@ pub(crate) mod tests {
         assert_eq!((i.modifier_idle_timeout, i.mac_remap), (s(30), false));
         let p = &c.paste;
         assert_eq!(
-            (p.chord.as_str(), p.pace, p.max_chars),
-            ("ctrl+option+shift+v", ms(15), 4096)
+            (p.chord, p.pace, p.max_chars),
+            (
+                kvm_proto::keymap::Chord::parse("ctrl+option+shift+v").unwrap(),
+                ms(15),
+                4096
+            )
         );
         assert_eq!(
             (p.max_bytes, p.modifier_wait, p.multiline),
@@ -1016,6 +1023,36 @@ pub(crate) mod tests {
         assert_eq!(c.log.filter, "info");
         assert_eq!(c.kvm.password.expose(), "kvm-secret");
         assert_eq!(c.rdp.nla_password.expose(), NLA);
+    }
+
+    /// DD11: `paste.chord` is parsed at load — one or more distinct
+    /// modifiers, then one letter or digit. A chord with no modifier would
+    /// swallow plain typing; one that cannot parse would never fire.
+    #[test]
+    fn the_paste_chord_parses_at_load() {
+        let d = tempfile::tempdir().unwrap();
+        let c = load(d.path(), &minimal(d.path())).unwrap();
+        assert_eq!(
+            c.paste.chord,
+            kvm_proto::keymap::Chord::parse("ctrl+option+shift+v").unwrap()
+        );
+        let bad = format!("{}[paste]\nchord = \"v\"\n", minimal(d.path()));
+        assert!(load(d.path(), &bad).is_err(), "a chord with no modifier");
+        // Beyond the plan's listing: any spelling Chord::parse takes loads;
+        // anything else is the fixed rule message, never the value.
+        let with = |chord: &str| format!("{}[paste]\nchord = \"{chord}\"\n", minimal(d.path()));
+        let c = load(d.path(), &with("Cmd + 1")).unwrap();
+        assert_eq!(
+            c.paste.chord,
+            kvm_proto::keymap::Chord::parse("cmd+1").unwrap()
+        );
+        for bad in ["", "ctrl+ctrl+v", "ctrl+f1", "ctrl+", "shift+ctrl"] {
+            let e = load(d.path(), &with(bad)).unwrap_err().to_string();
+            assert!(
+                e.starts_with("invalid config: paste.chord must be"),
+                "{bad:?}: {e}"
+            );
+        }
     }
 
     /// Review Focus 2: `echo` adds `\n`, Windows adds `\r\n`; exactly one
@@ -1309,6 +1346,20 @@ pub(crate) mod tests {
                 "a bad duration",
             ),
             t(format!("{base}[paste]\npace = \"{s}\"\n"), "a bad pace"),
+            // DD11 (PD7, C1 rule): `paste.chord` is a validated value now.
+            t(format!("{base}[paste]\nchord = \"{s}\"\n"), "a bad chord"),
+            t(
+                format!("{base}[paste]\nchord = \"ctrl+{s}\"\n"),
+                "a chord whose key is a word",
+            ),
+            t(
+                format!("{base}[paste]\nchord = \"{s}+v\"\n"),
+                "a chord whose modifier is a word",
+            ),
+            t(
+                format!("{base}[paste]\nchord = {n}\n"),
+                "a number where a chord goes",
+            ),
             t(
                 video(format!("default_size = \"{s}\"")),
                 "a bad default size",
