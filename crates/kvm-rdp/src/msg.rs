@@ -243,8 +243,9 @@ pub enum RdpInput {
     },
     /// A clipboard response failed (CB_RESPONSE_FAIL): the client's, or
     /// one IronRDP synthesized (its 64-pending overflow; a file list that
-    /// fails to parse is passed through raw instead). No text is coming for the request it answers; Task 4.1
-    /// ends the waiting paste at once (PD8 review (b)).
+    /// fails to parse is passed through raw instead). No text is coming for
+    /// the request it answers; Task 4.1 ends the waiting paste at once (PD8
+    /// review (b)).
     ClipboardFailed {
         slot: u64,
     },
