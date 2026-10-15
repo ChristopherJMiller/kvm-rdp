@@ -104,6 +104,21 @@ mod tests {
         (sim, ep, token)
     }
 
+    /// Final review I1 (§7.3): the websocket's socket has its send buffer
+    /// set before connect — locked at `CONTROL_SNDBUF` (Linux reports it
+    /// doubled), never autotuned (2.6 MB on loopback).
+    #[tokio::test]
+    async fn the_websockets_send_buffer_is_capped() {
+        use crate::kvm::endpoint::CONTROL_SNDBUF;
+        let (_sim, ep, token) = sim_and_token().await;
+        let (_ws, sock) = open_ws(&ep, &token, CT).await.unwrap();
+        let size = sock.send_buffer_size();
+        assert!(
+            (CONTROL_SNDBUF..=2 * CONTROL_SNDBUF).contains(&size),
+            "SO_SNDBUF {size}"
+        );
+    }
+
     #[tokio::test]
     async fn the_websocket_opens_with_the_token_cookie() {
         let (sim, ep, token) = sim_and_token().await;

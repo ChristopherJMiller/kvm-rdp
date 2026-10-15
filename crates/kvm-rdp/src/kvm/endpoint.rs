@@ -4,6 +4,10 @@
 //!
 //! Same pin rule and SPKI hash as `kvm-probe fingerprint` (which records
 //! `kvm.spki_sha256`); the two must stay byte-compatible (P18).
+//!
+//! The control websocket's socket also has a capped send buffer
+//! (`CONTROL_SNDBUF`, §7.3), so a KVM that stops or slows reading blocks a
+//! HID write within `hid_write_timeout`'s reach.
 use crate::config::{KvmConfig, Scheme};
 use crate::kvm::error::KvmError;
 use crate::logging::redact_url;
@@ -12,13 +16,24 @@ use rustls::crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signat
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
 use sha2::{Digest, Sha256};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::task::JoinHandle;
 use tokio_rustls::TlsConnector;
+
+/// The control websocket's `SO_SNDBUF` (final review I1; §7.3), set before
+/// connect. Setting it locks the size — no autotuning — and Linux doubles
+/// the value for its own bookkeeping (`getsockopt` reads 32 KiB). A HID
+/// report is ~37 bytes on the wire (9 bytes, a masked websocket frame, a
+/// TLS record), so well under a thousand fit before a write blocks and
+/// `hid_write_timeout` starts to count. Autotuned, the buffer reached
+/// 2.6 MB on loopback: ~45 000 reports — minutes of input, a key-up queued
+/// behind them — were accepted from a KVM that had stopped reading.
+pub const CONTROL_SNDBUF: usize = 16 * 1024;
 
 pub trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
@@ -105,7 +120,9 @@ impl KvmEndpoint {
     }
 
     /// `connect`, plus a second handle on the connection's socket, so its
-    /// owner can end it with a reset (`SocketHandle::reset_on_close`).
+    /// owner can end it with a reset (`SocketHandle::reset_on_close`). This
+    /// is the control websocket's connection, so its send buffer is also
+    /// capped at `CONTROL_SNDBUF` (I1).
     pub async fn connect_resettable(
         &self,
         port: u16,
@@ -119,17 +136,23 @@ impl KvmEndpoint {
         }
     }
 
+    /// `control`: the websocket's connection — its send buffer capped
+    /// before connect, and a second handle returned.
     async fn connect_inner(
         &self,
         port: u16,
-        handle: bool,
+        control: bool,
     ) -> Result<(KvmIo, Option<SocketHandle>), KvmError> {
-        let tcp = TcpStream::connect((self.host.as_str(), port))
-            .await
-            .map_err(|e| KvmError::Connect(e.kind()))?;
+        let tcp = if control {
+            self.tcp_capped(port, CONTROL_SNDBUF).await?
+        } else {
+            TcpStream::connect((self.host.as_str(), port))
+                .await
+                .map_err(|e| KvmError::Connect(e.kind()))?
+        };
         tcp.set_nodelay(true)
             .map_err(|e| KvmError::Connect(e.kind()))?;
-        let handle = if handle {
+        let handle = if control {
             let dup = socket2::SockRef::from(&tcp)
                 .try_clone()
                 .map_err(|e| KvmError::Connect(e.kind()))?;
@@ -139,6 +162,24 @@ impl KvmEndpoint {
         };
         let io = self.secure(tcp).await?;
         Ok((io, handle))
+    }
+
+    /// `TcpStream::connect`'s walk — every address `host` resolves to, in
+    /// turn; the last error if none connects — on sockets whose
+    /// `SO_SNDBUF` is set to `send_buffer` before connect (I1).
+    async fn tcp_capped(&self, port: u16, send_buffer: usize) -> Result<TcpStream, KvmError> {
+        let addrs = tokio::net::lookup_host((self.host.as_str(), port))
+            .await
+            .map_err(|e| KvmError::Connect(e.kind()))?;
+        // `TcpStream::connect`'s error when nothing resolves.
+        let mut last = std::io::ErrorKind::InvalidInput;
+        for addr in addrs {
+            match connect_with_send_buffer(addr, send_buffer).await {
+                Ok(tcp) => return Ok(tcp),
+                Err(e) => last = e.kind(),
+            }
+        }
+        Err(KvmError::Connect(last))
     }
 
     /// Pinned TLS over `tcp` for `https`; `tcp` itself for `http`.
@@ -169,6 +210,22 @@ impl KvmEndpoint {
     }
 }
 
+/// One connect to `addr` on a socket whose `SO_SNDBUF` is `send_buffer`,
+/// set before connect so the kernel never autotunes it (I1).
+async fn connect_with_send_buffer(
+    addr: SocketAddr,
+    send_buffer: usize,
+) -> std::io::Result<TcpStream> {
+    let sock = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::TCP),
+    )?;
+    sock.set_send_buffer_size(send_buffer)?;
+    sock.set_nonblocking(true)?;
+    TcpSocket::from_std_stream(sock.into()).connect(addr).await
+}
+
 /// A second handle on a connection's socket (a duplicated descriptor; I2,
 /// PC9 fix round 1). Dropping it does nothing to the connection, but it
 /// keeps the socket open while it lives: hold it no longer than the
@@ -181,6 +238,12 @@ impl SocketHandle {
     /// never delivered late.
     pub fn reset_on_close(&self) {
         let _ = self.0.set_linger(Some(Duration::ZERO));
+    }
+
+    /// The socket's `SO_SNDBUF` as the kernel reports it.
+    #[cfg(test)]
+    pub(crate) fn send_buffer_size(&self) -> usize {
+        self.0.send_buffer_size().unwrap_or(usize::MAX)
     }
 }
 

@@ -58,6 +58,7 @@ amended passage below is marked "rev 6.2". One line per change:
 - §6.9 (PC11, PC13): `no_avc420` also covers a client closing its EGFX channel mid-session; one accepted window (a teardown during a Preempt candidate's handoff grace) can miscount a plain disconnect as one.
 - §6.9 (PC18 m5, ruling 3): the ErrorInfo of a fatal cause at session start may not reach Windows App; a lingering close in IronRDP's teardown (a candidate fork patch 4) is the remedy if acceptance item 11 shows it lost.
 - §3.2, §7.3 (PC9 I2): a websocket whose writes did not all complete is reset (`SO_LINGER` 0), never closed with a FIN; only a close the KVM answered is a FIN.
+- §3.2, §7.3 (final review I1): the control websocket's `SO_SNDBUF` is capped at 16 KiB before connect, so `hid_write_timeout` sees a KVM that stops or slows reading within under a thousand reports, not ~45 000; Plan D's L4 resizes it from the ES3's HID report rate.
 - §7.3 (PC7 I1): a report is stamped with the epoch before the queue lock and dropped whole (`hid_epoch_discards`) if a release came between.
 - §9.1 (PC13, PC15): Hybrid is the only mode built; a client without CredSSP gets a plain disconnect; the TLS key type is logged at startup, never judged.
 - §10.4 (ruling 2, ruling 6): a registry table of every metric and label as built, with `frames_dropped{reason="repeat"}` and `{reason="replay_diverged"}`; only a frame a gate drops counts the gate (§11.3's stalled-client case notes what that asks of a test).
@@ -220,7 +221,8 @@ item the census did not measure is marked *open*.
   FLV keeps running, and the next FLV or websocket open fails auth and
   re-logs in once (§6.9).
 - Clients: hyper and tokio-tungstenite over tokio-rustls (aws-lc provider,
-  default features off). `TCP_NODELAY` on every KVM socket.
+  default features off). `TCP_NODELAY` on every KVM socket (rev 6.2: and
+  the control websocket's `SO_SNDBUF` capped at 16 KiB, §7.3).
 - Websocket limits: max message and frame 4 KiB, small write buffer; inbound
   data messages are read and discarded; an oversize message closes the socket
   without buffering it. Rev 6.2: the bridge ends a websocket with a FIN only
@@ -1262,6 +1264,17 @@ writer) is built.
 - A websocket write that takes longer than `hid_write_timeout` closes and
   reconnects the websocket (transient, §6.9) — rev 6.2: with a reset, so
   its unsent backlog is discarded, not delivered late (§3.2).
+- Rev 6.2 (final review I1): for that timeout to see a KVM that stops or
+  slows reading, the websocket's socket has its `SO_SNDBUF` capped at
+  16 KiB (`kvm::endpoint::CONTROL_SNDBUF`), set before connect so the
+  kernel never autotunes it (Linux doubles the value it is given: 32 KiB).
+  Autotuned, it reached 2.6 MB on loopback, and ~45 000 reports — minutes
+  of input — were queued in the kernel before any write blocked; a slow
+  reader would get a key-up queued behind ~1 MB while the target
+  auto-repeated the key held down (§7.4), and the queue's coalescing never
+  engages while the writer is never behind. Capped, a HID report being
+  ~37 bytes on the wire, under a thousand fit before a write blocks. Plan
+  D's L4 sizes the cap from the ES3's measured HID report rate.
 - `on_disconnected` sets release-all and then closes over the same ordered
   path, so the release is flushed before the socket closes.
 
@@ -1823,7 +1836,10 @@ time is budgeted for the harness itself. The video cases run once per
   last position sent, and none before the client's first pointer event — never
   (0, 0) unless the client put the pointer there. Rev 6.2 (DC7): Plan C's L2
   drives the HID writer through `HidControl` directly — reports reach kvm-sim,
-  a full queue resyncs, a blocked write reconnects, a reopen restores the
+  a full queue resyncs, a blocked write reconnects (final review I1: within
+  a bounded number of reports written, and with at most 400 of the old
+  websocket's reports reaching kvm-sim after the new one opens — a reset,
+  where a FIN delivers its whole send buffer), a reopen restores the
   pointer, the websocket survives another session's logout — and the
   input-event cases (RDP input → HID frames) are Plan D's, with its handler.
 - **Stuck keys**: every §7.4 trigger releases all; a key held across a release

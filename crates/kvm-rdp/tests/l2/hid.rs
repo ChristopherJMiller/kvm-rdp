@@ -92,8 +92,24 @@ async fn a_full_queue_resyncs_to_the_final_state() {
 
 /// §6.9 websocket: a write blocked past `hid_write_timeout` reconnects, and
 /// the new websocket starts with the session-start sequence.
+///
+/// Final review I1: the control socket's send buffer is capped
+/// (`kvm::endpoint::CONTROL_SNDBUF`), so a KVM that stops reading blocks a
+/// write within a bounded number of reports — about a thousand here, where
+/// the autotuned buffer (2.6 MB on loopback) swallowed ~45 000 first. The
+/// case pushes a batch only once every report pushed so far is written, so
+/// none is lost to a queue resync and the count is the writer's: load
+/// cannot inflate it. PC18 m3: the old connection is reset, not closed with
+/// a FIN — of its unread reports, at most `STALE_MAX` reach kvm-sim after
+/// the new websocket opens (what kvm-sim had already taken in; a FIN
+/// delivers the whole send buffer after it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_blocked_websocket_write_reconnects() {
+    /// Several times what fills the capped buffers; far below what an
+    /// uncapped one takes.
+    const PUSH_BUDGET: u64 = 4_000;
+    const BATCH: u64 = 100;
+    const STALE_MAX: usize = 400;
     let wt = ms(300);
     let mut sim = es3();
     sim.control_recv_buffer = Some(4096);
@@ -104,25 +120,55 @@ async fn a_blocked_websocket_write_reconnects() {
     .await;
     let c = env.client(Opts::new(2));
     c.wait_for(T, |e| pictures(e).len() >= 5).await;
-    env.hid_ready().await;
+    let old = env.hid_ready().await;
     let before = ws_opens(&env.sim.events()).len();
     env.sim.set_policy(|p| p.pause_ws_reads = true);
     let hid = env.bridge().hid().clone();
-    let mut x = 0u16;
+    let sent0 = env.metrics().hid_reports_sent.get();
+    let (mut pushed, mut x) = (0u64, 0u16);
     let reconnected = until(T, || {
-        for _ in 0..200 {
-            x = x % 29_999 + 1; // 1..=29 999: the test itself never sends (0, 0)
-            let _ = hid.push(HidFrame::abs_mouse(0, x, x), false);
+        if ws_opens(&env.sim.events()).len() > before {
+            return true;
         }
-        ws_opens(&env.sim.events()).len() > before
+        let written = env.metrics().hid_reports_sent.get().saturating_sub(sent0);
+        if written >= pushed && pushed < PUSH_BUDGET {
+            for _ in 0..BATCH {
+                x = x % 29_999 + 1; // 1..=29 999: the test itself never sends (0, 0)
+                let _ = hid.push(HidFrame::abs_mouse(0, x, x), false);
+            }
+            pushed += BATCH;
+        }
+        false
     })
     .await;
-    assert!(reconnected, "no reconnect after a blocked write");
+    assert!(
+        reconnected,
+        "no reconnect after {pushed} reports (budget {PUSH_BUDGET}): no write blocked"
+    );
     assert!(env.metrics().upstream_reconnects.get("websocket_write") >= 1);
     env.sim.set_policy(|p| p.pause_ws_reads = false);
     // The reopen has shown up: `hid_ready` now waits on it.
     let new = env.hid_ready().await;
-    let log = env.sim.events();
+    // Once kvm-sim has seen the old websocket end, every report it will
+    // ever take from it is in the log.
+    let log = env
+        .sim
+        .wait_for(T, |l| l.contains(&SimEvent::WsClose { conn: old }))
+        .await
+        .unwrap_or_else(|_| panic!("the old websocket never closed"));
+    let opened = log
+        .iter()
+        .position(|e| *e == SimEvent::WsOpen { conn: new })
+        .unwrap();
+    let stale = log[opened..]
+        .iter()
+        .filter(|e| matches!(e, SimEvent::Hid { conn, .. } if *conn == old))
+        .count();
+    assert!(
+        stale <= STALE_MAX,
+        "{stale} of the old websocket's reports reached kvm-sim after the new one \
+         opened (at most {STALE_MAX}): its backlog was delivered, not reset"
+    );
     // The new websocket starts with the session start; the pointer report
     // after it is at the last position the old one wrote — never (0, 0).
     let on_new = hid_on(&log, new);
