@@ -90,8 +90,9 @@ pub enum Ev {
     /// The CLIPRDR channel is up: the server accepted the format list that
     /// offers the client's text (`on_ready` follows its `FormatListResponse`).
     ClipReady,
-    /// The server asked for the client's text (a `FormatDataRequest`).
-    ClipAsked,
+    /// The server asked for the client's clipboard in this format (a
+    /// `FormatDataRequest`).
+    ClipAsked(ClipboardFormatId),
 }
 
 pub struct Opts {
@@ -873,12 +874,19 @@ impl CliprdrBackend for ClientClip {
     }
     fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
     fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
-    fn on_format_data_request(&mut self, _: FormatDataRequest) {
-        push(&self.log, Ev::ClipAsked);
+    /// The client holds only Unicode text, as it announced: a request for
+    /// it gets the text; one for any other format a failure (PD10 review
+    /// m2) — the answer a real client gives, so a bridge that asked for
+    /// the wrong format types nothing.
+    fn on_format_data_request(&mut self, req: FormatDataRequest) {
+        push(&self.log, Ev::ClipAsked(req.format));
+        let answer = if req.format == ClipboardFormatId::CF_UNICODETEXT {
+            OwnedFormatDataResponse::new_unicode_string(&self.text)
+        } else {
+            OwnedFormatDataResponse::new_error()
+        };
         self.proxy
-            .send_clipboard_message(ClipboardMessage::SendFormatData(
-                OwnedFormatDataResponse::new_unicode_string(&self.text),
-            ));
+            .send_clipboard_message(ClipboardMessage::SendFormatData(answer));
     }
     fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
     fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
@@ -945,7 +953,7 @@ pub fn timeline(evs: &[Ev]) -> Vec<String> {
             Ev::Reactivated(w, h) => Some(format!("reactivated {w}x{h}")),
             Ev::Terminated(_) => Some("terminated".to_owned()),
             Ev::Closed(_) => Some("closed".to_owned()),
-            Ev::ClipReady | Ev::ClipAsked => None,
+            Ev::ClipReady | Ev::ClipAsked(_) => None,
         })
         .collect()
 }

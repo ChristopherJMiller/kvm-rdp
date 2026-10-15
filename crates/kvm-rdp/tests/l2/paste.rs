@@ -15,6 +15,7 @@ use crate::harness::{
     CHORD_MODS, Env, KBD_ZERO, MARK, T, abs, env, es3, hid_on, ms, paste_chord, sized, typed,
     until, until_mark, until_mark_at, within, ws_opens,
 };
+use ironrdp_cliprdr::pdu::ClipboardFormatId;
 use kvm_proto::hid::HidFrame;
 use kvm_rdp::config::{Config, Multiline};
 use kvm_rdp::msg::Cause;
@@ -136,6 +137,19 @@ async fn a_paste_types_the_exact_report_list() {
     assert_eq!(settled(until_mark(&env, &c, ws).await), want);
     assert_eq!(env.metrics().paste_skipped_chars.get(), 1, "the emoji");
     assert_eq!(pasted(&env, "started"), 1);
+    let asked: Vec<ClipboardFormatId> = c
+        .events()
+        .iter()
+        .filter_map(|e| match e {
+            Ev::ClipAsked(f) => Some(*f),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        asked,
+        [ClipboardFormatId::CF_UNICODETEXT],
+        "§8: one request, for CF_UNICODETEXT"
+    );
 }
 
 /// §8 `multiline = "refuse"`: an inner break refuses the paste (nothing
