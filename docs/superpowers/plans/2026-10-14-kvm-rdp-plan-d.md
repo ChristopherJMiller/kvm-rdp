@@ -6132,7 +6132,7 @@ The struct literals the new fields reach: `clip: ClipSlot::default()` in the `Li
 
 In `src/bridge.rs` `spawn`, beside `gfx_slot`: `let clip_slot = ClipSlot::default(); let server_events = ServerEvents::default();` (Task 4.1 hands `server_events` to the input shell too). `ServerParts` gains `cliprdr: ClipFactory::new(Arc::new(AtomicU64::new(0)), clip_slot.clone(), to_pump.clone(), cfg.paste.max_bytes, server_events.clone())` — the factory itself, by value — and `Lifecycle` gains `clip: clip_slot`.
 
-- [ ] **Step 4: Run the test.** `cargo test --workspace --all-features --lib -- rdp::clipboard` — Expected: PASS — 4 passed. `cargo test --workspace --all-features --lib -- rdp::handler pump::shell` — Expected: PASS (the rigs with the new fields; the shell's existing cases). `nix develop --command cargo tree -d 2>&1 | grep -c ironrdp` — Expected: `0` (no duplicate `ironrdp-*`).
+- [ ] **Step 4: Run the test.** `cargo test --workspace --all-features --lib -- rdp::clipboard` — Expected: PASS — 4 passed. `cargo test --workspace --all-features --lib -- rdp::handler pump::shell` — Expected: PASS (the rigs with the new fields; the shell's existing cases). `nix develop --command cargo tree --workspace --target all -d --depth 0 --prefix none 2>/dev/null | grep '^ironrdp'` — Expected: no output (CI's §4.2 check: no duplicate `ironrdp-*` crate; PD8 review m6 — a plain `cargo tree -d | grep -c ironrdp` also counts IronRDP crates in other duplicates' inverse trees, 117 at 15fb098, so it is never 0).
 
 - [ ] **Step 5: Gate** (clippy, test, budget). **Step 6: Commit.**
 
