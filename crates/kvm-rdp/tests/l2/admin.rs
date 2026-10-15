@@ -342,6 +342,56 @@ fn byte_encodings(bytes: &[u8]) -> Vec<String> {
     v
 }
 
+const B64_STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// `bytes` in base64 with `alphabet`, `=`-padded when `pad`.
+fn base64(bytes: &[u8], alphabet: &[u8; 64], pad: bool) -> String {
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let at = |i: usize| u32::from(chunk.get(i).copied().unwrap_or(0));
+        let n = at(0) << 16 | at(1) << 8 | at(2);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let six = usize::try_from((n >> (18 - 6 * i)) & 63).unwrap();
+                out.push(char::from(alphabet[six]));
+            } else if pad {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Every base64 form of `bytes` a log could hold (PD10 re-review N1), in
+/// the standard and the URL-safe alphabet: the whole encoding, padded and
+/// unpadded, and — for each of the three byte alignments `bytes` may sit
+/// at inside a longer encoded stream (a PDU dump, a header before it) —
+/// the run of characters made of `bytes`' bits alone, which any such
+/// stream contains.
+fn base64_encodings(bytes: &[u8]) -> Vec<String> {
+    let mut url = *B64_STD;
+    url[62] = b'-';
+    url[63] = b'_';
+    let mut v = Vec::new();
+    for alphabet in [B64_STD, &url] {
+        v.push(base64(bytes, alphabet, true));
+        v.push(base64(bytes, alphabet, false));
+        for offset in 0..3usize {
+            let mut shifted = vec![0u8; offset];
+            shifted.extend_from_slice(bytes);
+            let encoded = base64(&shifted, alphabet, false);
+            // Character i holds bits 6i..6i+6: the first wholly after the
+            // offset's bits, up to the last wholly inside `bytes`.
+            let first = (8 * offset).div_ceil(6);
+            let last = 8 * (offset + bytes.len()) / 6;
+            if let Some(core) = encoded.get(first..last) {
+                v.push(core.to_owned());
+            }
+        }
+    }
+    v
+}
+
 /// What may never appear for one keystroke of `c` (DC9; PD10 review I1):
 /// its 12-byte keyboard frame and its five key slots in every
 /// `byte_encodings` form — which covers `HidFrame`'s, `KeyReport`'s and
@@ -349,10 +399,12 @@ fn byte_encodings(bytes: &[u8]) -> Vec<String> {
 /// usage code as a field with its value, in decimal and hex
 /// (`usage: 22`, `usage=0x16`, `"usage":22`, …), as `Stroke` or a log
 /// field would show it. `typed`: it came as a scancode, whose
-/// `code: 31`-style shapes are forbidden too (`Event::KeyPressed`'s).
+/// `code: 31`-style shapes are forbidden too (`Event::KeyPressed`'s). The
+/// frame's `base64_encodings` too.
 fn keystroke_encodings(c: char, typed: bool) -> Vec<String> {
     let s = us_stroke(c).unwrap();
     let mut v = byte_encodings(&press_frame(c));
+    v.extend(base64_encodings(&press_frame(c)));
     v.extend(byte_encodings(&[s.usage, 0, 0, 0, 0]));
     let mut fields = vec![("usage", s.usage)];
     if typed {
@@ -373,7 +425,7 @@ fn keystroke_encodings(c: char, typed: bool) -> Vec<String> {
 /// the text; its `{:?}`; its characters in `{:?}` and one by one with each
 /// separator; its UTF-16 code units in `{:?}` and hex; and its UTF-8
 /// bytes and its CF_UNICODETEXT bytes (UTF-16LE, with and without the NUL
-/// terminator) in every `byte_encodings` form.
+/// terminator) in every `byte_encodings` and `base64_encodings` form.
 fn text_encodings(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let units: Vec<u16> = text.encode_utf16().collect();
@@ -392,9 +444,10 @@ fn text_encodings(text: &str) -> Vec<String> {
     for sep in [" ", ",", ", ", ":"] {
         v.push(one_by_one.join(sep));
     }
-    v.extend(byte_encodings(text.as_bytes()));
-    v.extend(byte_encodings(&utf16));
-    v.extend(byte_encodings(&with_nul));
+    for bytes in [text.as_bytes(), &utf16, &with_nul] {
+        v.extend(byte_encodings(bytes));
+        v.extend(base64_encodings(bytes));
+    }
     v
 }
 
@@ -410,13 +463,20 @@ fn forbidden_input() -> Vec<String> {
     v
 }
 
-/// `needle` occurs in `hay` as a whole: an occurrence counts only if it is
-/// not the middle of a longer word or number — the character before it
-/// (when the needle starts with a letter or digit) and the one after it
-/// (when it ends with one) are not letters or digits. So `"code":4` never
-/// matches `"code":401`, and `[4, 0, 0, 0, 0]` never matches inside
-/// `[14, 0, 0, 0, 0]`.
+/// Needles this long or longer are matched anywhere (`appears`).
+const SUBSTRING_MIN: usize = 8;
+
+/// `needle` occurs in `hay`. A needle of `SUBSTRING_MIN` characters or more
+/// — the texts, contiguous hex, byte lists, base64 — counts anywhere, even
+/// inside a longer run (a hex or base64 dump with a header: PD10 re-review
+/// N4). A shorter one — a field shape like `usage=4` — counts only as a
+/// whole: the character before it (when it starts with a letter or digit)
+/// and the one after it (when it ends with one) are not letters or digits,
+/// so `usage=4` never matches `usage=40`.
 fn appears(hay: &str, needle: &str) -> bool {
+    if needle.len() >= SUBSTRING_MIN {
+        return hay.contains(needle);
+    }
     let alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
     let check_before = alnum(needle.chars().next());
     let check_after = alnum(needle.chars().last());
@@ -447,15 +507,17 @@ fn code_tokens() -> Vec<String> {
 
 /// A metric name or label value is the bridge's own vocabulary: parts
 /// joined by `_`, each lowercase letters and digits starting with a letter
-/// (`clipboard_oversize`, `no_avc420`, the frame type `p`). Label values
-/// are `&'static str` from bridge code (metrics.rs), so input can reach one
-/// only through a bug — and then a pasted word (`paste-canary-3e7a`) or a
-/// keystroke's code (`key_16`, `key_0c`) breaks this shape. (A single
-/// letter of input as its own part, `key_s`, would not: the vocabulary has
-/// one, `p`.)
+/// (`clipboard_oversize`, `no_avc420`), and two characters or more but for
+/// the frame type `p` — the one single-letter part the bridge has. Label
+/// values are `&'static str` from bridge code (metrics.rs), so input can
+/// reach one only through a bug — and then a pasted word
+/// (`canary-3e7a-kiwi`), a keystroke's code (`key_16`, `key_0c`) or one of
+/// its letters (`key_s`: neither SENTINEL nor CANARY has a `p`) breaks this
+/// shape.
 fn vocabulary(s: &str) -> bool {
     s.split('_').all(|p| {
-        p.starts_with(|c: char| c.is_ascii_lowercase())
+        (p.len() >= 2 || p == "p")
+            && p.starts_with(|c: char| c.is_ascii_lowercase())
             && p.chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     })
@@ -512,21 +574,68 @@ fn assert_metrics_hold_no_input(what: &str, body: &str, forbidden: &[String]) {
 }
 
 /// The targets of the input path (core, keys, pointer, paste, the shell,
-/// the CLIPRDR backend, the HID queue and writer), and the only lines they
-/// may log — (target, message, field names): §8's "no text" refusal.
-/// Content-independent (PD10 review I1(c)): a new log line on the input
-/// path fails here until it is reviewed and listed, whatever it formats.
-const INPUT_TARGETS: [&str; 4] = [
+/// the CLIPRDR backend, the HID queue and writer, and the pump shell that
+/// carries every clipboard word to the input core: shell.rs's
+/// `RdpInput::Clipboard*` arms), and the only lines they may log —
+/// (target, message, field names). Content-independent (PD10 review
+/// I1(c), re-review): a new log line on the input path fails here until it
+/// is reviewed and listed, whatever it formats. The pump shell's lines are
+/// every call site it has (shell.rs), not one run's sample, so a line that
+/// logs only on some timing never flakes this.
+const INPUT_TARGETS: [&str; 5] = [
     "kvm_rdp::input",
     "kvm_rdp::rdp::input",
     "kvm_rdp::rdp::clipboard",
     "kvm_rdp::hid",
+    "kvm_rdp::pump::shell",
 ];
-const INPUT_LINES: [(&str, &str, &[&str]); 1] = [(
-    "kvm_rdp::rdp::input",
-    "paste chord with no text on the clipboard",
-    &[],
-)];
+const INPUT_LINES: [(&str, &str, &[&str]); 9] = [
+    (
+        "kvm_rdp::rdp::input",
+        "paste chord with no text on the clipboard",
+        &[],
+    ),
+    (
+        "kvm_rdp::pump::shell",
+        "pump command",
+        &["current", "generation", "kind"],
+    ),
+    (
+        "kvm_rdp::pump::shell",
+        "disconnect watchdog fired: aborting the connection",
+        &["generation"],
+    ),
+    (
+        "kvm_rdp::pump::shell",
+        "no display stream for a resize",
+        &["height", "width"],
+    ),
+    (
+        "kvm_rdp::pump::shell",
+        "the server's event channel is closed",
+        &[],
+    ),
+    (
+        "kvm_rdp::pump::shell",
+        "EGFX batch encoding failed",
+        &["error"],
+    ),
+    (
+        "kvm_rdp::pump::shell",
+        "the client closed its EGFX channel mid-session",
+        &[],
+    ),
+    (
+        "kvm_rdp::pump::shell",
+        "the client offered no AVC420 capability set (§6.7)",
+        &["caps"],
+    ),
+    (
+        "kvm_rdp::pump::shell",
+        "disconnecting the client",
+        &["cause"],
+    ),
+];
 
 fn assert_input_path_lines_allowed(what: &str, v: &serde_json::Value, line: &str) {
     let target = v["target"].as_str().unwrap_or("");
@@ -741,16 +850,24 @@ fn no_debug_shows_input() {
 /// it (DC9), then SIGTERM. In stdout and stderr: neither the sentinel nor
 /// the paste canary in any encoding (`forbidden_input`: the text, its
 /// characters, bytes and code units, each keystroke's frame, key slots and
-/// codes; PD10 review I1), nor the NLA canary, the KVM password, NTLM (raw
-/// or base64) or a token query; no line from the input path but the
-/// reviewed ones (`INPUT_LINES`); no DEBUG or TRACE line from
-/// `ironrdp_*`/`sspi`; at least one TRACE line from bridge code;
-/// `SSLKEYLOGFILE` is never created. The shutdown's own lines are in the
-/// log checked (P10). `/metrics`, read before the SIGTERM, holds none of it
-/// either (`assert_metrics_hold_no_input`). Nor does any `{:?}` the input
-/// path could emit show the input (`no_debug_shows_input`).
+/// codes, in hex, decimal and base64; PD10 review I1 and re-review), nor
+/// the NLA canary, the KVM password, NTLM (raw or base64) or a token query;
+/// no line from the input path but the reviewed ones (`INPUT_LINES`, the
+/// pump shell's included); no DEBUG or TRACE line from `ironrdp_*`/`sspi`;
+/// at least one TRACE line from bridge code; `SSLKEYLOGFILE` is never
+/// created. The shutdown's own lines are in the log checked (P10).
+/// `/metrics`, read before the SIGTERM, holds none of it either
+/// (`assert_metrics_hold_no_input`). Nor does any `{:?}` the input path
+/// could emit show the input (`no_debug_shows_input`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secrets_never_reach_the_logs() {
+    // No letter of either string may pass `vocabulary` as a label part of
+    // its own; the encoder agrees with the base64 a review leak logged.
+    assert!(!SENTINEL.contains('p') && !CANARY.contains('p'));
+    assert_eq!(
+        base64(b"paste-canary-3e7a", B64_STD, true),
+        "cGFzdGUtY2FuYXJ5LTNlN2E="
+    );
     no_debug_shows_input();
     for filter in [
         "trace",
