@@ -306,13 +306,15 @@ impl WsTask {
                 // only while no keyboard report waits, and with the pointer
                 // part only while no pointer report does (R-I1): the newest
                 // state written ahead of them would type a key early and
-                // again, or break a drag.
-                if reassert_by.is_some_and(|by| tokio::time::Instant::now() >= by)
-                    && !self.hid.keyboard_queued()
-                {
+                // again, or break a drag. `reassert` decides that under the
+                // queue lock (`HidControl::reassert_frames`, which checks
+                // `keyboard_queued`): pushes come from the RDP thread while
+                // this task runs on the KVM runtime.
+                if reassert_by.is_some_and(|by| tokio::time::Instant::now() >= by) {
                     match self.reassert(&mut sink).await {
                         Some(false) => return Exit::Failed,
                         Some(true) => (reassert_at, reassert_by) = (None, None),
+                        // A keyboard report waits: not yet.
                         None => {}
                     }
                 }
