@@ -6,7 +6,18 @@
 //! built before a release never lands after its zeros (§7.3; design
 //! decision 6). The mutex is never held across an await (§4.3), and
 //! nothing is called into IronRDP under it: a `ServerEvent` is a channel
-//! send, made after the lock is released.
+//! send.
+//!
+//! A feed holds the core lock from its first step to the last of its
+//! outputs carried out (PD9 fix round 1, I1): two feeds — from the handler,
+//! the driver, the pump shell, or any other thread — never interleave their
+//! reports, so a Typist press built by one step never lands after another
+//! step's abort zero. Every lock taken under it is a leaf (the HID queue,
+//! the display, the metrics). And the handler takes input only on the RDP
+//! thread (`bind_rdp_thread`): IronRDP's ainput DVC calls it from
+//! `spawn_blocking`, one task per PDU in no order — a Devolutions extension
+//! Windows App does not use — and those calls are dropped and counted
+//! (`input_events_ignored`, as DD7 drops relative motion).
 //!
 //! The core follows the live generation (`Generations`), whatever word the
 //! pump shell last passed on: the handler moves it — and releases all —
@@ -33,7 +44,8 @@ use ironrdp_pdu::input::fast_path::SynchronizeFlags;
 use ironrdp_server::{KeyboardEvent, MouseButton, MouseEvent, RdpServerInputHandler, ServerEvent};
 use kvm_proto::keymap::Chord;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::thread::ThreadId;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
@@ -85,10 +97,10 @@ fn clock() -> Instant {
     tokio::time::Instant::now().into_std()
 }
 
-/// The input core and what its `Out`s need. Every `feed` caller — the
-/// handler, the driver and the pump shell — runs on the RDP `LocalSet`, so
-/// two feeds never interleave their `Out`s. A second thread must carry out
-/// `Out::Push`/`Out::Release` under the core lock (D27).
+/// The input core and what its `Out`s need. The handler, the driver and the
+/// pump shell all feed it on the RDP `LocalSet`; whatever thread a feed
+/// runs on, it steps and carries out its `Out`s under the core lock, so two
+/// feeds never interleave them (D27; PD9 fix round 1, I1).
 pub struct InputShared {
     core: Mutex<InputCore>,
     hid: Arc<HidControl>,
@@ -102,6 +114,8 @@ pub struct InputShared {
     deadline: AtomicU64,
     base: Instant,
     wake: Notify,
+    /// The RDP thread, the only one the handler takes input on (I1).
+    rdp_thread: OnceLock<ThreadId>,
 }
 
 impl InputShared {
@@ -118,7 +132,19 @@ impl InputShared {
             deadline: AtomicU64::new(0),
             base: clock(),
             wake: Notify::new(),
+            rdp_thread: OnceLock::new(),
         }
+    }
+
+    /// Record the calling thread as the RDP thread, whose handler calls are
+    /// the only ones taken (the first call wins; `bridge::rdp_main` makes
+    /// it before the server runs). Unbound, the handler takes nothing.
+    pub fn bind_rdp_thread(&self) {
+        let _ = self.rdp_thread.set(std::thread::current().id());
+    }
+
+    fn on_rdp_thread(&self) -> bool {
+        self.rdp_thread.get() == Some(&std::thread::current().id())
     }
 
     fn lock(&self) -> MutexGuard<'_, InputCore> {
@@ -176,24 +202,19 @@ impl InputShared {
     /// Bring the core to the live generation and carry out what that took
     /// — before any event's `Ctx` reads the epoch, so a release `follow`
     /// raised is behind every report the event builds (as carry 1's Tick
-    /// is). The live generation.
-    fn sync_generation(&self) -> Gen {
-        let (generation, outs) = {
-            let mut core = self.lock();
-            let mut outs = Vec::new();
-            let generation = self.follow(&mut core, &mut outs);
-            (generation, outs)
-        };
+    /// is). Under the caller's core lock. The live generation.
+    fn sync_generation(&self, core: &mut InputCore) -> Gen {
+        let mut outs = Vec::new();
+        let generation = self.follow(core, &mut outs);
         self.carry_out(generation, outs);
         generation
     }
 
-    /// One core step under the lock, at the live generation; the
-    /// generation it stepped and its `Out`s, carried out by the caller with
-    /// the lock released. With no session, input is dropped (and counted).
-    fn step(&self, now: Instant, event: Event) -> (Gen, Vec<Out>) {
-        let generation = self.sync_generation();
-        let mut core = self.lock();
+    /// One core step at the live generation, its `Out`s carried out, all
+    /// under the caller's core lock (I1). With no session, input is
+    /// dropped (and counted).
+    fn step(&self, core: &mut InputCore, now: Instant, event: Event) {
+        let generation = self.sync_generation(core);
         let mut outs = Vec::new();
         if generation == 0 {
             if is_client_input(&event) {
@@ -202,11 +223,11 @@ impl InputShared {
         } else {
             core.step(&self.ctx(now, generation), event, &mut outs);
         }
-        (generation, outs)
+        self.carry_out(generation, outs);
     }
 
-    /// Step the core with `event`, carry out its `Out`s with the lock
-    /// released, and re-arm the driver.
+    /// Step the core with `event`, carry out its `Out`s, and re-arm the
+    /// driver — one hold of the core lock (I1).
     ///
     /// PD9 carry 1 (PD6 m2): the timers fire only on a `Tick`, and the
     /// driver shares this thread, so an event can come after a deadline
@@ -217,14 +238,13 @@ impl InputShared {
     /// by `push_at`, its key then marked released-by-bridge.
     fn feed(&self, event: Event) {
         let now = clock();
-        let due = self.lock().next_deadline().is_some_and(|at| at <= now);
+        let mut core = self.lock();
+        let due = core.next_deadline().is_some_and(|at| at <= now);
         if due && !matches!(event, Event::Tick) {
-            let (generation, outs) = self.step(now, Event::Tick);
-            self.carry_out(generation, outs);
+            self.step(&mut core, now, Event::Tick);
         }
-        let (generation, outs) = self.step(now, event);
-        self.carry_out(generation, outs);
-        self.rearm();
+        self.step(&mut core, now, event);
+        self.rearm(&core);
     }
 
     fn carry_out(&self, generation: Gen, outs: Vec<Out>) {
@@ -286,9 +306,8 @@ impl InputShared {
     /// Publish the core's next deadline to the driver, and wake it if it
     /// changed. A deadline at or before `base` (none is: each follows an
     /// event after it) reads as 1 ns past it — at once, never "unarmed".
-    fn rearm(&self) {
-        let next = self.lock().next_deadline();
-        let v = next.map_or(0, |at| {
+    fn rearm(&self, core: &InputCore) {
+        let v = core.next_deadline().map_or(0, |at| {
             u64::try_from(at.saturating_duration_since(self.base).as_nanos())
                 .unwrap_or(u64::MAX)
                 .max(1)
@@ -303,8 +322,9 @@ impl InputShared {
     /// a stale word changes nothing.
     pub fn set_generation(&self, g: Gen) {
         let _ = g;
-        let _ = self.sync_generation();
-        self.rearm();
+        let mut core = self.lock();
+        let _ = self.sync_generation(&mut core);
+        self.rearm(&core);
     }
 
     pub fn keyboard(&self, e: KeyboardEvent) {
@@ -433,7 +453,9 @@ fn button_for(b: MouseButton) -> Option<Button> {
 }
 
 /// IronRDP's input handler: it only feeds `InputShared` (never blocks the
-/// RDP runtime, §4.3).
+/// RDP runtime, §4.3), and only on the RDP thread — a call from any other
+/// (IronRDP's ainput DVC runs it in `spawn_blocking`, I1) is dropped and
+/// counted.
 pub struct InputHandler {
     shared: Arc<InputShared>,
 }
@@ -443,14 +465,26 @@ impl InputHandler {
     pub fn new(shared: Arc<InputShared>) -> InputHandler {
         InputHandler { shared }
     }
+
+    fn admitted(&self) -> bool {
+        let on = self.shared.on_rdp_thread();
+        if !on {
+            self.shared.metrics.input_events_ignored.inc();
+        }
+        on
+    }
 }
 
 impl RdpServerInputHandler for InputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        self.shared.keyboard(event);
+        if self.admitted() {
+            self.shared.keyboard(event);
+        }
     }
     fn mouse(&mut self, event: MouseEvent) {
-        self.shared.mouse(event);
+        if self.admitted() {
+            self.shared.mouse(event);
+        }
     }
 }
 
@@ -486,6 +520,11 @@ impl InputShared {
     /// The `ServerEvent` cell this shell sends its clipboard requests on.
     pub(crate) fn events_for_test(&self) -> &ServerEvents {
         &self.events
+    }
+
+    /// The thread `bind_rdp_thread` recorded.
+    pub(crate) fn rdp_thread_for_test(&self) -> Option<ThreadId> {
+        self.rdp_thread.get().copied()
     }
 }
 
@@ -692,6 +731,7 @@ mod tests {
             metrics: metrics.clone(),
             cfg: InputRuntimeConfig::test(),
         }));
+        s.bind_rdp_thread(); // the test thread plays the RDP thread
         Rig {
             s,
             hid,
@@ -1267,5 +1307,131 @@ mod tests {
         {
             assert!(!text.contains(needle), "{needle} in {text}");
         }
+    }
+
+    // ---- PD9 fix round 1.
+
+    /// I1(b), the review's X3 stress: two threads feed at once — the
+    /// driver ticking a 2 080-character paste at pace 0, and a click from
+    /// another thread that aborts it — while a writer thread drains the
+    /// queue in order. A step's outputs are carried out under the core
+    /// lock, so a Typist press one step built never lands after another
+    /// step's abort zero: in 2 000 runs, none ends with a key down (before
+    /// the fix, 100–106 did, with no timer armed to release it).
+    #[test]
+    fn feeds_from_two_threads_never_leave_a_key_down() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const RUNS: usize = 2_000;
+        let text = utf16(&"abcdefghijklmnopqrstuvwxyz".repeat(80));
+        let mut held = 0usize;
+        for run in 0..RUNS {
+            let r = rig();
+            r.start();
+            r.s.clipboard_available(true);
+            r.chord();
+            r.s.clipboard_text(text.clone());
+            r.unchord(); // typing begins
+            let stop = Arc::new(AtomicBool::new(false));
+            let ended = Arc::new(AtomicBool::new(false));
+            let writer = {
+                let (hid, stop) = (r.hid.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut kbd = None;
+                    loop {
+                        let f = if hid.take_release() {
+                            hid.release_frames()
+                        } else if let Some(f) = hid.next_frame() {
+                            vec![f]
+                        } else if stop.load(Ordering::SeqCst) {
+                            break;
+                        } else {
+                            std::thread::yield_now();
+                            continue;
+                        };
+                        for f in f {
+                            hid.note_sent(&f);
+                            if matches!(f, HidFrame::Keyboard { .. }) {
+                                kbd = Some(f);
+                            }
+                        }
+                    }
+                    kbd
+                })
+            };
+            let driver = {
+                let (s, ended) = (r.s.clone(), ended.clone());
+                std::thread::spawn(move || {
+                    while !ended.load(Ordering::SeqCst) {
+                        s.feed(Event::Tick);
+                    }
+                })
+            };
+            let sent = 2 + u64::try_from(run % 40).unwrap();
+            let t0 = std::time::Instant::now();
+            while r.metrics.hid_reports_sent.get() < sent && t0.elapsed() < Duration::from_secs(5) {
+                std::thread::yield_now();
+            }
+            r.s.mouse(MouseEvent::Button {
+                x: 5,
+                y: 5,
+                button: MouseButton::Left,
+                pressed: true,
+            });
+            r.s.mouse(MouseEvent::Button {
+                x: 5,
+                y: 5,
+                button: MouseButton::Left,
+                pressed: false,
+            });
+            let ended_paste =
+                || r.metrics.paste_events.get("aborted") + r.metrics.paste_events.get("done") > 0;
+            while !ended_paste() && t0.elapsed() < Duration::from_secs(10) {
+                std::thread::yield_now();
+            }
+            assert!(ended_paste(), "run {run}: the paste never ended");
+            ended.store(true, Ordering::SeqCst);
+            driver.join().unwrap();
+            stop.store(true, Ordering::SeqCst);
+            let kbd = writer.join().unwrap();
+            if kbd.is_some_and(|k| k != KBD_ZERO) {
+                held += 1;
+            }
+        }
+        assert_eq!(held, 0, "{held} of {RUNS} runs ended with a key down");
+    }
+
+    /// I1(a): IronRDP's ainput DVC calls the handler from `spawn_blocking`,
+    /// off the RDP thread, one task per PDU in no order. Such a call is
+    /// dropped and counted (`input_events_ignored`), and pushes nothing; on
+    /// the RDP thread the handler works as ever.
+    #[tokio::test(flavor = "current_thread")]
+    async fn handler_calls_off_the_rdp_thread_are_dropped() {
+        let mut r = rig();
+        r.start();
+        let mut off = InputHandler::new(r.s.clone());
+        std::thread::spawn(move || {
+            off.mouse(MouseEvent::Button {
+                x: 5,
+                y: 5,
+                button: MouseButton::Left,
+                pressed: true,
+            });
+            off.keyboard(KeyboardEvent::Pressed {
+                code: 0x1E,
+                extended: false,
+            });
+        })
+        .join()
+        .unwrap();
+        assert_eq!(r.metrics.input_events_ignored.get(), 2);
+        // Only the session start's release went out: no click, no key.
+        assert_eq!(r.write(), [KBD_ZERO], "an off-thread call pushed");
+        let mut on = InputHandler::new(r.s.clone());
+        on.keyboard(KeyboardEvent::Pressed {
+            code: 0x1E,
+            extended: false,
+        });
+        assert_eq!(r.write().last(), Some(&kbd(0, 0x04)));
+        assert_eq!(r.metrics.input_events_ignored.get(), 2);
     }
 }

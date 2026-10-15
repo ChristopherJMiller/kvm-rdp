@@ -469,6 +469,8 @@ fn rdp_main(p: RdpParts, ready: std::sync::mpsc::Sender<Ready>, done: watch::Sen
             mut essential,
             seam,
         } = p;
+        // The handler takes input on this thread only (PD9 fix round 1, I1).
+        shell.input.bind_rdp_thread();
         let mut server = server::build(parts);
         let events = server.event_sender().clone();
         // §7.4's timers and the Typist's pace: the input core's driver, on
@@ -1944,6 +1946,13 @@ mod tests {
             .get()
             .expect("the input shell's ServerEvents cell is empty");
         assert!(sender.same_channel(&h.ctl.events));
+        // I1: bound to the RDP thread, not the caller's.
+        assert!(
+            h.input
+                .rdp_thread_for_test()
+                .is_some_and(|t| t != std::thread::current().id()),
+            "the input shell is not bound to the RDP thread"
+        );
         stop(h).await;
     }
 
