@@ -8,7 +8,7 @@ use crate::metrics::Metrics;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Largest request head accepted.
@@ -89,7 +89,7 @@ enum Head {
     Closed,
 }
 
-async fn read_head(sock: &mut TcpStream) -> std::io::Result<Head> {
+async fn read_head<S: AsyncRead + Unpin>(sock: &mut S) -> std::io::Result<Head> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0u8; 512];
     loop {
@@ -114,10 +114,19 @@ async fn read_head(sock: &mut TcpStream) -> std::io::Result<Head> {
     }
 }
 
-async fn handle(mut sock: TcpStream, health: Arc<Health>, metrics: Arc<Metrics>) {
+async fn handle(sock: TcpStream, health: Arc<Health>, metrics: Arc<Metrics>) {
     let _ = sock.set_nodelay(true);
+    respond(sock, &health, &metrics).await;
+}
+
+/// One request and its response on `sock`, every step bounded in time.
+async fn respond<S: AsyncRead + AsyncWrite + Unpin>(
+    mut sock: S,
+    health: &Health,
+    metrics: &Metrics,
+) {
     let (status, body) = match tokio::time::timeout(REQUEST_TIMEOUT, read_head(&mut sock)).await {
-        Ok(Ok(Head::Complete(head))) => route(&head, &health, &metrics),
+        Ok(Ok(Head::Complete(head))) => route(&head, health, metrics),
         Ok(Ok(Head::TooLarge)) => (431, "request head too large\n".to_owned()),
         _ => return,
     };
@@ -136,9 +145,19 @@ async fn handle(mut sock: TcpStream, health: Arc<Health>, metrics: Arc<Metrics>)
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let _ = sock.write_all(head.as_bytes()).await;
-    let _ = sock.write_all(body.as_bytes()).await;
-    let _ = sock.shutdown().await;
+    // Bounded like the head (final review Minor 2): a peer that never reads
+    // (a zero window) would otherwise hold this connection, and its permit,
+    // for as long as the kernel keeps probing — 32 of them, once a body
+    // outgrows the socket buffers, and `/livez` never answers again.
+    let written = tokio::time::timeout(REQUEST_TIMEOUT, async {
+        sock.write_all(head.as_bytes()).await?;
+        sock.write_all(body.as_bytes()).await?;
+        sock.shutdown().await
+    })
+    .await;
+    if !matches!(written, Ok(Ok(()))) {
+        return;
+    }
     // Drain what the client still sends (an oversized head's tail) so the
     // close is a FIN, not a reset that could beat the response to it.
     let mut sink = [0u8; 512];
@@ -263,6 +282,33 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(n, 0, "the silent connection is closed by the server");
+    }
+
+    /// Final review Minor 2 (§4.5): the response is written under the
+    /// same 2 s bound as the head, so a peer that sends a request and never
+    /// reads — a zero window — cannot hold its connection, and a permit,
+    /// past it (32 such peers would wedge `/livez` for good once a body
+    /// outgrows the kernel's buffers). The peer here is a 256-byte pipe: the
+    /// response head fits, the `/metrics` body does not. Time is paused, so
+    /// the bound costs nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_never_reads_the_response_is_let_go() {
+        let (mut client, server) = tokio::io::duplex(256);
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let (health, metrics) = (Health::new(Duration::from_secs(10)), Metrics::default());
+        let t = tokio::time::Instant::now();
+        let served =
+            tokio::time::timeout(REQUEST_TIMEOUT * 3, respond(server, &health, &metrics)).await;
+        assert!(
+            served.is_ok(),
+            "the response write outlived {:?} on a peer that never reads",
+            REQUEST_TIMEOUT * 3
+        );
+        assert!(t.elapsed() <= REQUEST_TIMEOUT * 2, "{:?}", t.elapsed());
+        drop(client);
     }
 
     /// Final review Minor 6 (§4.5): a head over 2 KiB is answered 431 even
