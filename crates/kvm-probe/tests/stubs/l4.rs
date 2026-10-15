@@ -1011,3 +1011,58 @@ fn netem_child() {
     });
     println!("CHILD-OK");
 }
+
+/// PD4 R-I1, the raw sweep: kvm-probe runs on a current-thread runtime,
+/// whose I/O driver runs only when the runtime parks. If it has not run
+/// since the KVM's data arrived, the websocket does not know the socket is
+/// readable and reads nothing; only `End::Fin`'s sweep of the kernel's
+/// receive queue then keeps the close a FIN. (The stub runs on its own
+/// thread and runtime, so this one can block without yielding.)
+#[test]
+fn a_fin_end_is_a_fin_before_the_runtime_has_seen_the_kvm_data() {
+    use kvm_probe::l4::hid::{End, HidWs};
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let stub = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let made = ledger_stub(LedgerOpts {
+                talk: Some((0, 2)),
+                ..LedgerOpts::default()
+            })
+            .await;
+            tx.send(made).unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(30), stop_rx).await;
+        });
+    });
+    let (port, ledger) = rx.recv_timeout(T).unwrap();
+    let wait_for = |done: &dyn Fn(&[Seen]) -> bool| {
+        let deadline = Instant::now() + T;
+        while !done(&ledger.lock().unwrap()) {
+            assert!(Instant::now() < deadline, "{:?}", ledger.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let w = HidWs::open(&plain(port), None, "0.1", T).await.unwrap();
+        // Blocking waits from here on: this runtime never parks, so its
+        // driver never sees the text frame arrive.
+        wait_for(&|l| l.first().is_some_and(|s| s.talked.is_some()));
+        std::thread::sleep(Duration::from_millis(100));
+        w.end(End::Fin).await;
+    });
+    wait_for(&|l| l.first().is_some_and(|s| s.ended.is_some()));
+    let seen = ledger.lock().unwrap().clone();
+    let _ = stop_tx.send(());
+    stub.join().unwrap();
+    assert_eq!(frames(&seen[0]), session_start());
+    assert_eq!(seen[0].ended.as_ref().unwrap().1, Ended::Fin);
+}
