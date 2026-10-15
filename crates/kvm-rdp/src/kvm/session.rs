@@ -1909,4 +1909,40 @@ mod tests {
             Duration::from_millis(750)
         );
     }
+
+    /// Task 4.2 through the actor: the websocket task re-asserts after the
+    /// session's own `reassert_after` — never within 2 s of a 600 s one
+    /// (the 1 s default would have), and soon after a 100 ms one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_websocket_reasserts_after_the_configured_wait() {
+        for (wait, want) in [
+            (Duration::from_secs(600), 0),
+            (Duration::from_millis(100), 1),
+        ] {
+            let mut r = rig(None, |c| c.reassert_after = wait).await;
+            r.streaming(1).await;
+            r.input_ready().await;
+            let _ = r.hid.push(
+                HidFrame::Keyboard {
+                    modifiers: 0,
+                    keys: [0x04, 0, 0, 0, 0],
+                },
+                false,
+            );
+            if want == 0 {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            } else {
+                let m = r.metrics.clone();
+                tokio::time::timeout(T, async {
+                    while m.hid_reasserts.get() == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("no re-assert");
+            }
+            assert_eq!(r.metrics.hid_reasserts.get(), want, "{wait:?}");
+            r.stop(1).await;
+        }
+    }
 }
