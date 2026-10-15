@@ -36,6 +36,7 @@ amended passage below is marked "rev 6.2". One line per change:
 - §4.5 (P17, PC4 M1): the admin listener serves at most 32 connections at once and drops the rest unanswered.
 - §4.5 (final review Minor 6): a request head is over 2 KiB by where its blank line ends, so one whose terminator arrives in the read that crosses the limit is still answered 431.
 - §4.5 (final review Minor 2): the response write and shutdown are bounded by the same 2 s as the head, so a peer that never reads cannot hold a connection, and one of the 32 permits, indefinitely.
+- §3.2, §4.4 (final review Minor 3): `kvm.scheme = "http"` logs one WARN at startup — no pin, the KVM password and token in cleartext, diagnosis only.
 - DC17 (§11.2): the L1 rig decodes `GraphicsPipelineServer`'s output with IronRDP's own PDU types, not `GraphicsPipelineClient`.
 - DC18 (§5.2, §8, §9.3, §11.6, §12, §15): §11.6's five L4 hardware checks move to Plan D's first task; Plan C adds four more to that list (§11.6).
 - DC19 (§12): CI gains a job timeout and a tracked-secrets gate ahead of Plan E.
@@ -208,7 +209,9 @@ item the census did not measure is marked *open*.
   the same or better) — the static capture's tail is worse (p99 83 vs 49 ms,
   max 136 vs 55 ms, n = 1 capture each; `census.md`, Leg A — transport), but
   the decision is unaffected. Scheme `http` (80 / 8880 / 8888) stays a config option
-  for diagnosis on the isolated segment only; neither of the conditions that
+  for diagnosis on the isolated segment only (rev 6.2, final review Minor 3:
+  startup logs one WARN saying so — no pin, and the KVM password and token
+  in cleartext); neither of the conditions that
   would have justified it (rustls cannot negotiate, measurable TLS latency)
   holds. TLS here buys confidentiality against the LAN, not trust in the
   device.
@@ -473,7 +476,7 @@ Windows App run retunes (§12):
 | `rdp.username` | `kvm` | Exact, case-sensitive match (§9.1) |
 | `admin.listen` | `0.0.0.0:9464` | §4.5 |
 | `kvm.host`, `kvm.spki_sha256` | required | One pin covers all three TLS ports (§3.2) |
-| `kvm.scheme` / ports | `https` / 443, 8881, 8889 | Confirmed by Leg A (§3.2) |
+| `kvm.scheme` / ports | `https` / 443, 8881, 8889 | Confirmed by Leg A (§3.2). `http` (80, 8880, 8888) is for diagnosis only, and startup warns once (rev 6.2) |
 | `kvm.connect_timeout` / `login_timeout` | 3 s / 5 s | No logout timeout: the bridge never logs out (§3.2) |
 | `kvm.backoff` | 250 ms ×2 → 8 s, ±20% jitter | Transient reconnects (§6.9). One backoff state per connection (FLV, websocket): the FLV's resets when a new FLV delivers its first tag, the websocket's once a reopened websocket has sent the session-start sequence |
 | `kvm.upstream_deadline` | 20 s | §6.9 |

@@ -226,6 +226,14 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
         key_bits = identity.key.bits(),
         "TLS identity loaded"
     );
+    // §3.2: plain HTTP is a diagnosis option on the isolated segment only
+    // (final review Minor 3).
+    if cfg.kvm.scheme == crate::config::Scheme::Http {
+        tracing::warn!(
+            "kvm.scheme is \"http\": no certificate pin, and the KVM password and token travel \
+             in cleartext; for diagnosis on the isolated segment only"
+        );
+    }
     let metrics = Arc::new(Metrics::default());
     let health = Arc::new(Health::new(cfg.admin.liveness_timeout));
     health.set_tls_loaded();
@@ -1526,6 +1534,39 @@ mod tests {
         assert!(
             lines.iter().all(|v| v["level"] == "INFO"),
             "a line above INFO from some thread: {lines:?}"
+        );
+        drop(sim);
+        rt.shutdown_timeout(Duration::from_secs(1));
+    }
+
+    /// Final review Minor 3 (§3.2, §4.4): `kvm.scheme = "http"` is for
+    /// diagnosis only — no pin, the KVM password and token in cleartext —
+    /// and startup says so, once, at WARN. (`https`, the default, warns
+    /// nothing: the test above sees only INFO from every thread.) The line
+    /// comes from `spawn`'s own thread, so a scoped subscriber sees it.
+    #[test]
+    fn startup_warns_once_when_the_kvm_scheme_is_http() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let sim = rt.block_on(sim());
+        let d = tempfile::tempdir().unwrap();
+        let cfg = config_for(&sim, d.path(), |c| {
+            c.kvm.scheme = crate::config::Scheme::Http;
+        });
+        let out = Captured::default();
+        let sub = crate::logging::subscriber("info", out.clone()).unwrap();
+        let h = tracing::subscriber::with_default(sub, || spawn(cfg)).unwrap();
+        rt.block_on(stop(h));
+        let lines = out.lines();
+        let warns: Vec<_> = lines.iter().filter(|v| v["level"] == "WARN").collect();
+        assert_eq!(warns.len(), 1, "{lines:?}");
+        let message = warns[0]["fields"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("kvm.scheme") && message.contains("cleartext"),
+            "{message}"
         );
         drop(sim);
         rt.shutdown_timeout(Duration::from_secs(1));
