@@ -725,7 +725,7 @@ mod tests {
     use crate::rdp::handler::Lifecycle;
     use crate::rdp::input::{InputDeps, InputRuntimeConfig};
     use ironrdp_cliprdr::backend::CliprdrBackendFactory as _;
-    use ironrdp_cliprdr::pdu::FormatDataResponse;
+    use ironrdp_cliprdr::pdu::{ClipboardFormat, ClipboardFormatId, FormatDataResponse};
     use ironrdp_core::encode_vec;
     use ironrdp_server::KeyboardEvent;
     // `start` and `process` are `DvcProcessor` methods on the GFX server,
@@ -1122,6 +1122,8 @@ mod tests {
         events: mpsc::UnboundedReceiver<ServerEvent>,
         cmds: mpsc::UnboundedReceiver<KvmCommand>,
         metrics: Arc<Metrics>,
+        /// The input shell the shell feeds (`paste.modifier_wait` = `WIRED_WAIT`).
+        input: Arc<InputShared>,
     }
 
     fn wired() -> W {
@@ -1165,7 +1167,10 @@ mod tests {
             events: ServerEvents::default(),
             gens: gens.clone(),
             metrics: metrics.clone(),
-            cfg: InputRuntimeConfig::test(),
+            cfg: InputRuntimeConfig {
+                modifier_wait: WIRED_WAIT,
+                ..InputRuntimeConfig::test()
+            },
         }));
         let deps = ShellDeps {
             cfg: cfg.clone(),
@@ -1177,7 +1182,7 @@ mod tests {
             suppressed: Arc::new(AtomicBool::new(false)),
             rtt: Arc::new(AtomicU32::new(u32::MAX)),
             to_kvm: ktx,
-            input,
+            input: input.clone(),
         };
         let pump = Pump::with_slate(cfg, metrics.clone(), None);
         tokio::task::spawn_local(PumpShell::with_pump(deps, pump).run(rdp_rx, kvm_rx));
@@ -1190,8 +1195,12 @@ mod tests {
             events,
             cmds,
             metrics,
+            input,
         }
     }
+
+    /// The wired rig's `paste.modifier_wait`: a paste times out in real time.
+    const WIRED_WAIT: Duration = Duration::from_millis(100);
 
     /// The wired rig's `paste.max_bytes`.
     const CLIP_MAX: usize = 16;
@@ -2355,6 +2364,82 @@ mod tests {
                 w.settled().await;
             })
             .await;
+    }
+
+    /// PD9 review I3: the shell feeds a word's own answer before the ones
+    /// the backend dropped behind it — the order the client sent them.
+    /// Paste 1 times out with its request outstanding; paste 2 asks; paste
+    /// 1's late answer and paste 2's arrive before the shell runs — one word
+    /// in flight, one lost behind it. The late answer is discarded (`late`),
+    /// paste 2's lost answer ends it at once, and nothing is typed. Reversed,
+    /// "old" would answer paste 2 and be typed. The same for a late failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_late_answer_and_the_one_lost_behind_it_keep_their_order() {
+        for failed in [false, true] {
+            LocalSet::new()
+                .run_until(async {
+                    let mut w = wired();
+                    let mut ours = w.clips.build_cliprdr_backend();
+                    let (chan, _) = w.live().await;
+                    let m = w.metrics.clone();
+                    let keys = |down: bool| {
+                        for code in [0x1D, 0x38, 0x2A, 0x2F] {
+                            w.input.keyboard(if down {
+                                KeyboardEvent::Pressed {
+                                    code,
+                                    extended: false,
+                                }
+                            } else {
+                                KeyboardEvent::Released {
+                                    code,
+                                    extended: false,
+                                }
+                            });
+                        }
+                    };
+                    ours.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+                    tokio::time::sleep(Duration::from_millis(20)).await; // the shell takes it
+                    keys(true); // paste 1 asks
+                    assert_eq!(m.paste_events.get("started"), 1, "failed: {failed}");
+                    tokio::time::sleep(WIRED_WAIT + Duration::from_millis(50)).await;
+                    keys(false); // paste 1 ends unanswered
+                    assert_eq!(m.paste_events.get("aborted"), 1, "failed: {failed}");
+                    keys(true); // paste 2 asks
+                    // Before the shell runs: paste 1's late answer, then 2's.
+                    ours.on_format_data_response(if failed {
+                        FormatDataResponse::new_error()
+                    } else {
+                        FormatDataResponse::new_unicode_string("old")
+                    });
+                    ours.on_format_data_response(FormatDataResponse::new_unicode_string("new"));
+                    until("both answers", || {
+                        m.clipboard_discarded.get("in_flight") == 1
+                    })
+                    .await;
+                    assert_eq!(m.clipboard_discarded.get("late"), 1, "failed: {failed}");
+                    assert_eq!(m.paste_events.get("aborted"), 2, "failed: {failed}");
+                    keys(false);
+                    let mut typed = Vec::new();
+                    loop {
+                        if w.h.hid.take_release() {
+                            continue;
+                        }
+                        let Some(f) = w.h.hid.next_frame() else {
+                            break;
+                        };
+                        if let kvm_proto::hid::HidFrame::Keyboard { keys, .. } = f
+                            && keys[0] != 0
+                        {
+                            typed.push(keys[0]);
+                        }
+                    }
+                    assert!(typed.is_empty(), "failed: {failed}: typed {typed:02x?}");
+                    assert_eq!(m.paste_events.get("done"), 0);
+                    w.teardown(chan);
+                    w.settled().await;
+                })
+                .await;
+        }
     }
     /// PC17 (found by L2's quick-reconnect case): a client re-advertises
     /// and disconnects at once. IronRDP runs the re-advertise's `on_ready`,
