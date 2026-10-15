@@ -146,7 +146,11 @@ mod tests {
     /// characters of `[A-Za-z0-9._/-]` — passes.
     #[test]
     fn only_a_static_path_passes() {
-        let longest = format!("/{}.html", "a".repeat(MAX_PATH - 5));
+        // The ruling's 128, as literals: a bound derived from `MAX_PATH`
+        // would move with it.
+        assert_eq!(MAX_PATH, 128);
+        let longest = format!("/{}.html", "a".repeat(123));
+        assert_eq!(longest.len(), 1 + 128);
         for ok in [
             "/",
             "/about.html",
@@ -171,7 +175,8 @@ mod tests {
     /// an extensionless name; a missing leading `/`; past 128 characters.
     #[test]
     fn everything_else_is_refused() {
-        let past = format!("/{}.html", "a".repeat(MAX_PATH - 4));
+        let past = format!("/{}.html", "a".repeat(124));
+        assert_eq!(past.len(), 1 + 129);
         for bad in [
             "/cgi-bin/login.lua?logout",
             "/cgi-bin/login.lua",
