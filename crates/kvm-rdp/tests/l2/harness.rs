@@ -491,29 +491,6 @@ pub fn hid_stamped(sim: &KvmSim, conn: u64) -> Vec<(Instant, Vec<u8>)> {
         .collect()
 }
 
-/// `pred` never holds over kvm-sim's log for `d` — `Client::never`'s rule
-/// (PC16 re-review): the last check's snapshot is taken once the deadline
-/// has passed, and no poll sleeps past it, so an event recorded in the
-/// last poll interval is judged too.
-pub async fn sim_never(sim: &KvmSim, d: Duration, pred: impl Fn(&[SimEvent]) -> bool) {
-    let t0 = Instant::now();
-    loop {
-        let last = t0.elapsed() >= d;
-        let log = sim.events();
-        assert!(
-            !pred(&log),
-            "it happened on kvm-sim; its HID frames: {:02x?}",
-            log.iter()
-                .filter(|e| matches!(e, SimEvent::Hid { .. }))
-                .collect::<Vec<_>>()
-        );
-        if last {
-            return;
-        }
-        tokio::time::sleep(ms(20).min(d.saturating_sub(t0.elapsed()))).await;
-    }
-}
-
 /// A slice NAL with any trailing zero bytes trimmed (§6.2 trims them).
 fn key(nal: &[u8]) -> Vec<u8> {
     let end = nal.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
