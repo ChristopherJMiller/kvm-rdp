@@ -53,9 +53,12 @@ pub fn source(name: &str) -> Source {
     Source::fixture(name).unwrap()
 }
 
-/// The fixtures' size as the default: no connect-time resize, no slate.
+/// The fixtures' size as the default: no connect-time resize, no slate;
+/// and no re-assert within a case (D10a): the exact-frame cases never see
+/// one on a shared host. Task 5.3's re-assert case sets its own.
 pub fn sized(c: &mut Config) {
     c.video.default_size = (640, 360);
+    c.input.reassert_after = Duration::from_secs(600);
 }
 
 /// A loopback address no other `Env` binds — 127.128-191.x.y, from this

@@ -240,6 +240,10 @@ pub struct InputConfig {
     pub key_repeat_timeout: Duration,
     pub modifier_idle_timeout: Duration,
     pub mac_remap: bool,
+    /// How long past each websocket open's session start the full HID state
+    /// is re-asserted, once (§3.2, §7.4; PC9 fix 2, DD8). 1 s until L4
+    /// retunes it (Task 6.1).
+    pub reassert_after: Duration,
 }
 
 /// `paste.*` (§8). `chord` is parsed at load (DD11); it is config, not
@@ -511,6 +515,7 @@ struct RawInput {
     key_repeat_timeout: Option<String>,
     modifier_idle_timeout: Option<String>,
     mac_remap: Option<bool>,
+    reassert_after: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -852,6 +857,7 @@ fn build(raw: Raw, base: &Path) -> Result<Config, ConfigError> {
             "input.modifier_idle_timeout",
         )?,
         mac_remap: ri.mac_remap.unwrap_or(false),
+        reassert_after: dur(ri.reassert_after.as_ref(), s(1), "input.reassert_after")?,
     };
     let rp = &raw.paste;
     // DD11: one or more distinct modifiers, then one letter or digit. The
@@ -1011,6 +1017,8 @@ pub(crate) mod tests {
             (256, s(1), s(10))
         );
         assert_eq!((i.modifier_idle_timeout, i.mac_remap), (s(30), false));
+        // Task 4.2 (DD8): 1 s until L4 retunes it (Task 6.1).
+        assert_eq!(i.reassert_after, s(1));
         let p = &c.paste;
         assert_eq!(
             (p.chord, p.pace, p.max_chars),
@@ -1135,6 +1143,14 @@ pub(crate) mod tests {
             // PD9 carry 5 (PD7 m4): the Typist takes up to 8 reports a
             // step and typing's start one more (DD6).
             ("[input]\nqueue = 8\n", "an HID queue below DD6's 9"),
+            (
+                "[input]\nreassert_after = \"0s\"\n",
+                "a zero re-assert wait",
+            ),
+            (
+                "[input]\nreassert_after = \"7200s\"\n",
+                "a re-assert wait above 1 h",
+            ),
         ] {
             let r = load(d.path(), &format!("{base}{extra}"));
             assert!(
@@ -1375,6 +1391,11 @@ pub(crate) mod tests {
             t(
                 format!("{base}[input]\nqueue = {n}\n"),
                 "an input.queue out of range",
+            ),
+            // Task 4.2 (D10a, C1 rule): the new key.
+            t(
+                format!("{base}[input]\nreassert_after = \"{s}\"\n"),
+                "a bad reassert_after",
             ),
             // DD11 (PD7, C1 rule): `paste.chord` is a validated value now.
             t(format!("{base}[paste]\nchord = \"{s}\"\n"), "a bad chord"),

@@ -66,6 +66,8 @@ pub struct SessionConfig {
     pub flv_idle_timeout: Duration,
     pub idr_side_timeout: Duration,
     pub hid_write_timeout: Duration,
+    /// `input.reassert_after` (PC9 fix 2, DD8; D10a).
+    pub reassert_after: Duration,
     pub admission: AdmissionConfig,
 }
 
@@ -81,6 +83,7 @@ impl SessionConfig {
             flv_idle_timeout: c.video.flv_idle_timeout,
             idr_side_timeout: c.video.idr_side_timeout,
             hid_write_timeout: c.input.hid_write_timeout,
+            reassert_after: c.input.reassert_after,
             admission: c.video.admission(),
         }
     }
@@ -181,6 +184,7 @@ impl<'d> Session<'d> {
                 backoff: Backoff::new(cfg.backoff, Jitter::from_clock()),
                 connect_timeout: cfg.connect_timeout,
                 write_timeout: cfg.hid_write_timeout,
+                reassert_after: cfg.reassert_after,
                 metrics: deps.metrics.clone(),
             }
             .run(),
@@ -631,6 +635,7 @@ mod tests {
             flv_idle_timeout: Duration::from_secs(2),
             idr_side_timeout: Duration::from_secs(1),
             hid_write_timeout: Duration::from_secs(1),
+            reassert_after: crate::hid::writer::REASSERT_AFTER,
             admission: AdmissionConfig::default(),
         };
         set(&mut cfg);
@@ -1086,6 +1091,7 @@ mod tests {
                 flv_idle_timeout: Duration::from_secs(2),
                 idr_side_timeout: Duration::from_secs(1),
                 hid_write_timeout: Duration::from_secs(1),
+                reassert_after: crate::hid::writer::REASSERT_AFTER,
                 admission: AdmissionConfig::default(),
             }),
             to_pump: mpsc::channel(8).0,

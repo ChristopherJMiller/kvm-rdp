@@ -160,6 +160,16 @@ impl HidQueue {
         None
     }
 
+    /// The last full keyboard report, then the last mouse report (the
+    /// resync state): what a re-assert re-sends.
+    #[must_use]
+    pub fn current_state(&self) -> Vec<HidFrame> {
+        let mut v = Vec::new();
+        v.extend(self.latest_kbd);
+        v.extend(self.latest_mouse);
+        v
+    }
+
     /// Release-all: nothing queued survives; the remembered state becomes
     /// "nothing pressed" at the same position.
     pub fn release(&mut self) {
@@ -287,6 +297,13 @@ impl HidControl {
             self.metrics.hid_epoch_discards.add(discarded);
         }
         f
+    }
+
+    /// §7.4/§3.2 (PC9 fix 2): the full state to re-assert once a reconnect
+    /// settles — the last keyboard and mouse reports the KVM should hold.
+    #[must_use]
+    pub fn current_state_frames(&self) -> Vec<HidFrame> {
+        self.q().current_state()
     }
 
     /// Reports queued and not yet taken by the writer: the input shell's

@@ -260,6 +260,8 @@ pub struct Metrics {
     pub hid_reports_coalesced: Counter,
     pub hid_resyncs: Counter,
     pub hid_epoch_discards: Counter,
+    /// PC9 fix 2: full-state re-asserts once a websocket (re)open settles.
+    pub hid_reasserts: Counter,
     pub release_all: Family,
     pub sessions: Counter,
     pub disconnects: Family,
@@ -395,6 +397,10 @@ impl Default for Metrics {
                 "kvm_rdp_hid_epoch_discards",
                 "Reports discarded by a release epoch",
             ),
+            hid_reasserts: Counter::new(
+                "kvm_rdp_hid_reasserts",
+                "Full-state re-asserts after a reconnect",
+            ),
             release_all: Family::new(
                 "kvm_rdp_release_all",
                 "Release-all by trigger (§7.4)",
@@ -447,6 +453,7 @@ impl Metrics {
             &self.hid_reports_coalesced,
             &self.hid_resyncs,
             &self.hid_epoch_discards,
+            &self.hid_reasserts,
             &self.sessions,
             &self.accept_refused,
             &self.input_events_ignored,
@@ -572,9 +579,10 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            42,
-            "17 counters, 12 families, 8 gauges, 5 histograms"
+            43,
+            "18 counters, 12 families, 8 gauges, 5 histograms"
         );
+        assert!(t.contains("# TYPE kvm_rdp_hid_reasserts_total counter\n"));
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
