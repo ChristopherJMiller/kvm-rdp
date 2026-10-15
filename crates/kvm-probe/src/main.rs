@@ -319,6 +319,84 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| kvm::bounded_debug(&e))?;
             println!("logins={} stopped={:?}", r.logins, r.stopped);
         }
+        Cmd::HidPageUrl => {
+            // The owner opens this on the Mac themselves (Task 1.6 step 1).
+            println!("{}", l4::page::url());
+        }
+        Cmd::HidType {
+            conn,
+            chars,
+            paces,
+            runs,
+            snapshot,
+            settle_ms,
+        } => {
+            let pw = password(&conn)?;
+            let t = target(&conn.endpoint);
+            let (ffmpeg, dir) = match &snapshot {
+                Some(_) => (
+                    Some(sandbox::resolve_ffmpeg().map_err(|e| e.to_string())?),
+                    Some(captures_dir()?),
+                ),
+                None => (None, None),
+            };
+            let snapshots = match (&snapshot, &ffmpeg, &dir) {
+                (Some(prefix), Some(ffmpeg), Some(dir)) => Some(l4::hid::Snapshots {
+                    prefix,
+                    settle: Duration::from_millis(settle_ms),
+                    dir,
+                    ffmpeg,
+                    pin: conn.pin_for(Port::Video),
+                }),
+                _ => None,
+            };
+            let plan = l4::hid::TypePlan {
+                chars,
+                paces_ms: &paces,
+                runs,
+                snapshots,
+            };
+            // Once for the whole command, before the login, so an
+            // interrupt at any point is never lost (D34).
+            let mut irq = l4::hid::Interrupts::new().map_err(|e| kvm::bounded_debug(&e))?;
+            session(&conn, &pw, async |tok: &str| {
+                l4::hid::type_runs(
+                    &t,
+                    conn.pin_for(Port::Control),
+                    tok,
+                    &plan,
+                    &mut irq,
+                    |line| println!("{line}"),
+                )
+                .await
+            })
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))??;
+        }
+        Cmd::HidRelease { conn, x, y } => {
+            let pw = password(&conn)?;
+            let t = target(&conn.endpoint);
+            session(&conn, &pw, async |tok: &str| {
+                l4::hid::ensure_released(&t, conn.pin_for(Port::Control), tok, x.zip(y)).await
+            })
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))?
+            .map_err(|e| kvm::bounded_debug(&e))?;
+            println!("released");
+        }
+        Cmd::Snapshot { conn, name } => {
+            let pw = password(&conn)?;
+            let t = target(&conn.endpoint);
+            let ffmpeg = sandbox::resolve_ffmpeg().map_err(|e| e.to_string())?;
+            let dir = captures_dir()?;
+            let png = session(&conn, &pw, async |tok: &str| {
+                l4::snapshot::snapshot(&t, conn.pin_for(Port::Video), tok, &dir, &name, &ffmpeg)
+                    .await
+            })
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))??;
+            println!("snapshot: {}", png.display());
+        }
         Cmd::LogoutWatch { conn, max_secs } => {
             let pw = password(&conn)?;
             let r = l4::session::logout_watch(

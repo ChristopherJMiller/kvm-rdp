@@ -1,10 +1,14 @@
-//! Plan D's L4 hardware checks (spec §11.6). Every check here reads the
-//! KVM; none sends a HID frame except `logout-watch`'s one all-zero release
-//! (the HID checks are `hid`, `hold`), and none logs out (kvm-probe cannot,
-//! §3.2). Device text reaches the terminal
-//! only escaped and bounded (§9.2): `escaped`, `RefusalForm`.
+//! Plan D's L4 hardware checks (spec §11.6). None logs out (kvm-probe
+//! cannot, §3.2). The non-HID checks send no HID frame except
+//! `logout-watch`'s one all-zero release; the HID checks (`hid`, and
+//! Task 1.5's `hold`) end every run released (`hid::guarded`) and type only
+//! the test page's pattern (`page`). Device text reaches the terminal only
+//! escaped and bounded (§9.2): `escaped`, `RefusalForm`.
 pub mod flv;
+pub mod hid;
+pub mod page;
 pub mod session;
+pub mod snapshot;
 pub mod ws;
 
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};

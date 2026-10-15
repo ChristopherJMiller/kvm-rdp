@@ -33,7 +33,7 @@ impl From<CaptureError> for std::io::Error {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CaptureDir {
     root: PathBuf,
 }

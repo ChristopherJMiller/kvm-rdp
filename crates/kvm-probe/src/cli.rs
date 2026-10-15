@@ -84,7 +84,13 @@ impl Cli {
             Cmd::LogoutWatch { conn, .. } => {
                 (&conn.endpoint, &[Port::Web, Port::Video, Port::Control])
             }
-            Cmd::Fingerprint { .. } | Cmd::SampleRange { .. } | Cmd::Summarize { .. } => {
+            Cmd::HidType { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Control, Port::Video]),
+            Cmd::HidRelease { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Control]),
+            Cmd::Snapshot { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Video]),
+            Cmd::Fingerprint { .. }
+            | Cmd::SampleRange { .. }
+            | Cmd::Summarize { .. }
+            | Cmd::HidPageUrl => {
                 return Ok(());
             }
         };
@@ -120,6 +126,41 @@ fn sample_dimension(s: &str) -> Result<usize, String> {
         Ok(v)
     } else {
         Err(format!("must be in {}..={}", range.start(), range.end()))
+    }
+}
+
+/// `hid-type --chars` (no burst is unbounded): 1..=`l4::hid::MAX_CHARS`,
+/// else a usage error. `type_text` checks the same bound again.
+fn hid_chars(s: &str) -> Result<usize, String> {
+    let v: usize = s.parse().map_err(|e| format!("{e}"))?;
+    let max = crate::l4::hid::MAX_CHARS;
+    if (1..=max).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("must be in 1..={max}"))
+    }
+}
+
+/// One `hid-type --paces` value in milliseconds: at most
+/// `l4::hid::MAX_PACE` (a key is held for one pace).
+fn hid_pace(s: &str) -> Result<u64, String> {
+    let v: u64 = s.parse().map_err(|e| format!("{e}"))?;
+    let max = crate::l4::ms(crate::l4::hid::MAX_PACE);
+    if v <= max {
+        Ok(v)
+    } else {
+        Err(format!("must be at most {max} (ms)"))
+    }
+}
+
+/// `hid-release --x/--y`: an absolute coordinate, 0..=32767 (§3.3).
+fn abs_coord(s: &str) -> Result<u16, String> {
+    let v: u16 = s.parse().map_err(|e| format!("{e}"))?;
+    let max = kvm_proto::hid::ABS_MAX;
+    if v <= max {
+        Ok(v)
+    } else {
+        Err(format!("must be in 0..={max}"))
     }
 }
 
@@ -317,6 +358,52 @@ pub enum Cmd {
         conn: Conn,
         #[arg(long, default_value_t = 300)]
         max_secs: u64,
+    },
+    /// L4 [OWNER]: print the HID test page's data: URL for the owner to
+    /// open on the Mac. Sends nothing to the KVM.
+    HidPageUrl,
+    /// L4: on one login, type the generated pattern (never any other text)
+    /// into the HID test page --runs times at each of --paces (ms); prints
+    /// what the page should show after each run. Each run ends with a release.
+    HidType {
+        #[command(flatten)]
+        conn: Conn,
+        /// Characters per run, 1..=500 (no burst is unbounded).
+        #[arg(long, default_value_t = 200, value_parser = hid_chars)]
+        chars: usize,
+        /// Milliseconds after each report, each at most 100 (a key is held
+        /// for one pace).
+        #[arg(long, value_delimiter = ',', default_value = "0,5,10,15", value_parser = hid_pace)]
+        paces: Vec<u64>,
+        #[arg(long, default_value_t = 3)]
+        runs: u32,
+        /// After each run and --settle-ms, a snapshot named
+        /// `<PREFIX><pace>_<run>` (e.g. `type0_1`).
+        #[arg(long)]
+        snapshot: Option<String>,
+        #[arg(long, default_value_t = 2000)]
+        settle_ms: u64,
+    },
+    /// L4: release every key and button from a fresh process — a new HID
+    /// websocket's session start, and a zero-button pointer report at
+    /// (--x, --y) if both are given. Run it after any HID command that
+    /// failed, was interrupted or was killed (D6b).
+    HidRelease {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, requires = "y", value_parser = abs_coord)]
+        x: Option<u16>,
+        #[arg(long, requires = "x", value_parser = abs_coord)]
+        y: Option<u16>,
+    },
+    /// L4: captures/<name>.flv up to its first IDR, decoded in the sandbox
+    /// to captures/<name>.flv.png. Only while the Mac shows the HID test
+    /// page or the lock screen.
+    Snapshot {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long)]
+        name: String,
     },
     /// Decode one frame of captures/<name> in the sandbox; report native Y min/max.
     ///
@@ -606,6 +693,9 @@ mod tests {
             vec!["token-life"],
             vec!["session-cap"],
             vec!["logout-watch"],
+            vec!["hid-type"],
+            vec!["hid-release"],
+            vec!["snapshot", "--name", "s"],
         ] {
             let mut argv = vec!["kvm-probe"];
             argv.extend(&sub);
@@ -817,5 +907,169 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn hid_argv<'a>(sub: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+        let mut argv = vec![
+            "kvm-probe",
+            sub,
+            "--host",
+            "h",
+            "--pin",
+            "ab",
+            "--password-file",
+            "/tmp/pw",
+        ];
+        argv.extend(extra);
+        argv
+    }
+
+    /// The HID subcommands' defaults (Task 1.6 runs them as written);
+    /// `hid-page-url` takes nothing and connects nowhere.
+    #[test]
+    fn hid_subcommands_parse_with_their_defaults() {
+        let c = Cli::try_parse_from(["kvm-probe", "hid-page-url"]).unwrap();
+        assert!(matches!(c.cmd, Cmd::HidPageUrl));
+        assert!(c.validate().is_ok());
+        let c = Cli::try_parse_from(hid_argv("hid-type", &[])).unwrap();
+        assert!(c.validate().is_ok());
+        assert!(matches!(
+            c.cmd,
+            Cmd::HidType { chars: 200, ref paces, runs: 3, snapshot: None, settle_ms: 2000, .. }
+                if paces == &[0, 5, 10, 15]
+        ));
+        let c = Cli::try_parse_from(hid_argv("hid-release", &[])).unwrap();
+        assert!(c.validate().is_ok());
+        assert!(matches!(
+            c.cmd,
+            Cmd::HidRelease {
+                x: None,
+                y: None,
+                ..
+            }
+        ));
+        let c =
+            Cli::try_parse_from(hid_argv("hid-release", &["--x", "100", "--y", "200"])).unwrap();
+        assert!(matches!(
+            c.cmd,
+            Cmd::HidRelease {
+                x: Some(100),
+                y: Some(200),
+                ..
+            }
+        ));
+        let c = Cli::try_parse_from(hid_argv("snapshot", &["--name", "pre_7"])).unwrap();
+        assert!(c.validate().is_ok());
+        assert!(matches!(c.cmd, Cmd::Snapshot { ref name, .. } if name == "pre_7"));
+    }
+
+    /// No burst is unbounded: `--chars` is 1..=500 and each `--paces`
+    /// value at most 100 ms, refused at parse time.
+    #[test]
+    fn hid_type_bounds_its_burst() {
+        for ok in [
+            &["--chars", "1"][..],
+            &["--chars", "500"],
+            &["--paces", "0,100"],
+        ] {
+            assert!(
+                Cli::try_parse_from(hid_argv("hid-type", ok)).is_ok(),
+                "{ok:?}"
+            );
+        }
+        for bad in [
+            &["--chars", "501"][..],
+            &["--chars", "0"],
+            &["--chars", "1000000"],
+            &["--paces", "101"],
+            &["--paces", "0,5,1000"],
+        ] {
+            let err = Cli::try_parse_from(hid_argv("hid-type", bad)).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `hid-type` types only the generated pattern: its arguments are
+    /// exactly these — none names text or a file to type (the password
+    /// file is only ever read to log in).
+    #[test]
+    fn hid_type_takes_no_text_to_type() {
+        let cmd = Cli::command();
+        let sub = cmd.find_subcommand("hid-type").unwrap();
+        let mut args: Vec<&str> = sub.get_arguments().map(|a| a.get_id().as_str()).collect();
+        args.sort_unstable();
+        assert_eq!(
+            args,
+            [
+                "chars",
+                "control_pin",
+                "host",
+                "paces",
+                "password_file",
+                "pin",
+                "runs",
+                "scheme",
+                "settle_ms",
+                "snapshot",
+                "video_pin"
+            ]
+        );
+        for flag in ["--text", "--file", "--type", "--string"] {
+            let err = Cli::try_parse_from(hid_argv("hid-type", &[flag, "x"])).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+    }
+
+    /// `hid-release`'s pointer report needs both coordinates, each in
+    /// 0..=32767 — never a silent (0, 0) or half a position.
+    #[test]
+    fn hid_release_takes_both_coordinates_or_neither() {
+        for half in [&["--x", "1"][..], &["--y", "1"]] {
+            let err = Cli::try_parse_from(hid_argv("hid-release", half)).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{half:?}"
+            );
+        }
+        let err = Cli::try_parse_from(hid_argv("hid-release", &["--x", "32768", "--y", "1"]))
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(
+            Cli::try_parse_from(hid_argv("hid-release", &["--x", "32767", "--y", "0"])).is_ok()
+        );
+    }
+
+    /// Each HID subcommand's https pin check covers the ports it touches:
+    /// `hid-type` all three (login, typing, snapshots), `hid-release` web
+    /// and control, `snapshot` web and video.
+    #[test]
+    fn hid_subcommands_need_a_pin_for_each_port_they_touch() {
+        let only = |sub: &'static str, extra: &[&'static str], port_pins: &[&'static str]| {
+            let mut argv = vec![
+                "kvm-probe",
+                sub,
+                "--host",
+                "h",
+                "--password-file",
+                "/tmp/pw",
+            ];
+            argv.extend(extra);
+            argv.extend(port_pins);
+            Cli::try_parse_from(argv).unwrap().validate()
+        };
+        assert!(only("hid-type", &[], &["--video-pin", "v", "--control-pin", "c"]).is_err());
+        assert!(only("hid-release", &[], &["--control-pin", "c"]).is_err());
+        assert!(only("snapshot", &["--name", "s"], &["--video-pin", "v"]).is_err());
+        let err = only("hid-type", &[], &["--pin", "w", "--control-pin", "c"]);
+        assert!(err.is_ok(), "--pin covers video: {err:?}");
     }
 }

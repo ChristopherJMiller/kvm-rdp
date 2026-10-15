@@ -243,7 +243,7 @@ pub(crate) async fn open_flv(
 /// refuses to open if *anything* — a regular file or a symlink, dangling
 /// or not — already exists at `path`, without ever following it; mode
 /// `0o600` matches the 0700 captures dir's own access discipline.
-fn open_capture_file(path: &Path) -> Result<std::fs::File, KvmError> {
+pub(crate) fn open_capture_file(path: &Path) -> Result<std::fs::File, KvmError> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

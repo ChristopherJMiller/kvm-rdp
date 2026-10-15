@@ -24,48 +24,157 @@ pub fn build_ffmpeg_sandbox_argv(
     capture_name: &str,
     out_name: &str,
 ) -> Vec<String> {
-    let cap_in = format!("/cap/{capture_name}");
-    let cap_out = format!("/cap/{out_name}");
-    vec![
-        "nice".to_string(),
-        "-n".to_string(),
-        "19".to_string(),
-        "bwrap".to_string(),
-        "--new-session".to_string(),
-        "--unshare-all".to_string(),
-        "--die-with-parent".to_string(),
-        "--clearenv".to_string(),
-        "--dev".to_string(),
-        "/dev".to_string(),
-        "--proc".to_string(),
-        "/proc".to_string(),
-        "--ro-bind".to_string(),
-        "/nix".to_string(),
-        "/nix".to_string(),
-        "--bind".to_string(),
-        cap_host_dir.to_string_lossy().into_owned(),
-        "/cap".to_string(),
-        "--chdir".to_string(),
-        "/cap".to_string(),
-        "--".to_string(),
-        ffmpeg.to_string_lossy().into_owned(),
-        "-hide_banner".to_string(),
-        "-nostdin".to_string(),
-        "-y".to_string(),
-        "-threads".to_string(),
-        "4".to_string(),
-        "-loglevel".to_string(),
-        "verbose".to_string(),
-        "-i".to_string(),
-        cap_in,
-        "-map".to_string(),
-        "0:v:0".to_string(),
-        "-frames:v".to_string(),
-        "1".to_string(),
-        "-f".to_string(),
-        "rawvideo".to_string(),
-        cap_out,
+    let mut v = sandbox_prefix(ffmpeg, cap_host_dir);
+    v.extend([
+        "-i".to_owned(),
+        format!("/cap/{capture_name}"),
+        "-map".to_owned(),
+        "0:v:0".to_owned(),
+        "-frames:v".to_owned(),
+        "1".to_owned(),
+        "-f".to_owned(),
+        "rawvideo".to_owned(),
+        format!("/cap/{out_name}"),
+    ]);
+    v
+}
+
+/// `nice -n 19 bwrap … ffmpeg <common options>`, up to its input (§12):
+/// every namespace unshared (no network), an empty environment, a new
+/// session (no terminal), `/nix` read-only and the captures dir — only it —
+/// read-write at `/cap`.
+fn sandbox_prefix(ffmpeg: &Path, cap_host_dir: &Path) -> Vec<String> {
+    [
+        "nice",
+        "-n",
+        "19",
+        "bwrap",
+        "--new-session",
+        "--unshare-all",
+        "--die-with-parent",
+        "--clearenv",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--ro-bind",
+        "/nix",
+        "/nix",
+        "--bind",
     ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .chain([
+        cap_host_dir.to_string_lossy().into_owned(),
+        "/cap".to_owned(),
+        "--chdir".to_owned(),
+        "/cap".to_owned(),
+        "--".to_owned(),
+        ffmpeg.to_string_lossy().into_owned(),
+    ])
+    .chain(
+        [
+            "-hide_banner",
+            "-nostdin",
+            "-y",
+            "-threads",
+            "4",
+            "-loglevel",
+            "verbose",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned()),
+    )
+    .collect()
+}
+
+/// The snapshot (Plan D L4): the same sandbox decoding one frame of an FLV
+/// capture to a PNG — a picture of the HID test page for the agent to read.
+pub fn build_snapshot_argv(
+    ffmpeg: &Path,
+    cap_host_dir: &Path,
+    capture_name: &str,
+    out_name: &str,
+) -> Vec<String> {
+    let mut v = sandbox_prefix(ffmpeg, cap_host_dir);
+    v.extend([
+        "-i".to_owned(),
+        format!("/cap/{capture_name}"),
+        "-map".to_owned(),
+        "0:v:0".to_owned(),
+        "-frames:v".to_owned(),
+        "1".to_owned(),
+        "-update".to_owned(),
+        "1".to_owned(),
+        format!("/cap/{out_name}"),
+    ]);
+    v
+}
+
+/// Cap on a snapshot PNG (a 1080p RGB frame is ~6 MiB uncompressed).
+const SNAPSHOT_PNG_CAP: usize = 64 * 1024 * 1024;
+
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// Decode `capture_name`'s first frame to `<capture_name>.png` in the
+/// sandbox. Live only, like `run_sample_range`; names are validated by
+/// `CaptureDir::resolve` before anything runs.
+pub fn run_snapshot(
+    ffmpeg: &Path,
+    dir: &CaptureDir,
+    capture_name: &str,
+) -> std::io::Result<PathBuf> {
+    run_snapshot_with(ffmpeg, dir, capture_name, run_argv)
+}
+
+/// `run_snapshot` with its one spawn injected (`run_argv` live; a fake in
+/// the tests, which pin that the sandbox argv is all that runs). The PNG
+/// is then read the way sandbox output must be (`captures::read_capped`:
+/// no symlink, a regular file, bounded) and must be a PNG: a compromised
+/// decoder could leave a symlink there pointing at a host file, which the
+/// agent reading the snapshot would otherwise follow. Anything else is
+/// removed (the entry, never its target) and refused.
+fn run_snapshot_with(
+    ffmpeg: &Path,
+    dir: &CaptureDir,
+    capture_name: &str,
+    run: impl FnOnce(&[String]) -> std::io::Result<Output>,
+) -> std::io::Result<PathBuf> {
+    let cap_in_host = dir.resolve(capture_name)?;
+    let out_name = format!("{capture_name}.png");
+    let out_host = dir.resolve(&out_name)?;
+    let cap_host_dir = cap_in_host
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| std::io::Error::other("no capture dir"))?;
+    remove_stale_output(&out_host)?;
+    let output = run(&build_snapshot_argv(
+        ffmpeg,
+        &cap_host_dir,
+        capture_name,
+        &out_name,
+    ))?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "sandboxed ffmpeg failed: {}",
+            sanitize_for_terminal(&output.stderr)
+        )));
+    }
+    match captures::read_capped(dir, &out_name, SNAPSHOT_PNG_CAP) {
+        Ok(png) if png.starts_with(PNG_SIGNATURE) => Ok(out_host),
+        Ok(_) => {
+            remove_stale_output(&out_host)?;
+            Err(std::io::Error::other(
+                "the sandbox's snapshot output is not a PNG; removed",
+            ))
+        }
+        Err(e) => {
+            remove_stale_output(&out_host)?;
+            Err(std::io::Error::other(format!(
+                "the sandbox's snapshot output was refused ({e}); removed"
+            )))
+        }
+    }
 }
 
 /// True if ffmpeg's verbose log shows swscale or an auto-inserted scale filter.
@@ -957,6 +1066,189 @@ mod tests {
                 .and_then(|i| i.checked_add(1)),
             "--new-session must come right after bwrap"
         );
+    }
+
+    /// The snapshot runs in the same sandbox as `sample-range`, decoding
+    /// one frame to a PNG beside the capture.
+    #[test]
+    fn the_snapshot_argv_is_the_sandbox_with_a_png_output() {
+        let ffmpeg = Path::new("/nix/store/x-ffmpeg/bin/ffmpeg");
+        let dir = Path::new("/repo/captures");
+        let raw = build_ffmpeg_sandbox_argv(ffmpeg, dir, "a.flv", "a.flv.y");
+        let png = build_snapshot_argv(ffmpeg, dir, "a.flv", "a.flv.png");
+        let prefix = raw.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(png.get(..prefix), raw.get(..prefix));
+        let tail: Vec<&str> = png.iter().skip(prefix).map(String::as_str).collect();
+        assert_eq!(
+            tail,
+            [
+                "-i",
+                "/cap/a.flv",
+                "-map",
+                "0:v:0",
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                "/cap/a.flv.png"
+            ]
+        );
+    }
+
+    /// The snapshot's decoder sees nothing but the store and the captures
+    /// dir (§12): every namespace unshared (no network, so no TCP to the
+    /// KVM or anywhere, and no abstract-socket SSH agent), an empty
+    /// environment (no `HOME`, no `SSH_AUTH_SOCK`), no terminal, `/nix`
+    /// read-only, and one writable bind — the captures dir itself, never
+    /// the repo or a home directory above it.
+    #[test]
+    fn the_snapshot_sandbox_has_no_network_home_agent_or_repo() {
+        let argv = build_snapshot_argv(
+            Path::new("/nix/store/x-ffmpeg/bin/ffmpeg"),
+            Path::new("/home/owner/kvm-rdp/captures"),
+            "a.flv",
+            "a.flv.png",
+        );
+        let at = |a: &str| argv.iter().position(|x| x == a);
+        let end = at("--").unwrap();
+        assert_eq!(argv.get(..4).unwrap(), ["nice", "-n", "19", "bwrap"]);
+        for flag in [
+            "--new-session",
+            "--unshare-all",
+            "--die-with-parent",
+            "--clearenv",
+        ] {
+            assert!(at(flag).is_some_and(|i| i < end), "{flag} missing");
+        }
+        let opts = argv.get(..end).unwrap();
+        for banned in [
+            "--share-net",
+            "--setenv",
+            "--bind-try",
+            "--dev-bind",
+            "--ro-bind-try",
+            "--symlink",
+        ] {
+            assert!(!opts.iter().any(|a| a == banned), "{banned}");
+        }
+        let binds: Vec<(&str, &str, &str)> = opts
+            .windows(3)
+            .filter_map(|w| match w {
+                [flag, from, to] if flag.starts_with("--") && flag.contains("bind") => {
+                    Some((flag.as_str(), from.as_str(), to.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            binds,
+            [
+                ("--ro-bind", "/nix", "/nix"),
+                ("--bind", "/home/owner/kvm-rdp/captures", "/cap")
+            ]
+        );
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains("HOME") || a.contains("SSH_AUTH_SOCK")),
+            "{argv:?}"
+        );
+        // ffmpeg itself runs in /cap and writes only there.
+        assert_eq!(
+            argv.get(end.checked_add(1).unwrap()).unwrap(),
+            "/nix/store/x-ffmpeg/bin/ffmpeg"
+        );
+        assert_eq!(argv.last().unwrap(), "/cap/a.flv.png");
+    }
+
+    /// The exit status `run_snapshot_with`'s fake runners report.
+    fn exit(code: i32) -> std::process::ExitStatus {
+        std::os::unix::process::ExitStatusExt::from_raw(code.wrapping_mul(256))
+    }
+
+    const PNG_MAGIC: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+    /// `run_snapshot` runs exactly the sandbox argv — nothing else spawns —
+    /// with the capture's own directory bound, and returns the PNG beside
+    /// the capture.
+    #[test]
+    fn run_snapshot_runs_only_the_sandbox_argv() {
+        let base = tmp_base("snapshot-argv");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("captures");
+        let dir = CaptureDir::create(&root).unwrap();
+        let ffmpeg = Path::new("/nix/store/x-ffmpeg/bin/ffmpeg");
+        let mut runs = Vec::new();
+        let png = run_snapshot_with(ffmpeg, &dir, "s.flv", |argv| {
+            runs.push(argv.to_vec());
+            std::fs::write(root.join("s.flv.png"), PNG_MAGIC).unwrap();
+            Ok(Output {
+                status: exit(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        })
+        .unwrap();
+        assert_eq!(png, root.join("s.flv.png"));
+        assert_eq!(
+            runs,
+            [build_snapshot_argv(ffmpeg, &root, "s.flv", "s.flv.png")]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An unsafe name never reaches the sandbox; a failed decode is an
+    /// error with its stderr sanitised; and a PNG the decoder replaced with
+    /// a symlink (a compromised ffmpeg pointing it at a host secret for
+    /// the agent to read) or with anything but a PNG is refused and
+    /// removed, its target untouched.
+    #[test]
+    fn run_snapshot_refuses_unsafe_names_failures_and_planted_output() {
+        let base = tmp_base("snapshot-refusals");
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("captures");
+        let dir = CaptureDir::create(&root).unwrap();
+        let ffmpeg = Path::new("/nix/store/x-ffmpeg/bin/ffmpeg");
+        for bad in ["../s.flv", "a/s.flv", ""] {
+            let r = run_snapshot_with(ffmpeg, &dir, bad, |_| panic!("ran for {bad:?}"));
+            assert!(r.is_err(), "{bad:?}");
+        }
+        let err = run_snapshot_with(ffmpeg, &dir, "s.flv", |_| {
+            Ok(Output {
+                status: exit(1),
+                stdout: Vec::new(),
+                stderr: b"bad\x1b]0;x\x07".to_vec(),
+            })
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("sandboxed ffmpeg failed"), "{err}");
+        assert!(!err.to_string().contains('\x1b'), "{err:?}");
+
+        let secret = base.join("secret");
+        std::fs::write(&secret, b"do not read").unwrap();
+        let planted = run_snapshot_with(ffmpeg, &dir, "s.flv", |_| {
+            std::os::unix::fs::symlink(&secret, root.join("s.flv.png")).unwrap();
+            Ok(Output {
+                status: exit(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        });
+        assert!(planted.is_err());
+        assert!(std::fs::symlink_metadata(root.join("s.flv.png")).is_err());
+        assert_eq!(std::fs::read(&secret).unwrap(), b"do not read");
+
+        let not_png = run_snapshot_with(ffmpeg, &dir, "s.flv", |_| {
+            std::fs::write(root.join("s.flv.png"), b"GIF89a").unwrap();
+            Ok(Output {
+                status: exit(0),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        });
+        assert!(not_png.is_err());
+        assert!(std::fs::symlink_metadata(root.join("s.flv.png")).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

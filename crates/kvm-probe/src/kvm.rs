@@ -110,9 +110,24 @@ async fn connect_and_handshake(
         .map_err(|e| KvmError::Connect(e.to_string()))?;
     tcp.set_nodelay(true)
         .map_err(|e| KvmError::Connect(e.to_string()))?;
+    over(target, tcp, pin_sha256_hex).await
+}
+
+/// Pinned TLS (`Https`) or nothing (`Http`) over a connected socket — the
+/// one TLS path, shared by `connect_to` and the HID checks' resettable
+/// sockets (`l4::hid`). An `Https` target with no pin is refused here too
+/// (R9), so no caller can reach an accept-any handshake through it.
+pub(crate) async fn over(
+    target: &KvmTarget,
+    tcp: TcpStream,
+    pin_sha256_hex: Option<&str>,
+) -> Result<BoxedIo, KvmError> {
     match target.scheme {
         Scheme::Http => Ok(Box::new(tcp)),
         Scheme::Https => {
+            if pin_sha256_hex.is_none() {
+                return Err(KvmError::Tls("pin required for https".into()));
+            }
             let connector = TlsConnector::from(Arc::new(client_config(pin_sha256_hex)));
             let name = ServerName::try_from(target.host.clone())
                 .map_err(|_| KvmError::Tls("bad server name".into()))?;
