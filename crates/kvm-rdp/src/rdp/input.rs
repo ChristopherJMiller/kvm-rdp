@@ -1434,4 +1434,28 @@ mod tests {
         assert_eq!(r.write().last(), Some(&kbd(0, 0x04)));
         assert_eq!(r.metrics.input_events_ignored.get(), 2);
     }
+
+    /// I2 (a), the review's X1 through the shell: one request is never
+    /// answered; five pastes ten minutes apart, each answered at once, all
+    /// type (before, all five were discarded as `late`). The stale request
+    /// is retired once, counted `unanswered`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_request_never_answered_does_not_break_later_pastes() {
+        let mut r = rig();
+        r.start();
+        r.s.clipboard_available(true);
+        r.chord();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        r.unchord(); // paste 1 ends unanswered; its answer never comes
+        for n in 0..5 {
+            tokio::time::advance(Duration::from_secs(600)).await;
+            r.chord();
+            r.s.clipboard_text(utf16("ok"));
+            r.unchord();
+            assert_eq!(r.type_out().await, [0x12, 0x0E], "paste {n}");
+        }
+        assert_eq!(r.metrics.paste_events.get("done"), 5);
+        assert_eq!(r.metrics.clipboard_discarded.get("unanswered"), 1);
+        assert_eq!(r.metrics.clipboard_discarded.get("late"), 0);
+    }
 }

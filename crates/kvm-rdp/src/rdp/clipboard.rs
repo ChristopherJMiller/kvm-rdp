@@ -39,7 +39,8 @@ use crate::pump::Input;
 use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
-    FileContentsRequest, FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    FileContentsRequest, FileContentsResponse, FileDescriptor, FormatDataRequest,
+    FormatDataResponse, LockDataId,
 };
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -360,6 +361,24 @@ impl CliprdrBackend for ClipBackend {
     fn on_lock(&mut self, _data_id: LockDataId) {}
 
     fn on_unlock(&mut self, _data_id: LockDataId) {}
+
+    /// IronRDP parsed an answer as a file list (a client that named
+    /// CF_UNICODETEXT its `FileGroupDescriptorW` after the bridge asked —
+    /// PD8's residual) and never calls `on_format_data_response` for it. It
+    /// is an answer all the same: forwarded as one with no text, so the
+    /// input core's request count stays true (PD9 review I2). Nothing of
+    /// the list is kept.
+    fn on_remote_file_list(&mut self, _files: &[FileDescriptor], _clip_data_id: Option<u32>) {
+        if self.ended {
+            return;
+        }
+        if let Some(answer) = self.answer_place() {
+            let _ = self.to_pump.send(RdpInput::ClipboardFailed {
+                slot: self.slot,
+                answer,
+            });
+        }
+    }
 }
 
 #[cfg(test)]
@@ -373,7 +392,9 @@ mod tests {
     use super::*;
     use crate::input::{Ctx, Event, InputCore, Out, PasteOutcome};
     use ironrdp_cliprdr::backend::ClipboardMessage;
-    use ironrdp_cliprdr::pdu::{ClipboardPdu, FileContentsFlags, OwnedFormatDataResponse};
+    use ironrdp_cliprdr::pdu::{
+        ClipboardPdu, FileContentsFlags, FileDescriptor, OwnedFormatDataResponse, PackedFileList,
+    };
     use ironrdp_cliprdr::{Cliprdr, CliprdrClient, CliprdrServer};
     use ironrdp_svc::{StaticVirtualChannel, SvcMessage};
     use kvm_proto::hid::HidFrame;
@@ -1040,6 +1061,55 @@ mod tests {
             b1.on_format_data_response(FormatDataResponse::new_error());
             b1.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
         }
+    }
+
+    /// PD9 fix round 1, I2 (b): a file list IronRDP parsed out of an answer
+    /// (`on_remote_file_list`) is an answer to the bridge's request all the
+    /// same — forwarded as `ClipboardFailed` (no text), through the answer
+    /// word's place, so the input core's request count stays true.
+    #[test]
+    fn a_file_list_answer_is_an_answer_with_no_text() {
+        let (f, _slot, mut rx) = factory();
+        let mut b = f.build_cliprdr_backend();
+        b.on_remote_file_list(&[], None);
+        let Ok(RdpInput::ClipboardFailed { slot: 1, answer }) = rx.try_recv() else {
+            panic!("the file list was not forwarded as an answer");
+        };
+        b.on_remote_file_list(&[], Some(3));
+        assert!(rx.try_recv().is_err(), "a second word in flight");
+        assert_eq!(answer.lost(), 1);
+    }
+
+    /// I2 (b) on the wire, the PD8 residual: the client names CF_UNICODETEXT
+    /// as its `FileGroupDescriptorW` between the chord and the request, so
+    /// IronRDP takes the bridge's request for a file list and parses the
+    /// answer as one (never `on_format_data_response`). The backend still
+    /// reports it: one answer, no text.
+    #[test]
+    fn a_spoofed_file_list_answer_still_counts_as_an_answer() {
+        let list = PackedFileList {
+            files: vec![FileDescriptor::new("a.txt").with_file_size(1)],
+        };
+        let bytes = OwnedFormatDataResponse::new_file_list(&list)
+            .unwrap()
+            .data()
+            .to_vec();
+        let (f, _slot, mut rx) = factory();
+        let mut w = Wire::start(&f, Some(bytes));
+        assert_eq!(offered(&mut rx, 1), Some(true));
+        let spoof = vec![
+            ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)
+                .with_name(ClipboardFormatName::FILE_LIST),
+        ];
+        let msgs = w.client_does(ClipboardMessage::SendInitiateCopy(spoof));
+        w.settle(Vec::new(), msgs);
+        assert_eq!(offered(&mut rx, 1), Some(false));
+        w.request_text();
+        assert!(
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardFailed { slot: 1, .. })),
+            "the spoofed answer reached nothing"
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     fn ctx(now: Instant) -> Ctx {

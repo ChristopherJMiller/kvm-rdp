@@ -53,8 +53,9 @@ pub enum State {
     Pending {
         deadline: Instant,
         /// Clipboard answers due before this paste's own (PD9 carry 3a):
-        /// the requests still unanswered when it asked. CLIPRDR answers in
-        /// order, so its answer is the one that comes when this is 0.
+        /// the requests still unanswered when it asked, less those answered or
+        /// retired since (I2). CLIPRDR answers in order, so its answer is the
+        /// one that comes when this is 0.
         ahead: u32,
         text: Option<Vec<char>>,
         skipped: usize,

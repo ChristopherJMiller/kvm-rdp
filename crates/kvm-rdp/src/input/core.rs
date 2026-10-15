@@ -34,6 +34,17 @@
 //! discarded and counted (`late`, or `unasked` with none outstanding), so a
 //! paste never types the answer to an earlier one that timed out.
 //!
+//! A request whose answer never comes would otherwise shift every later
+//! answer onto the request before it, for the rest of the session (PD9
+//! review I2): a client that never answers, or one whose answer IronRDP
+//! parses as a file list (the backend forwards that as an answer with no
+//! text). So each request keeps its instant, and one `request_retire` old
+//! (`max(60 s, 2 × paste.modifier_wait)`: never a waiting paste's own) is
+//! retired, counted `unanswered`, when the next paste starts or the next
+//! answer comes — no timer of its own. An answer later than that may pair
+//! with a newer request: its content is still the client's clipboard, and
+//! a transit stall that long is a stalled session (accepted residual).
+//!
 //! Every type here that holds input (`Event`, `Out`, `InputCore`) has a
 //! redacted `Debug` (PD5 ruling, §4.5): kinds, counts and flags only —
 //! pasted text included (PD7 rule).
@@ -45,6 +56,7 @@ use crate::msg::Gen;
 use kvm_proto::hid::HidFrame;
 use kvm_proto::keymap::{Chord, USAGE_ESC, modifier_bit, us_stroke, usage_for_scancode};
 use kvm_proto::paste::{PastePolicy, Prepared, RELEASE, Typist, decode_utf16le, prepare};
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// What the shell knows at one step (no input state: a derived `Debug` is
@@ -136,7 +148,8 @@ pub enum Out {
     /// A paste outcome, for the shell to count (§8).
     Paste(PasteOutcome),
     /// A clipboard answer no paste took (PD9 carry 3): `"late"` (an earlier
-    /// request's, after its paste ended) or `"unasked"`; never typed.
+    /// request's, after its paste ended) or `"unasked"`; never typed. Or a
+    /// request retired with no answer, `"unanswered"` (I2).
     ClipboardDiscarded(&'static str),
 }
 
@@ -212,15 +225,11 @@ pub struct InputCore {
     paste: State,
     /// The last format list offered Unicode text (D9c).
     clipboard_text: bool,
-    /// Clipboard requests made this generation whose answer has not come
-    /// (PD9 carry 3a). Within a generation it cannot drift: a request goes
-    /// only after this session's format list, which put IronRDP's CLIPRDR
-    /// in Ready (lib.rs:741) — the one state in which `initiate_paste`
-    /// refuses without a callback — and IronRDP answers locally, through
-    /// the backend, the requests it will not send (its 64-pending cap). A
-    /// request that strays into another connection dies with this one:
-    /// `on_generation` zeroes the count. Saturating; a chord per request.
-    requests: u32,
+    /// When each clipboard request made this generation and not answered
+    /// went out, oldest first (PD9 carry 3a; I2): at most `MAX_REQUESTS`,
+    /// each retired once `request_retire` old. A request that strays into
+    /// another connection dies with this one: `on_generation` clears it.
+    requests: VecDeque<Instant>,
 }
 
 /// Whose a clipboard answer is (PD9 carry 3a).
@@ -231,6 +240,22 @@ enum Whose {
     Late,
     /// No request is outstanding.
     Unasked,
+}
+
+/// At most this many clipboard requests are remembered (IronRDP's own cap
+/// on unanswered ones, ironrdp-cliprdr's 64): one past it retires the
+/// oldest (PD9 review I2).
+pub const MAX_REQUESTS: usize = 64;
+
+/// The least age at which an unanswered clipboard request is retired.
+pub const REQUEST_RETIRE_MIN: Duration = Duration::from_secs(60);
+
+/// When a clipboard request no answer has come for is retired (PD9 review
+/// I2): `max(60 s, 2 × paste.modifier_wait)` — never while the paste that
+/// made it still waits.
+#[must_use]
+pub fn request_retire(modifier_wait: Duration) -> Duration {
+    REQUEST_RETIRE_MIN.max(modifier_wait.saturating_mul(2))
 }
 
 /// §4.5 (PD5 ruling): the keyboard's, pointer's and paste's redacted
@@ -247,7 +272,7 @@ impl std::fmt::Debug for InputCore {
             .field("modifier_idle_armed", &self.modifier_idle_at.is_some())
             .field("paste", &self.paste)
             .field("clipboard_text", &self.clipboard_text)
-            .field("requests", &self.requests)
+            .field("requests", &self.requests.len())
             .finish()
     }
 }
@@ -272,7 +297,7 @@ impl InputCore {
             modifier_idle_at: None,
             paste: State::Idle,
             clipboard_text: false,
-            requests: 0,
+            requests: VecDeque::new(),
         }
     }
 
@@ -324,7 +349,7 @@ impl InputCore {
         self.modifier_idle_at = None;
         self.paste = State::Idle;
         self.clipboard_text = false;
-        self.requests = 0;
+        self.requests.clear();
         ended
     }
 
@@ -529,13 +554,13 @@ impl InputCore {
                 }
             }
             Event::ClipboardAvailable(text) => self.clipboard_text = text,
-            Event::ClipboardText(bytes) => match self.answer() {
+            Event::ClipboardText(bytes) => match self.answer(ctx, out) {
                 Whose::Paste => self.clipboard_text_arrived(ctx, &bytes, out),
                 other => Self::discard(&other, out),
             },
             // PD8 review (b): the paste that asked ends at once, not after
             // `paste.modifier_wait`.
-            Event::ClipboardFailed => match self.answer() {
+            Event::ClipboardFailed => match self.answer(ctx, out) {
                 Whose::Paste => {
                     self.end_paste(ctx, PasteOutcome::Aborted("clipboard_failed"), out);
                 }
@@ -544,7 +569,7 @@ impl InputCore {
             // The session is ending (the pump's close follows); the paste
             // that asked is counted as refused for it. Nothing else to do.
             Event::ClipboardOversize => {
-                if let Whose::Paste = self.answer() {
+                if let Whose::Paste = self.answer(ctx, out) {
                     self.end_paste(ctx, PasteOutcome::Refused(PasteRefusal::Oversize), out);
                 }
             }
@@ -552,7 +577,7 @@ impl InputCore {
             // requests, oldest first. Bounded by the requests outstanding.
             Event::ClipboardLost(n) => {
                 for _ in 0..n {
-                    match self.answer() {
+                    match self.answer(ctx, out) {
                         Whose::Paste => {
                             self.end_paste(ctx, PasteOutcome::Aborted("clipboard_lost"), out);
                         }
@@ -569,12 +594,13 @@ impl InputCore {
     /// oldest outstanding request's (PD9 carry 3a). The Pending paste takes
     /// it only if that request is its own (`ahead` is 0) and no text has
     /// come — an answer to an earlier paste that timed out or was aborted
-    /// never reaches the next.
-    fn answer(&mut self) -> Whose {
-        let Some(left) = self.requests.checked_sub(1) else {
+    /// never reaches the next. Requests `request_retire` old are retired
+    /// first (I2).
+    fn answer(&mut self, ctx: &Ctx, out: &mut Vec<Out>) -> Whose {
+        self.retire(ctx, out);
+        if self.requests.pop_front().is_none() {
             return Whose::Unasked;
-        };
-        self.requests = left;
+        }
         match &mut self.paste {
             State::Pending {
                 ahead, text: None, ..
@@ -586,6 +612,37 @@ impl InputCore {
                 }
             },
             _ => Whose::Late,
+        }
+    }
+
+    /// I2: retire every request `request_retire` old, counted `unanswered`.
+    /// One ahead of the Pending paste's own leaves one fewer to wait for.
+    /// The paste's own is retired only once the paste is past its own wait
+    /// (at most half that age) and no step has ended it yet: it ends now,
+    /// `modifier_wait`, as its next step would have ended it.
+    fn retire(&mut self, ctx: &Ctx, out: &mut Vec<Out>) {
+        let after = request_retire(ctx.modifier_wait);
+        while let Some(at) = self.requests.front().copied() {
+            if ctx.now < deadline(at, after) {
+                break;
+            }
+            let _ = self.requests.pop_front();
+            out.push(Out::ClipboardDiscarded("unanswered"));
+            let own = match &mut self.paste {
+                State::Pending {
+                    ahead, text: None, ..
+                } => match ahead.checked_sub(1) {
+                    Some(a) => {
+                        *ahead = a;
+                        false
+                    }
+                    None => true,
+                },
+                _ => false,
+            };
+            if own {
+                self.end_paste(ctx, PasteOutcome::Aborted("modifier_wait"), out);
+            }
         }
     }
 
@@ -738,14 +795,20 @@ impl InputCore {
             out.push(Out::Paste(PasteOutcome::Refused(why)));
             return;
         }
-        // Its answer comes after those of the requests still unanswered.
+        // Its answer comes after those of the requests still unanswered —
+        // less any retired now (I2), and at most `MAX_REQUESTS` remembered.
+        self.retire(ctx, out);
+        if self.requests.len() >= MAX_REQUESTS {
+            let _ = self.requests.pop_front();
+            out.push(Out::ClipboardDiscarded("unanswered"));
+        }
         self.paste = State::Pending {
             deadline: deadline(ctx.now, ctx.modifier_wait),
-            ahead: self.requests,
+            ahead: u32::try_from(self.requests.len()).unwrap_or(u32::MAX),
             text: None,
             skipped: 0,
         };
-        self.requests = self.requests.saturating_add(1);
+        self.requests.push_back(ctx.now);
         out.push(Out::Paste(PasteOutcome::Started));
         out.push(Out::RequestClipboard);
     }
@@ -3731,6 +3794,136 @@ mod tests {
         assert_eq!(pushes(&out).len(), TYPIST_ROOM, "{}", show(&out));
         r.advance(Duration::from_millis(1));
         assert_eq!(pushes(&r.step(Event::Tick)).len(), TYPIST_ROOM);
+    }
+
+    // ---- PD9 fix round 1, I2: requests the client never answers.
+
+    /// A paste through to its outcome: the chord, the answer `text`, the
+    /// chord's keys up, Ticks to the end. Its outcome and every discard.
+    fn paste_with(r: &mut Rig, text: &str) -> (PasteOutcome, Vec<&'static str>) {
+        let mut out = Vec::new();
+        hold_chord(r);
+        out.extend(r.step(chord_event()));
+        out.extend(r.step(Event::ClipboardText(utf16le(text))));
+        out.extend(release_chord(r));
+        for _ in 0..64 {
+            if outcomes(&out)
+                .iter()
+                .any(|p| !matches!(p, PasteOutcome::Started))
+            {
+                break;
+            }
+            r.advance(Duration::from_millis(1));
+            out.extend(r.step(Event::Tick));
+        }
+        let end = outcomes(&out)
+            .into_iter()
+            .find(|p| !matches!(p, PasteOutcome::Started))
+            .cloned()
+            .expect("the paste never ended");
+        (end, discards(&out))
+    }
+
+    /// I2 (a), the review's X1: a client that never answers one request
+    /// does not break paste for the session. The request is retired once it
+    /// is `request_retire` old (counted `unanswered`), and every later paste
+    /// takes its own answer — before, all five were discarded as `late`.
+    #[test]
+    fn a_request_never_answered_is_retired() {
+        let mut r = Rig::new();
+        assert_eq!(
+            request_retire(Duration::from_secs(5)),
+            Duration::from_secs(60)
+        );
+        time_out_a_paste(&mut r); // its request is never answered
+        for n in 0..5 {
+            r.advance(Duration::from_secs(600));
+            let (end, discarded) = paste_with(&mut r, "ok");
+            assert_eq!(
+                end,
+                PasteOutcome::Done {
+                    typed: 2,
+                    skipped: 0
+                },
+                "paste {n}"
+            );
+            let want: &[&str] = if n == 0 { &["unanswered"] } else { &[] };
+            assert_eq!(discarded, want, "paste {n}");
+        }
+    }
+
+    /// I2: a request younger than `request_retire` is still outstanding —
+    /// its late answer, at half that age, is discarded and never typed;
+    /// the next answer is the waiting paste's.
+    #[test]
+    fn a_late_answer_before_retirement_is_still_discarded() {
+        let mut r = Rig::new();
+        time_out_a_paste(&mut r);
+        r.advance(request_retire(Duration::from_secs(5)) / 2);
+        hold_chord(&mut r);
+        r.step(chord_event());
+        assert_eq!(
+            discards(&r.step(Event::ClipboardText(utf16le("old")))),
+            ["late"]
+        );
+        r.step(Event::ClipboardText(utf16le("k")));
+        let _ = release_chord(&mut r);
+        assert_eq!(
+            finish(&mut r),
+            PasteOutcome::Done {
+                typed: 1,
+                skipped: 0
+            }
+        );
+    }
+
+    /// I2: `request_retire` is `max(60 s, 2 × modifier_wait)`, so a Pending
+    /// paste's own request is never retired while it waits; were the first
+    /// step after its wait to come later still, the paste ends
+    /// `modifier_wait` (it is past it) and the answer that step brings is
+    /// discarded — never typed.
+    #[test]
+    fn a_pastes_own_request_is_never_retired_while_it_waits() {
+        assert_eq!(
+            request_retire(Duration::from_secs(100)),
+            Duration::from_secs(200)
+        );
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        r.advance(Duration::from_secs(61)); // no step meanwhile
+        let out = r.step(Event::ClipboardText(utf16le("late")));
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("modifier_wait")]
+        ));
+        assert_eq!(discards(&out), ["unanswered", "unasked"]);
+        assert!(!pushes_usage(&out, 0x0F), "{}", show(&out));
+    }
+
+    /// I2: at most `MAX_REQUESTS` (64, IronRDP's own cap) are remembered;
+    /// a request past it retires the oldest, counted.
+    #[test]
+    fn the_outstanding_requests_are_bounded() {
+        let mut r = Rig::new();
+        let mut discarded = Vec::new();
+        for _ in 0..70 {
+            hold_chord(&mut r);
+            discarded.extend(discards(&r.step(chord_event())));
+            // Esc ends it at once: 70 pastes well inside `request_retire`.
+            r.step(Event::KeyPressed {
+                code: 0x01,
+                extended: false,
+            });
+            r.step(Event::KeyReleased {
+                code: 0x01,
+                extended: false,
+            });
+            let _ = release_chord(&mut r);
+            r.advance(Duration::from_millis(1));
+        }
+        assert_eq!(r.core.requests.len(), MAX_REQUESTS);
+        assert_eq!(discarded, ["unanswered"; 6]);
     }
 
     // ---- The property: no event or time sequence ends with a key held.

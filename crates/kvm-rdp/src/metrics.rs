@@ -272,7 +272,8 @@ pub struct Metrics {
     pub paste_events: Family,
     pub paste_skipped_chars: Counter,
     /// PD9 carry 3: clipboard answers no paste took (`late`, `unasked`), or
-    /// that the backend dropped while another was in flight (`in_flight`).
+    /// that the backend dropped while another was in flight (`in_flight`);
+    /// and requests retired with no answer (`unanswered`, I2).
     pub clipboard_discarded: Family,
 }
 
