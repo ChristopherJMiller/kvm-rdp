@@ -26,7 +26,7 @@ pub struct Cli {
 }
 
 impl Cli {
-    /// I1: `required_if_eq("scheme", "https")` on `Conn::pin` only fires
+    /// I1: `required_if_eq("scheme", "https")` on `Endpoint::pin` only fires
     /// when `--scheme https` is given explicitly on argv — it does not see
     /// `scheme` falling back to its own default (also `Https`). Call this
     /// after a successful parse to catch that case too: `scheme == Https`
@@ -34,24 +34,25 @@ impl Cli {
     /// if clap itself had refused it. R9's intent — refuse early — outranks
     /// its verbatim attribute (controller ruling). `fingerprint` takes no
     /// pin at all (record mode) and is exempt, as are the two subcommands
-    /// with no `Conn` (`sample-range`, `summarize`).
+    /// that connect nowhere (`sample-range`, `summarize`).
     ///
     /// Final review I4: the check is on the *effective* pin
-    /// (`Conn::pin_for`) of every port the subcommand touches — web (login) plus video for `capture`/`first-idr`, web plus control for
+    /// (`Endpoint::pin_for`) of every port the subcommand touches — web (login) plus video for `capture`/`first-idr`, web plus control for
     /// `ws-open`.
     ///
     /// PD2 fix round 1: the checks that log in more than once (token-life,
     /// session-cap) are refused here without `--owner-consent`, before
     /// `main` reads the password file or opens a connection.
     pub fn validate(&self) -> Result<(), clap::Error> {
-        let (conn, ports): (&Conn, &[Port]) = match &self.cmd {
+        let (at, ports): (&Endpoint, &[Port]) = match &self.cmd {
             Cmd::Capture { conn, .. } | Cmd::FirstIdr { conn, .. } => {
-                (conn, &[Port::Web, Port::Video])
+                (&conn.endpoint, &[Port::Web, Port::Video])
             }
-            Cmd::WsOpen { conn } => (conn, &[Port::Web, Port::Control]),
-            Cmd::ConcurrentFlv { conn, .. } => (conn, &[Port::Web, Port::Video]),
-            Cmd::RefusalForms { conn } => (conn, &[Port::Video, Port::Control]),
-            Cmd::WsClose { conn, .. } => (conn, &[Port::Web, Port::Control]),
+            Cmd::WsOpen { conn } => (&conn.endpoint, &[Port::Web, Port::Control]),
+            Cmd::ConcurrentFlv { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Video]),
+            // No login, so no web port.
+            Cmd::RefusalForms { endpoint } => (endpoint, &[Port::Video, Port::Control]),
+            Cmd::WsClose { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Control]),
             Cmd::TokenLife {
                 conn,
                 owner_consent,
@@ -78,18 +79,20 @@ impl Cli {
                         ),
                     ));
                 }
-                (conn, &[Port::Web, Port::Control])
+                (&conn.endpoint, &[Port::Web, Port::Control])
             }
-            Cmd::LogoutWatch { conn, .. } => (conn, &[Port::Web, Port::Video, Port::Control]),
+            Cmd::LogoutWatch { conn, .. } => {
+                (&conn.endpoint, &[Port::Web, Port::Video, Port::Control])
+            }
             Cmd::Fingerprint { .. } | Cmd::SampleRange { .. } | Cmd::Summarize { .. } => {
                 return Ok(());
             }
         };
-        if conn.scheme != SchemeArg::Https {
+        if at.scheme != SchemeArg::Https {
             return Ok(());
         }
         for &port in ports {
-            if conn.pin_for(port).is_none() {
+            if at.pin_for(port).is_none() {
                 let mut cmd = Cli::command();
                 return Err(cmd.error(
                     clap::error::ErrorKind::MissingRequiredArgument,
@@ -120,8 +123,11 @@ fn sample_dimension(s: &str) -> Result<usize, String> {
     }
 }
 
+/// Where the KVM is and how its ports are pinned. Every subcommand that
+/// connects takes this: `refusal-forms`, which never logs in, takes only
+/// this; the rest take it inside `Conn`.
 #[derive(clap::Args, Debug, Clone)]
-pub struct Conn {
+pub struct Endpoint {
     #[arg(long)]
     pub host: String,
     #[arg(long, value_enum, default_value_t = SchemeArg::Https)]
@@ -139,6 +145,13 @@ pub struct Conn {
     /// 8889`; defaults to --pin.
     #[arg(long)]
     pub control_pin: Option<String>,
+}
+
+/// An `Endpoint` and the password file: the subcommands that log in.
+#[derive(clap::Args, Debug, Clone)]
+pub struct Conn {
+    #[command(flatten)]
+    pub endpoint: Endpoint,
     /// File holding the KVM password (never pass it on the command line).
     #[arg(long)]
     pub password_file: PathBuf,
@@ -155,7 +168,7 @@ pub enum Port {
     Control,
 }
 
-impl Conn {
+impl Endpoint {
     /// The SPKI pin for connections to `port` (final review I4): the web
     /// port always uses `--pin`; the video and control ports use their own
     /// `--video-pin` / `--control-pin` when given, else `--pin`. The ES3's
@@ -168,6 +181,13 @@ impl Conn {
             Port::Video => self.video_pin.as_deref().or(self.pin.as_deref()),
             Port::Control => self.control_pin.as_deref().or(self.pin.as_deref()),
         }
+    }
+}
+
+impl Conn {
+    /// Its endpoint's `Endpoint::pin_for`.
+    pub fn pin_for(&self, port: Port) -> Option<&str> {
+        self.endpoint.pin_for(port)
     }
 }
 
@@ -249,10 +269,11 @@ pub enum Cmd {
         gop: u32,
     },
     /// L4: how the KVM refuses an FLV and a websocket with a never-issued
-    /// token and with none (status, Content-Type, body prefix). No login.
+    /// token and with none (status, Content-Type, body prefix). No login,
+    /// so no --password-file.
     RefusalForms {
         #[command(flatten)]
-        conn: Conn,
+        endpoint: Endpoint,
     },
     /// L4: open the control websocket, read for --idle-secs sending
     /// nothing, send a close frame, and report the KVM's answer and how its
@@ -588,7 +609,11 @@ mod tests {
         ] {
             let mut argv = vec!["kvm-probe"];
             argv.extend(&sub);
-            argv.extend(["--host", "h", "--pin", "ab", "--password-file", "/tmp/pw"]);
+            argv.extend(["--host", "h", "--pin", "ab"]);
+            // refusal-forms never logs in, so it takes no password file.
+            if sub != ["refusal-forms"] {
+                argv.extend(["--password-file", "/tmp/pw"]);
+            }
             assert!(Cli::try_parse_from(&argv).is_ok(), "{sub:?}");
             argv.push("--logout");
             let err = Cli::try_parse_from(&argv).unwrap_err();
@@ -606,16 +631,11 @@ mod tests {
     fn l4_subcommands_parse_with_their_defaults() {
         // token-life and session-cap also need the owner's consent (below).
         let parse = |sub: &str| {
-            let mut argv = vec![
-                "kvm-probe",
-                sub,
-                "--host",
-                "h",
-                "--pin",
-                "ab",
-                "--password-file",
-                "/tmp/pw",
-            ];
+            let mut argv = vec!["kvm-probe", sub, "--host", "h", "--pin", "ab"];
+            // refusal-forms never logs in, so it takes no password file.
+            if sub != "refusal-forms" {
+                argv.extend(["--password-file", "/tmp/pw"]);
+            }
             if matches!(sub, "token-life" | "session-cap") {
                 argv.push("--owner-consent");
             }
@@ -678,6 +698,53 @@ mod tests {
         ])
         .unwrap();
         assert!(c.validate().is_err());
+    }
+
+    /// refusal-forms never logs in: it takes the host, the scheme and the
+    /// pins of the two ports it touches (video, control), and no password
+    /// file — not even an optional one.
+    #[test]
+    fn refusal_forms_takes_no_password_file() {
+        let c = Cli::try_parse_from(["kvm-probe", "refusal-forms", "--host", "h", "--pin", "ab"])
+            .unwrap();
+        assert!(c.validate().is_ok());
+        let err = Cli::try_parse_from([
+            "kvm-probe",
+            "refusal-forms",
+            "--host",
+            "h",
+            "--pin",
+            "ab",
+            "--password-file",
+            "/tmp/pw",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        // No login, so no web-port pin: its own two ports' pins suffice...
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "refusal-forms",
+            "--host",
+            "h",
+            "--video-pin",
+            "v",
+            "--control-pin",
+            "c",
+        ])
+        .unwrap();
+        assert!(c.validate().is_ok());
+        // ...and each is still required under https.
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "refusal-forms",
+            "--host",
+            "h",
+            "--video-pin",
+            "v",
+        ])
+        .unwrap();
+        let err = c.validate().unwrap_err();
+        assert!(err.to_string().contains("--control-pin"), "{err}");
     }
 
     /// token-life and session-cap log in more than once: on a KVM that
@@ -745,7 +812,7 @@ mod tests {
         .unwrap();
         match c.cmd {
             Cmd::FirstIdr { conn, trials } => {
-                assert_eq!(conn.scheme, SchemeArg::Http);
+                assert_eq!(conn.endpoint.scheme, SchemeArg::Http);
                 assert_eq!(trials, 20);
             }
             other => panic!("{other:?}"),

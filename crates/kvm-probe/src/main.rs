@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 
 use kvm_probe::captures::{self, CaptureDir};
-use kvm_probe::cli::{Cli, Cmd, Conn, Port, SchemeArg};
+use kvm_probe::cli::{Cli, Cmd, Conn, Endpoint, Port, SchemeArg};
 use kvm_probe::kvm::KvmError;
 use kvm_probe::request::{KvmTarget, Scheme};
 use kvm_probe::{capture, fingerprint, kvm, l4, report, sandbox, secret, trial, wsprobe};
@@ -25,18 +25,18 @@ const CAPTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../captures"
 /// capture, but never unbounded.
 const SUMMARIZE_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-fn target(conn: &Conn) -> KvmTarget {
-    match conn.scheme {
+fn target(at: &Endpoint) -> KvmTarget {
+    match at.scheme {
         SchemeArg::Https => KvmTarget {
             scheme: Scheme::Https,
-            host: conn.host.clone(),
+            host: at.host.clone(),
             login_port: 443,
             video_port: 8881,
             control_port: 8889,
         },
         SchemeArg::Http => KvmTarget {
             scheme: Scheme::Http,
-            host: conn.host.clone(),
+            host: at.host.clone(),
             login_port: 80,
             video_port: 8880,
             control_port: 8888,
@@ -57,7 +57,7 @@ async fn session<T>(
     work: impl AsyncFnOnce(&str) -> T,
 ) -> Result<T, KvmError> {
     kvm::with_session(
-        &target(conn),
+        &target(&conn.endpoint),
         conn.pin_for(Port::Web),
         password,
         unix_now()?,
@@ -135,7 +135,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             max_mb,
         } => {
             let pw = password(&conn)?;
-            let t = target(&conn);
+            let t = target(&conn.endpoint);
             let s = session(
                 &conn,
                 &pw,
@@ -185,7 +185,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             };
             // m1 (corrected): ONE login; every trial reopens av.flv on that token. Never a logout (§3.2). m7: a failed trial is printed with a bounded, escaped reason and the run goes on.
             let report = trial::first_idr_run(
-                &target(&conn),
+                &target(&conn.endpoint),
                 conn.pin_for(Port::Web),
                 conn.pin_for(Port::Video),
                 &pw,
@@ -205,7 +205,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Cmd::WsOpen { conn } => {
             let pw = password(&conn)?;
-            let t = target(&conn);
+            let t = target(&conn.endpoint);
             let d = session(&conn, &pw, async |tok: &str| {
                 wsprobe::open_control_websocket(&t, conn.pin_for(Port::Control), tok).await
             })
@@ -216,7 +216,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Cmd::ConcurrentFlv { conn, trials, gop } => {
             let pw = password(&conn)?;
-            let t = target(&conn);
+            let t = target(&conn.endpoint);
             let plan = l4::flv::ConcurrentPlan {
                 trials,
                 gop,
@@ -234,30 +234,32 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| kvm::bounded_debug(&e))?;
             println!("{}", l4::flv::summary(&report));
         }
-        Cmd::RefusalForms { conn } => {
-            let t = target(&conn);
+        Cmd::RefusalForms { endpoint } => {
+            let t = target(&endpoint);
             let wait = Duration::from_secs(5);
             for (what, token) in [
                 ("never-issued token", Some(l4::NEVER_ISSUED)),
                 ("no token", None),
             ] {
-                let flv = match l4::flv::open(&t, conn.pin_for(Port::Video), token, wait).await {
+                let flv = match l4::flv::open(&t, endpoint.pin_for(Port::Video), token, wait).await
+                {
                     Ok(l4::flv::FlvOpen::Stream(_)) => "served an FLV".to_owned(),
                     Ok(l4::flv::FlvOpen::Refused(f)) => format!("refused: {f}"),
                     Err(e) => format!("failed: {}", kvm::bounded_debug(&e)),
                 };
                 println!("av.flv, {what}: {flv}");
-                let ws = match l4::ws::upgrade(&t, conn.pin_for(Port::Control), token, wait).await {
-                    Ok(l4::ws::Upgrade::Accepted(_)) => "upgraded".to_owned(),
-                    Ok(l4::ws::Upgrade::Refused(f)) => format!("refused: {f}"),
-                    Err(e) => format!("failed: {}", kvm::bounded_debug(&e)),
-                };
+                let ws =
+                    match l4::ws::upgrade(&t, endpoint.pin_for(Port::Control), token, wait).await {
+                        Ok(l4::ws::Upgrade::Accepted(_)) => "upgraded".to_owned(),
+                        Ok(l4::ws::Upgrade::Refused(f)) => format!("refused: {f}"),
+                        Err(e) => format!("failed: {}", kvm::bounded_debug(&e)),
+                    };
                 println!("websocket, {what}: {ws}");
             }
         }
         Cmd::WsClose { conn, idle_secs } => {
             let pw = password(&conn)?;
-            let t = target(&conn);
+            let t = target(&conn.endpoint);
             let report = session(&conn, &pw, async |tok: &str| {
                 match l4::ws::upgrade(
                     &t,
@@ -289,7 +291,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .map(|m| Duration::from_secs(m.saturating_mul(60)))
                 .collect();
             let probes = l4::session::token_life(
-                &target(&conn),
+                &target(&conn.endpoint),
                 conn.pin_for(Port::Web),
                 conn.pin_for(Port::Control),
                 &pw,
@@ -305,7 +307,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             warn_extra_logins("session-cap");
             let pw = password(&conn)?;
             let r = l4::session::session_cap(
-                &target(&conn),
+                &target(&conn.endpoint),
                 conn.pin_for(Port::Web),
                 conn.pin_for(Port::Control),
                 &pw,
@@ -320,7 +322,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Cmd::LogoutWatch { conn, max_secs } => {
             let pw = password(&conn)?;
             let r = l4::session::logout_watch(
-                &target(&conn),
+                &target(&conn.endpoint),
                 conn.pin_for(Port::Web),
                 conn.pin_for(Port::Video),
                 conn.pin_for(Port::Control),
