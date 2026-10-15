@@ -1695,12 +1695,13 @@ mod tests {
     }
 
     /// This thread's CPU time (Linux: `/proc/thread-self/schedstat`, its
-    /// first field is nanoseconds on CPU).
+    /// first field is nanoseconds on CPU); `None` on a kernel built without
+    /// schedstat.
     #[cfg(target_os = "linux")]
-    fn thread_cpu() -> Duration {
-        let stat = std::fs::read_to_string("/proc/thread-self/schedstat").unwrap();
-        let ns = stat.split_whitespace().next().unwrap().parse().unwrap();
-        Duration::from_nanos(ns)
+    fn thread_cpu() -> Option<Duration> {
+        let stat = std::fs::read_to_string("/proc/thread-self/schedstat").ok()?;
+        let ns = stat.split_whitespace().next()?.parse().ok()?;
+        Some(Duration::from_nanos(ns))
     }
 
     /// m4: once the KVM stream closes (the KVM actor ends at
@@ -1709,9 +1710,18 @@ mod tests {
     /// a suppression release lands. (Unguarded, the closed stream is ready
     /// on every poll; since I1 the tick still goes first, so the cost is the
     /// spin, measured as this thread's CPU time.)
+    ///
+    /// Parked #7 (PC14 n2): the release is waited for, bounded, rather than
+    /// assumed after a fixed sleep a slow tick can outlast; the spin is then
+    /// measured over a fixed window. Without schedstat there is nothing to
+    /// measure, so the test skips rather than panics.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
     async fn a_closed_kvm_stream_is_not_polled_again() {
+        if thread_cpu().is_none() {
+            eprintln!("skipped: no /proc/thread-self/schedstat to measure CPU time with");
+            return;
+        }
         LocalSet::new()
             .run_until(async {
                 let mut t = shell(|c| c.suppress_debounce = Duration::from_millis(100));
@@ -1720,15 +1730,23 @@ mod tests {
                 t.first_idr(generation).await;
                 t.event().await; // a KVM frame went out: suppression counts (§6.6)
                 t.kvm = mpsc::channel(1).0; // its only sender gone: the stream closes
-                let (cpu0, wall0) = (thread_cpu(), Instant::now());
                 t.suppressed.store(true, Ordering::SeqCst);
+                let released = tokio::time::timeout(Duration::from_secs(5), async {
+                    while t.metrics.release_all.get("suppression") == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                assert!(released.is_ok(), "no tick ran once the KVM stream closed");
+                let (Some(cpu0), wall0) = (thread_cpu(), Instant::now()) else {
+                    return;
+                };
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                let (cpu, wall) = (thread_cpu().saturating_sub(cpu0), wall0.elapsed());
-                assert_eq!(
-                    t.metrics.release_all.get("suppression"),
-                    1,
-                    "no tick ran once the KVM stream closed"
-                );
+                let (Some(cpu1), wall) = (thread_cpu(), wall0.elapsed()) else {
+                    return;
+                };
+                let cpu = cpu1.saturating_sub(cpu0);
+                assert_eq!(t.metrics.release_all.get("suppression"), 1);
                 assert!(
                     cpu < wall / 3,
                     "the RDP thread spun on the closed KVM stream: {cpu:?} of CPU in {wall:?}"
