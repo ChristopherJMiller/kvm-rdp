@@ -467,22 +467,28 @@ fn forbidden_input() -> Vec<String> {
 const SUBSTRING_MIN: usize = 8;
 
 /// `needle` occurs in `hay`. A needle of `SUBSTRING_MIN` characters or more
-/// — the texts, contiguous hex, byte lists, base64 — counts anywhere, even
-/// inside a longer run (a hex or base64 dump with a header: PD10 re-review
-/// N4). A shorter one — a field shape like `usage=4` — counts only as a
-/// whole: the character before it (when it starts with a letter or digit)
-/// and the one after it (when it ends with one) are not letters or digits,
-/// so `usage=4` never matches `usage=40`.
+/// holding anything but digits — the texts, hex with a letter in it, byte
+/// lists, base64 — counts anywhere, even inside a longer run (a hex or
+/// base64 dump with a header: PD10 re-review N4). A needle of digits alone
+/// (a key-slot array's hex, `2300000000`) counts only as a number of its
+/// own: no digit, letter or decimal point either side, so a histogram's
+/// `0.02300000000…` sum never matches it. A shorter needle — a field shape
+/// like `usage=4` — counts only as a whole: the character before it (when
+/// it starts with a letter or digit) and the one after it (when it ends
+/// with one) are not letters or digits, so `usage=4` never matches
+/// `usage=40`.
 fn appears(hay: &str, needle: &str) -> bool {
-    if needle.len() >= SUBSTRING_MIN {
+    let digits_only = needle.chars().all(|c| c.is_ascii_digit());
+    if needle.len() >= SUBSTRING_MIN && !digits_only {
         return hay.contains(needle);
     }
     let alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    let joins = |c: Option<char>| alnum(c) || (digits_only && c == Some('.'));
     let check_before = alnum(needle.chars().next());
     let check_after = alnum(needle.chars().last());
     hay.match_indices(needle).any(|(i, m)| {
-        let joined_before = check_before && alnum(hay[..i].chars().last());
-        let joined_after = check_after && alnum(hay[i + m.len()..].chars().next());
+        let joined_before = check_before && joins(hay[..i].chars().last());
+        let joined_after = check_after && joins(hay[i + m.len()..].chars().next());
         !joined_before && !joined_after
     })
 }
