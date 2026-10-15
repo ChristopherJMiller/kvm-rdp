@@ -3913,6 +3913,29 @@ mod tests {
         assert!(!pushes_usage(&out, 0x0F), "{}", show(&out));
     }
 
+    /// I2: a request retired while a paste waits behind it moves that
+    /// paste up — the paste's own answer, coming after the retirement, is
+    /// its (not taken for the retired one's and discarded).
+    #[test]
+    fn a_request_retired_while_a_paste_waits_behind_it() {
+        let mut r = Rig::new();
+        time_out_a_paste(&mut r); // its request went out at t0; now t0 + 5 s
+        r.advance(Duration::from_secs(53)); // that request is 58 s old
+        hold_chord(&mut r);
+        r.step(chord_event()); // one request ahead of this one's
+        r.advance(Duration::from_secs(3)); // 61 s old; this paste waited 3 s of 5
+        let out = r.step(Event::ClipboardText(utf16le("k")));
+        assert_eq!(discards(&out), ["unanswered"], "{}", show(&out));
+        let _ = release_chord(&mut r);
+        assert_eq!(
+            finish(&mut r),
+            PasteOutcome::Done {
+                typed: 1,
+                skipped: 0
+            }
+        );
+    }
+
     /// I2: at most `MAX_REQUESTS` (64, IronRDP's own cap) are remembered;
     /// a request past it retires the oldest, counted.
     #[test]
