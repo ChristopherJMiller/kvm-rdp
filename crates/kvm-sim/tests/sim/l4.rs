@@ -8,7 +8,7 @@ use kvm_probe::l4::flv::{self, ConcurrentPlan, FlvOpen, Side};
 use kvm_probe::l4::hid::{self, End, HidWs};
 use kvm_probe::l4::session::{self, CapReport, Outcome};
 use kvm_probe::l4::ws::{self, Reply, TcpEnd, Upgrade};
-use kvm_probe::l4::{page, snapshot};
+use kvm_probe::l4::{hold, page, snapshot, web};
 use kvm_proto::hid::HidFrame;
 use kvm_sim::{KvmSim, SimEvent};
 use std::io::{BufRead as _, Write as _};
@@ -1037,6 +1037,353 @@ async fn snapshot_decodes_one_idr_to_a_png_in_the_sandbox() {
     );
     let mode = std::fs::metadata(&root).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, 0o700);
+    no_hid(&sim);
+}
+
+// --- Task 1.5: hid-hold, hid-stale, web-get.
+
+/// A key held when the websocket is reset: kvm-sim records the session
+/// start and the held press, and nothing after it on that socket. (On the
+/// real ES3 the agent reads the page by snapshot; here, the mechanics.)
+/// The press is '1' alone: no modifier, no Esc (PD3 R-I1).
+#[tokio::test]
+async fn hid_hold_holds_one_key_and_ends_the_way_it_was_told() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let r = hold::hold_then_kill(
+        &target(&sim),
+        Some(sim.spki_sha256()),
+        &token,
+        hold::HOLD_USAGE,
+        End::Reset,
+        Duration::from_millis(300),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.end, End::Reset);
+    let got = hid_count(&sim, 0, 3).await;
+    assert_eq!(
+        got,
+        [
+            HidFrame::SetMode { hid_type: 0 }.to_vec(),
+            kbd(0, 0),
+            kbd(0, 0x1E)
+        ]
+    );
+    all_closed(&sim).await;
+    assert_eq!(hid_on_ws(&sim, 0), got, "a frame after the held press");
+    assert_eq!(ws_opens(&sim), 1);
+    assert_safe_typing(&all_hid(&sim));
+    no_logout(&sim);
+}
+
+/// `hid-hold` holds `HOLD_USAGE` and nothing else: any other usage (Esc,
+/// a letter, a modifier's usage), or a hold past `MAX_OBSERVE`, is refused
+/// before anything connects.
+#[tokio::test]
+async fn hid_hold_refuses_any_other_key_or_an_unbounded_hold_before_connecting() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    for (usage, observe) in [
+        (0x29, Duration::from_millis(10)),
+        (0x04, Duration::from_millis(10)),
+        (0xE3, Duration::from_millis(10)),
+        (0x00, Duration::from_millis(10)),
+        (
+            hold::HOLD_USAGE,
+            hold::MAX_OBSERVE + Duration::from_millis(1),
+        ),
+    ] {
+        let e = hold::hold_then_kill(&t, pin, &token, usage, End::Fin, observe)
+            .await
+            .unwrap_err();
+        assert!(format!("{e:?}").contains("hid-hold"), "{usage:#04x}: {e:?}");
+    }
+    assert_eq!(ws_opens(&sim), 0);
+    assert_eq!(sim.stats().accepts_control, 0);
+    no_logout(&sim);
+}
+
+/// What one `hid-hold` / `hid-stale` snapshot hook saw: the suffix it was
+/// called with and how many websockets kvm-sim had opened by then.
+type Shots = std::sync::Mutex<Vec<(String, usize)>>;
+
+/// `hid-hold`'s whole run (Task 1.6 step 8): the held press, the `_held`
+/// snapshot while nothing has released it, then `guarded`'s release, then
+/// the `_released` snapshot. It ends released: the last frame kvm-sim read
+/// is a zero report, on a fresh websocket opened after the `_held`
+/// snapshot.
+#[tokio::test]
+async fn hid_hold_snapshots_the_held_key_then_ends_released() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    let shots = Shots::default();
+    let r = hold::hid_hold(
+        &t,
+        pin,
+        &token,
+        End::Fin,
+        Duration::from_millis(200),
+        &mut irq,
+        async |suffix: &str| {
+            shots
+                .lock()
+                .unwrap()
+                .push((suffix.to_owned(), ws_opens(&sim)));
+            Ok(())
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.end, End::Fin);
+    assert_eq!(
+        *shots.lock().unwrap(),
+        [("_held".to_owned(), 1), ("_released".to_owned(), 2)]
+    );
+    assert_eq!(hold::SHOTS, ["_held", "_released"]);
+    all_closed(&sim).await;
+    assert_eq!(
+        hid_on_ws(&sim, 0),
+        [session_start().to_vec(), vec![kbd(0, 0x1E)]].concat()
+    );
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+    assert_eq!(ws_opens(&sim), 2);
+    assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
+    assert_safe_typing(&all_hid(&sim));
+    no_logout(&sim);
+}
+
+/// ...and when its `_held` snapshot fails (with '1' still held), the
+/// release runs twice, `SECOND_RELEASE_AFTER` apart (PD3 I1); kvm-sim
+/// answers neither release's close frame, so the result is KEY MAY BE
+/// HELD with the remedy, the snapshot's error inside. No `_released`
+/// snapshot is taken.
+#[tokio::test]
+async fn hid_hold_releases_twice_when_its_held_snapshot_fails() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    let shots = Shots::default();
+    let e = hold::hid_hold(
+        &t,
+        pin,
+        &token,
+        End::Reset,
+        Duration::from_millis(200),
+        &mut irq,
+        async |suffix: &str| {
+            shots
+                .lock()
+                .unwrap()
+                .push((suffix.to_owned(), ws_opens(&sim)));
+            Err(kvm_probe::kvm::KvmError::Io(
+                "the snapshot failed".to_owned(),
+            ))
+        },
+    )
+    .await
+    .unwrap_err();
+    let e = format!("{e:?}");
+    assert!(
+        e.contains("KEY MAY BE HELD") && e.contains("hid-release"),
+        "{e}"
+    );
+    assert!(e.contains("the snapshot failed"), "{e}");
+    assert_eq!(*shots.lock().unwrap(), [("_held".to_owned(), 1)]);
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 3);
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    let opens = ws_open_times(&sim);
+    let apart = opens[2].saturating_duration_since(opens[1]);
+    assert!(apart >= Duration::from_millis(4500), "{apart:?}");
+    assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
+    assert_safe_typing(&all_hid(&sim));
+    no_logout(&sim);
+}
+
+/// The burst's frames, built here from D5's rule (not with
+/// `hid::stale_frame`): 'a'..'t' on even `i`, the all-zero release on odd.
+fn burst_frame(i: usize) -> Vec<u8> {
+    if i % 2 == 1 {
+        kbd(0, 0)
+    } else {
+        kbd(0, 0x04 + u8::try_from((i / 2) % 20).unwrap())
+    }
+}
+
+/// The re-assert carry (PC9 fix 2), bounded (D5): exactly STALE_BURST
+/// reports, alternating press and release and ending on a release, then a
+/// reset; the fresh websocket starts with the session start and the Right
+/// Ctrl tap that resets the test page (never Esc, PD3 R-I1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hid_stale_sends_a_bounded_alternating_burst_then_a_fresh_session_start() {
+    let sim = sim_with(|c| c.control_recv_buffer = Some(4096)).await;
+    let token = login(&sim).await;
+    let r = hid::stale_after_reset(
+        &target(&sim),
+        Some(sim.spki_sha256()),
+        &token,
+        Duration::from_millis(300),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.pushed, 128);
+    assert_eq!(hid::STALE_BURST, 128);
+    let fresh = hid_count(&sim, 1, 4).await;
+    assert_eq!(
+        fresh.get(..4).unwrap(),
+        [session_start(), reset_tap()].concat()
+    );
+    all_closed(&sim).await;
+    assert_eq!(hid_on_ws(&sim, 1), [session_start(), reset_tap()].concat());
+    let old = hid_on_ws(&sim, 0);
+    assert_eq!(old.get(..2).unwrap(), session_start());
+    assert!(old.len() <= 130, "past the burst's cap: {}", old.len());
+    for (i, f) in old.iter().skip(2).enumerate() {
+        assert_eq!(
+            *f,
+            hid::stale_frame(u64::try_from(i).unwrap()).to_vec(),
+            "burst frame {i}"
+        );
+        assert_eq!(*f, burst_frame(i), "burst frame {i}");
+    }
+    if old.len() == 130 {
+        assert_eq!(
+            old.last().unwrap(),
+            &kbd(0, 0),
+            "a complete burst ends released"
+        );
+    }
+    assert_eq!(ws_opens(&sim), 2);
+    assert_safe_typing(&old);
+    assert_safe_typing(&all_hid(&sim));
+    no_logout(&sim);
+}
+
+/// `hid-stale` refuses a settle past `MAX_SETTLE` (a stale press could be
+/// down through it) before anything connects.
+#[tokio::test]
+async fn hid_stale_refuses_an_unbounded_settle_before_connecting() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let e = hid::stale_after_reset(
+        &target(&sim),
+        Some(sim.spki_sha256()),
+        &token,
+        hid::MAX_SETTLE + Duration::from_millis(1),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{e:?}").contains("hid-stale"), "{e:?}");
+    assert_eq!(ws_opens(&sim), 0);
+    assert_eq!(sim.stats().accepts_control, 0);
+}
+
+/// `hid-stale`'s whole run (Task 1.6 step 9): the burst, the fresh
+/// session start and reset tap, the settle and the snapshot — all before
+/// any release — then two releases `SECOND_RELEASE_AFTER` apart, on every
+/// path (D5: a backlog can drain late). kvm-sim answers neither release's
+/// close frame, so even this run, whose body succeeded, ends KEY MAY BE
+/// HELD with the remedy (PD3 R-m1). The burst's report is printed first,
+/// so it is never lost to that error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hid_stale_releases_twice_and_is_loud_when_neither_release_is_confirmed() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    let shots = Shots::default();
+    let mut lines = Vec::new();
+    let e = hid::hid_stale(
+        &t,
+        pin,
+        &token,
+        Duration::from_millis(300),
+        &mut irq,
+        async |suffix: &str| {
+            shots
+                .lock()
+                .unwrap()
+                .push((suffix.to_owned(), ws_opens(&sim)));
+            Ok(())
+        },
+        |l| lines.push(l),
+    )
+    .await
+    .unwrap_err();
+    let e = format!("{e:?}");
+    assert!(
+        e.contains("KEY MAY BE HELD") && e.contains("hid-release"),
+        "{e}"
+    );
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("pushed: 128"), "{lines:?}");
+    // The one snapshot comes after the fresh websocket, before a release.
+    assert_eq!(*shots.lock().unwrap(), [(String::new(), 2)]);
+    assert_eq!(hid::STALE_SHOTS, [""]);
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 4, "{:?}", sim.stats());
+    assert_eq!(hid_on_ws(&sim, 1), [session_start(), reset_tap()].concat());
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    assert_eq!(hid_on_ws(&sim, 3), session_start());
+    let opens = ws_open_times(&sim);
+    let apart = opens[3].saturating_duration_since(opens[2]);
+    assert!(apart >= Duration::from_millis(4500), "{apart:?}");
+    assert!(hid_on_ws(&sim, 0).len() <= 130);
+    assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
+    assert_safe_typing(&all_hid(&sim));
+    no_logout(&sim);
+}
+
+/// `web-get` reads `/`: status, the `Server` header (absent on the ES3,
+/// census) and the body's start, bounded. kvm-sim answers 404.
+#[tokio::test]
+async fn web_get_reads_the_root_page() {
+    let sim = sim_with(|_| {}).await;
+    let p = web::get(&target(&sim), Some(sim.spki_sha256()), "/")
+        .await
+        .unwrap();
+    assert!(p.status == 404 || p.status == 200, "{p:?}");
+    assert_eq!(
+        (p.status, p.server.as_deref(), p.snippet.as_str()),
+        (404, None, "not found")
+    );
+    no_logout(&sim);
+    no_hid(&sim);
+}
+
+/// `web-get` can never log out or type: a path into `cgi-bin` or to a
+/// `.lua` script, with a query, a fragment, a percent-escape, a `..`
+/// segment, or not absolute is refused before anything connects — kvm-sim
+/// would otherwise take `/cgi-bin/login.lua?logout` as the global logout.
+#[tokio::test]
+async fn web_get_never_requests_a_path_that_could_log_out_or_type() {
+    let sim = sim_with(|_| {}).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    for path in [
+        "/cgi-bin/login.lua?logout",
+        "/cgi-bin/login.lua",
+        "/CGI-BIN/x",
+        "/hid.lua",
+        "/x?logout",
+        "/x#y",
+        "/%63gi-bin/login.lua",
+        "/../cgi-bin",
+        "//evil/",
+        "x",
+        "",
+        "/logout",
+    ] {
+        let e = web::get(&t, pin, path).await.unwrap_err();
+        assert!(format!("{e:?}").contains("web-get"), "{path:?}: {e:?}");
+    }
+    assert_eq!(sim.stats().accepts_web, 0);
+    no_logout(&sim);
     no_hid(&sim);
 }
 

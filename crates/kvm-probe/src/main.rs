@@ -101,6 +101,52 @@ fn captures_dir() -> Result<CaptureDir, String> {
     CaptureDir::create(Path::new(CAPTURES_DIR)).map_err(|e| format!("{e:?}"))
 }
 
+/// `--snapshot NAME` for `hid-hold` and `hid-stale`: the sandbox's ffmpeg
+/// and the captures dir, every `<NAME><suffix>` checked before anything
+/// types (`l4::hid::check_snapshot_names`).
+struct Shots {
+    name: String,
+    ffmpeg: std::path::PathBuf,
+    dir: CaptureDir,
+}
+
+impl Shots {
+    fn new(name: Option<&str>, suffixes: &[&str]) -> Result<Option<Shots>, String> {
+        let Some(name) = name else {
+            return Ok(None);
+        };
+        let ffmpeg = sandbox::resolve_ffmpeg().map_err(|e| e.to_string())?;
+        let dir = captures_dir()?;
+        l4::hid::check_snapshot_names(&dir, suffixes.iter().map(|s| format!("{name}{s}")))?;
+        Ok(Some(Shots {
+            name: name.to_owned(),
+            ffmpeg,
+            dir,
+        }))
+    }
+}
+
+/// One snapshot, `<NAME><suffix>`, printed; nothing without --snapshot. A
+/// `KvmError`, so that a failed snapshot ends a `guarded` body (and the
+/// release still runs).
+async fn shot(
+    shots: Option<&Shots>,
+    t: &KvmTarget,
+    pin: Option<&str>,
+    tok: &str,
+    suffix: &str,
+) -> Result<(), KvmError> {
+    let Some(s) = shots else {
+        return Ok(());
+    };
+    let name = format!("{}{suffix}", s.name);
+    let png = l4::snapshot::snapshot(t, pin, tok, &s.dir, &name, &s.ffmpeg)
+        .await
+        .map_err(KvmError::Io)?;
+    say(format_args!("snapshot: {}", png.display()));
+    Ok(())
+}
+
 /// Create `<dir>/<name>` for writing, via the same no-clobber,
 /// no-symlink-follow, 0600 discipline as every other capture output
 /// (`create_new` + `mode(0o600)`; never `File::create`).
@@ -417,6 +463,77 @@ async fn run(cli: Cli) -> Result<(), String> {
                     "release UNCONFIRMED: the session start was sent, but {why}; a snapshot must show `held -`"
                 )),
             }
+        }
+        Cmd::HidHold {
+            conn,
+            end,
+            observe_ms,
+            snapshot,
+        } => {
+            if let Some(w) = l4::hid::abort_build_warning() {
+                say_err(format_args!("kvm-probe: {w}"));
+            }
+            let pw = password(&conn)?;
+            let t = target(&conn.endpoint);
+            let shots = Shots::new(snapshot.as_deref(), &l4::hold::SHOTS)?;
+            // Once for the whole command, before the login (D34).
+            let mut irq = l4::hid::Interrupts::new().map_err(|e| kvm::bounded_debug(&e))?;
+            let report = session(&conn, &pw, async |tok: &str| {
+                l4::hold::hid_hold(
+                    &t,
+                    conn.pin_for(Port::Control),
+                    tok,
+                    end.into(),
+                    Duration::from_millis(observe_ms),
+                    &mut irq,
+                    async |suffix: &str| {
+                        shot(shots.as_ref(), &t, conn.pin_for(Port::Video), tok, suffix).await
+                    },
+                )
+                .await
+            })
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))?
+            .map_err(|e| kvm::bounded_debug(&e))?;
+            say(format_args!("{report:?}"));
+        }
+        Cmd::HidStale {
+            conn,
+            settle_ms,
+            snapshot,
+        } => {
+            if let Some(w) = l4::hid::abort_build_warning() {
+                say_err(format_args!("kvm-probe: {w}"));
+            }
+            let pw = password(&conn)?;
+            let t = target(&conn.endpoint);
+            let shots = Shots::new(snapshot.as_deref(), &l4::hid::STALE_SHOTS)?;
+            let mut irq = l4::hid::Interrupts::new().map_err(|e| kvm::bounded_debug(&e))?;
+            // The report is printed as soon as the burst is out (`out`),
+            // before the snapshot and both releases.
+            session(&conn, &pw, async |tok: &str| {
+                l4::hid::hid_stale(
+                    &t,
+                    conn.pin_for(Port::Control),
+                    tok,
+                    Duration::from_millis(settle_ms),
+                    &mut irq,
+                    async |suffix: &str| {
+                        shot(shots.as_ref(), &t, conn.pin_for(Port::Video), tok, suffix).await
+                    },
+                    |line| say(format_args!("{line}")),
+                )
+                .await
+            })
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))?
+            .map_err(|e| kvm::bounded_debug(&e))?;
+        }
+        Cmd::WebGet { endpoint, path } => {
+            let p = l4::web::get(&target(&endpoint), endpoint.pin_for(Port::Web), &path)
+                .await
+                .map_err(|e| kvm::bounded_debug(&e))?;
+            println!("status={} server={:?}\n{}", p.status, p.server, p.snippet);
         }
         Cmd::Snapshot { conn, name } => {
             let pw = password(&conn)?;

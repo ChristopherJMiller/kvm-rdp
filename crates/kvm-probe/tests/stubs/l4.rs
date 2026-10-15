@@ -174,3 +174,187 @@ async fn a_failed_body_whose_releases_are_confirmed_keeps_its_own_error() {
     got.sort_unstable();
     assert_eq!(got, [2, 2, 3]);
 }
+
+/// How a plain-TCP websocket stub saw each connection end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ended {
+    CloseFrame,
+    Fin,
+    Reset,
+    Other(String),
+}
+
+/// A plain-TCP (no TLS, so a FIN and a reset are told apart cleanly)
+/// websocket stub for any number of connections: records each one's data
+/// frames and how it ended.
+async fn end_stub() -> (u16, Arc<std::sync::Mutex<Vec<(Vec<Vec<u8>>, Ended)>>>) {
+    use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let log = log.clone();
+            tokio::spawn(async move {
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                    return;
+                };
+                let mut frames = Vec::new();
+                let ended = loop {
+                    match tokio::time::timeout(T, ws.next()).await {
+                        Ok(Some(Ok(Message::Close(_)))) => break Ended::CloseFrame,
+                        Ok(Some(Ok(Message::Binary(b)))) => frames.push(b),
+                        Ok(Some(Ok(_))) => {}
+                        Ok(Some(Err(Error::Protocol(
+                            ProtocolError::ResetWithoutClosingHandshake,
+                        )))) => break Ended::Fin,
+                        Ok(Some(Err(Error::Io(e))))
+                            if e.kind() == std::io::ErrorKind::ConnectionReset =>
+                        {
+                            break Ended::Reset;
+                        }
+                        Ok(Some(Err(e))) => break Ended::Other(e.to_string()),
+                        Ok(None) => break Ended::Other("eof".to_owned()),
+                        Err(_) => break Ended::Other("timeout".to_owned()),
+                    }
+                };
+                log.lock().unwrap().push((frames, ended));
+            });
+        }
+    });
+    (port, seen)
+}
+
+/// DC18's census fact is per end kind, so `hold_then_kill` must end the
+/// websocket exactly as told: a close frame, a FIN, or a reset — each
+/// after the session start and the one held '1', and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hid_hold_ends_its_websocket_the_way_it_was_told() {
+    use kvm_probe::l4::hid::End;
+    use kvm_probe::l4::hold;
+    use kvm_proto::hid::HidFrame;
+    let (port, seen) = end_stub().await;
+    let t = KvmTarget {
+        scheme: Scheme::Http,
+        ..target(port)
+    };
+    let held = vec![
+        HidFrame::SetMode { hid_type: 0 }.to_vec(),
+        HidFrame::Keyboard {
+            modifiers: 0,
+            keys: [0; 5],
+        }
+        .to_vec(),
+        HidFrame::Keyboard {
+            modifiers: 0,
+            keys: [0x1E, 0, 0, 0, 0],
+        }
+        .to_vec(),
+    ];
+    for (n, (end, want)) in [
+        (End::CloseFrame, Ended::CloseFrame),
+        (End::Fin, Ended::Fin),
+        (End::Reset, Ended::Reset),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let r = hold::hold_then_kill(
+            &t,
+            None,
+            "0.1",
+            hold::HOLD_USAGE,
+            end,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.end, end);
+        let deadline = std::time::Instant::now() + T;
+        while seen.lock().unwrap().len() <= n {
+            assert!(std::time::Instant::now() < deadline, "{end:?}: no end seen");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let got = seen.lock().unwrap()[n].clone();
+        assert_eq!(got, (held.clone(), want), "{end:?}");
+    }
+}
+
+/// D5 and PD3 R-m1, the other half: a KVM that confirms both releases
+/// (it answers each close frame) — `hid-stale` ends Ok with its report,
+/// after exactly two releases, each the session start alone; the burst's
+/// websocket carried at most the session start and the 128 reports, the
+/// fresh one the session start and the reset tap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hid_stale_with_confirmed_releases_ends_ok_after_two_releases() {
+    use kvm_probe::l4::hid;
+    let (port, pin, closed) = answering_stub().await;
+    let t = target(port);
+    let mut irq = hid::Interrupts::new().unwrap();
+    let mut lines = Vec::new();
+    let r = hid::hid_stale(
+        &t,
+        Some(&pin),
+        "0.1",
+        Duration::from_millis(100),
+        &mut irq,
+        async |_: &str| Ok(()),
+        |l| lines.push(l),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.pushed, 128);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let deadline = std::time::Instant::now() + T;
+    while closed.lock().unwrap().len() < 4 {
+        assert!(std::time::Instant::now() < deadline, "{:?}", closed.lock());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The burst's websocket was reset, so how much of it the stub read
+    // before the reset may vary; the other three are exact.
+    let got = closed.lock().unwrap().clone();
+    assert_eq!(got.len(), 4, "a websocket too many or too few: {got:?}");
+    assert!(got.iter().filter(|&&n| n == 2).count() >= 2, "{got:?}");
+    assert!(got.contains(&4), "{got:?}");
+    assert!(got.iter().all(|&n| n <= 130), "{got:?}");
+}
+
+/// `web-get` over a hostile page: the status, the `Server` header cut to
+/// 120 bytes and the body's first 512 bytes, each escaped — no raw control
+/// byte or non-ASCII byte reaches the terminal, however long the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_get_bounds_and_escapes_a_hostile_page() {
+    use kvm_probe::l4::{escaped, web};
+    let mut body = b"\x1b]0;owned\x07\x00".to_vec();
+    body.extend(std::iter::repeat_n(b'\x1b', 100_000));
+    let mut server = b"ES3 \"x\" \\ \xff\xfe ".to_vec();
+    server.extend(std::iter::repeat_n(b'v', 300));
+    let mut resp = b"HTTP/1.1 200 OK\r\nServer: ".to_vec();
+    resp.extend_from_slice(&server);
+    resp.extend_from_slice(
+        format!(
+            "\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .as_bytes(),
+    );
+    resp.extend_from_slice(&body);
+    let stub = support::start_http_stub(resp).await;
+    let t = KvmTarget {
+        login_port: stub.port,
+        ..target(1)
+    };
+    let p = web::get(&t, Some(&stub.pin_hex), "/about.html")
+        .await
+        .unwrap();
+    assert_eq!(p.status, 200);
+    assert_eq!(p.server.as_deref(), Some(escaped(&server, 120).as_str()));
+    assert_eq!(p.snippet, escaped(&body, 512));
+    for s in [p.server.as_deref().unwrap(), p.snippet.as_str()] {
+        assert!(s.bytes().all(|b| (0x20..0x7f).contains(&b)), "{s:?}");
+    }
+    let req = stub.requests.lock().unwrap()[0].clone();
+    assert!(req.starts_with("GET /about.html HTTP/1.1\r\n"), "{req}");
+}

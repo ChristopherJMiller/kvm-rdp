@@ -649,7 +649,20 @@ pub async fn guarded<T>(
     body: impl std::future::Future<Output = Result<T, KvmError>>,
 ) -> Result<T, KvmError> {
     let mut r = Releaser::new(token, None, RELEASE_WINDOW);
-    guarded_with(t, pin, &mut r, pointer, irq, body).await
+    guarded_with(t, pin, &mut r, pointer, irq, Second::AfterFailure, body).await
+}
+
+/// When `guarded_with` releases a second time, `SECOND_RELEASE_AFTER`
+/// after the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Second {
+    /// After a body that ran and did not end Ok (PD3 I1): what the KVM had
+    /// already received from it may still be read after the first release.
+    AfterFailure,
+    /// After any body that ran, Ok or not: it reset a websocket with a
+    /// backlog on purpose (`hid_stale`, D5), so that backlog may drain
+    /// after the first release whatever the body returned.
+    Always,
 }
 
 async fn guarded_with<T>(
@@ -658,6 +671,7 @@ async fn guarded_with<T>(
     r: &mut Releaser<'_>,
     pointer: Option<(u16, u16)>,
     irq: &mut Interrupts,
+    second: Second,
     body: impl std::future::Future<Output = Result<T, KvmError>>,
 ) -> Result<T, KvmError> {
     let ran = std::cell::Cell::new(false);
@@ -679,23 +693,25 @@ async fn guarded_with<T>(
     };
     let first = release_loop(t, pin, r, pointer).await?;
     report(first);
-    if let Err(e) = &out
-        && ran.get()
-    {
+    if ran.get() && (out.is_err() || second == Second::Always) {
         tokio::time::sleep(SECOND_RELEASE_AFTER).await;
-        let second = release_loop(t, pin, r, pointer).await?;
-        report(second);
+        let again = release_loop(t, pin, r, pointer).await?;
+        report(again);
         // PD3 R-m1: the KVM confirmed neither release after a body that
-        // failed mid-stream — its backlog may still land after both (a stall
+        // failed mid-stream (or, `Always`, reset a websocket with a backlog
+        // on purpose) — that backlog may still land after both (a stall
         // outlasting them). That is the one case no client-side order can
         // prevent, so it is loud: KEY MAY BE HELD, the body's error inside.
         if matches!(
-            (first, second),
+            (first, again),
             (Released::Unconfirmed(_), Released::Unconfirmed(_))
         ) {
+            let why = match &out {
+                Err(e) => format!("The run failed: {}", escaped(what(e).as_bytes(), 80)),
+                Ok(_) => "The run completed, but it reset a websocket whose backlog may land after both releases".to_owned(),
+            };
             return Err(KvmError::Io(format!(
-                "KEY MAY BE HELD on the Mac (neither release was confirmed): run `kvm-probe hid-release` and check `held -`. The run failed: {}",
-                escaped(what(e).as_bytes(), 80)
+                "KEY MAY BE HELD on the Mac (neither release was confirmed): run `kvm-probe hid-release` and check `held -`. {why}"
             )));
         }
     }
@@ -722,6 +738,27 @@ pub struct Snapshots<'a> {
     pub ffmpeg: &'a Path,
     /// The video port's pin.
     pub pin: Option<&'a str>,
+}
+
+/// Every snapshot a HID command will take, checked before anything types
+/// (a name taken would fail mid-run): each `<name>.flv` must be a safe
+/// name in `dir` that does not exist yet.
+pub fn check_snapshot_names(
+    dir: &CaptureDir,
+    names: impl IntoIterator<Item = String>,
+) -> Result<(), String> {
+    for name in names {
+        let path = dir
+            .resolve(&format!("{name}.flv"))
+            .map_err(|e| format!("{e:?}"))?;
+        if std::fs::symlink_metadata(&path).is_ok() {
+            return Err(format!(
+                "{} exists: pick another --snapshot",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `hid-type`'s runs: `runs` of `page::pattern(chars)` at each of
@@ -800,18 +837,12 @@ pub async fn type_runs(
             .map(|s| format!("{}{pace}_{run}", s.prefix))
     };
     if let Some(s) = &plan.snapshots {
-        for &pace in plan.paces_ms {
-            for run in 1..=plan.runs {
-                let flv = format!("{}.flv", name(pace, run).unwrap_or_default());
-                let path = s.dir.resolve(&flv).map_err(|e| format!("{e:?}"))?;
-                if std::fs::symlink_metadata(&path).is_ok() {
-                    return Err(format!(
-                        "{} exists: pick another --snapshot prefix",
-                        path.display()
-                    ));
-                }
-            }
-        }
+        check_snapshot_names(
+            s.dir,
+            plan.paces_ms.iter().flat_map(|&pace| {
+                (1..=plan.runs).map(move |run| name(pace, run).unwrap_or_default())
+            }),
+        )?;
     }
     let text = super::page::pattern(plan.chars);
     let mut releaser = Releaser::new(token, plan.relogin.as_ref(), plan.release_window);
@@ -820,12 +851,20 @@ pub async fn type_runs(
             irq.check().map_err(|e| kvm::bounded_debug(&e))?;
             // The current token: a fresh one if a release logged in again.
             let tok = releaser.token.clone();
-            let r = guarded_with(t, pin, &mut releaser, None, irq, async {
-                let mut w = HidWs::open(t, pin, &tok, OPEN_TIMEOUT).await?;
-                let r = type_text(&mut w, &text, Duration::from_millis(pace_ms)).await?;
-                w.end(End::CloseFrame).await;
-                Ok(r)
-            })
+            let r = guarded_with(
+                t,
+                pin,
+                &mut releaser,
+                None,
+                irq,
+                Second::AfterFailure,
+                async {
+                    let mut w = HidWs::open(t, pin, &tok, OPEN_TIMEOUT).await?;
+                    let r = type_text(&mut w, &text, Duration::from_millis(pace_ms)).await?;
+                    w.end(End::CloseFrame).await;
+                    Ok(r)
+                },
+            )
             .await
             .map_err(|e| kvm::bounded_debug(&e))?;
             out(format!("pace {pace_ms} ms, run {run}/{}: {r}", plan.runs));
@@ -841,6 +880,115 @@ pub async fn type_runs(
         }
     }
     Ok(())
+}
+
+/// `hid-stale`'s burst length (D5): enough to see whether a reset
+/// websocket's backlog is still read, small enough to type out harmlessly
+/// as 64 letters into the test page if it is.
+pub const STALE_BURST: u64 = 128;
+
+/// The longest `hid-stale` waits for stale presses to land (`--settle-ms`;
+/// Task 1.6 uses 5 s): a cut backlog can leave one press down through it,
+/// so it is bounded like every hold.
+pub const MAX_SETTLE: Duration = Duration::from_secs(30);
+
+/// `hid_stale`'s one snapshot suffix: `<NAME>` itself, after the settle.
+pub const STALE_SHOTS: [&str; 1] = [""];
+
+/// The burst's `i`-th report: a press of `a`..`t` on even `i`, the
+/// all-zero release on odd `i`. The burst ends on a release, so a backlog
+/// read to its end leaves nothing held, and one cut anywhere leaves at most
+/// one key down for the release after it to clear. No modifier, never Esc
+/// (PD3 R-I1).
+#[must_use]
+pub fn stale_frame(i: u64) -> HidFrame {
+    if i % 2 == 1 {
+        return KBD_ZERO;
+    }
+    press(Stroke {
+        usage: 0x04u8.saturating_add(u8::try_from((i / 2) % 20).unwrap_or(0)),
+        shift: false,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleReport {
+    /// Burst reports written before the reset (`STALE_BURST` unless a
+    /// write failed).
+    pub pushed: u64,
+}
+
+fn check_settle(settle: Duration) -> Result<(), KvmError> {
+    if settle > MAX_SETTLE {
+        return Err(KvmError::Io(format!(
+            "hid-stale settles for at most {MAX_SETTLE:?}; got {settle:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// The re-assert measurement (PC9 fix 2): write the `STALE_BURST` burst at
+/// pace 0 and reset the websocket (§3.2's rule for a stalled one), then
+/// open a fresh one — its session start releases — and reset the test page
+/// with `reset_page`'s Right Ctrl tap (never Esc, PD3 R-I1), which clears
+/// its text and counts, so the page then shows only stale presses the KVM
+/// read **after** the fresh session start. Wait `settle` (at most
+/// `MAX_SETTLE`, else refused before anything connects) for them; the
+/// caller snapshots the page before any release (`hid_stale`). Only the
+/// device (or kvm-sim) sees what it read, so the report is just what was
+/// written.
+pub async fn stale_after_reset(
+    t: &KvmTarget,
+    pin: Option<&str>,
+    token: &str,
+    settle: Duration,
+) -> Result<StaleReport, KvmError> {
+    check_settle(settle)?;
+    let mut w = HidWs::open(t, pin, token, OPEN_TIMEOUT).await?;
+    let mut pushed = 0u64;
+    for i in 0..STALE_BURST {
+        if w.send(stale_frame(i)).await.is_err() {
+            break;
+        }
+        pushed = pushed.saturating_add(1);
+    }
+    w.end(End::Reset).await;
+    let mut fresh = HidWs::open(t, pin, token, OPEN_TIMEOUT).await?;
+    reset_page(&mut fresh).await?;
+    fresh.end(End::CloseFrame).await;
+    tokio::time::sleep(settle).await;
+    Ok(StaleReport { pushed })
+}
+
+/// `hid-stale` (Task 1.6 step 9): `stale_after_reset`, its report through
+/// `out` at once (so a later error never hides it), and `shot(STALE_SHOTS[0])`
+/// — all before any release, in one section that releases twice on every
+/// path where it ran, `SECOND_RELEASE_AFTER` apart (D5: the burst's
+/// backlog may drain after the first; `Second::Always`). If the KVM
+/// confirmed neither release the result is KEY MAY BE HELD, even after a
+/// body that succeeded (PD3 R-m1). A settle past `MAX_SETTLE` is refused
+/// before anything connects.
+pub async fn hid_stale(
+    t: &KvmTarget,
+    pin: Option<&str>,
+    token: &str,
+    settle: Duration,
+    irq: &mut Interrupts,
+    mut shot: impl AsyncFnMut(&str) -> Result<(), KvmError>,
+    mut out: impl FnMut(String),
+) -> Result<StaleReport, KvmError> {
+    check_settle(settle)?;
+    let [name] = STALE_SHOTS;
+    let mut r = Releaser::new(token, None, RELEASE_WINDOW);
+    let report = guarded_with(t, pin, &mut r, None, irq, Second::Always, async {
+        let report = stale_after_reset(t, pin, token, settle).await?;
+        out(format!("{report:?}"));
+        shot(name).await?;
+        Ok(report)
+    })
+    .await?;
+    irq.check()?;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -877,5 +1025,43 @@ mod tests {
             assert!(modifiers == 0 || modifiers == MOD_LSHIFT, "{c:?}");
             assert!(!keys.contains(&0x29), "{c:?} is Esc");
         }
+    }
+
+    /// D5, from literals: 128 reports, a press of 'a'..'t' (cycling) with
+    /// no modifier on even `i` and the all-zero release on odd `i` — 64
+    /// presses, never two keys down, and the last report a release.
+    #[test]
+    fn the_stale_burst_is_bounded_alternating_and_ends_released() {
+        assert_eq!(STALE_BURST, 128);
+        // 'a'..'t' from the US layout, cycling — not the burst's formula.
+        let letters: Vec<u8> = ('a'..='t').filter_map(us_stroke).map(|s| s.usage).collect();
+        assert_eq!(letters.len(), 20);
+        let mut want = Vec::new();
+        for &usage in letters.iter().cycle().take(64) {
+            want.push(HidFrame::Keyboard {
+                modifiers: 0,
+                keys: [usage, 0, 0, 0, 0],
+            });
+            want.push(KBD_ZERO);
+        }
+        let burst: Vec<HidFrame> = (0..STALE_BURST).map(stale_frame).collect();
+        assert_eq!(burst, want);
+        assert_eq!(burst.last(), Some(&KBD_ZERO));
+        assert!(!letters.contains(&kvm_proto::keymap::USAGE_ESC));
+    }
+
+    /// A HID command checks every snapshot name before anything types: an
+    /// unsafe name, or one already taken, is refused.
+    #[test]
+    fn snapshot_names_are_checked_before_anything_types() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = CaptureDir::create(&base.path().join("captures")).unwrap();
+        let taken = dir.resolve("hold_held.flv").unwrap();
+        std::fs::write(&taken, b"").unwrap();
+        let names = |n: &[&str]| n.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(check_snapshot_names(&dir, names(&["stale", "hold_released"])).is_ok());
+        let e = check_snapshot_names(&dir, names(&["stale", "hold_held"])).unwrap_err();
+        assert!(e.contains("exists"), "{e}");
+        assert!(check_snapshot_names(&dir, names(&["../x"])).is_err());
     }
 }

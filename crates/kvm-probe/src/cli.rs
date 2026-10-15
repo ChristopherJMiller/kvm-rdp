@@ -15,6 +15,24 @@ pub enum SchemeArg {
     Http,
 }
 
+/// How `hid-hold` ends the websocket with the key held.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum EndArg {
+    Close,
+    Fin,
+    Reset,
+}
+
+impl From<EndArg> for crate::l4::hid::End {
+    fn from(e: EndArg) -> Self {
+        match e {
+            EndArg::Close => Self::CloseFrame,
+            EndArg::Fin => Self::Fin,
+            EndArg::Reset => Self::Reset,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "kvm-probe",
@@ -109,6 +127,11 @@ impl Cli {
             }
             Cmd::HidRelease { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Control]),
             Cmd::Snapshot { conn, .. } => (&conn.endpoint, &[Port::Web, Port::Video]),
+            Cmd::HidHold { conn, .. } | Cmd::HidStale { conn, .. } => {
+                (&conn.endpoint, &[Port::Web, Port::Control, Port::Video])
+            }
+            // No login: the web port alone.
+            Cmd::WebGet { endpoint, .. } => (endpoint, &[Port::Web]),
             Cmd::Fingerprint { .. }
             | Cmd::SampleRange { .. }
             | Cmd::Summarize { .. }
@@ -184,6 +207,33 @@ fn hid_pace(s: &str) -> Result<u64, String> {
     } else {
         Err(format!("must be at most {max} (ms)"))
     }
+}
+
+/// Milliseconds, at most `max` (a hold or a settle is never unbounded).
+fn ms_at_most(s: &str, max: std::time::Duration) -> Result<u64, String> {
+    let v: u64 = s.parse().map_err(|e| format!("{e}"))?;
+    let max = crate::l4::ms(max);
+    if v <= max {
+        Ok(v)
+    } else {
+        Err(format!("must be at most {max} (ms)"))
+    }
+}
+
+/// `hid-hold --observe-ms`: at most `l4::hold::MAX_OBSERVE`.
+fn hold_observe(s: &str) -> Result<u64, String> {
+    ms_at_most(s, crate::l4::hold::MAX_OBSERVE)
+}
+
+/// `hid-stale --settle-ms`: at most `l4::hid::MAX_SETTLE`.
+fn stale_settle(s: &str) -> Result<u64, String> {
+    ms_at_most(s, crate::l4::hid::MAX_SETTLE)
+}
+
+/// `web-get --path`: a static page's path (`l4::web::check_path`), never
+/// one that could log out or type.
+fn web_path(s: &str) -> Result<String, String> {
+    crate::l4::web::check_path(s).map(|()| s.to_owned())
 }
 
 /// `hid-release --x/--y`: an absolute coordinate, 0..=32767 (§3.3).
@@ -438,6 +488,44 @@ pub enum Cmd {
         conn: Conn,
         #[arg(long)]
         name: String,
+    },
+    /// L4 [OWNER present]: hold '1' (and only '1'), end the websocket by
+    /// --end, wait --observe-ms with nothing released; with --snapshot N,
+    /// snapshot `N_held` then and `N_released` after the release. Ends with
+    /// a release (and another 5 s later if the run failed).
+    HidHold {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, value_enum, default_value_t = EndArg::Reset)]
+        end: EndArg,
+        /// How long '1' stays held on the dead websocket, at most 10000.
+        #[arg(long, default_value_t = 1500, value_parser = hold_observe)]
+        observe_ms: u64,
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
+    /// L4 [OWNER present]: the bounded stale burst (128 reports, alternating
+    /// press and release), a reset, a fresh session start and the Right
+    /// Ctrl tap that resets the test page, --settle-ms, then (with
+    /// --snapshot N) snapshot `N`. Ends with a release, and another 5 s
+    /// later.
+    HidStale {
+        #[command(flatten)]
+        conn: Conn,
+        /// How long stale presses may land before the snapshot, at most 30000.
+        #[arg(long, default_value_t = 5000, value_parser = stale_settle)]
+        settle_ms: u64,
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
+    /// L4: GET a static page on the web port (no login); status, `Server`
+    /// header, bounded escaped snippet. Never a script, CGI, login or
+    /// logout path.
+    WebGet {
+        #[command(flatten)]
+        endpoint: Endpoint,
+        #[arg(long, default_value = "/", value_parser = web_path)]
+        path: String,
     },
     /// Decode one frame of captures/<name> in the sandbox; report native Y min/max.
     ///
@@ -1137,5 +1225,173 @@ mod tests {
         assert!(only("snapshot", &["--name", "s"], &["--video-pin", "v"]).is_err());
         let err = only("hid-type", &[], &["--pin", "w", "--control-pin", "c"]);
         assert!(err.is_ok(), "--pin covers video: {err:?}");
+    }
+
+    #[test]
+    fn end_arg_maps_each_value_to_its_end() {
+        use crate::l4::hid::End;
+        assert_eq!(End::from(EndArg::Close), End::CloseFrame);
+        assert_eq!(End::from(EndArg::Fin), End::Fin);
+        assert_eq!(End::from(EndArg::Reset), End::Reset);
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "hid-hold",
+            "--host",
+            "h",
+            "--pin",
+            "ab",
+            "--password-file",
+            "/p",
+            "--end",
+            "fin",
+        ])
+        .unwrap();
+        assert!(matches!(
+            c.cmd,
+            Cmd::HidHold {
+                end: EndArg::Fin,
+                observe_ms: 1500,
+                ..
+            }
+        ));
+    }
+
+    fn web_argv<'a>(extra: &[&'a str]) -> Vec<&'a str> {
+        let mut argv = vec!["kvm-probe", "web-get", "--host", "h", "--pin", "ab"];
+        argv.extend(extra);
+        argv
+    }
+
+    /// Task 1.6 steps 8, 9 and 14 run these as written.
+    #[test]
+    fn hid_hold_hid_stale_and_web_get_parse_with_their_defaults() {
+        let c = Cli::try_parse_from(hid_argv("hid-hold", &[])).unwrap();
+        assert!(c.validate().is_ok());
+        assert!(matches!(
+            c.cmd,
+            Cmd::HidHold {
+                end: EndArg::Reset,
+                observe_ms: 1500,
+                snapshot: None,
+                ..
+            }
+        ));
+        let c = Cli::try_parse_from(hid_argv(
+            "hid-hold",
+            &["--end", "close", "--snapshot", "hold_close"],
+        ))
+        .unwrap();
+        assert!(matches!(
+            c.cmd,
+            Cmd::HidHold { end: EndArg::Close, snapshot: Some(ref n), .. } if n == "hold_close"
+        ));
+        let c = Cli::try_parse_from(hid_argv("hid-stale", &[])).unwrap();
+        assert!(c.validate().is_ok());
+        assert!(matches!(
+            c.cmd,
+            Cmd::HidStale {
+                settle_ms: 5000,
+                snapshot: None,
+                ..
+            }
+        ));
+        let c = Cli::try_parse_from(web_argv(&[])).unwrap();
+        assert!(c.validate().is_ok());
+        assert!(matches!(c.cmd, Cmd::WebGet { ref path, .. } if path == "/"));
+    }
+
+    /// `hid-hold` holds only '1' and `hid-stale` sends only its burst:
+    /// neither takes a key, a text or a file to type.
+    #[test]
+    fn hid_hold_and_hid_stale_take_no_key_or_text() {
+        let cmd = Cli::command();
+        for (sub, own) in [
+            ("hid-hold", &["end", "observe_ms", "snapshot"][..]),
+            ("hid-stale", &["settle_ms", "snapshot"]),
+        ] {
+            let mut args: Vec<&str> = cmd
+                .find_subcommand(sub)
+                .unwrap()
+                .get_arguments()
+                .map(|a| a.get_id().as_str())
+                .collect();
+            args.sort_unstable();
+            let mut want = vec![
+                "control_pin",
+                "host",
+                "password_file",
+                "pin",
+                "scheme",
+                "video_pin",
+            ];
+            want.extend(own);
+            want.sort_unstable();
+            assert_eq!(args, want, "{sub}");
+            for flag in ["--usage", "--key", "--text", "--file"] {
+                let err = Cli::try_parse_from(hid_argv(sub, &[flag, "x"])).unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{sub} {flag}"
+                );
+            }
+        }
+    }
+
+    /// Nothing is held or left to land without bound: `--observe-ms` (the
+    /// key held on a dead websocket) is at most `hold::MAX_OBSERVE`,
+    /// `--settle-ms` at most `hid::MAX_SETTLE`, refused at parse time.
+    #[test]
+    fn hid_hold_and_hid_stale_bound_their_waits() {
+        for (sub, flag, at, past) in [
+            ("hid-hold", "--observe-ms", "10000", "10001"),
+            ("hid-stale", "--settle-ms", "30000", "30001"),
+        ] {
+            assert!(Cli::try_parse_from(hid_argv(sub, &[flag, at])).is_ok());
+            let err = Cli::try_parse_from(hid_argv(sub, &[flag, past])).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{sub}");
+        }
+        assert_eq!(
+            crate::l4::ms(crate::l4::hold::MAX_OBSERVE),
+            10_000,
+            "the parser's bound"
+        );
+        assert_eq!(crate::l4::ms(crate::l4::hid::MAX_SETTLE), 30_000);
+    }
+
+    /// `web-get` never logs in (no `--password-file`) and never requests a
+    /// path that could log out or type: `--path` is a static page's path,
+    /// refused at parse time otherwise.
+    #[test]
+    fn web_get_takes_only_a_static_path_and_no_password() {
+        assert!(Cli::try_parse_from(web_argv(&["--path", "/about.html"])).is_ok());
+        for bad in ["/cgi-bin/login.lua?logout", "/x?y", "about", "/a/../b"] {
+            let err = Cli::try_parse_from(web_argv(&["--path", bad])).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{bad}");
+        }
+        let err = Cli::try_parse_from(web_argv(&["--password-file", "/tmp/pw"])).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// `hid-hold` and `hid-stale` touch all three ports (login, the HID
+    /// websocket, snapshots); `web-get` only the web port.
+    #[test]
+    fn hid_hold_hid_stale_and_web_get_need_a_pin_for_each_port_they_touch() {
+        let run = |sub: &'static str, pins: &[&'static str]| {
+            let mut argv = vec!["kvm-probe", sub, "--host", "h"];
+            if sub != "web-get" {
+                argv.extend(["--password-file", "/tmp/pw"]);
+            }
+            argv.extend(pins);
+            Cli::try_parse_from(argv).unwrap().validate()
+        };
+        for sub in ["hid-hold", "hid-stale"] {
+            assert!(run(sub, &["--video-pin", "v", "--control-pin", "c"]).is_err());
+            assert!(run(sub, &["--pin", "w", "--control-pin", "c"]).is_ok());
+            assert!(run(sub, &["--pin", "w", "--video-pin", "v"]).is_ok());
+        }
+        assert!(run("web-get", &["--video-pin", "v", "--control-pin", "c"]).is_err());
+        assert!(run("web-get", &["--pin", "w"]).is_ok());
+        assert!(run("web-get", &["--scheme", "http"]).is_ok());
     }
 }
