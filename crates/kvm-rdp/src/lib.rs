@@ -18,6 +18,7 @@ pub mod bridge;
 pub mod cli;
 pub mod config;
 pub mod hid;
+pub mod input;
 pub mod kvm;
 pub mod logging;
 pub mod metrics;

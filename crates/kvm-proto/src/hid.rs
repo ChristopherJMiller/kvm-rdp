@@ -13,6 +13,22 @@
 /// Largest absolute coordinate (§3.3: x, y in 0..=32767).
 pub const ABS_MAX: u16 = 32_767;
 
+/// §7.2: scale a client coordinate `v` on a `span`-wide (or -tall) axis to
+/// 0..=`ABS_MAX`, clamped. `span <= 1` (an unknown or degenerate surface)
+/// maps everything to 0.
+#[must_use]
+pub fn scale_abs(v: u16, span: u16) -> u16 {
+    let Some(last) = span.checked_sub(1) else {
+        return 0;
+    };
+    let v = u32::from(v.min(last));
+    let scaled = v
+        .saturating_mul(u32::from(ABS_MAX))
+        .checked_div(u32::from(last))
+        .unwrap_or(0);
+    u16::try_from(scaled).unwrap_or(ABS_MAX)
+}
+
 /// Wheel direction: one notch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Wheel {
@@ -171,6 +187,26 @@ mod tests {
             .to_vec(),
             [0xAA, 0xAA, 0x04, 0x20, 0x00, 0x00, 0x00, 0xFF]
         );
+    }
+
+    /// §7.2: x_hid = x * 32767 / (w-1), clamped at the edges; a 1-wide or
+    /// 0-wide span maps everything to 0 (no division by zero).
+    #[test]
+    fn scale_abs_matches_section_7_2() {
+        assert_eq!(scale_abs(0, 1920), 0);
+        assert_eq!(scale_abs(1919, 1920), 32_767);
+        assert_eq!(scale_abs(960, 1920), 16_392); // 960·32767/1919, §7.2
+        assert_eq!(scale_abs(959, 1919), 16_383); // the exact half
+        assert_eq!(scale_abs(5000, 1920), 32_767, "past the edge clamps");
+        assert_eq!(scale_abs(0, 1), 0);
+        assert_eq!(scale_abs(7, 0), 0);
+        assert_eq!(scale_abs(719, 720), 32_767);
+        // One past the edge: unclamped, 1920·32767/1919 = 32 784 still fits
+        // a u16, so only the clamp keeps it in 0..=32767 (§3.3).
+        assert_eq!(scale_abs(1920, 1920), 32_767, "one past the edge clamps");
+        assert_eq!(scale_abs(u16::MAX, u16::MAX), 32_767);
+        assert_eq!(scale_abs(u16::MAX, 2), 32_767);
+        assert_eq!(scale_abs(u16::MAX, 1), 0);
     }
 
     #[test]
