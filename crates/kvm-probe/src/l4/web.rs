@@ -4,8 +4,8 @@
 //!
 //! It can never log out or type (owner rules, §3.2): the KVM's dynamic
 //! endpoints — `/cgi-bin/login.lua?logout` is the global logout, and a
-//! CGI script can type — are refused with every path that is not a plain
-//! static one (`check_path`), before anything connects.
+//! CGI script can type — are refused, as is every path that is not on
+//! `check_path`'s allowlist of static pages, before anything connects.
 use super::escaped;
 use crate::kvm::{self, KvmError};
 use crate::request::KvmTarget;
@@ -15,9 +15,14 @@ use std::time::Duration;
 
 const MAX_SNIPPET: usize = 512;
 const MAX_SERVER: usize = 120;
-const GET_TIMEOUT: Duration = Duration::from_secs(10);
-/// The longest `--path`.
-pub const MAX_PATH: usize = 256;
+/// The whole GET's bound: connect, request, headers and the snippet.
+pub const GET_TIMEOUT: Duration = Duration::from_secs(10);
+/// The most characters after the leading `/` (PD4 m3).
+pub const MAX_PATH: usize = 128;
+
+/// The static files `web-get` fetches, by extension (any case); otherwise
+/// only `/` or a directory (a trailing `/`).
+pub const STATIC_EXTENSIONS: [&str; 7] = [".html", ".htm", ".js", ".css", ".txt", ".json", ".xml"];
 
 #[derive(Debug, Clone)]
 pub struct Page {
@@ -26,45 +31,65 @@ pub struct Page {
     pub snippet: String,
 }
 
-/// A static page's path, or why not: absolute, at most `MAX_PATH` bytes of
-/// `[A-Za-z0-9/._-]` (so no query, fragment, percent-escape or space), no
-/// empty, `.` or `..` segment, and nothing naming a script, CGI, login or
-/// logout (any case).
+/// PD4 m3: an allowlist. A path passes only if it is `/` followed by at
+/// most `MAX_PATH` characters of `[A-Za-z0-9._/-]` (so no query, fragment,
+/// percent-escape, `;`, space or control byte); has no `..`, `.lua`,
+/// `.cgi`, `cgi-bin`, `login` or `logout` anywhere (any case); has no
+/// empty segment but a trailing one and no segment starting with `.`
+/// (so no `.`, `..` or dotfile); and names a directory (`/`, or a trailing
+/// `/`) or a static file (`STATIC_EXTENSIONS`). Everything else — a
+/// script, an extensionless name, a backup — is refused.
 pub fn check_path(path: &str) -> Result<(), String> {
     let refuse = |why: &str| Err(format!("web-get fetches only a static page's path: {why}"));
-    if !path.starts_with('/') {
+    let Some(rest) = path.strip_prefix('/') else {
         return refuse("it must start with /");
-    }
-    if path.len() > MAX_PATH {
+    };
+    if rest.len() > MAX_PATH {
         return refuse("it is too long");
     }
-    if !path
+    if !rest
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
     {
         return refuse("only letters, digits and / . _ - (no query, fragment or escape)");
     }
-    // The leading '/' gives one empty first segment; a trailing one ("/x/")
-    // is a directory index and is fine.
-    let mut segments = path.split('/').skip(1).peekable();
-    while let Some(s) = segments.next() {
-        if matches!(s, "." | "..") || (s.is_empty() && segments.peek().is_some()) {
-            return refuse("no empty, . or .. segment");
-        }
-    }
-    let lower = path.to_ascii_lowercase();
-    if ["cgi", ".lua", "login", "logout"]
+    let lower = rest.to_ascii_lowercase();
+    if ["..", ".lua", ".cgi", "cgi-bin", "login", "logout"]
         .iter()
         .any(|w| lower.contains(w))
     {
-        return refuse("never a script, CGI, login or logout");
+        return refuse("never .., a script, CGI, login or logout");
+    }
+    let mut segments = lower.split('/').peekable();
+    while let Some(s) = segments.next() {
+        let last = segments.peek().is_none();
+        if (s.is_empty() && !last) || s.starts_with('.') {
+            return refuse("no empty segment, . segment or dotfile");
+        }
+        if last && !s.is_empty() && !STATIC_EXTENSIONS.iter().any(|e| s.ends_with(e)) {
+            return refuse(
+                "only a directory (ending in /) or a .html .htm .js .css .txt .json .xml file",
+            );
+        }
     }
     Ok(())
 }
 
+/// GET `path` (a static page's, `check_path`, else refused before
+/// anything connects), bounded by `GET_TIMEOUT`.
 pub async fn get(t: &KvmTarget, pin: Option<&str>, path: &str) -> Result<Page, KvmError> {
+    get_within(t, pin, path, GET_TIMEOUT).await
+}
+
+/// `get`, bounded by `within` instead (tests shorten it).
+pub async fn get_within(
+    t: &KvmTarget,
+    pin: Option<&str>,
+    path: &str,
+    within: Duration,
+) -> Result<Page, KvmError> {
     check_path(path).map_err(KvmError::Io)?;
-    tokio::time::timeout(GET_TIMEOUT, get_inner(t, pin, path))
+    tokio::time::timeout(within, get_inner(t, pin, path))
         .await
         .map_err(|_| KvmError::Http(format!("web-get: GET {path} timed out")))?
 }
@@ -116,43 +141,87 @@ async fn get_inner(t: &KvmTarget, pin: Option<&str>, path: &str) -> Result<Page,
 mod tests {
     use super::*;
 
-    /// Static pages pass; anything that could reach a script — the global
-    /// logout first — or smuggle one past the check is refused.
+    /// PD4 m3: an allowlist — `/`, a directory (`…/`) or a static file
+    /// (`.html .htm .js .css .txt .json .xml`, any case) under at most 128
+    /// characters of `[A-Za-z0-9._/-]` — passes.
     #[test]
     fn only_a_static_path_passes() {
+        let longest = format!("/{}.html", "a".repeat(MAX_PATH - 5));
         for ok in [
             "/",
             "/about.html",
+            "/About.HTM",
             "/static/js/app.min.js",
+            "/css/site.css",
             "/a_b-c/",
             "/version.txt",
+            "/api/info.json",
+            "/sitemap.xml",
+            longest.as_str(),
         ] {
             assert_eq!(check_path(ok), Ok(()), "{ok}");
         }
-        let long = format!("/{}", "a".repeat(MAX_PATH));
+    }
+
+    /// PD4 m3: everything else is refused — each line a way to reach a
+    /// script, a hidden file or another host past a check: the global
+    /// logout and every ES3 `cgi-bin/*.lua` form, any case; a query,
+    /// fragment, escape, `;`, space, backslash, control or non-ASCII byte;
+    /// `.`/`..`/dot segments and dotfiles; an empty segment; a script or
+    /// an extensionless name; a missing leading `/`; past 128 characters.
+    #[test]
+    fn everything_else_is_refused() {
+        let past = format!("/{}.html", "a".repeat(MAX_PATH - 4));
         for bad in [
             "/cgi-bin/login.lua?logout",
             "/cgi-bin/login.lua",
             "/cgi-bin/",
-            "/CGI-BIN/x",
+            "/CGI-BIN/x.html",
+            "/Cgi-Bin/index.html",
+            "/cgi-bin.html",
             "/hid.lua",
             "/x.LUA",
+            "/x.lua.html",
+            "/x.cgi",
+            "/x.Cgi.html",
             "/logout",
+            "/logout.html",
             "/Login.html",
+            "/x.html?logout",
             "/x?logout",
-            "/x#y",
-            "/%63gi-bin/x",
-            "/a b",
-            "/a\\b",
-            "/../x",
-            "/a/./b",
-            "/a/..",
-            "//evil/",
-            "/a//b",
-            "x",
+            "/x.html#y",
+            "/%63gi-bin/x.html",
+            "/x.html%00",
+            "/x.html;logout",
+            "/a b.html",
+            "/a\\b.html",
+            "/a\tb.html",
+            "/a.html\r\nX: y",
+            "/\u{e9}.html",
+            "/x.html\u{200b}",
+            "/../x.html",
+            "/a/../b.html",
+            "/a/..html",
+            "/a..b.html",
+            "/./x.html",
+            "/a/./b.html",
+            "/.git/config",
+            "/.env",
+            "/a/.hidden.html",
+            "/.html",
+            "//evil/x.html",
+            "/a//b.html",
+            "/x.sh",
+            "/x.php",
+            "/x.pl",
+            "/reboot",
+            "/signout",
+            "/upload",
+            "/x.html.bak",
+            "x.html",
             "",
-            "http://evil/",
-            long.as_str(),
+            "http://evil/x.html",
+            past.as_str(),
         ] {
             let e = check_path(bad).unwrap_err();
             assert!(e.starts_with("web-get"), "{bad:?}: {e}");

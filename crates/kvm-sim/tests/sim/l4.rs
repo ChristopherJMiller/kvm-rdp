@@ -1109,11 +1109,27 @@ async fn hid_hold_refuses_any_other_key_or_an_unbounded_hold_before_connecting()
 /// called with and how many websockets kvm-sim had opened by then.
 type Shots = std::sync::Mutex<Vec<(String, usize)>>;
 
+/// A snapshot hook that records into `shots` and succeeds.
+macro_rules! record_into {
+    ($shots:expr, $sim:expr) => {
+        async |suffix: &str, _token: &str| {
+            $shots
+                .lock()
+                .unwrap()
+                .push((suffix.to_owned(), ws_opens($sim)));
+            Ok(())
+        }
+    };
+}
+
 /// `hid-hold`'s whole run (Task 1.6 step 8): the held press, the `_held`
-/// snapshot while nothing has released it, then `guarded`'s release, then
-/// the `_released` snapshot. It ends released: the last frame kvm-sim read
-/// is a zero report, on a fresh websocket opened after the `_held`
-/// snapshot.
+/// snapshot while nothing has released it, then two releases
+/// `SECOND_RELEASE_AFTER` apart — its body left '1' last on a dead
+/// websocket, so it always releases twice (PD4 I2) — then the `_released`
+/// snapshot. kvm-sim answers neither release's close frame, so the result
+/// is KEY MAY BE HELD with the remedy (PD3 R-m1), and `_released` is still
+/// taken: it is how `held -` is checked. The last frame kvm-sim read is a
+/// zero report.
 #[tokio::test]
 async fn hid_hold_snapshots_the_held_key_then_ends_released() {
     let sim = sim_with(|_| {}).await;
@@ -1121,27 +1137,24 @@ async fn hid_hold_snapshots_the_held_key_then_ends_released() {
     let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
     let mut irq = hid::Interrupts::new().unwrap();
     let shots = Shots::default();
-    let r = hold::hid_hold(
+    let e = hold::hid_hold(
         &t,
         pin,
         &token,
-        End::Fin,
-        Duration::from_millis(200),
+        &hold::HoldPlan::new(End::Fin, Duration::from_millis(200)),
         &mut irq,
-        async |suffix: &str| {
-            shots
-                .lock()
-                .unwrap()
-                .push((suffix.to_owned(), ws_opens(&sim)));
-            Ok(())
-        },
+        record_into!(shots, &sim),
     )
     .await
-    .unwrap();
-    assert_eq!(r.end, End::Fin);
+    .unwrap_err();
+    let e = format!("{e:?}");
+    assert!(
+        e.contains("KEY MAY BE HELD") && e.contains("hid-release"),
+        "{e}"
+    );
     assert_eq!(
         *shots.lock().unwrap(),
-        [("_held".to_owned(), 1), ("_released".to_owned(), 2)]
+        [("_held".to_owned(), 1), ("_released".to_owned(), 3)]
     );
     assert_eq!(hold::SHOTS, ["_held", "_released"]);
     all_closed(&sim).await;
@@ -1150,17 +1163,20 @@ async fn hid_hold_snapshots_the_held_key_then_ends_released() {
         [session_start().to_vec(), vec![kbd(0, 0x1E)]].concat()
     );
     assert_eq!(hid_on_ws(&sim, 1), session_start());
-    assert_eq!(ws_opens(&sim), 2);
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    assert_eq!(ws_opens(&sim), 3);
+    let opens = ws_open_times(&sim);
+    let apart = opens[2].saturating_duration_since(opens[1]);
+    assert!(apart >= Duration::from_millis(4500), "{apart:?}");
     assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
     assert_safe_typing(&all_hid(&sim));
     no_logout(&sim);
 }
 
 /// ...and when its `_held` snapshot fails (with '1' still held), the
-/// release runs twice, `SECOND_RELEASE_AFTER` apart (PD3 I1); kvm-sim
-/// answers neither release's close frame, so the result is KEY MAY BE
-/// HELD with the remedy, the snapshot's error inside. No `_released`
-/// snapshot is taken.
+/// release runs twice, `SECOND_RELEASE_AFTER` apart; the result is KEY MAY
+/// BE HELD, the snapshot's error inside, and `_released` is still taken
+/// after both releases.
 #[tokio::test]
 async fn hid_hold_releases_twice_when_its_held_snapshot_fails() {
     let sim = sim_with(|_| {}).await;
@@ -1172,17 +1188,20 @@ async fn hid_hold_releases_twice_when_its_held_snapshot_fails() {
         &t,
         pin,
         &token,
-        End::Reset,
-        Duration::from_millis(200),
+        &hold::HoldPlan::new(End::Reset, Duration::from_millis(200)),
         &mut irq,
-        async |suffix: &str| {
+        async |suffix: &str, _token: &str| {
             shots
                 .lock()
                 .unwrap()
                 .push((suffix.to_owned(), ws_opens(&sim)));
-            Err(kvm_probe::kvm::KvmError::Io(
-                "the snapshot failed".to_owned(),
-            ))
+            if suffix == "_held" {
+                Err(kvm_probe::kvm::KvmError::Io(
+                    "the snapshot failed".to_owned(),
+                ))
+            } else {
+                Ok(())
+            }
         },
     )
     .await
@@ -1193,7 +1212,10 @@ async fn hid_hold_releases_twice_when_its_held_snapshot_fails() {
         "{e}"
     );
     assert!(e.contains("the snapshot failed"), "{e}");
-    assert_eq!(*shots.lock().unwrap(), [("_held".to_owned(), 1)]);
+    assert_eq!(
+        *shots.lock().unwrap(),
+        [("_held".to_owned(), 1), ("_released".to_owned(), 3)]
+    );
     all_closed(&sim).await;
     assert_eq!(ws_opens(&sim), 3);
     assert_eq!(hid_on_ws(&sim, 1), session_start());
@@ -1203,6 +1225,188 @@ async fn hid_hold_releases_twice_when_its_held_snapshot_fails() {
     assert!(apart >= Duration::from_millis(4500), "{apart:?}");
     assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
     assert_safe_typing(&all_hid(&sim));
+    no_logout(&sim);
+}
+
+/// PD4 I2, the review's reproduction: kvm-sim's reads are paused before
+/// `hid-hold` and resumed after it returns (`--observe-ms 0`, no
+/// snapshot), so the held '1' and both releases are all read late, in any
+/// order. A successful run releases twice, and with neither release
+/// confirmed it is never Ok: KEY MAY BE HELD with the remedy, every time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hid_hold_whose_releases_are_stalled_is_never_ok() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    sim.set_policy(|p| p.pause_ws_reads = true);
+    let r = hold::hid_hold(
+        &t,
+        pin,
+        &token,
+        &hold::HoldPlan::new(End::Reset, Duration::ZERO),
+        &mut irq,
+        async |_: &str, _: &str| Ok(()),
+    )
+    .await;
+    sim.set_policy(|p| p.pause_ws_reads = false);
+    let e = format!("{:?}", r.unwrap_err());
+    assert!(
+        e.contains("KEY MAY BE HELD") && e.contains("hid-release"),
+        "{e}"
+    );
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 3, "{:?}", sim.stats());
+    // Drained before the reset (I1): the press reached kvm-sim whole.
+    assert_eq!(
+        hid_on_ws(&sim, 0),
+        [session_start().to_vec(), vec![kbd(0, 0x1E)]].concat()
+    );
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    no_logout(&sim);
+}
+
+/// PD4 m1: '1' is held for a bounded time, snapshot included. A `_held`
+/// snapshot that hangs is cut off at the plan's `shot_window`, the
+/// section releases (twice: it failed), and the run is loud. The default
+/// window is `hid::SHOT_WINDOW` (10 s), so `hold::MAX_HELD` — observe,
+/// drain, end and the `_held` snapshot, each bounded — is 24 s.
+#[tokio::test]
+async fn a_hung_held_snapshot_is_cut_off_and_the_key_released() {
+    assert_eq!(hid::SHOT_WINDOW, Duration::from_secs(10));
+    assert_eq!(hold::MAX_HELD, Duration::from_secs(24));
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    let plan = hold::HoldPlan {
+        shot_window: Duration::from_millis(300),
+        ..hold::HoldPlan::new(End::Fin, Duration::from_millis(100))
+    };
+    let opened = std::sync::Mutex::new(None);
+    let started = std::time::Instant::now();
+    let e = hold::hid_hold(
+        &t,
+        pin,
+        &token,
+        &plan,
+        &mut irq,
+        async |suffix: &str, _: &str| {
+            if suffix == "_held" {
+                *opened.lock().unwrap() = Some(ws_opens(&sim));
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Ok(())
+        },
+    )
+    .await
+    .unwrap_err();
+    let e = format!("{e:?}");
+    assert!(e.contains("KEY MAY BE HELD"), "{e}");
+    assert!(e.contains("snapshot took longer"), "{e}");
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(*opened.lock().unwrap(), Some(1));
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 3);
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+    assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
+    no_logout(&sim);
+}
+
+/// PD4 m5: a `hid-hold` release refused for a token that lapsed
+/// mid-command logs in again — once — and both releases go out on the
+/// fresh token, as does the `_released` snapshot (PD3 m7's rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hid_hold_release_refused_for_its_token_logs_in_again_once() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    let plan = hold::HoldPlan {
+        relogin: Some(hid::Relogin {
+            web_pin: pin,
+            password: sim.password(),
+        }),
+        ..hold::HoldPlan::new(End::Fin, Duration::from_millis(300))
+    };
+    let tokens = std::sync::Mutex::new(Vec::new());
+    let lapse = async {
+        sim.wait_for(T, |_| ws_opens(&sim) >= 1).await.unwrap();
+        sim.expire_tokens();
+    };
+    let (r, ()) = tokio::join!(
+        hold::hid_hold(
+            &t,
+            pin,
+            &token,
+            &plan,
+            &mut irq,
+            async |s: &str, tok: &str| {
+                tokens.lock().unwrap().push((s.to_owned(), tok.to_owned()));
+                Ok(())
+            }
+        ),
+        lapse
+    );
+    let e = format!("{:?}", r.unwrap_err());
+    assert!(e.contains("KEY MAY BE HELD"), "{e}");
+    assert_eq!(sim.stats().logins_ok, 2);
+    assert!(refusals(&sim) >= 1);
+    let tokens = tokens.lock().unwrap().clone();
+    assert_eq!(tokens.len(), 2, "{tokens:?}");
+    assert_eq!(tokens[0], ("_held".to_owned(), token.clone()));
+    assert_eq!(tokens[1].0, "_released");
+    assert_ne!(tokens[1].1, token, "the snapshot used the lapsed token");
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 3);
+    assert_eq!(hid_on_ws(&sim, 1), session_start());
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    no_logout(&sim);
+}
+
+/// PD4 m5: ...and so does a `hid-stale` release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hid_stale_release_refused_for_its_token_logs_in_again_once() {
+    let sim = sim_with(|_| {}).await;
+    let token = login(&sim).await;
+    let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
+    let mut irq = hid::Interrupts::new().unwrap();
+    let plan = hid::StalePlan {
+        relogin: Some(hid::Relogin {
+            web_pin: pin,
+            password: sim.password(),
+        }),
+        ..hid::StalePlan::new(Duration::from_millis(300))
+    };
+    let lapse = async {
+        sim.wait_for(T, |_| ws_opens(&sim) >= 2).await.unwrap();
+        sim.expire_tokens();
+    };
+    let (r, ()) = tokio::join!(
+        hid::hid_stale(
+            &t,
+            pin,
+            &token,
+            &plan,
+            &mut irq,
+            async |_: &str, _: &str| Ok(()),
+            |_| {}
+        ),
+        lapse
+    );
+    let e = format!("{:?}", r.unwrap_err());
+    assert!(e.contains("KEY MAY BE HELD"), "{e}");
+    assert_eq!(sim.stats().logins_ok, 2);
+    assert!(refusals(&sim) >= 1);
+    all_closed(&sim).await;
+    assert_eq!(ws_opens(&sim), 4);
+    assert_eq!(hid_on_ws(&sim, 2), session_start());
+    assert_eq!(hid_on_ws(&sim, 3), session_start());
     no_logout(&sim);
 }
 
@@ -1217,9 +1421,10 @@ fn burst_frame(i: usize) -> Vec<u8> {
 }
 
 /// The re-assert carry (PC9 fix 2), bounded (D5): exactly STALE_BURST
-/// reports, alternating press and release and ending on a release, then a
-/// reset; the fresh websocket starts with the session start and the Right
-/// Ctrl tap that resets the test page (never Esc, PD3 R-I1).
+/// reports, alternating press and release and ending on a release, all of
+/// them delivered (drained before the reset, PD4 I1), then a reset; the
+/// fresh websocket starts with the session start and the Right Ctrl tap
+/// that resets the test page (never Esc, PD3 R-I1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hid_stale_sends_a_bounded_alternating_burst_then_a_fresh_session_start() {
     let sim = sim_with(|c| c.control_recv_buffer = Some(4096)).await;
@@ -1243,7 +1448,7 @@ async fn hid_stale_sends_a_bounded_alternating_burst_then_a_fresh_session_start(
     assert_eq!(hid_on_ws(&sim, 1), [session_start(), reset_tap()].concat());
     let old = hid_on_ws(&sim, 0);
     assert_eq!(old.get(..2).unwrap(), session_start());
-    assert!(old.len() <= 130, "past the burst's cap: {}", old.len());
+    assert_eq!(old.len(), 130, "the burst was cut or overran its cap");
     for (i, f) in old.iter().skip(2).enumerate() {
         assert_eq!(
             *f,
@@ -1252,13 +1457,11 @@ async fn hid_stale_sends_a_bounded_alternating_burst_then_a_fresh_session_start(
         );
         assert_eq!(*f, burst_frame(i), "burst frame {i}");
     }
-    if old.len() == 130 {
-        assert_eq!(
-            old.last().unwrap(),
-            &kbd(0, 0),
-            "a complete burst ends released"
-        );
-    }
+    assert_eq!(
+        old.last().unwrap(),
+        &kbd(0, 0),
+        "a complete burst ends released"
+    );
     assert_eq!(ws_opens(&sim), 2);
     assert_safe_typing(&old);
     assert_safe_typing(&all_hid(&sim));
@@ -1280,17 +1483,30 @@ async fn hid_stale_refuses_an_unbounded_settle_before_connecting() {
     .await
     .unwrap_err();
     assert!(format!("{e:?}").contains("hid-stale"), "{e:?}");
+    let mut irq = hid::Interrupts::new().unwrap();
+    let e = hid::hid_stale(
+        &target(&sim),
+        Some(sim.spki_sha256()),
+        &token,
+        &hid::StalePlan::new(hid::MAX_SETTLE + Duration::from_millis(1)),
+        &mut irq,
+        async |_: &str, _: &str| Ok(()),
+        |_| {},
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{e:?}").contains("hid-stale"), "{e:?}");
     assert_eq!(ws_opens(&sim), 0);
     assert_eq!(sim.stats().accepts_control, 0);
 }
 
 /// `hid-stale`'s whole run (Task 1.6 step 9): the burst, the fresh
 /// session start and reset tap, the settle and the snapshot — all before
-/// any release — then two releases `SECOND_RELEASE_AFTER` apart, on every
-/// path (D5: a backlog can drain late). kvm-sim answers neither release's
-/// close frame, so even this run, whose body succeeded, ends KEY MAY BE
-/// HELD with the remedy (PD3 R-m1). The burst's report is printed first,
-/// so it is never lost to that error.
+/// any release, and the report line before the snapshot (PD4 m4) — then
+/// two releases `SECOND_RELEASE_AFTER` apart, on every path where the
+/// burst was sent (D5: a backlog can drain late). kvm-sim answers neither
+/// release's close frame, so even this run, whose body succeeded, ends KEY
+/// MAY BE HELD with the remedy (PD3 R-m1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hid_stale_releases_twice_and_is_loud_when_neither_release_is_confirmed() {
     let sim = sim_with(|_| {}).await;
@@ -1298,21 +1514,23 @@ async fn hid_stale_releases_twice_and_is_loud_when_neither_release_is_confirmed(
     let (t, pin) = (target(&sim), Some(sim.spki_sha256()));
     let mut irq = hid::Interrupts::new().unwrap();
     let shots = Shots::default();
-    let mut lines = Vec::new();
+    let lines = std::sync::Mutex::new(Vec::<String>::new());
+    let lines_at_shot = std::sync::Mutex::new(None);
     let e = hid::hid_stale(
         &t,
         pin,
         &token,
-        Duration::from_millis(300),
+        &hid::StalePlan::new(Duration::from_millis(300)),
         &mut irq,
-        async |suffix: &str| {
+        async |suffix: &str, _: &str| {
+            *lines_at_shot.lock().unwrap() = Some(lines.lock().unwrap().len());
             shots
                 .lock()
                 .unwrap()
                 .push((suffix.to_owned(), ws_opens(&sim)));
             Ok(())
         },
-        |l| lines.push(l),
+        |l| lines.lock().unwrap().push(l),
     )
     .await
     .unwrap_err();
@@ -1321,8 +1539,14 @@ async fn hid_stale_releases_twice_and_is_loud_when_neither_release_is_confirmed(
         e.contains("KEY MAY BE HELD") && e.contains("hid-release"),
         "{e}"
     );
+    let lines = lines.lock().unwrap().clone();
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("pushed: 128"), "{lines:?}");
+    assert_eq!(
+        *lines_at_shot.lock().unwrap(),
+        Some(1),
+        "the report came after the snapshot"
+    );
     // The one snapshot comes after the fresh websocket, before a release.
     assert_eq!(*shots.lock().unwrap(), [(String::new(), 2)]);
     assert_eq!(hid::STALE_SHOTS, [""]);
@@ -1334,7 +1558,7 @@ async fn hid_stale_releases_twice_and_is_loud_when_neither_release_is_confirmed(
     let opens = ws_open_times(&sim);
     let apart = opens[3].saturating_duration_since(opens[2]);
     assert!(apart >= Duration::from_millis(4500), "{apart:?}");
-    assert!(hid_on_ws(&sim, 0).len() <= 130);
+    assert_eq!(hid_on_ws(&sim, 0).len(), 130);
     assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
     assert_safe_typing(&all_hid(&sim));
     no_logout(&sim);

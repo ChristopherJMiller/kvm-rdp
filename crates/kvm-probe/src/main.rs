@@ -478,16 +478,23 @@ async fn run(cli: Cli) -> Result<(), String> {
             let shots = Shots::new(snapshot.as_deref(), &l4::hold::SHOTS)?;
             // Once for the whole command, before the login (D34).
             let mut irq = l4::hid::Interrupts::new().map_err(|e| kvm::bounded_debug(&e))?;
+            // A release refused for a lapsed token logs in again, once (PD4 m5).
+            let plan = l4::hold::HoldPlan {
+                relogin: Some(l4::hid::Relogin {
+                    web_pin: conn.pin_for(Port::Web),
+                    password: &pw,
+                }),
+                ..l4::hold::HoldPlan::new(end.into(), Duration::from_millis(observe_ms))
+            };
             let report = session(&conn, &pw, async |tok: &str| {
                 l4::hold::hid_hold(
                     &t,
                     conn.pin_for(Port::Control),
                     tok,
-                    end.into(),
-                    Duration::from_millis(observe_ms),
+                    &plan,
                     &mut irq,
-                    async |suffix: &str| {
-                        shot(shots.as_ref(), &t, conn.pin_for(Port::Video), tok, suffix).await
+                    async |suffix: &str, token: &str| {
+                        shot(shots.as_ref(), &t, conn.pin_for(Port::Video), token, suffix).await
                     },
                 )
                 .await
@@ -511,15 +518,22 @@ async fn run(cli: Cli) -> Result<(), String> {
             let mut irq = l4::hid::Interrupts::new().map_err(|e| kvm::bounded_debug(&e))?;
             // The report is printed as soon as the burst is out (`out`),
             // before the snapshot and both releases.
+            let plan = l4::hid::StalePlan {
+                relogin: Some(l4::hid::Relogin {
+                    web_pin: conn.pin_for(Port::Web),
+                    password: &pw,
+                }),
+                ..l4::hid::StalePlan::new(Duration::from_millis(settle_ms))
+            };
             session(&conn, &pw, async |tok: &str| {
                 l4::hid::hid_stale(
                     &t,
                     conn.pin_for(Port::Control),
                     tok,
-                    Duration::from_millis(settle_ms),
+                    &plan,
                     &mut irq,
-                    async |suffix: &str| {
-                        shot(shots.as_ref(), &t, conn.pin_for(Port::Video), tok, suffix).await
+                    async |suffix: &str, token: &str| {
+                        shot(shots.as_ref(), &t, conn.pin_for(Port::Video), token, suffix).await
                     },
                     |line| say(format_args!("{line}")),
                 )

@@ -491,14 +491,15 @@ pub enum Cmd {
     },
     /// L4 [OWNER present]: hold '1' (and only '1'), end the websocket by
     /// --end, wait --observe-ms with nothing released; with --snapshot N,
-    /// snapshot `N_held` then and `N_released` after the release. Ends with
-    /// a release (and another 5 s later if the run failed).
+    /// snapshot `N_held` then and `N_released` after the releases. Ends with
+    /// a release, and another 5 s later; '1' is held at most 24 s.
     HidHold {
         #[command(flatten)]
         conn: Conn,
         #[arg(long, value_enum, default_value_t = EndArg::Reset)]
         end: EndArg,
-        /// How long '1' stays held on the dead websocket, at most 10000.
+        /// How long '1' stays held on the dead websocket before `N_held`, at
+        /// most 10000 (with the drain, the end and the snapshot, at most 24 s).
         #[arg(long, default_value_t = 1500, value_parser = hold_observe)]
         observe_ms: u64,
         #[arg(long)]

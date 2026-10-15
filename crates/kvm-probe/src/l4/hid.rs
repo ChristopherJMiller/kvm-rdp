@@ -63,6 +63,16 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const RELEASE_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long `End::CloseFrame` waits for the KVM's close frame.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
+/// The longest `HidWs::end` takes: the close frame's write, then the wait
+/// for the KVM's.
+pub const END_WINDOW: Duration = WRITE_TIMEOUT.saturating_add(CLOSE_WAIT);
+/// PD4 I1: how long `HidWs::drain` waits for everything sent to be
+/// acknowledged — in the KVM's own kernel — before a reset could cut it.
+pub const DRAIN_WINDOW: Duration = Duration::from_secs(1);
+/// PD4 m1: the longest one snapshot inside a HID section may take (the
+/// IDR wait is 5 s, then the sandboxed decode): a key held through it is
+/// held for a bounded time.
+pub const SHOT_WINDOW: Duration = Duration::from_secs(10);
 
 pub const KBD_ZERO: HidFrame = HidFrame::Keyboard {
     modifiers: 0,
@@ -244,6 +254,41 @@ impl HidWs {
         self.last_pos
     }
 
+    /// PD4 I1: wait, bounded by `within` (1 ms polls), until the kernel's
+    /// send queue is empty — `SIOCOUTQ` (`TIOCOUTQ`) is 0: every byte sent
+    /// is acknowledged, so it is in the KVM's own kernel and a reset can no
+    /// longer cut it (`SO_LINGER` 0 purges only what is still queued here).
+    /// Every write is flushed through TLS before `send` returns, so this
+    /// covers all of it. Why not, if it does not.
+    pub async fn drain(&self, within: Duration) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            let queued = self
+                .unacknowledged()
+                .map_err(|e| format!("SIOCOUTQ failed: {e}"))?;
+            if queued == 0 {
+                return Ok(());
+            }
+            if started.elapsed() >= within {
+                return Err(format!("{queued} bytes unacknowledged after {within:?}"));
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Bytes sent but not yet acknowledged by the KVM (`SIOCOUTQ`).
+    fn unacknowledged(&self) -> std::io::Result<u64> {
+        use std::os::fd::AsRawFd as _;
+        let mut n: libc::c_int = 0;
+        // SAFETY: SIOCOUTQ (TIOCOUTQ) on a TCP socket's descriptor writes
+        // one int through the pointer, which is valid for the call.
+        let rc = unsafe { libc::ioctl(self.sock.as_raw_fd(), libc::TIOCOUTQ, &raw mut n) };
+        if rc < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
     /// End the websocket `how`. Every step is bounded: the close frame's
     /// write by `WRITE_TIMEOUT` (a KVM that stopped reading cannot stall
     /// it), the wait for the KVM's close by 2 s. `CloseFrame` and `Fin`
@@ -411,15 +456,19 @@ pub struct Relogin<'a> {
 
 /// The release path's state across a command's sections: the token (a
 /// fresh one after a re-login), the fresh logins left, the retry window.
-struct Releaser<'r> {
-    token: String,
+pub(crate) struct Releaser<'r> {
+    pub(crate) token: String,
     relogin: Option<&'r Relogin<'r>>,
     relogins_left: u32,
     window: Duration,
 }
 
 impl<'r> Releaser<'r> {
-    fn new(token: &str, relogin: Option<&'r Relogin<'r>>, window: Duration) -> Releaser<'r> {
+    pub(crate) fn new(
+        token: &str,
+        relogin: Option<&'r Relogin<'r>>,
+        window: Duration,
+    ) -> Releaser<'r> {
         Releaser {
             token: token.to_owned(),
             relogin,
@@ -655,7 +704,7 @@ pub async fn guarded<T>(
 /// When `guarded_with` releases a second time, `SECOND_RELEASE_AFTER`
 /// after the first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Second {
+pub(crate) enum Second {
     /// After a body that ran and did not end Ok (PD3 I1): what the KVM had
     /// already received from it may still be read after the first release.
     AfterFailure,
@@ -665,7 +714,7 @@ enum Second {
     Always,
 }
 
-async fn guarded_with<T>(
+pub(crate) async fn guarded_with<T>(
     t: &KvmTarget,
     pin: Option<&str>,
     r: &mut Releaser<'_>,
@@ -913,8 +962,9 @@ pub fn stale_frame(i: u64) -> HidFrame {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaleReport {
-    /// Burst reports written before the reset (`STALE_BURST` unless a
-    /// write failed).
+    /// Burst reports the KVM's kernel acknowledged before the reset (PD4
+    /// I1): all `STALE_BURST` of them — a burst cut short is an error,
+    /// never a report.
     pub pushed: u64,
 }
 
@@ -928,15 +978,22 @@ fn check_settle(settle: Duration) -> Result<(), KvmError> {
 }
 
 /// The re-assert measurement (PC9 fix 2): write the `STALE_BURST` burst at
-/// pace 0 and reset the websocket (§3.2's rule for a stalled one), then
-/// open a fresh one — its session start releases — and reset the test page
-/// with `reset_page`'s Right Ctrl tap (never Esc, PD3 R-I1), which clears
-/// its text and counts, so the page then shows only stale presses the KVM
-/// read **after** the fresh session start. Wait `settle` (at most
-/// `MAX_SETTLE`, else refused before anything connects) for them; the
-/// caller snapshots the page before any release (`hid_stale`). Only the
-/// device (or kvm-sim) sees what it read, so the report is just what was
-/// written.
+/// pace 0, wait (`DRAIN_WINDOW`) until all of it is acknowledged — in the
+/// KVM's own kernel, so the reset cannot cut it (PD4 I1) — and reset the
+/// websocket (§3.2's rule for a stalled one); then open a fresh one — its
+/// session start releases — and reset the test page with `reset_page`'s
+/// Right Ctrl tap (never Esc, PD3 R-I1), which clears its text and counts,
+/// so the page then shows only stale presses the KVM read **after** the
+/// fresh session start. Wait `settle` (at most `MAX_SETTLE`, else refused
+/// before anything connects) for them; the caller snapshots the page
+/// before any release (`hid_stale`).
+///
+/// The KVM holds the whole burst, which ends on a zero, so however late it
+/// reads it, it ends released. A burst that stopped early, or never
+/// drained, is an error that says KEY MAY BE HELD — never a report: one
+/// that never drained is closed with a FIN, not reset, so the KVM still
+/// gets all of it, ending on a zero, rather than a cut that may end on a
+/// press.
 pub async fn stale_after_reset(
     t: &KvmTarget,
     pin: Option<&str>,
@@ -947,10 +1004,20 @@ pub async fn stale_after_reset(
     let mut w = HidWs::open(t, pin, token, OPEN_TIMEOUT).await?;
     let mut pushed = 0u64;
     for i in 0..STALE_BURST {
-        if w.send(stale_frame(i)).await.is_err() {
-            break;
+        if let Err(e) = w.send(stale_frame(i)).await {
+            // Not ended: the drop resets.
+            return Err(KvmError::Io(format!(
+                "the stale burst stopped after {pushed} of {STALE_BURST} reports ({}), so the KVM may hold a cut backlog: KEY MAY BE HELD on the Mac — run `kvm-probe hid-release` and check `held -`",
+                escaped(what(&e).as_bytes(), 80)
+            )));
         }
         pushed = pushed.saturating_add(1);
+    }
+    if let Err(why) = w.drain(DRAIN_WINDOW).await {
+        w.end(End::Fin).await;
+        return Err(KvmError::Io(format!(
+            "the stale burst never drained ({why}), so it was closed, not reset, and the run measures nothing: KEY MAY BE HELD on the Mac — run `kvm-probe hid-release` and check `held -`"
+        )));
     }
     w.end(End::Reset).await;
     let mut fresh = HidWs::open(t, pin, token, OPEN_TIMEOUT).await?;
@@ -961,34 +1028,73 @@ pub async fn stale_after_reset(
 }
 
 /// `hid-stale` (Task 1.6 step 9): `stale_after_reset`, its report through
-/// `out` at once (so a later error never hides it), and `shot(STALE_SHOTS[0])`
-/// — all before any release, in one section that releases twice on every
-/// path where it ran, `SECOND_RELEASE_AFTER` apart (D5: the burst's
-/// backlog may drain after the first; `Second::Always`). If the KVM
-/// confirmed neither release the result is KEY MAY BE HELD, even after a
-/// body that succeeded (PD3 R-m1). A settle past `MAX_SETTLE` is refused
-/// before anything connects.
+/// `out` at once (so a later error never hides it, PD4 m4), and
+/// `shot(STALE_SHOTS[0], token)`, bounded by `plan.shot_window` (PD4 m1) —
+/// all before any release, in one section that releases twice on every
+/// path where the burst was sent, `SECOND_RELEASE_AFTER` apart (D5: the
+/// burst's backlog may drain after the first; `Second::Always`). If the
+/// KVM confirmed neither release the result is KEY MAY BE HELD, even after
+/// a body that succeeded (PD3 R-m1). A release refused for its token logs
+/// in again once with `plan.relogin` (PD4 m5). A settle past `MAX_SETTLE`
+/// is refused before anything connects.
 pub async fn hid_stale(
     t: &KvmTarget,
     pin: Option<&str>,
     token: &str,
-    settle: Duration,
+    plan: &StalePlan<'_>,
     irq: &mut Interrupts,
-    mut shot: impl AsyncFnMut(&str) -> Result<(), KvmError>,
+    mut shot: impl AsyncFnMut(&str, &str) -> Result<(), KvmError>,
     mut out: impl FnMut(String),
 ) -> Result<StaleReport, KvmError> {
-    check_settle(settle)?;
+    check_settle(plan.settle)?;
     let [name] = STALE_SHOTS;
-    let mut r = Releaser::new(token, None, RELEASE_WINDOW);
+    let mut r = Releaser::new(token, plan.relogin.as_ref(), RELEASE_WINDOW);
     let report = guarded_with(t, pin, &mut r, None, irq, Second::Always, async {
-        let report = stale_after_reset(t, pin, token, settle).await?;
-        out(format!("{report:?}"));
-        shot(name).await?;
+        let report = stale_after_reset(t, pin, token, plan.settle).await?;
+        out(format!(
+            "{report:?} (all acknowledged by the KVM before the reset)"
+        ));
+        bounded_shot(plan.shot_window, shot(name, token)).await?;
         Ok(report)
     })
     .await?;
     irq.check()?;
     Ok(report)
+}
+
+/// `hid_stale`'s settings.
+pub struct StalePlan<'a> {
+    /// How long stale presses may land before the snapshot (at most
+    /// `MAX_SETTLE`).
+    pub settle: Duration,
+    /// The snapshot's bound: `SHOT_WINDOW` (tests shorten it).
+    pub shot_window: Duration,
+    /// A fresh login for a release refused for its token (PD3 m7, PD4 m5).
+    pub relogin: Option<Relogin<'a>>,
+}
+
+impl<'a> StalePlan<'a> {
+    /// `SHOT_WINDOW`, no fresh login.
+    #[must_use]
+    pub fn new(settle: Duration) -> StalePlan<'a> {
+        StalePlan {
+            settle,
+            shot_window: SHOT_WINDOW,
+            relogin: None,
+        }
+    }
+}
+
+/// PD4 m1: a snapshot inside a HID section, bounded by `window`, so a key
+/// held through it is held for a bounded time; past it, the error ends
+/// the section and the release runs.
+pub(crate) async fn bounded_shot(
+    window: Duration,
+    shot: impl std::future::Future<Output = Result<(), KvmError>>,
+) -> Result<(), KvmError> {
+    tokio::time::timeout(window, shot)
+        .await
+        .map_err(|_| KvmError::Io(format!("the snapshot took longer than {window:?}")))?
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use kvm_probe::l4::ws::{self, Reply, TcpEnd, Upgrade};
 use kvm_probe::request::{KvmTarget, Scheme};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt as _;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
@@ -175,7 +175,10 @@ async fn a_failed_body_whose_releases_are_confirmed_keeps_its_own_error() {
     assert_eq!(got, [2, 2, 3]);
 }
 
-/// How a plain-TCP websocket stub saw each connection end.
+// --- Task 1.5: hid-hold and hid-stale against a ledger stub (PD4 fix
+// round 1: I1, I2, I3, m4, m5).
+
+/// How a ledger stub saw a connection end.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Ended {
     CloseFrame,
@@ -184,74 +187,208 @@ enum Ended {
     Other(String),
 }
 
-/// A plain-TCP (no TLS, so a FIN and a reset are told apart cleanly)
-/// websocket stub for any number of connections: records each one's data
-/// frames and how it ended.
-async fn end_stub() -> (u16, Arc<std::sync::Mutex<Vec<(Vec<Vec<u8>>, Ended)>>>) {
+/// What a ledger stub saw on one connection, in accept order.
+#[derive(Debug, Clone)]
+struct Seen {
+    /// When it was accepted.
+    opened: Instant,
+    /// Each data frame and when it was read.
+    frames: Vec<(Instant, Vec<u8>)>,
+    ended: Option<(Instant, Ended)>,
+    /// When it was accepted, the kernel's TCP state (`tcpi_state`) of every
+    /// earlier connection, by index: `TCP_CLOSE` once a reset arrived,
+    /// `TCP_CLOSE_WAIT` once a FIN did, `TCP_ESTABLISHED` before either.
+    /// Read from the kernel, so it is exact whatever the stub's tasks were
+    /// doing.
+    states_at_open: Vec<u8>,
+}
+
+const TCP_ESTABLISHED: u8 = 1;
+const TCP_CLOSE: u8 = 7;
+const TCP_CLOSE_WAIT: u8 = 8;
+
+/// The kernel's TCP state of `s` (`TCP_INFO`), read-only.
+fn tcp_state(s: &socket2::Socket) -> u8 {
+    use std::os::fd::AsRawFd as _;
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            s.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&raw mut info).cast(),
+            &raw mut len,
+        )
+    };
+    assert_eq!(rc, 0, "TCP_INFO: {}", std::io::Error::last_os_error());
+    info.tcpi_state
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct LedgerOpts {
+    /// `(n, after, for)`: connection `n` reads nothing once it has read
+    /// `after` frames, for `for` — its kernel still takes (and ACKs) what
+    /// fits its receive buffer: a KVM whose handler is stuck.
+    stall: Option<(usize, usize, Duration)>,
+    /// `SO_RCVBUF` on the listener, inherited by each accepted socket.
+    rcvbuf: Option<u32>,
+}
+
+type Ledger = Arc<std::sync::Mutex<Vec<Seen>>>;
+
+/// A plain-TCP websocket stub (no TLS, so a FIN and a reset are told
+/// apart cleanly) for any number of connections. It answers every close
+/// frame — a KVM that confirms releases — and records `Seen` for each
+/// connection.
+async fn ledger_stub(opts: LedgerOpts) -> (u16, Ledger) {
     use tokio_tungstenite::tungstenite::{Error, error::ProtocolError};
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    if let Some(n) = opts.rcvbuf {
+        sock.set_recv_buffer_size(n).unwrap();
+    }
+    sock.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = sock.listen(64).unwrap();
     let port = listener.local_addr().unwrap().port();
-    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let log = seen.clone();
+    let ledger: Ledger = Arc::default();
+    let log = ledger.clone();
     tokio::spawn(async move {
+        let mut socks: Vec<socket2::Socket> = Vec::new();
         while let Ok((tcp, _)) = listener.accept().await {
+            let opened = Instant::now();
+            let states_at_open = socks.iter().map(tcp_state).collect();
+            socks.push(socket2::SockRef::from(&tcp).try_clone().unwrap());
+            let n = {
+                let mut l = log.lock().unwrap();
+                l.push(Seen {
+                    opened,
+                    frames: Vec::new(),
+                    ended: None,
+                    states_at_open,
+                });
+                l.len() - 1
+            };
             let log = log.clone();
             tokio::spawn(async move {
                 let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
                     return;
                 };
-                let mut frames = Vec::new();
+                let mut stalled = false;
                 let ended = loop {
-                    match tokio::time::timeout(T, ws.next()).await {
-                        Ok(Some(Ok(Message::Close(_)))) => break Ended::CloseFrame,
-                        Ok(Some(Ok(Message::Binary(b)))) => frames.push(b),
+                    if let Some((k, after, d)) = opts.stall
+                        && k == n
+                        && !stalled
+                        && log.lock().unwrap()[n].frames.len() >= after
+                    {
+                        stalled = true;
+                        tokio::time::sleep(d).await;
+                    }
+                    let got = tokio::time::timeout(Duration::from_secs(30), ws.next()).await;
+                    let at = Instant::now();
+                    match got {
+                        Ok(Some(Ok(Message::Close(_)))) => {
+                            // The next read flushes tungstenite's queued
+                            // answer, then ends the stream.
+                            let _ = tokio::time::timeout(T, ws.next()).await;
+                            break (at, Ended::CloseFrame);
+                        }
+                        Ok(Some(Ok(Message::Binary(b)))) => {
+                            log.lock().unwrap()[n].frames.push((at, b));
+                        }
                         Ok(Some(Ok(_))) => {}
                         Ok(Some(Err(Error::Protocol(
                             ProtocolError::ResetWithoutClosingHandshake,
-                        )))) => break Ended::Fin,
+                        )))) => break (at, Ended::Fin),
                         Ok(Some(Err(Error::Io(e))))
                             if e.kind() == std::io::ErrorKind::ConnectionReset =>
                         {
-                            break Ended::Reset;
+                            break (at, Ended::Reset);
                         }
-                        Ok(Some(Err(e))) => break Ended::Other(e.to_string()),
-                        Ok(None) => break Ended::Other("eof".to_owned()),
-                        Err(_) => break Ended::Other("timeout".to_owned()),
+                        Ok(Some(Err(e))) => break (at, Ended::Other(e.to_string())),
+                        Ok(None) => break (at, Ended::Other("eof".to_owned())),
+                        Err(_) => break (at, Ended::Other("timeout".to_owned())),
                     }
                 };
-                log.lock().unwrap().push((frames, ended));
+                log.lock().unwrap()[n].ended = Some(ended);
             });
         }
     });
-    (port, seen)
+    (port, ledger)
 }
 
+/// Wait (bounded) until the ledger has `n` connections and all have ended.
+async fn all_ended(ledger: &Ledger, n: usize, within: Duration) -> Vec<Seen> {
+    let deadline = Instant::now() + within;
+    loop {
+        {
+            let l = ledger.lock().unwrap();
+            if l.len() >= n && l.iter().all(|s| s.ended.is_some()) {
+                return l.clone();
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{:?}",
+            ledger
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|s| (s.frames.len(), s.ended.clone()))
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn plain(port: u16) -> KvmTarget {
+    KvmTarget {
+        scheme: Scheme::Http,
+        ..target(port)
+    }
+}
+
+fn kbd(modifiers: u8, k: u8) -> Vec<u8> {
+    kvm_proto::hid::HidFrame::Keyboard {
+        modifiers,
+        keys: [k, 0, 0, 0, 0],
+    }
+    .to_vec()
+}
+
+fn session_start() -> Vec<Vec<u8>> {
+    vec![
+        kvm_proto::hid::HidFrame::SetMode { hid_type: 0 }.to_vec(),
+        kbd(0, 0),
+    ]
+}
+
+fn frames(s: &Seen) -> Vec<Vec<u8>> {
+    s.frames.iter().map(|(_, f)| f.clone()).collect()
+}
+
+/// The stale burst's 130 frames as the KVM reads them: the session start,
+/// then 'a'..'t' (cycling) each followed by a zero report, 64 times.
+fn whole_burst() -> Vec<Vec<u8>> {
+    let mut v = session_start();
+    for i in 0..64u8 {
+        v.push(kbd(0, 0x04 + i % 20));
+        v.push(kbd(0, 0));
+    }
+    v
+}
+
+/// One snapshot hook's calls: the suffix, the token it was given, when.
+type Shots = Arc<std::sync::Mutex<Vec<(String, String, Instant)>>>;
+
 /// DC18's census fact is per end kind, so `hold_then_kill` must end the
-/// websocket exactly as told: a close frame, a FIN, or a reset — each
+/// websocket exactly as told — a close frame, a FIN, or a reset — each
 /// after the session start and the one held '1', and nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hid_hold_ends_its_websocket_the_way_it_was_told() {
     use kvm_probe::l4::hid::End;
     use kvm_probe::l4::hold;
-    use kvm_proto::hid::HidFrame;
-    let (port, seen) = end_stub().await;
-    let t = KvmTarget {
-        scheme: Scheme::Http,
-        ..target(port)
-    };
-    let held = vec![
-        HidFrame::SetMode { hid_type: 0 }.to_vec(),
-        HidFrame::Keyboard {
-            modifiers: 0,
-            keys: [0; 5],
-        }
-        .to_vec(),
-        HidFrame::Keyboard {
-            modifiers: 0,
-            keys: [0x1E, 0, 0, 0, 0],
-        }
-        .to_vec(),
-    ];
+    let (port, ledger) = ledger_stub(LedgerOpts::default()).await;
+    let held = [session_start(), vec![kbd(0, 0x1E)]].concat();
     for (n, (end, want)) in [
         (End::CloseFrame, Ended::CloseFrame),
         (End::Fin, Ended::Fin),
@@ -261,7 +398,7 @@ async fn hid_hold_ends_its_websocket_the_way_it_was_told() {
     .enumerate()
     {
         let r = hold::hold_then_kill(
-            &t,
+            &plain(port),
             None,
             "0.1",
             hold::HOLD_USAGE,
@@ -271,54 +408,369 @@ async fn hid_hold_ends_its_websocket_the_way_it_was_told() {
         .await
         .unwrap();
         assert_eq!(r.end, end);
-        let deadline = std::time::Instant::now() + T;
-        while seen.lock().unwrap().len() <= n {
-            assert!(std::time::Instant::now() < deadline, "{end:?}: no end seen");
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        let got = seen.lock().unwrap()[n].clone();
-        assert_eq!(got, (held.clone(), want), "{end:?}");
+        let seen = all_ended(&ledger, n + 1, T).await;
+        assert_eq!(frames(&seen[n]), held, "{end:?}");
+        assert_eq!(seen[n].ended.as_ref().unwrap().1, want, "{end:?}");
     }
 }
 
-/// D5 and PD3 R-m1, the other half: a KVM that confirms both releases
-/// (it answers each close frame) — `hid-stale` ends Ok with its report,
-/// after exactly two releases, each the session start alone; the burst's
-/// websocket carried at most the session start and the 128 reports, the
-/// fresh one the session start and the reset tap.
+/// I3 and I2 (PD4 fix round 1): `hid_hold` itself, once per end kind,
+/// against a KVM that confirms releases. Each run:
+/// - ends the held websocket as told (the kernel's view: closed by a
+///   reset, half-closed by a FIN) before the release opens;
+/// - takes `_held` no sooner than `observe` after the press arrived, and
+///   before any release;
+/// - releases twice, `SECOND_RELEASE_AFTER` apart, even though it
+///   succeeded (its body left '1' last on a dead websocket);
+/// - takes `_released` after both, with the token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hid_hold_runs_each_end_kind_and_releases_twice() {
+    use kvm_probe::l4::hid::{End, Interrupts};
+    use kvm_probe::l4::hold;
+    let observe = Duration::from_millis(1000);
+    let one = async |end: End| {
+        let (port, ledger) = ledger_stub(LedgerOpts::default()).await;
+        let shots: Shots = Arc::default();
+        let mut irq = Interrupts::new().unwrap();
+        let r = hold::hid_hold(
+            &plain(port),
+            None,
+            "0.1",
+            &hold::HoldPlan::new(end, observe),
+            &mut irq,
+            async |suffix: &str, token: &str| {
+                shots
+                    .lock()
+                    .unwrap()
+                    .push((suffix.to_owned(), token.to_owned(), Instant::now()));
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.end, end);
+        let seen = all_ended(&ledger, 3, T).await;
+        (seen, shots.lock().unwrap().clone())
+    };
+    let ((close, close_shots), (fin, fin_shots), (reset, reset_shots)) =
+        tokio::join!(one(End::CloseFrame), one(End::Fin), one(End::Reset));
+    for (end, seen, shots, kind, state) in [
+        (End::CloseFrame, close, close_shots, Ended::CloseFrame, None),
+        (End::Fin, fin, fin_shots, Ended::Fin, Some(TCP_CLOSE_WAIT)),
+        (
+            End::Reset,
+            reset,
+            reset_shots,
+            Ended::Reset,
+            Some(TCP_CLOSE),
+        ),
+    ] {
+        assert_eq!(seen.len(), 3, "{end:?}: {seen:?}");
+        let (held, rel1, rel2) = (&seen[0], &seen[1], &seen[2]);
+        assert_eq!(
+            frames(held),
+            [session_start(), vec![kbd(0, 0x1E)]].concat(),
+            "{end:?}"
+        );
+        assert_eq!(held.ended.as_ref().unwrap().1, kind, "{end:?}");
+        if let Some(s) = state {
+            assert_eq!(
+                rel1.states_at_open[0], s,
+                "{end:?}: not ended before the release"
+            );
+        }
+        for rel in [rel1, rel2] {
+            assert_eq!(frames(rel), session_start(), "{end:?}");
+            assert_eq!(rel.ended.as_ref().unwrap().1, Ended::CloseFrame, "{end:?}");
+        }
+        let apart = rel2.opened.saturating_duration_since(rel1.opened);
+        assert!(apart >= Duration::from_millis(4500), "{end:?}: {apart:?}");
+        let names: Vec<&str> = shots.iter().map(|(s, _, _)| s.as_str()).collect();
+        assert_eq!(names, ["_held", "_released"], "{end:?}");
+        assert!(shots.iter().all(|(_, tok, _)| tok == "0.1"), "{end:?}");
+        let press_at = held.frames[2].0;
+        let held_at = shots[0].2;
+        assert!(
+            held_at.saturating_duration_since(press_at) >= observe - Duration::from_millis(100),
+            "{end:?}: _held came {:?} after the press",
+            held_at.saturating_duration_since(press_at)
+        );
+        assert!(held_at <= rel1.opened, "{end:?}: _held after a release");
+        assert!(
+            shots[1].2 >= rel2.ended.as_ref().unwrap().0,
+            "{end:?}: _released too early"
+        );
+    }
+}
+
+/// I3 (PD4 fix round 1): `hid_stale`'s mechanics, against a KVM that
+/// confirms releases.
+/// - The burst's websocket carries the session start and all 128 reports
+///   (drained before the reset, I1) and ends by a reset — the kernel shows
+///   it closed by a reset before the fresh websocket was accepted.
+/// - The fresh one carries the session start and the reset tap, then a
+///   close frame.
+/// - The snapshot comes no sooner than `settle` after the fresh websocket
+///   opened, after the report line (m4), and before any release.
+/// - Two releases, `SECOND_RELEASE_AFTER` apart.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn hid_stale_with_confirmed_releases_ends_ok_after_two_releases() {
-    use kvm_probe::l4::hid;
-    let (port, pin, closed) = answering_stub().await;
-    let t = target(port);
-    let mut irq = hid::Interrupts::new().unwrap();
-    let mut lines = Vec::new();
+async fn hid_stale_resets_the_drained_burst_before_the_fresh_websocket_and_settles() {
+    use kvm_probe::l4::hid::{self, Interrupts};
+    let (port, ledger) = ledger_stub(LedgerOpts::default()).await;
+    let settle = Duration::from_millis(1000);
+    let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let shots: Shots = Arc::default();
+    let lines_at_shot = Arc::new(AtomicUsize::new(usize::MAX));
+    let mut irq = Interrupts::new().unwrap();
     let r = hid::hid_stale(
-        &t,
-        Some(&pin),
+        &plain(port),
+        None,
         "0.1",
-        Duration::from_millis(100),
+        &hid::StalePlan::new(settle),
         &mut irq,
-        async |_: &str| Ok(()),
-        |l| lines.push(l),
+        async |suffix: &str, token: &str| {
+            lines_at_shot.store(lines.lock().unwrap().len(), Ordering::SeqCst);
+            shots
+                .lock()
+                .unwrap()
+                .push((suffix.to_owned(), token.to_owned(), Instant::now()));
+            Ok(())
+        },
+        |l| lines.lock().unwrap().push(l),
     )
     .await
     .unwrap();
     assert_eq!(r.pushed, 128);
-    assert_eq!(lines.len(), 1, "{lines:?}");
-    let deadline = std::time::Instant::now() + T;
-    while closed.lock().unwrap().len() < 4 {
-        assert!(std::time::Instant::now() < deadline, "{:?}", closed.lock());
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    let seen = all_ended(&ledger, 4, T).await;
+    assert_eq!(seen.len(), 4, "{seen:?}");
+    let (burst, fresh, rel1, rel2) = (&seen[0], &seen[1], &seen[2], &seen[3]);
+    assert_eq!(frames(burst), whole_burst());
+    assert_eq!(burst.ended.as_ref().unwrap().1, Ended::Reset);
+    assert_eq!(
+        fresh.states_at_open[0], TCP_CLOSE,
+        "the burst's websocket was not reset before the fresh one opened"
+    );
+    assert_eq!(
+        frames(fresh),
+        [session_start(), vec![kbd(0x10, 0), kbd(0, 0)]].concat()
+    );
+    assert_eq!(fresh.ended.as_ref().unwrap().1, Ended::CloseFrame);
+    let shots = shots.lock().unwrap().clone();
+    assert_eq!(shots.len(), 1);
+    assert_eq!(shots[0].0, "");
+    assert_eq!(
+        lines_at_shot.load(Ordering::SeqCst),
+        1,
+        "the report came after the snapshot"
+    );
+    let since_fresh = shots[0].2.saturating_duration_since(fresh.opened);
+    assert!(
+        since_fresh >= settle,
+        "the snapshot came {since_fresh:?} after the fresh websocket"
+    );
+    assert!(
+        shots[0].2 <= rel1.opened,
+        "the snapshot came after a release"
+    );
+    for rel in [rel1, rel2] {
+        assert_eq!(frames(rel), session_start());
+        assert_eq!(rel.ended.as_ref().unwrap().1, Ended::CloseFrame);
+        assert_eq!(rel.states_at_open[0], TCP_CLOSE);
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    // The burst's websocket was reset, so how much of it the stub read
-    // before the reset may vary; the other three are exact.
-    let got = closed.lock().unwrap().clone();
-    assert_eq!(got.len(), 4, "a websocket too many or too few: {got:?}");
-    assert!(got.iter().filter(|&&n| n == 2).count() >= 2, "{got:?}");
-    assert!(got.contains(&4), "{got:?}");
-    assert!(got.iter().all(|&n| n <= 130), "{got:?}");
+    let apart = rel2.opened.saturating_duration_since(rel1.opened);
+    assert!(apart >= Duration::from_millis(4500), "{apart:?}");
+    let lines = lines.lock().unwrap().clone();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("pushed: 128"), "{lines:?}");
+}
+
+/// I1 (PD4 fix round 1), the review's reproduction: the burst's handler
+/// is stuck (it reads its session start, then nothing for 8 s) while
+/// every other connection is read and its release confirmed at once. The
+/// run waits for the burst to drain into the KVM's kernel before the
+/// reset, so the stuck handler later reads the whole burst — after both
+/// releases — and its last report is a zero: nothing is left held, and
+/// the run's `pushed: 128` is what the KVM got.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hid_stale_drains_so_a_stuck_reader_still_ends_released() {
+    use kvm_probe::l4::hid::{self, Interrupts};
+    let (port, ledger) = ledger_stub(LedgerOpts {
+        stall: Some((0, 2, Duration::from_secs(8))),
+        ..LedgerOpts::default()
+    })
+    .await;
+    let mut irq = Interrupts::new().unwrap();
+    let r = hid::hid_stale(
+        &plain(port),
+        None,
+        "0.1",
+        &hid::StalePlan::new(Duration::from_millis(100)),
+        &mut irq,
+        async |_: &str, _: &str| Ok(()),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(r.pushed, 128);
+    let seen = all_ended(&ledger, 4, Duration::from_secs(20)).await;
+    let burst = &seen[0];
+    assert_eq!(
+        frames(burst),
+        whole_burst(),
+        "the stuck handler got a cut burst"
+    );
+    assert_eq!(burst.frames.last().unwrap().1, kbd(0, 0));
+    let second_release_end = seen[3].ended.as_ref().unwrap().0;
+    assert!(
+        burst.frames.last().unwrap().0 > second_release_end,
+        "the backlog did not land after both releases: the case is not exercised"
+    );
+}
+
+/// I1 (PD4 fix round 1): a burst that never drains — the stuck handler's
+/// receive buffer is tiny, so its window closes — is never reset (which
+/// would cut it at an arbitrary report): it is closed with a FIN, so the
+/// KVM gets all of it, ending on a zero, once it reads again. The run is
+/// loud whatever the releases said: KEY MAY BE HELD with the remedy, and
+/// why. No fresh websocket is opened, and both releases run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hid_stale_never_cuts_a_burst_that_does_not_drain() {
+    use kvm_probe::l4::hid::{self, Interrupts};
+    let (port, ledger) = ledger_stub(LedgerOpts {
+        stall: Some((0, 2, Duration::from_secs(4))),
+        rcvbuf: Some(1),
+    })
+    .await;
+    let mut irq = Interrupts::new().unwrap();
+    let mut lines = Vec::new();
+    let e = hid::hid_stale(
+        &plain(port),
+        None,
+        "0.1",
+        &hid::StalePlan::new(Duration::from_millis(100)),
+        &mut irq,
+        async |_: &str, _: &str| Ok(()),
+        |l| lines.push(l),
+    )
+    .await
+    .unwrap_err();
+    let e = format!("{e:?}");
+    assert!(
+        e.contains("KEY MAY BE HELD") && e.contains("hid-release"),
+        "{e}"
+    );
+    assert!(e.contains("drain"), "{e}");
+    assert!(lines.is_empty(), "{lines:?}");
+    let seen = all_ended(&ledger, 3, Duration::from_secs(20)).await;
+    assert_eq!(seen.len(), 3, "a fresh websocket was opened: {seen:?}");
+    assert_eq!(frames(&seen[0]), whole_burst(), "the burst was cut");
+    assert_eq!(seen[0].ended.as_ref().unwrap().1, Ended::Fin);
+    for rel in &seen[1..] {
+        assert_eq!(frames(rel), session_start());
+    }
+}
+
+/// m4 (PD4 fix round 1): the report line is out before the snapshot, so
+/// a snapshot that fails never hides it; the section still releases twice
+/// and the snapshot's error is the result (both releases confirmed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hid_stale_prints_its_report_before_a_snapshot_that_fails() {
+    use kvm_probe::l4::hid::{self, Interrupts};
+    let (port, ledger) = ledger_stub(LedgerOpts::default()).await;
+    let mut irq = Interrupts::new().unwrap();
+    let mut lines = Vec::new();
+    let e = hid::hid_stale(
+        &plain(port),
+        None,
+        "0.1",
+        &hid::StalePlan::new(Duration::from_millis(100)),
+        &mut irq,
+        async |_: &str, _: &str| {
+            Err(kvm_probe::kvm::KvmError::Io(
+                "the snapshot failed".to_owned(),
+            ))
+        },
+        |l| lines.push(l),
+    )
+    .await
+    .unwrap_err();
+    assert!(format!("{e:?}").contains("the snapshot failed"), "{e:?}");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("pushed: 128"), "{lines:?}");
+    let seen = all_ended(&ledger, 4, T).await;
+    assert_eq!(frames(&seen[2]), session_start());
+    assert_eq!(frames(&seen[3]), session_start());
+}
+
+/// m2 (PD4 fix round 1): a TLS stub that writes `prefix` after reading
+/// the request head, then holds the connection open for 30 s.
+async fn hanging_http_stub(prefix: Vec<u8>) -> (u16, String) {
+    use tokio::io::AsyncReadExt as _;
+    let (acceptor, pin_hex) = support::tls_acceptor_and_pin();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, prefix) = (acceptor.clone(), prefix.clone());
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let mut head = vec![0u8; 4096];
+                let _ = tls.read(&mut head).await;
+                let _ = tls.write_all(&prefix).await;
+                let _ = tls.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    (port, pin_hex)
+}
+
+/// m2: `web-get` stops reading at its 512-byte snippet — a page that
+/// promises 100 000 bytes, sends 600 and then stalls is answered at once,
+/// not at the timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_get_stops_reading_at_its_snippet_bound() {
+    use kvm_probe::l4::web;
+    let mut resp =
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 100000\r\n\r\n".to_vec();
+    resp.extend(std::iter::repeat_n(b'x', 600));
+    let (port, pin) = hanging_http_stub(resp).await;
+    let t = KvmTarget {
+        login_port: port,
+        ..target(1)
+    };
+    let started = Instant::now();
+    let p = tokio::time::timeout(Duration::from_secs(3), web::get(&t, Some(&pin), "/"))
+        .await
+        .expect("web-get read past its bound")
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(p.snippet, "x".repeat(512));
+}
+
+/// m2: a page that never answers ends at the GET's bound: `web::get` is
+/// `get_within(GET_TIMEOUT)`, 10 s; here a 300 ms bound ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn web_get_times_out_on_a_page_that_never_answers() {
+    use kvm_probe::l4::web;
+    assert_eq!(web::GET_TIMEOUT, Duration::from_secs(10));
+    let (port, pin) = hanging_http_stub(Vec::new()).await;
+    let t = KvmTarget {
+        login_port: port,
+        ..target(1)
+    };
+    let started = Instant::now();
+    let e = tokio::time::timeout(
+        Duration::from_secs(3),
+        web::get_within(&t, Some(&pin), "/", Duration::from_millis(300)),
+    )
+    .await
+    .expect("web-get never timed out")
+    .unwrap_err();
+    assert!(format!("{e:?}").contains("timed out"), "{e:?}");
+    assert!(started.elapsed() >= Duration::from_millis(300));
 }
 
 /// `web-get` over a hostile page: the status, the `Server` header cut to
