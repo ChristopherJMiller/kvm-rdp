@@ -39,6 +39,10 @@ impl Cli {
     /// Final review I4: the check is on the *effective* pin
     /// (`Conn::pin_for`) of every port the subcommand touches — web (login) plus video for `capture`/`first-idr`, web plus control for
     /// `ws-open`.
+    ///
+    /// PD2 fix round 1: the checks that log in more than once (token-life,
+    /// session-cap) are refused here without `--owner-consent`, before
+    /// `main` reads the password file or opens a connection.
     pub fn validate(&self) -> Result<(), clap::Error> {
         let (conn, ports): (&Conn, &[Port]) = match &self.cmd {
             Cmd::Capture { conn, .. } | Cmd::FirstIdr { conn, .. } => {
@@ -47,9 +51,35 @@ impl Cli {
             Cmd::WsOpen { conn } => (conn, &[Port::Web, Port::Control]),
             Cmd::ConcurrentFlv { conn, .. } => (conn, &[Port::Web, Port::Video]),
             Cmd::RefusalForms { conn } => (conn, &[Port::Video, Port::Control]),
-            Cmd::WsClose { conn, .. }
-            | Cmd::TokenLife { conn, .. }
-            | Cmd::SessionCap { conn, .. } => (conn, &[Port::Web, Port::Control]),
+            Cmd::WsClose { conn, .. } => (conn, &[Port::Web, Port::Control]),
+            Cmd::TokenLife {
+                conn,
+                owner_consent,
+                ..
+            }
+            | Cmd::SessionCap {
+                conn,
+                owner_consent,
+                ..
+            } => {
+                if !owner_consent {
+                    let sub = if matches!(self.cmd, Cmd::TokenLife { .. }) {
+                        "token-life"
+                    } else {
+                        "session-cap"
+                    };
+                    return Err(Cli::command().error(
+                        clap::error::ErrorKind::MissingRequiredArgument,
+                        format!(
+                            "{sub} logs in more than once: on a KVM that evicts its oldest \
+                             session at a cap, that can end the owner's web-UI session. Run it \
+                             only with the owner's explicit consent, and pass --owner-consent \
+                             to say so"
+                        ),
+                    ));
+                }
+                (conn, &[Port::Web, Port::Control])
+            }
             Cmd::LogoutWatch { conn, .. } => (conn, &[Port::Web, Port::Video, Port::Control]),
             Cmd::Fingerprint { .. } | Cmd::SampleRange { .. } | Cmd::Summarize { .. } => {
                 return Ok(());
@@ -70,6 +100,12 @@ impl Cli {
         Ok(())
     }
 }
+
+/// `--owner-consent` on the checks that log in more than once (token-life,
+/// session-cap): `validate` refuses them without it.
+const OWNER_CONSENT_HELP: &str = "The owner has explicitly consented: this check logs in more than \
+     once, and on a KVM that evicts its oldest session at a cap that can end the owner's \
+     web-UI session";
 
 /// `sample-range --width/--height` value parser (final review m2): a
 /// decimal in `sandbox::SAMPLE_DIMENSION_RANGE` (16..=8192), else a clap
@@ -228,22 +264,28 @@ pub enum Cmd {
         idle_secs: u64,
     },
     /// L4: log in once per --minutes value now, then probe each token once,
-    /// at that age, with a bare websocket upgrade. Never logs out.
+    /// at that age, with a bare websocket upgrade. Those logins can end the
+    /// owner's web-UI session if the KVM evicts its oldest at a cap: it
+    /// runs only with --owner-consent, after session-cap. Never logs out.
     TokenLife {
         #[command(flatten)]
         conn: Conn,
         #[arg(long, value_delimiter = ',', default_value = "1,5,15,30,60")]
         minutes: Vec<u64>,
+        #[arg(long, help = OWNER_CONSENT_HELP)]
+        owner_consent: bool,
     },
     /// L4: log in up to --max times, checking after each that the first and
     /// the newest token still work. If the KVM evicts its oldest session at
-    /// a cap, this can end the owner's web-UI session: run it only with the
-    /// owner's consent. Never logs out.
+    /// a cap, this can end the owner's web-UI session: it runs only with
+    /// --owner-consent. Never logs out.
     SessionCap {
         #[command(flatten)]
         conn: Conn,
         #[arg(long, default_value_t = 16)]
         max: u32,
+        #[arg(long, help = OWNER_CONSENT_HELP)]
+        owner_consent: bool,
     },
     /// L4 [OWNER, optional]: log in, open the control websocket and an FLV,
     /// print READY, and watch while the OWNER logs out in the vendor web UI
@@ -562,8 +604,9 @@ mod tests {
     /// each one's https pin check covers the ports it touches.
     #[test]
     fn l4_subcommands_parse_with_their_defaults() {
+        // token-life and session-cap also need the owner's consent (below).
         let parse = |sub: &str| {
-            let c = Cli::try_parse_from([
+            let mut argv = vec![
                 "kvm-probe",
                 sub,
                 "--host",
@@ -572,8 +615,11 @@ mod tests {
                 "ab",
                 "--password-file",
                 "/tmp/pw",
-            ])
-            .unwrap();
+            ];
+            if matches!(sub, "token-life" | "session-cap") {
+                argv.push("--owner-consent");
+            }
+            let c = Cli::try_parse_from(argv).unwrap();
             assert!(c.validate().is_ok(), "{sub}");
             c.cmd
         };
@@ -613,6 +659,7 @@ mod tests {
             "/tmp/pw",
             "--minutes",
             "2,7",
+            "--owner-consent",
         ])
         .unwrap();
         assert!(matches!(c.cmd, Cmd::TokenLife { minutes, .. } if minutes == [2, 7]));
@@ -631,6 +678,56 @@ mod tests {
         ])
         .unwrap();
         assert!(c.validate().is_err());
+    }
+
+    /// token-life and session-cap log in more than once: on a KVM that
+    /// evicts its oldest session at a cap, either can end the owner's
+    /// web-UI session. Each runs only with `--owner-consent`, and without
+    /// it `validate` refuses and says why — before `main` reads the
+    /// password file or touches the network.
+    #[test]
+    fn extra_login_checks_need_the_owners_consent() {
+        let argv = |sub: &'static str| {
+            vec![
+                "kvm-probe",
+                sub,
+                "--host",
+                "h",
+                "--pin",
+                "ab",
+                "--password-file",
+                "/tmp/pw",
+            ]
+        };
+        for sub in ["token-life", "session-cap"] {
+            let err = Cli::try_parse_from(argv(sub))
+                .unwrap()
+                .validate()
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{sub}"
+            );
+            let text = err.to_string();
+            assert!(
+                text.contains(sub) && text.contains("--owner-consent") && text.contains("evict"),
+                "{sub}: {text}"
+            );
+            let mut consented = argv(sub);
+            consented.push("--owner-consent");
+            assert!(
+                Cli::try_parse_from(consented).unwrap().validate().is_ok(),
+                "{sub}"
+            );
+        }
+        // The other logged-in checks log in once and need no consent.
+        for sub in ["concurrent-flv", "ws-close", "logout-watch"] {
+            assert!(
+                Cli::try_parse_from(argv(sub)).unwrap().validate().is_ok(),
+                "{sub}"
+            );
+        }
     }
 
     #[test]

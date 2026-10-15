@@ -67,6 +67,15 @@ async fn session<T>(
     .await
 }
 
+/// The warning a check that logs in more than once prints before it starts
+/// (token-life, session-cap); `Cli::validate` has already refused it
+/// without `--owner-consent`.
+fn warn_extra_logins(sub: &str) {
+    eprintln!(
+        "kvm-probe: {sub} can end other sessions if the KVM evicts its oldest; run it only with the owner's consent"
+    );
+}
+
 /// Seconds since the Unix epoch, for the login body's `time` field.
 fn unix_now() -> Result<i64, KvmError> {
     let now = SystemTime::now()
@@ -272,7 +281,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| kvm::bounded_debug(&e))??;
             println!("{report:?}");
         }
-        Cmd::TokenLife { conn, minutes } => {
+        Cmd::TokenLife { conn, minutes, .. } => {
+            warn_extra_logins("token-life");
             let pw = password(&conn)?;
             let ages: Vec<Duration> = minutes
                 .iter()
@@ -291,10 +301,8 @@ async fn run(cli: Cli) -> Result<(), String> {
             .map_err(|e| kvm::bounded_debug(&e))?;
             println!("{} tokens probed", probes.len());
         }
-        Cmd::SessionCap { conn, max } => {
-            eprintln!(
-                "kvm-probe: session-cap can end other sessions if the KVM evicts its oldest; run it only with the owner's consent"
-            );
+        Cmd::SessionCap { conn, max, .. } => {
+            warn_extra_logins("session-cap");
             let pw = password(&conn)?;
             let r = l4::session::session_cap(
                 &target(&conn),
