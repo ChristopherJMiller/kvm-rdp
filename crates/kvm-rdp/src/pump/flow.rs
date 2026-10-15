@@ -89,6 +89,14 @@ impl Stall {
     }
 }
 
+/// §6.6: the standing delay is the median of the last `RTT_WINDOW` live
+/// samples (parked #1: one constant for the window, its push/pop and the
+/// median's buffer).
+const RTT_WINDOW: usize = 8;
+/// §6.6: a handle unchanged for this many consecutive probes is no signal —
+/// a rule of its own, which happens to share the number.
+const STALE_PROBES: u32 = 8;
+
 /// The auto-detect RTT samples of one generation (§6.6 standing delay).
 #[derive(Debug, Default)]
 struct Rtt {
@@ -127,7 +135,7 @@ impl Rtt {
         if !self.active {
             return false;
         }
-        if self.samples.len() >= 8 {
+        if self.samples.len() >= RTT_WINDOW {
             self.samples.pop_front();
         }
         self.samples.push_back(v);
@@ -136,12 +144,12 @@ impl Rtt {
     }
 
     fn standing_ms(&self) -> Option<u32> {
-        if !self.active || self.unchanged >= 8 || self.last == Some(u32::MAX) {
+        if !self.active || self.unchanged >= STALE_PROBES || self.last == Some(u32::MAX) {
             return None;
         }
         // A fixed stack buffer instead of a per-call `Vec`: `samples` never
-        // holds more than 8 (the push/pop in `sample` enforces it).
-        let mut buf = [0u32; 8];
+        // holds more than `RTT_WINDOW` (the push/pop in `sample` enforces it).
+        let mut buf = [0u32; RTT_WINDOW];
         let mut len = 0usize;
         for (slot, v) in buf.iter_mut().zip(self.samples.iter()) {
             *slot = *v;
@@ -661,5 +669,20 @@ mod tests {
             f.standing_delay_ms().is_some(),
             "8 repeats across the test in all, but never 8 consecutive"
         );
+    }
+
+    /// §6.6's window is 8 samples wide, not 7 or 9 (parked #1: the one
+    /// `RTT_WINDOW`): after a high outlier and seven rising samples, the
+    /// window of 8 still holds the outlier, so its median is the fifth
+    /// value; 7 would have evicted it, 9 would hold the baseline too.
+    #[test]
+    fn the_standing_delay_window_is_eight_samples() {
+        let mut f = Flow::new(cfg());
+        f.rtt_sample(1); // reference
+        for v in [2, 900, 100, 200, 300, 400, 500, 600, 700] {
+            assert!(f.rtt_sample(v));
+        }
+        // Window: 900, 100..=700 (2 evicted) → sorted, [4] = 500; baseline 2.
+        assert_eq!(f.standing_delay_ms(), Some(500 - 2));
     }
 }
