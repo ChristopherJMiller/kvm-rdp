@@ -9,13 +9,14 @@
 //! released state (PD6 m6). The session start's release is one, so the
 //! first event of a case pushes that zero ahead of its own report; the
 //! goldens expect it (`EPOCH_ZERO`).
-use crate::client::{FpButton, Opts, pictures};
+use crate::client::{Client, FpButton, Opts, pictures};
 use crate::harness::{
     Env, KBD_ZERO, SURFACE, T, abs, after_start, env, es3, hid_on, hid_stamped, ms, sized,
     streaming, until, until_mark, within, ws_opens,
 };
 use kvm_proto::hid::{HidFrame, Wheel};
 use kvm_rdp::hid::HidControl;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Set-1 make codes.
@@ -121,19 +122,26 @@ fn k_state(held: bool) -> HidFrame {
     }
 }
 
-/// §7.3 through the client (Plan C's `hid::a_full_queue_resyncs`, now from
-/// the client). With kvm-sim's reads paused, a flood fills kvm-sim's small
-/// receive buffer and the bridge's capped send buffer until a write blocks
-/// — checked: reports wait and none is written for `STALL` — overflowing
-/// the input queue (its least, 9) on the way. The queue is then filled to
-/// exactly its cap, so the final press is a push that finds it full:
-/// queued nowhere, it reaches the KVM only as the resync's final state.
-/// Once reads resume, the last frame kvm-sim sees is that state.
-/// `hid_write_timeout` is raised so the blocked write never reconnects, and
-/// `key_repeat_timeout` so the key held meanwhile is never released.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
-    const QUEUE: usize = 9;
+/// A session whose HID writer is blocked: kvm-sim's reads are paused, and
+/// a flood has filled kvm-sim's small receive buffer and the bridge's
+/// capped send buffer until a write blocks — checked: reports wait in the
+/// queue and none is written for `STALL`. `k_held`: whether the marker key
+/// K is down.
+struct Blocked {
+    env: Env,
+    c: Client,
+    ws: u64,
+    hid: Arc<HidControl>,
+    k_held: bool,
+}
+
+/// `Blocked`, with the input queue at its least (9). The fill is bounded by
+/// `T`, not by a count of floods: a starved writer may need many to fill
+/// the buffers, because a full queue collapses each flood into resyncs
+/// (PD10 review I2). `hid_write_timeout` is raised far past every bound
+/// the cases wait on, so the blocked write never reconnects, and
+/// `key_repeat_timeout` so K is never released by the timer.
+async fn blocked_writer() -> Blocked {
     /// Far more reports than kvm-sim's 4 KiB receive buffer and the 16 KiB
     /// send cap hold together (about 18 bytes each on the wire).
     const FLOOD: usize = 4000;
@@ -143,7 +151,7 @@ async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
     let env = env(sim, |c| {
         sized(c);
         c.input.queue = QUEUE;
-        c.input.hid_write_timeout = Duration::from_secs(5);
+        c.input.hid_write_timeout = Duration::from_secs(30);
         c.input.key_repeat_timeout = Duration::from_secs(60);
     })
     .await;
@@ -160,7 +168,8 @@ async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
             [(k, true), (k, false)]
         })
         .collect();
-    for round in 1.. {
+    let t0 = Instant::now();
+    loop {
         c.keys(&flood);
         // A marker press: once it is the queue's newest state, every event
         // before it has been pushed.
@@ -171,8 +180,8 @@ async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
             break;
         }
         assert!(
-            round < 5,
-            "the writer never blocked: {} reports written",
+            t0.elapsed() < T,
+            "the writer never blocked within {T:?}: {} reports written",
             written()
         );
         c.key(K, false);
@@ -182,32 +191,60 @@ async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
         env.metrics().hid_resyncs.get() >= 1,
         "the flood never overflowed the queue"
     );
-    // k's release and press, one push each, until the queue holds exactly
-    // its cap: the writer is blocked, so nothing leaves it meanwhile.
-    let mut held = true;
-    while hid.queued() < QUEUE {
-        held = !held;
-        c.key(K, held);
-        newest(&hid, k_state(held)).await;
+    Blocked {
+        env,
+        c,
+        ws,
+        hid,
+        k_held: true,
     }
-    let resyncs = env.metrics().hid_resyncs.get();
-    c.key(Z, true);
+}
+
+impl Blocked {
+    /// K's release and press, one push each, until the queue holds exactly
+    /// `n`: the writer is blocked, so nothing leaves the queue meanwhile.
+    async fn fill_to(&mut self, n: usize) {
+        while self.hid.queued() < n {
+            self.k_held = !self.k_held;
+            self.c.key(K, self.k_held);
+            newest(&self.hid, k_state(self.k_held)).await;
+        }
+    }
+}
+
+/// The input queue's capacity in the blocked-writer cases: its least.
+const QUEUE: usize = 9;
+
+/// §7.3 through the client (Plan C's `hid::a_full_queue_resyncs`, now from
+/// the client). With the writer blocked (`blocked_writer`, whose flood has
+/// overflowed the queue on the way), the queue is filled to exactly its
+/// cap, so the final press is a push that finds it full: queued nowhere,
+/// it reaches the KVM only as the resync's final state. Once reads resume,
+/// the last frame kvm-sim sees is that state.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
+    let mut b = blocked_writer().await;
+    b.fill_to(QUEUE).await;
+    let resyncs = b.env.metrics().hid_resyncs.get();
+    b.c.key(Z, true);
     let last = HidFrame::Keyboard {
         modifiers: 0,
-        keys: if held {
+        keys: if b.k_held {
             [0x0E, 0x1D, 0, 0, 0]
         } else {
             [0x1D, 0, 0, 0, 0]
         },
     };
-    newest(&hid, last).await;
+    newest(&b.hid, last).await;
     assert_eq!(
-        (hid.queued(), env.metrics().hid_resyncs.get()),
+        (b.hid.queued(), b.env.metrics().hid_resyncs.get()),
         (0, resyncs + 1),
         "the final press was queued, not carried by a resync"
     );
-    env.sim.set_policy(|p| p.pause_ws_reads = false);
-    env.sim
+    b.env.sim.set_policy(|p| p.pause_ws_reads = false);
+    let ws = b.ws;
+    b.env
+        .sim
         .wait_for(T, |l| hid_on(l, ws).last() == Some(&last.to_vec()))
         .await
         .unwrap_or_else(|l| {
@@ -217,12 +254,87 @@ async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
             )
         });
     assert_eq!(
-        ws_opens(&env.sim.events()).len(),
+        ws_opens(&b.env.sim.events()).len(),
         1,
         "the paused reads reconnected the websocket"
     );
-    c.key(Z, false);
-    c.key(K, false);
+    b.c.key(Z, false);
+    b.c.key(K, false);
+}
+
+/// §11.3 Input (§7.3, §7.4; PD10 review m5): with reports queued behind a
+/// blocked write, a release trigger — the client's Synchronize — produces
+/// only the zero reports and then the current state. Q's press and release
+/// are queued (the queue is emptied first by one clearing push), the
+/// Synchronize releases all, and once reads resume no Q report ever
+/// reaches kvm-sim: after what was already on the wire come the release's
+/// zero, the next step's epoch zero and the new state, X held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_behind_a_blocked_write_sends_only_zeros_then_new_state() {
+    const Q: u8 = 0x10; // usage 0x14
+    const X: u8 = 0x2D; // usage 0x1B
+    let mut b = blocked_writer().await;
+    // Full, then one more push clears it (a resync): the queue is empty.
+    b.fill_to(QUEUE).await;
+    b.k_held = !b.k_held;
+    b.c.key(K, b.k_held);
+    newest(&b.hid, k_state(b.k_held)).await;
+    assert_eq!(b.hid.queued(), 0);
+    let with_q = HidFrame::Keyboard {
+        modifiers: 0,
+        keys: if b.k_held {
+            [0x0E, 0x14, 0, 0, 0]
+        } else {
+            [0x14, 0, 0, 0, 0]
+        },
+    };
+    b.c.key(Q, true);
+    newest(&b.hid, with_q).await;
+    b.c.key(Q, false);
+    newest(&b.hid, k_state(b.k_held)).await;
+    assert_eq!(b.hid.queued(), 2, "Q's reports are queued");
+    b.c.synchronize(false);
+    assert!(
+        until(T, || b.env.metrics().release_all.get("synchronize") == 1).await,
+        "the Synchronize released nothing"
+    );
+    b.c.key(X, true);
+    let new_state = kbd(0, 0x1B);
+    newest(
+        &b.hid,
+        HidFrame::Keyboard {
+            modifiers: 0,
+            keys: [0x1B, 0, 0, 0, 0],
+        },
+    )
+    .await;
+    b.env.sim.set_policy(|p| p.pause_ws_reads = false);
+    let ws = b.ws;
+    let log = b
+        .env
+        .sim
+        .wait_for(T, |l| hid_on(l, ws).last() == Some(&new_state))
+        .await
+        .unwrap_or_else(|l| {
+            panic!(
+                "the new state never came last: {:02x?}",
+                hid_on(&l, ws).last()
+            )
+        });
+    let frames = hid_on(&log, ws);
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f.len() == 12 && f[7..].contains(&0x14)),
+        "a report queued behind the blocked write reached the KVM after the release"
+    );
+    assert_eq!(
+        frames[frames.len() - 3..],
+        [zero(), EPOCH_ZERO.to_vec(), new_state],
+        "the release's zero, the epoch zero, then the new state"
+    );
+    assert_eq!(ws_opens(&log).len(), 1, "the paused reads reconnected");
+    b.c.key(X, false);
 }
 
 /// §3.2, §7.3: a websocket reopen's session start puts the pointer where
@@ -294,6 +406,10 @@ async fn every_section_7_4_trigger_releases_all() {
 /// §7.4 released-by-bridge: a key held across a release (here a websocket
 /// reconnect, which keeps the marks) is not pressed again by its
 /// typematic repeats — only by a fresh press after its client release.
+/// And the release really is the core's (PD10 review m1): another key
+/// pressed while the client still holds the first reports alone, never
+/// with the first re-sent beside it — a reconnect that left the core's
+/// state held would type the first key again here.
 /// (Deviation from the plan's Synchronize: see the case above.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_held_across_a_release_is_not_repressed_by_repeats() {
@@ -309,13 +425,21 @@ async fn a_key_held_across_a_release_is_not_repressed_by_repeats() {
     for _ in 0..3 {
         c.key(A, true); // typematic repeats of the still-held key
     }
+    c.key(B, true); // a held, not re-sent
+    c.key(B, false);
     c.key(A, false);
     c.key(A, true); // a fresh press
     c.key(A, false);
     assert_eq!(
         until_mark(&env, &c, ws2).await,
-        [EPOCH_ZERO.to_vec(), kbd(0, 0x04), zero()],
-        "a repeat re-pressed a key released by the bridge"
+        [
+            EPOCH_ZERO.to_vec(),
+            kbd(0, 0x05),
+            zero(),
+            kbd(0, 0x04),
+            zero()
+        ],
+        "a key released by the bridge was pressed again"
     );
     assert_eq!(env.metrics().release_all.get("websocket_reconnect"), 1);
 }
@@ -361,16 +485,15 @@ async fn typematic_repeats_hold_the_key_but_silence_releases_it() {
     assert_eq!(env.metrics().release_all.get("key_repeat"), 1);
 }
 
-/// §7.4: mouse motion is not keyboard activity — a held key with no repeat
-/// releases at `key_repeat_timeout` (scaled to 1 s) while the pointer keeps
-/// moving.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn mouse_motion_never_resets_the_key_timers() {
+/// Hold `held` (a set-1 make code whose report is `pressed`), then move the
+/// pointer every 200 ms for 2 s with no keyboard event: the release (the
+/// first all-zero keyboard report after `pressed`) comes `within` 0.5×–5×
+/// of `timeout` after the press, and before the motion stopped.
+async fn released_despite_motion(env: &Env, c: &Client, ws: u64, held: u8, pressed: Vec<u8>) {
     let timeout = ms(1000);
-    let (env, c) = streaming(|c| c.input.key_repeat_timeout = timeout).await;
-    let ws = env.hid_ready().await;
+    let after = hid_on(&env.sim.events(), ws).len();
     let t0 = Instant::now();
-    c.key(A, true);
+    c.key(held, true);
     let mut moved_until = t0;
     for i in 0..10u16 {
         tokio::time::sleep(ms(200)).await;
@@ -378,11 +501,8 @@ async fn mouse_motion_never_resets_the_key_timers() {
         moved_until = Instant::now();
     }
     let released = |f: &[Vec<u8>]| -> Option<usize> {
-        let pressed = f.iter().position(|x| *x == kbd(0, 0x04))?;
-        f[pressed..]
-            .iter()
-            .position(|x| *x == zero())
-            .map(|i| pressed + i)
+        let p = after + f.get(after..)?.iter().position(|x| *x == pressed)?;
+        f[p..].iter().position(|x| *x == zero()).map(|i| p + i)
     };
     env.sim
         .wait_for(T, |l| released(&hid_on(l, ws)).is_some())
@@ -396,7 +516,26 @@ async fn mouse_motion_never_resets_the_key_timers() {
         at < moved_until,
         "the release came only after the motion stopped"
     );
+}
+
+/// §7.4 / §11.3: mouse motion is not keyboard activity, for either timer
+/// (both scaled to 1 s). A held key with no repeat releases at
+/// `key_repeat_timeout`, and a held modifier with no keyboard event at
+/// `modifier_idle_timeout` (PD10 review m3), while the pointer keeps moving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mouse_motion_never_resets_the_key_timers() {
+    let (env, c) = streaming(|c| {
+        c.input.key_repeat_timeout = ms(1000);
+        c.input.modifier_idle_timeout = ms(1000);
+    })
+    .await;
+    let ws = env.hid_ready().await;
+    released_despite_motion(&env, &c, ws, A, kbd(0, 0x04)).await;
     assert_eq!(env.metrics().release_all.get("key_repeat"), 1);
+    c.key(A, false);
+    released_despite_motion(&env, &c, ws, LCTRL, kbd(0x01, 0)).await;
+    assert_eq!(env.metrics().release_all.get("modifier_idle"), 1);
+    c.key(LCTRL, false);
 }
 
 /// §11.3 Stuck keys (D10b): two keys held, typematic repeats of the second
