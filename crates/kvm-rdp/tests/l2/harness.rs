@@ -9,6 +9,8 @@
 #![allow(dead_code)]
 use crate::client::{Client, Opts};
 use kvm_proto::h264::split_annex_b;
+use kvm_proto::hid::{HidFrame, scale_abs};
+use kvm_proto::keymap::{us_stroke, usage_for_scancode};
 use kvm_rdp::bridge::{self, BridgeHandle};
 use kvm_rdp::config::Config;
 use kvm_rdp::metrics::Metrics;
@@ -23,6 +25,11 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 pub const USER: &str = "kvm";
 /// The NLA password — and the secrets case's canary (§11.3).
 pub const NLA: &str = "l2-canary-7f3a9c2e5b1d4a6f8e0c";
+/// The secrets case's keystroke sentinel (DC9): typed as scancodes. Letters,
+/// digits and `-` only — no Shift.
+pub const SENTINEL: &str = "sentinel-6b1f0c9d2a";
+/// The secrets case's paste canary (DC9): pasted over CLIPRDR. No Shift.
+pub const CANARY: &str = "paste-canary-3e7a";
 /// The upper bound on anything L2 waits for.
 pub const T: Duration = Duration::from_secs(10);
 pub const SET_MODE: [u8; 4] = [0x88, 0x88, 0x01, 0x30];
@@ -37,6 +44,123 @@ pub const LONGGOP: &str = "360p30_main_longgop.h264";
 
 pub fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
+}
+
+/// The default paste chord's make codes (`ctrl+option+shift+v`, §8).
+pub const CHORD_MODS: [u8; 3] = [0x1D, 0x38, 0x2A]; // LCtrl, LAlt, LShift
+pub const CHORD_KEY: u8 = 0x2F; // V
+
+/// Press the chord's modifiers and V, release V, then — if `release_mods`
+/// — the modifiers (they must release for the paste to type, §8).
+pub fn paste_chord(c: &Client, release_mods: bool) {
+    for m in CHORD_MODS {
+        c.key(m, true);
+    }
+    c.key(CHORD_KEY, true);
+    c.key(CHORD_KEY, false);
+    if release_mods {
+        for m in CHORD_MODS {
+            c.key(m, false);
+        }
+    }
+}
+
+/// The set-1 make code that types `c` on the US layout without Shift.
+pub fn scancode(c: char) -> u8 {
+    let s = us_stroke(c).unwrap_or_else(|| panic!("{c:?} has no US-layout key"));
+    assert!(!s.shift, "{c:?} needs Shift");
+    (1..0x80u8)
+        .find(|code| usage_for_scancode(*code, false) == Some(s.usage))
+        .unwrap_or_else(|| panic!("no scancode types {c:?}"))
+}
+
+/// Type `text` (no Shift) as scancode presses and releases.
+pub fn type_text(c: &Client, text: &str) {
+    for ch in text.chars() {
+        let code = scancode(ch);
+        c.key(code, true);
+        c.key(code, false);
+    }
+}
+
+/// The §8 report list the US layout types `text` with (each character a
+/// press, then the all-zero release), as kvm-sim records it.
+pub fn typed(text: &str) -> Vec<Vec<u8>> {
+    text.chars()
+        .flat_map(|ch| {
+            let s = us_stroke(ch).unwrap_or_else(|| panic!("{ch:?} has no US-layout key"));
+            let modifiers = if s.shift { 0x02 } else { 0 };
+            [
+                HidFrame::Keyboard {
+                    modifiers,
+                    keys: [s.usage, 0, 0, 0, 0],
+                }
+                .to_vec(),
+                KBD_ZERO.to_vec(),
+            ]
+        })
+        .collect()
+}
+
+/// The surface `sized` gives every case: what §7.2 scales against.
+pub const SURFACE: (u16, u16) = (640, 360);
+/// A client position no script otherwise uses: the end-of-script mark.
+pub const MARK: (u16, u16) = (7, 11);
+
+/// An absolute-mouse frame for a client position on `SURFACE` (§7.2).
+pub fn abs(buttons: u8, x: u16, y: u16) -> Vec<u8> {
+    HidFrame::abs_mouse(buttons, scale_abs(x, SURFACE.0), scale_abs(y, SURFACE.1)).to_vec()
+}
+
+/// kvm-sim's frames on `ws` after its session start, once there are at
+/// least `want` (everything recorded by then).
+pub async fn after_start(env: &Env, ws: u64, want: usize) -> Vec<Vec<u8>> {
+    let log = env
+        .sim
+        .wait_for(T, |l| hid_on(l, ws).len() >= 2 + want)
+        .await
+        .unwrap_or_else(|l| {
+            panic!(
+                "fewer than {want} frames after the session start within {T:?}: {:02x?}",
+                hid_on(&l, ws)
+            )
+        });
+    let all = hid_on(&log, ws);
+    assert_eq!(
+        all[..2],
+        [SET_MODE.to_vec(), KBD_ZERO.to_vec()],
+        "the session start"
+    );
+    all[2..].to_vec()
+}
+
+/// End a script with a move to `MARK` (buttons up), and return kvm-sim's
+/// frames on `ws` after its session start and before the mark's frame. One
+/// client connection keeps every event in order, so a frame the script
+/// should not have made shows up before the mark, not after the check.
+pub async fn until_mark(env: &Env, c: &Client, ws: u64) -> Vec<Vec<u8>> {
+    until_mark_at(env, c, ws, MARK).await
+}
+
+/// `until_mark` with a mark of the case's choosing: a websocket whose
+/// session start already puts the pointer at `MARK` (a later session's,
+/// after a case's earlier mark) needs another.
+pub async fn until_mark_at(env: &Env, c: &Client, ws: u64, at: (u16, u16)) -> Vec<Vec<u8>> {
+    c.mouse_move(at.0, at.1);
+    let mark = abs(0, at.0, at.1);
+    let log = env
+        .sim
+        .wait_for(T, |l| hid_on(l, ws).contains(&mark))
+        .await
+        .unwrap_or_else(|l| panic!("the mark never came: {:02x?}", hid_on(&l, ws)));
+    let all = hid_on(&log, ws);
+    assert_eq!(
+        all[..2],
+        [SET_MODE.to_vec(), KBD_ZERO.to_vec()],
+        "the session start"
+    );
+    let end = all.iter().position(|f| *f == mark).unwrap();
+    all[2..end].to_vec()
 }
 
 /// The ES3-shaped POC-0 fixture (640×360, Baseline) at the ES3's pacing.

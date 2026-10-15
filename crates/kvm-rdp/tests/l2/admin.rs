@@ -4,9 +4,16 @@
 //! websocket message (DC24).
 use crate::client::{Client, Ev, Opts, description, pictures, terminated, timeline};
 use crate::harness::{
-    NLA, T, edit_toml, env, es3, hid_on, ms, sized, streaming, until, write_files, ws_opens,
+    CANARY, CHORD_KEY, CHORD_MODS, NLA, SENTINEL, T, edit_toml, env, es3, hid_on, ms, paste_chord,
+    scancode, sized, streaming, type_text, until, write_files, ws_opens,
 };
+use kvm_proto::hid::HidFrame;
+use kvm_proto::keymap::{Chord, us_stroke};
+use kvm_proto::paste::{PastePolicy, Typist, prepare};
 use kvm_rdp::admin::{MAX_CONNECTIONS, REQUEST_TIMEOUT};
+use kvm_rdp::hid::Report;
+use kvm_rdp::input::keys::Keyboard;
+use kvm_rdp::input::{Ctx, Event, InputCore, Out};
 use kvm_rdp::msg::Cause;
 use kvm_sim::{KvmSim, SimEvent};
 use std::ffi::OsStr;
@@ -286,14 +293,207 @@ impl Drop for Bin {
     }
 }
 
+/// The press frame the US layout types `c` with (no Shift).
+fn press_frame(c: char) -> Vec<u8> {
+    let s = us_stroke(c).unwrap();
+    HidFrame::Keyboard {
+        modifiers: if s.shift { 0x02 } else { 0 },
+        keys: [s.usage, 0, 0, 0, 0],
+    }
+    .to_vec()
+}
+
+/// What may never reach a log or a `{:?}` for a typed `text` (DC9): the
+/// text, and each of its keystrokes' 12-byte keyboard frames as lowercase
+/// hex and as Rust prints the bytes.
+fn forbidden_for(text: &str) -> Vec<String> {
+    let mut v = vec![text.to_owned()];
+    for c in text.chars() {
+        let f = press_frame(c);
+        v.push(f.iter().map(|b| format!("{b:02x}")).collect());
+        v.push(format!("{f:?}"));
+    }
+    v
+}
+
+/// `frames` holds `text`'s presses in order (anything may lie between:
+/// the release zeros, a re-assert).
+fn typed_in_order(frames: &[Vec<u8>], text: &str) -> bool {
+    let mut want = text.chars().map(press_frame).peekable();
+    for f in frames {
+        if want.peek() == Some(f) {
+            let _ = want.next();
+        }
+    }
+    want.peek().is_none()
+}
+
+/// `text` with each letter and digit moved one along (`z`→`a`, `9`→`0`):
+/// the same keystrokes' shape — length, Shift, line breaks — with other keys.
+fn decoy(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            'z' => 'a',
+            '9' => '0',
+            'a'..='y' | '0'..='8' => char::from(u8::try_from(c).unwrap() + 1),
+            other => other,
+        })
+        .collect()
+}
+
+/// Every `{:?}` the bridge's input path makes of a script, run through the
+/// real `InputCore` (pace 0, all eight reports of room): `typed` as
+/// scancode presses and releases, then `pasted` through the default chord
+/// — each event, each out, each frame pushed and its queued `Report`, the
+/// core after every step, each stroke, the keyboard and its key reports,
+/// the prepared text and the Typist. Redacted (PD5 ruling, §4.5), none of
+/// it can depend on which keys were typed or what was pasted.
+fn debug_transcript(typed: &str, pasted: &str) -> Vec<String> {
+    let ctx = Ctx {
+        now: Instant::now(),
+        epoch: 1,
+        generation: 1,
+        surface: (640, 360),
+        mac_remap: false,
+        key_repeat_timeout: Duration::from_secs(10),
+        modifier_idle_timeout: Duration::from_secs(30),
+        chord: Chord::parse("ctrl+option+shift+v").unwrap(),
+        pace: Duration::ZERO,
+        modifier_wait: Duration::from_secs(5),
+        multiline_refuse: false,
+        max_chars: 4096,
+        queue_room: 8,
+    };
+    let step = |core: &mut InputCore, e: Event, lines: &mut Vec<String>| {
+        lines.push(format!("{e:?}"));
+        let mut out = Vec::new();
+        core.step(&ctx, e, &mut out);
+        for o in &out {
+            lines.push(format!("{o:?}"));
+            if let Out::Push {
+                frame,
+                motion_only,
+                stamp,
+            } = o
+            {
+                lines.push(format!("{frame:?}"));
+                let r = Report {
+                    epoch: *stamp,
+                    frame: *frame,
+                    motion_only: *motion_only,
+                };
+                lines.push(format!("{r:?}"));
+            }
+        }
+        lines.push(format!("{core:?}"));
+    };
+    let mut core = InputCore::new();
+    let mut lines = Vec::new();
+    step(&mut core, Event::ClipboardAvailable(true), &mut lines);
+    let mut keyboard = Keyboard::default();
+    for ch in typed.chars() {
+        let code = scancode(ch);
+        lines.push(format!("{:?}", us_stroke(ch).unwrap()));
+        lines.push(format!("{:?}", keyboard.press(code, false)));
+        lines.push(format!("{keyboard:?}"));
+        lines.push(format!("{:?}", keyboard.release(code, false)));
+        let (pressed, released) = (
+            Event::KeyPressed {
+                code,
+                extended: false,
+            },
+            Event::KeyReleased {
+                code,
+                extended: false,
+            },
+        );
+        step(&mut core, pressed, &mut lines);
+        step(&mut core, released, &mut lines);
+    }
+    let chord = CHORD_MODS
+        .iter()
+        .map(|m| (*m, true))
+        .chain([(CHORD_KEY, true), (CHORD_KEY, false)])
+        .chain(CHORD_MODS.iter().map(|m| (*m, false)));
+    for (code, down) in chord {
+        let e = if down {
+            Event::KeyPressed {
+                code,
+                extended: false,
+            }
+        } else {
+            Event::KeyReleased {
+                code,
+                extended: false,
+            }
+        };
+        step(&mut core, e, &mut lines);
+    }
+    let mut bytes: Vec<u8> = pasted.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    bytes.extend([0, 0]);
+    step(&mut core, Event::ClipboardText(bytes), &mut lines);
+    for _ in 0..pasted.len() {
+        step(&mut core, Event::Tick, &mut lines);
+    }
+    assert!(
+        lines.iter().any(|l| l.starts_with("Paste(Done")),
+        "the transcript's paste never finished"
+    );
+    let (prepared, skips) = prepare(
+        pasted,
+        &PastePolicy {
+            multiline_refuse: false,
+            max_chars: 4096,
+        },
+    );
+    lines.push(format!("{prepared:?}"));
+    lines.push(format!("{skips:?}"));
+    let chars: Vec<char> = pasted.chars().collect();
+    let mut typist = Typist::new(&chars);
+    lines.push(format!("{typist:?}"));
+    for f in typist.by_ref() {
+        lines.push(format!("{f:?}"));
+    }
+    lines.push(format!("{typist:?}"));
+    lines
+}
+
+/// DC9 (PD5 ruling): no `{:?}` the bridge's input path could emit carries
+/// a keystroke or pasted text. Each is identical for the sentinel and the
+/// canary and for decoys of the same shape — a `Debug` that showed a key,
+/// a frame's bytes or a character would differ — and none holds either
+/// string or a keystroke's frame bytes.
+fn no_debug_shows_input() {
+    let real = debug_transcript(SENTINEL, CANARY);
+    let other = debug_transcript(&decoy(SENTINEL), &decoy(CANARY));
+    assert_ne!(decoy(SENTINEL), SENTINEL);
+    assert_eq!(real.len(), other.len());
+    for (a, b) in real.iter().zip(&other) {
+        assert_eq!(a, b, "a Debug shows what was typed or pasted");
+    }
+    let forbidden: Vec<String> = forbidden_for(SENTINEL)
+        .into_iter()
+        .chain(forbidden_for(CANARY))
+        .collect();
+    for line in &real {
+        for f in &forbidden {
+            assert!(!line.contains(f.as_str()), "{f:?} is in a Debug: {line}");
+        }
+    }
+}
+
 /// §11.3 secrets hygiene, both filters: an NLA session whose password is
-/// the canary, then SIGTERM. Neither the canary, the KVM password, NTLM
-/// (raw or base64) nor a token query reaches stdout or stderr; no DEBUG or
-/// TRACE line from `ironrdp_*`/`sspi`; at least one TRACE line from bridge
-/// code; `SSLKEYLOGFILE` is never created. The shutdown's own lines are in
-/// the log checked (P10).
+/// the canary, a keystroke sentinel typed and a paste canary pasted through
+/// it (DC9), then SIGTERM. Neither canary, the sentinel, their keystrokes'
+/// frame bytes, the KVM password, NTLM (raw or base64) nor a token query
+/// reaches stdout or stderr; no DEBUG or TRACE line from
+/// `ironrdp_*`/`sspi`; at least one TRACE line from bridge code;
+/// `SSLKEYLOGFILE` is never created. The shutdown's own lines are in the
+/// log checked (P10). Nor does any `{:?}` the input path could emit show
+/// the input (`no_debug_shows_input`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secrets_never_reach_the_logs() {
+    no_debug_shows_input();
     for filter in [
         "trace",
         "kvm_rdp=trace,ironrdp_acceptor::credssp=trace,sspi::ntlm=trace",
@@ -308,8 +508,35 @@ async fn secrets_never_reach_the_logs() {
         let keylog = dir.path().join("keylog.txt");
         let mut bin = Bin::spawn(dir.path(), &[("SSLKEYLOGFILE", keylog.as_os_str())]);
         let rdp = bin.ready().await;
-        let c = Client::connect(rdp, Opts::new(2));
-        c.wait_for(T, |e| pictures(e).len() >= 5).await;
+        let c = Client::connect(rdp, Opts::new(2).clipboard(CANARY));
+        c.wait_for(T, |e| {
+            pictures(e).len() >= 5 && e.iter().any(|x| matches!(x, Ev::ClipReady))
+        })
+        .await;
+        // DC9: type the sentinel, paste the canary; both reach kvm-sim.
+        let ws = ws_started(&sim, 0).await;
+        type_text(&c, SENTINEL);
+        let log = sim
+            .wait_for(T, |l| typed_in_order(&hid_on(l, ws), SENTINEL))
+            .await
+            .unwrap_or_else(|l| {
+                panic!(
+                    "{filter}: the sentinel was not typed: {:02x?}",
+                    hid_on(&l, ws)
+                )
+            });
+        let typed_before = hid_on(&log, ws).len();
+        paste_chord(&c, true);
+        sim.wait_for(T, |l| {
+            typed_in_order(&hid_on(l, ws)[typed_before..], CANARY)
+        })
+        .await
+        .unwrap_or_else(|l| {
+            panic!(
+                "{filter}: the canary was not pasted: {:02x?}",
+                hid_on(&l, ws)
+            )
+        });
         bin.sigterm();
         assert!(bin.wait(T).await.success(), "{filter}");
         let out = bin.output();
@@ -319,9 +546,13 @@ async fn secrets_never_reach_the_logs() {
             "{filter}: the shutdown's last lines are not in the log checked (P10)"
         );
         let all = out.join("\n");
-        for secret in [NLA, sim.password(), "NTLMSSP", "TlRMTVNTUA", "token="] {
+        let fixed = [NLA, sim.password(), "NTLMSSP", "TlRMTVNTUA", "token="].map(str::to_owned);
+        let input = forbidden_for(SENTINEL)
+            .into_iter()
+            .chain(forbidden_for(CANARY));
+        for secret in fixed.into_iter().chain(input) {
             assert!(
-                !all.contains(secret),
+                !all.contains(secret.as_str()),
                 "{filter}: {secret:?} reached the logs"
             );
         }

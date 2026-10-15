@@ -15,6 +15,7 @@ mod harness;
 mod hid;
 mod input;
 mod lifecycle;
+mod paste;
 mod resize;
 mod sessions;
 mod video;

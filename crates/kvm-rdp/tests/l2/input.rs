@@ -2,27 +2,22 @@
 //! handler → the core → the writer → kvm-sim. Each case waits for
 //! `hid_ready` (the session-start sequence on the wire) before it sends,
 //! and asserts on the frames kvm-sim recorded after that sequence. A
-//! script's final check ends at a pointer move to `MARK`: one client
-//! connection keeps every event in order, so a frame the script should not
-//! have made shows up before the mark's frame, not after the check.
+//! script's final check ends at a pointer move to `MARK` (`until_mark`).
 //!
 //! Every release is followed, on the core's next step, by one extra
 //! all-zero keyboard report: the step that sees the moved epoch pushes its
 //! released state (PD6 m6). The session start's release is one, so the
 //! first event of a case pushes that zero ahead of its own report; the
 //! goldens expect it (`EPOCH_ZERO`).
-use crate::client::{Client, FpButton, Opts, pictures};
+use crate::client::{FpButton, Opts, pictures};
 use crate::harness::{
-    Env, KBD_ZERO, SET_MODE, T, env, es3, hid_on, hid_stamped, ms, sized, streaming, until, within,
-    ws_opens,
+    Env, KBD_ZERO, SURFACE, T, abs, after_start, env, es3, hid_on, hid_stamped, ms, sized,
+    streaming, until, until_mark, within, ws_opens,
 };
-use kvm_proto::hid::{HidFrame, Wheel, scale_abs};
+use kvm_proto::hid::{HidFrame, Wheel};
 use kvm_rdp::hid::HidControl;
 use std::time::{Duration, Instant};
 
-/// The fixture's surface (`sized`): what §7.2 scales against.
-const W: u16 = 640;
-const H: u16 = 360;
 /// Set-1 make codes.
 const A: u8 = 0x1E; // usage 0x04
 const B: u8 = 0x30; // usage 0x05
@@ -33,8 +28,6 @@ const LCTRL: u8 = 0x1D; // modifier bit 0x01
 const RIGHT: u8 = 0x4D; // E0 4D: usage 0x4F
 /// The zero report the first step after a release pushes (module doc).
 const EPOCH_ZERO: [u8; 12] = KBD_ZERO;
-/// A client position no script otherwise uses: the end-of-script mark.
-const MARK: (u16, u16) = (7, 11);
 
 fn kbd(modifiers: u8, k: u8) -> Vec<u8> {
     keys(modifiers, [k, 0, 0, 0, 0])
@@ -46,45 +39,6 @@ fn keys(modifiers: u8, keys: [u8; 5]) -> Vec<u8> {
 
 fn zero() -> Vec<u8> {
     KBD_ZERO.to_vec()
-}
-
-/// An absolute-mouse frame for a client position, scaled per §7.2.
-fn abs(buttons: u8, x: u16, y: u16) -> Vec<u8> {
-    HidFrame::abs_mouse(buttons, scale_abs(x, W), scale_abs(y, H)).to_vec()
-}
-
-/// kvm-sim's frames on `ws` after its session start, once there are at
-/// least `want` (everything recorded by then).
-async fn after_start(env: &Env, ws: u64, want: usize) -> Vec<Vec<u8>> {
-    let log = env
-        .sim
-        .wait_for(T, |l| hid_on(l, ws).len() >= 2 + want)
-        .await
-        .unwrap_or_else(|l| {
-            panic!(
-                "fewer than {want} frames after the session start within {T:?}: {:02x?}",
-                hid_on(&l, ws)
-            )
-        });
-    let all = hid_on(&log, ws);
-    assert_eq!(all[..2], [SET_MODE.to_vec(), zero()], "the session start");
-    all[2..].to_vec()
-}
-
-/// End the script with a move to `MARK` (buttons up), and return kvm-sim's
-/// frames on `ws` after its session start and before the mark's frame.
-async fn until_mark(env: &Env, c: &Client, ws: u64) -> Vec<Vec<u8>> {
-    c.mouse_move(MARK.0, MARK.1);
-    let mark = abs(0, MARK.0, MARK.1);
-    let log = env
-        .sim
-        .wait_for(T, |l| hid_on(l, ws).contains(&mark))
-        .await
-        .unwrap_or_else(|l| panic!("the mark never came: {:02x?}", hid_on(&l, ws)));
-    let all = hid_on(&log, ws);
-    assert_eq!(all[..2], [SET_MODE.to_vec(), zero()], "the session start");
-    let end = all.iter().position(|f| *f == mark).unwrap();
-    all[2..end].to_vec()
 }
 
 /// Where kvm-sim recorded the `n`th frame (0-based) after `ws`'s session
@@ -101,7 +55,7 @@ async fn stamp_of(env: &Env, ws: u64, n: usize) -> Instant {
 async fn every_input_event_maps_to_byte_exact_hid_frames() {
     let (env, c) = streaming(|_| {}).await;
     let ws = env.hid_ready().await;
-    let (cx, cy) = (W / 2, H / 2);
+    let (cx, cy) = (SURFACE.0 / 2, SURFACE.1 / 2);
     c.key(LSHIFT, true);
     c.key(A, true);
     c.key(A, false);

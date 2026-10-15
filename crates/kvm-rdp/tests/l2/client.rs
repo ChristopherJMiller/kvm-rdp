@@ -5,10 +5,19 @@
 //! client runs on its own thread and runtime and binds its own `127.0.0.N`
 //! source address (§11.1). It sends fast-path input (keys, Unicode units,
 //! the pointer, the wheel, Synchronize) through its `ActiveStage`, as a real
-//! client does (DC7). Each case uses a subset of these helpers.
+//! client does (DC7), and with `Opts::clipboard` it holds Unicode text on a
+//! CLIPRDR channel and answers the bridge's requests for it (§8). Each case
+//! uses a subset of these helpers.
 #![allow(dead_code)]
 use crate::harness::{NLA, T, USER};
 use ironrdp_async::FramedWrite as _;
+use ironrdp_cliprdr::CliprdrClient;
+use ironrdp_cliprdr::backend::{ClipboardMessage, ClipboardMessageProxy, CliprdrBackend};
+use ironrdp_cliprdr::pdu::{
+    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
+    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    OwnedFormatDataResponse,
+};
 use ironrdp_connector::connection_activation::{
     ConnectionActivationFactory, ConnectionActivationState,
 };
@@ -78,6 +87,11 @@ pub enum Ev {
     /// `ActiveStageOutput::Terminate`: an ErrorInfo's description.
     Terminated(String),
     Closed(String),
+    /// The CLIPRDR channel is up: the server accepted the format list that
+    /// offers the client's text (`on_ready` follows its `FormatListResponse`).
+    ClipReady,
+    /// The server asked for the client's text (a `FormatDataRequest`).
+    ClipAsked,
 }
 
 pub struct Opts {
@@ -91,6 +105,9 @@ pub struct Opts {
     /// `SO_RCVBUF` for the client socket (a client that stops reading
     /// should block the server's writes quickly).
     recv_buffer: Option<u32>,
+    /// The client's clipboard text: with it, a CLIPRDR channel that offers
+    /// CF_UNICODETEXT and answers the server's requests for it.
+    clipboard: Option<String>,
 }
 
 impl Opts {
@@ -105,7 +122,13 @@ impl Opts {
             caps: Some(census_caps()),
             ack: Ack::Normal,
             recv_buffer: None,
+            clipboard: None,
         }
+    }
+    /// Hold `text` on the client's clipboard (CF_UNICODETEXT, §8).
+    pub fn clipboard(mut self, text: &str) -> Opts {
+        self.clipboard = Some(text.to_owned());
+        self
     }
     pub fn user(mut self, u: &str) -> Opts {
         self.user = u.to_owned();
@@ -464,6 +487,7 @@ async fn connect(
     opts: &Opts,
     log: &Log,
     ack: &Arc<Mutex<Ack>>,
+    clip: mpsc::UnboundedSender<ClipboardMessage>,
 ) -> Result<(Upgraded, ConnectionResult), String> {
     let socket = TcpSocket::new_v4().map_err(|e| e.to_string())?;
     if let Some(n) = opts.recv_buffer {
@@ -494,6 +518,15 @@ async fn connect(
         };
         connector =
             connector.with_static_channel(DrdynvcClient::new().with_dynamic_channel(capture));
+    }
+    // Without it, `clip` drops here and the run loop's clipboard arm closes.
+    if let Some(text) = &opts.clipboard {
+        let backend = ClientClip {
+            text: text.clone(),
+            proxy: ClipProxy(clip),
+            log: log.clone(),
+        };
+        connector = connector.with_static_channel(CliprdrClient::new(Box::new(backend)));
     }
     let should_upgrade = ironrdp_async::connect_begin(&mut framed, &mut connector)
         .await
@@ -578,12 +611,15 @@ fn run(
         .build()
         .unwrap();
     rt.block_on(async move {
-        let (mut framed, result) =
-            match tokio::time::timeout(CONNECT_BOUND, connect(server, &opts, &log, &ack)).await {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => return push(&log, Ev::ConnectFailed(e)),
-                Err(_) => return push(&log, Ev::ConnectFailed("timeout".to_owned())),
-            };
+        // What the clipboard backend asks the loop to send (its proxy).
+        let (clip_tx, mut clip_rx) = mpsc::unbounded_channel();
+        let connecting = connect(server, &opts, &log, &ack, clip_tx);
+        let (mut framed, result) = match tokio::time::timeout(CONNECT_BOUND, connecting).await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return push(&log, Ev::ConnectFailed(e)),
+            Err(_) => return push(&log, Ev::ConnectFailed("timeout".to_owned())),
+        };
+        let mut clip_open = true;
         push(&log, Ev::Connected);
         let factory = result.activation_factory;
         let mut stage = ActiveStageBuilder {
@@ -651,6 +687,36 @@ fn run(
                         return push(&log, Ev::Closed("client".to_owned()));
                     }
                 },
+                // The clipboard backend's intents, encoded on the SVC path:
+                // its format list (on the server's Monitor Ready, D9b) and
+                // its answers.
+                m = clip_rx.recv(), if clip_open => {
+                    let Some(m) = m else {
+                        clip_open = false;
+                        continue;
+                    };
+                    let Some(cliprdr) = stage.get_svc_processor_mut::<CliprdrClient>() else {
+                        continue;
+                    };
+                    let msgs = match m {
+                        ClipboardMessage::SendInitiateCopy(formats) => cliprdr.initiate_copy(&formats),
+                        ClipboardMessage::SendFormatData(r) => cliprdr.submit_format_data(r),
+                        _ => continue,
+                    };
+                    let bytes = msgs
+                        .map_err(|e| e.to_string())
+                        .and_then(|m| stage.process_svc_processor_messages(m).map_err(|e| e.to_string()));
+                    match bytes {
+                        Ok(b) => {
+                            if write_failed.is_none()
+                                && let Err(e) = framed.write_all(&b).await
+                            {
+                                write_failed = Some(e.to_string());
+                            }
+                        }
+                        Err(e) => push(&log, Ev::Closed(format!("cliprdr: {e}"))),
+                    }
+                }
                 pdu = framed.read_pdu(), if reading => {
                     let (action, frame) = match pdu {
                         Ok(v) => v,
@@ -755,6 +821,72 @@ impl DvcProcessor for Capture {
 
 impl DvcClientProcessor for Capture {}
 
+/// The clipboard backend's proxy into the run loop.
+#[derive(Debug)]
+struct ClipProxy(mpsc::UnboundedSender<ClipboardMessage>);
+
+impl ClipboardMessageProxy for ClipProxy {
+    fn send_clipboard_message(&self, message: ClipboardMessage) {
+        let _ = self.0.send(message);
+    }
+}
+
+/// The client's clipboard (§8), as a real client runs it: it offers
+/// CF_UNICODETEXT when the server's Monitor Ready asks for its format list
+/// (D9b: `on_request_format_list`; `on_ready` comes only after the server's
+/// `FormatListResponse`), and answers every data request with its text,
+/// NUL-terminated as Windows, Windows App and FreeRDP send it (D4).
+struct ClientClip {
+    text: String,
+    proxy: ClipProxy,
+    log: Log,
+}
+
+// `CliprdrBackend: AsAny + Debug + Send`; `AsAny` has no blanket impl (D1c).
+impl_as_any!(ClientClip);
+
+/// The text is a case's canary at times: its length only.
+impl std::fmt::Debug for ClientClip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientClip")
+            .field("text_len", &self.text.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CliprdrBackend for ClientClip {
+    fn temporary_directory(&self) -> &str {
+        "."
+    }
+    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+        ClipboardGeneralCapabilityFlags::empty()
+    }
+    fn on_ready(&mut self) {
+        push(&self.log, Ev::ClipReady);
+    }
+    fn on_request_format_list(&mut self) {
+        // Monitor Ready: announce that the client holds Unicode text (D9b).
+        self.proxy
+            .send_clipboard_message(ClipboardMessage::SendInitiateCopy(vec![
+                ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+            ]));
+    }
+    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
+    fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
+    fn on_format_data_request(&mut self, _: FormatDataRequest) {
+        push(&self.log, Ev::ClipAsked);
+        self.proxy
+            .send_clipboard_message(ClipboardMessage::SendFormatData(
+                OwnedFormatDataResponse::new_unicode_string(&self.text),
+            ));
+    }
+    fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
+    fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
+    fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
+    fn on_lock(&mut self, _: LockDataId) {}
+    fn on_unlock(&mut self, _: LockDataId) {}
+}
+
 pub struct Picture {
     pub frame_id: u32,
     pub annex_b: Vec<u8>,
@@ -813,6 +945,7 @@ pub fn timeline(evs: &[Ev]) -> Vec<String> {
             Ev::Reactivated(w, h) => Some(format!("reactivated {w}x{h}")),
             Ev::Terminated(_) => Some("terminated".to_owned()),
             Ev::Closed(_) => Some("closed".to_owned()),
+            Ev::ClipReady | Ev::ClipAsked => None,
         })
         .collect()
 }
