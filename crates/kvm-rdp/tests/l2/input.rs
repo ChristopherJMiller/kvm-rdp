@@ -115,24 +115,34 @@ async fn newest(hid: &HidControl, frame: HidFrame) {
     );
 }
 
-fn k_state(held: bool) -> HidFrame {
-    HidFrame::Keyboard {
-        modifiers: 0,
-        keys: [if held { 0x0E } else { 0 }, 0, 0, 0, 0],
+/// The toggled key of the blocked-writer cases (set-1 0x32, usage 0x10).
+const M: u8 = 0x32;
+
+/// The keyboard state with K held (it is, all through the blocked-writer
+/// cases), M held if `m`, and then `then`'s usages, in press order.
+fn with_k(m: bool, then: &[u8]) -> HidFrame {
+    let mut keys = [0u8; 5];
+    let held = std::iter::once(0x0E)
+        .chain(m.then_some(0x10))
+        .chain(then.iter().copied());
+    for (slot, usage) in keys.iter_mut().zip(held) {
+        *slot = usage;
     }
+    HidFrame::Keyboard { modifiers: 0, keys }
 }
 
 /// A session whose HID writer is blocked: kvm-sim's reads are paused, and
 /// a flood has filled kvm-sim's small receive buffer and the bridge's
 /// capped send buffer until a write blocks — checked: reports wait in the
-/// queue and none is written for `STALL`. `k_held`: whether the marker key
-/// K is down.
+/// queue and none is written for `STALL`. K is held from before the flood
+/// and stays held (PD10 re-review m5-r), so no report written before a
+/// release is all-zero; M is the toggled key, `m_held` whether it is down.
 struct Blocked {
     env: Env,
     c: Client,
     ws: u64,
     hid: Arc<HidControl>,
-    k_held: bool,
+    m_held: bool,
 }
 
 /// `Blocked`, with the input queue at its least (9). The fill is bounded by
@@ -140,7 +150,7 @@ struct Blocked {
 /// the buffers, because a full queue collapses each flood into resyncs
 /// (PD10 review I2). `hid_write_timeout` is raised far past every bound
 /// the cases wait on, so the blocked write never reconnects, and
-/// `key_repeat_timeout` so K is never released by the timer.
+/// `key_repeat_timeout` so the held keys are never released by the timer.
 async fn blocked_writer() -> Blocked {
     /// Far more reports than kvm-sim's 4 KiB receive buffer and the 16 KiB
     /// send cap hold together (about 18 bytes each on the wire).
@@ -160,8 +170,11 @@ async fn blocked_writer() -> Blocked {
     let ws = env.hid_ready().await;
     let hid = env.bridge().hid().clone();
     let written = || env.metrics().hid_reports_sent.get();
+    c.key(K, true);
+    newest(&hid, with_k(false, &[])).await;
     env.sim.set_policy(|p| p.pause_ws_reads = true);
-    // Press and release a..j over and over: every event is a new state.
+    // Press and release a..j over and over, K held: every event is a new
+    // state, and none is all-zero.
     let flood: Vec<(u8, bool)> = (0..FLOOD / 2)
         .flat_map(|i| {
             let k = [0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24][i % 10];
@@ -173,8 +186,8 @@ async fn blocked_writer() -> Blocked {
         c.keys(&flood);
         // A marker press: once it is the queue's newest state, every event
         // before it has been pushed.
-        c.key(K, true);
-        newest(&hid, k_state(true)).await;
+        c.key(M, true);
+        newest(&hid, with_k(true, &[])).await;
         let w = written();
         if !until(STALL, || written() != w).await && hid.queued() > 0 {
             break;
@@ -184,8 +197,8 @@ async fn blocked_writer() -> Blocked {
             "the writer never blocked within {T:?}: {} reports written",
             written()
         );
-        c.key(K, false);
-        newest(&hid, k_state(false)).await;
+        c.key(M, false);
+        newest(&hid, with_k(false, &[])).await;
     }
     assert!(
         env.metrics().hid_resyncs.get() >= 1,
@@ -196,18 +209,30 @@ async fn blocked_writer() -> Blocked {
         c,
         ws,
         hid,
-        k_held: true,
+        m_held: true,
     }
 }
 
 impl Blocked {
-    /// K's release and press, one push each, until the queue holds exactly
+    /// Toggle M: one push.
+    async fn toggle(&mut self) {
+        self.m_held = !self.m_held;
+        self.c.key(M, self.m_held);
+        newest(&self.hid, with_k(self.m_held, &[])).await;
+    }
+
+    /// M's release and press, one push each, until the queue holds exactly
     /// `n`: the writer is blocked, so nothing leaves the queue meanwhile.
+    /// Bounded by `T` (PD10 re-review m-r2): a writer that is not blocked
+    /// drains the queue, and this would chase it.
     async fn fill_to(&mut self, n: usize) {
+        let t0 = Instant::now();
         while self.hid.queued() < n {
-            self.k_held = !self.k_held;
-            self.c.key(K, self.k_held);
-            newest(&self.hid, k_state(self.k_held)).await;
+            assert!(
+                t0.elapsed() < T,
+                "the queue never held {n} reports within {T:?}: the writer is not blocked"
+            );
+            self.toggle().await;
         }
     }
 }
@@ -227,14 +252,7 @@ async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
     b.fill_to(QUEUE).await;
     let resyncs = b.env.metrics().hid_resyncs.get();
     b.c.key(Z, true);
-    let last = HidFrame::Keyboard {
-        modifiers: 0,
-        keys: if b.k_held {
-            [0x0E, 0x1D, 0, 0, 0]
-        } else {
-            [0x1D, 0, 0, 0, 0]
-        },
-    };
+    let last = with_k(b.m_held, &[0x1D]);
     newest(&b.hid, last).await;
     assert_eq!(
         (b.hid.queued(), b.env.metrics().hid_resyncs.get()),
@@ -259,6 +277,7 @@ async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
         "the paused reads reconnected the websocket"
     );
     b.c.key(Z, false);
+    b.c.key(M, false);
     b.c.key(K, false);
 }
 
@@ -267,7 +286,8 @@ async fn a_full_queue_resyncs_to_the_correct_final_state_through_the_client() {
 /// only the zero reports and then the current state. Q's press and release
 /// are queued (the queue is emptied first by one clearing push), the
 /// Synchronize releases all, and once reads resume no Q report ever
-/// reaches kvm-sim: after what was already on the wire come the release's
+/// reaches kvm-sim: after what was already on the wire — every report of
+/// it with K held, so none all-zero (re-review m5-r) — come the release's
 /// zero, the next step's epoch zero and the new state, X held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_release_behind_a_blocked_write_sends_only_zeros_then_new_state() {
@@ -276,22 +296,12 @@ async fn a_release_behind_a_blocked_write_sends_only_zeros_then_new_state() {
     let mut b = blocked_writer().await;
     // Full, then one more push clears it (a resync): the queue is empty.
     b.fill_to(QUEUE).await;
-    b.k_held = !b.k_held;
-    b.c.key(K, b.k_held);
-    newest(&b.hid, k_state(b.k_held)).await;
+    b.toggle().await;
     assert_eq!(b.hid.queued(), 0);
-    let with_q = HidFrame::Keyboard {
-        modifiers: 0,
-        keys: if b.k_held {
-            [0x0E, 0x14, 0, 0, 0]
-        } else {
-            [0x14, 0, 0, 0, 0]
-        },
-    };
     b.c.key(Q, true);
-    newest(&b.hid, with_q).await;
+    newest(&b.hid, with_k(b.m_held, &[0x14])).await;
     b.c.key(Q, false);
-    newest(&b.hid, k_state(b.k_held)).await;
+    newest(&b.hid, with_k(b.m_held, &[])).await;
     assert_eq!(b.hid.queued(), 2, "Q's reports are queued");
     b.c.synchronize(false);
     assert!(
@@ -335,6 +345,8 @@ async fn a_release_behind_a_blocked_write_sends_only_zeros_then_new_state() {
     );
     assert_eq!(ws_opens(&log).len(), 1, "the paused reads reconnected");
     b.c.key(X, false);
+    b.c.key(M, false);
+    b.c.key(K, false);
 }
 
 /// §3.2, §7.3: a websocket reopen's session start puts the pointer where
