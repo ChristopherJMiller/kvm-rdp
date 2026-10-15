@@ -1254,7 +1254,17 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 1, "{text}");
         assert!(lines[0].contains("paste chord with no text"), "{text}");
-        for needle in [canary, "Keyboard", "AbsMouse", "777", "333", "0x1e", "0x04"] {
+        // The canary as its UTF-16 bytes, decimal and hex, as a `?bytes`
+        // field would show them.
+        let (dec, hex) = (
+            format!("{:?}", &utf16(canary)[..8]),
+            format!("{:02x?}", &utf16(canary)[..8]),
+        );
+        let bytes = [dec.trim_matches(['[', ']']), hex.trim_matches(['[', ']'])];
+        for needle in [canary, "Keyboard", "AbsMouse", "777", "333", "0x1e", "0x04"]
+            .into_iter()
+            .chain(bytes)
+        {
             assert!(!text.contains(needle), "{needle} in {text}");
         }
     }

@@ -2323,6 +2323,39 @@ mod tests {
             .await;
     }
 
+    /// PD9 carry 3 (m2) through the wiring: a flood of answers from this
+    /// connection's real backend, before the shell runs, is one word on the
+    /// pump's channel; the shell feeds the input core that answer and the
+    /// ones dropped behind it (counted `in_flight`, and answers all the
+    /// same — none was asked for, so the one with text is `unasked`); its
+    /// place is free again once the shell took it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_backends_answer_flood_reaches_the_input_core_bounded() {
+        LocalSet::new()
+            .run_until(async {
+                let mut w = wired();
+                let mut ours = w.clips.build_cliprdr_backend();
+                let (chan, _) = w.live().await;
+                for _ in 0..1_000 {
+                    ours.on_format_data_response(FormatDataResponse::new_unicode_string("x"));
+                }
+                let m = w.metrics.clone();
+                until("the answer and the 999 behind it", || {
+                    m.clipboard_discarded.get("unasked") == 1
+                        && m.clipboard_discarded.get("in_flight") == 999
+                })
+                .await;
+                ours.on_format_data_response(FormatDataResponse::new_error());
+                until("the next answer, forwarded", || {
+                    m.clipboard_discarded.get("unasked") == 2
+                })
+                .await;
+                assert_eq!(m.clipboard_discarded.get("in_flight"), 999);
+                w.teardown(chan);
+                w.settled().await;
+            })
+            .await;
+    }
     /// PC17 (found by L2's quick-reconnect case): a client re-advertises
     /// and disconnects at once. IronRDP runs the re-advertise's `on_ready`,
     /// then the teardown's `on_close` and `on_disconnected`, all before the
