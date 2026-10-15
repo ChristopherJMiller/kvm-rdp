@@ -104,3 +104,41 @@ pub(crate) fn private_loopback() -> std::net::IpAddr {
     let [_, _, hi, lo] = std::process::id().to_be_bytes();
     std::net::Ipv4Addr::new(127, 64 | (hi & 0x3f), lo, u8::try_from(n + 2).unwrap()).into()
 }
+
+/// Run the test body `f` on a fresh current-thread runtime with the paused
+/// clock — as `#[tokio::test(start_paused = true)]` does — but on a thread
+/// of its own, and fail if it has not finished within `limit` of real time
+/// (PD9 review I5). A task that busy-loops on a deadline already passed
+/// keeps the runtime from ever idling, so the paused clock never advances
+/// and no `tokio::time::timeout` inside the test can fire: without this a
+/// regression of that shape hangs the run instead of failing it. A body
+/// still spinning is left behind on its thread, which does not hold the
+/// process's exit.
+pub(crate) fn paused_within<F, Fut>(limit: Duration, f: F)
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(f())));
+        let _ = tx.send(done);
+    });
+    match rx.recv_timeout(limit) {
+        Ok(Ok(())) => {}
+        Ok(Err(panic)) => std::panic::resume_unwind(panic),
+        Err(_) => panic!(
+            "the test did not finish within {limit:?} of real time: something spins under the \
+             paused clock"
+        ),
+    }
+}
+
+/// `paused_within`'s bound for the paused-clock tests: each takes well
+/// under a second of real time.
+pub(crate) const PAUSED_WATCHDOG: Duration = Duration::from_secs(10);

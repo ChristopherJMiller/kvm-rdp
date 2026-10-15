@@ -1404,64 +1404,76 @@ mod tests {
     /// stale press the KVM read from its own buffer is overwritten. `drive`
     /// discards what was queued before it (writer.rs:254), so the reports
     /// are pushed after the session start (D2c).
-    #[tokio::test(start_paused = true)]
-    async fn the_writer_reasserts_the_full_state_after_a_reconnect() {
-        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
-        let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
-        t.reassert_after = Duration::from_millis(500);
-        let sink = GateSink::new(true);
-        let s2 = sink.clone();
-        let drive = tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
-        wait_sent(&sink, 2).await; // SET_MODE, KBD_ZERO
-        // The client has 'a' down and the pointer at (300, 400).
-        hid.push(kbd(0x04), false);
-        hid.push(HidFrame::abs_mouse(0, 300, 400), false);
-        wait_sent(&sink, 4).await;
-        let before = sink.sent().len(); // 4
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        // One re-assert: the current keyboard and mouse state again.
-        let after = sink.sent();
-        assert_eq!(after.len(), before + 2, "{after:?}");
-        assert_eq!(after[4], kbd(0x04).to_vec());
-        assert_eq!(after[5], HidFrame::abs_mouse(0, 300, 400).to_vec());
-        assert_eq!(hid.metrics.hid_reasserts.get(), 1);
-        drive.abort();
+    #[test]
+    fn the_writer_reasserts_the_full_state_after_a_reconnect() {
+        // PD9 review I5: a real-time bound on the paused clock.
+        crate::testkit::paused_within(crate::testkit::PAUSED_WATCHDOG, || async {
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
+            t.reassert_after = Duration::from_millis(500);
+            let sink = GateSink::new(true);
+            let s2 = sink.clone();
+            let drive =
+                tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
+            wait_sent(&sink, 2).await; // SET_MODE, KBD_ZERO
+            // The client has 'a' down and the pointer at (300, 400).
+            hid.push(kbd(0x04), false);
+            hid.push(HidFrame::abs_mouse(0, 300, 400), false);
+            wait_sent(&sink, 4).await;
+            let before = sink.sent().len(); // 4
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            // One re-assert: the current keyboard and mouse state again.
+            let after = sink.sent();
+            assert_eq!(after.len(), before + 2, "{after:?}");
+            assert_eq!(after[4], kbd(0x04).to_vec());
+            assert_eq!(after[5], HidFrame::abs_mouse(0, 300, 400).to_vec());
+            assert_eq!(hid.metrics.hid_reasserts.get(), 1);
+            drive.abort();
+        });
     }
 
     /// The re-assert happens once per websocket, not repeatedly.
-    #[tokio::test(start_paused = true)]
-    async fn the_reassert_is_once_per_websocket() {
-        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
-        let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
-        t.reassert_after = Duration::from_millis(200);
-        let sink = GateSink::new(true);
-        let s2 = sink.clone();
-        let drive = tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
-        wait_sent(&sink, 2).await;
-        hid.push(kbd(0x04), false);
-        wait_sent(&sink, 3).await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        assert_eq!(hid.metrics.hid_reasserts.get(), 1);
-        drive.abort();
+    #[test]
+    fn the_reassert_is_once_per_websocket() {
+        // PD9 review I5: a real-time bound on the paused clock.
+        crate::testkit::paused_within(crate::testkit::PAUSED_WATCHDOG, || async {
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
+            t.reassert_after = Duration::from_millis(200);
+            let sink = GateSink::new(true);
+            let s2 = sink.clone();
+            let drive =
+                tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
+            wait_sent(&sink, 2).await;
+            hid.push(kbd(0x04), false);
+            wait_sent(&sink, 3).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(hid.metrics.hid_reasserts.get(), 1);
+            drive.abort();
+        });
     }
 
     /// D21: continuous motion keeps the HID side busy, and the re-assert
     /// still goes out at its deadline.
-    #[tokio::test(start_paused = true)]
-    async fn the_reassert_is_not_starved_by_motion() {
-        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
-        let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
-        t.reassert_after = Duration::from_millis(100);
-        let sink = GateSink::new(true);
-        let s2 = sink.clone();
-        let drive = tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
-        wait_sent(&sink, 2).await;
-        for i in 0..40u16 {
-            hid.push(HidFrame::abs_mouse(0, i, i), true);
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        assert_eq!(hid.metrics.hid_reasserts.get(), 1);
-        drive.abort();
+    #[test]
+    fn the_reassert_is_not_starved_by_motion() {
+        // PD9 review I5: a real-time bound on the paused clock.
+        crate::testkit::paused_within(crate::testkit::PAUSED_WATCHDOG, || async {
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
+            t.reassert_after = Duration::from_millis(100);
+            let sink = GateSink::new(true);
+            let s2 = sink.clone();
+            let drive =
+                tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
+            wait_sent(&sink, 2).await;
+            for i in 0..40u16 {
+                hid.push(HidFrame::abs_mouse(0, i, i), true);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(hid.metrics.hid_reasserts.get(), 1);
+            drive.abort();
+        });
     }
 
     /// D21, with an arm ahead of the re-assert's wake ready at every
@@ -1515,35 +1527,39 @@ mod tests {
     /// A re-assert's frames go out after a release pending at its deadline
     /// (the loop serves the release first), and it re-asserts the released
     /// state: no key the release cleared comes back.
-    #[tokio::test(start_paused = true)]
-    async fn the_reassert_never_brings_back_a_released_key() {
-        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
-        let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
-        t.reassert_after = Duration::from_millis(100);
-        let sink = GateSink::new(true);
-        let s2 = sink.clone();
-        let drive = tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
-        wait_sent(&sink, 2).await;
-        sink.set(false); // the KVM stops reading for a while
-        hid.push(kbd(0x04), false); // taken, its write blocked
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        hid.push(kbd(0x05), false); // queued behind it
-        hid.release_all(ReleaseTrigger::KeyRepeat);
-        tokio::time::sleep(Duration::from_millis(100)).await; // past the deadline
-        sink.set(true);
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(hid.metrics.hid_reasserts.get(), 1);
-        // The blocked 'a', the release's zero, then the re-assert: zero.
-        assert_eq!(
-            sink.sent(),
-            [
-                SET_MODE.to_vec(),
-                KBD_ZERO.to_vec(),
-                kbd(0x04).to_vec(),
-                KBD_ZERO.to_vec(),
-                KBD_ZERO.to_vec(),
-            ]
-        );
-        drive.abort();
+    #[test]
+    fn the_reassert_never_brings_back_a_released_key() {
+        // PD9 review I5: a real-time bound on the paused clock.
+        crate::testkit::paused_within(crate::testkit::PAUSED_WATCHDOG, || async {
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
+            t.reassert_after = Duration::from_millis(100);
+            let sink = GateSink::new(true);
+            let s2 = sink.clone();
+            let drive =
+                tokio::spawn(async move { t.drive(s2, futures_util::stream::pending()).await });
+            wait_sent(&sink, 2).await;
+            sink.set(false); // the KVM stops reading for a while
+            hid.push(kbd(0x04), false); // taken, its write blocked
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            hid.push(kbd(0x05), false); // queued behind it
+            hid.release_all(ReleaseTrigger::KeyRepeat);
+            tokio::time::sleep(Duration::from_millis(100)).await; // past the deadline
+            sink.set(true);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(hid.metrics.hid_reasserts.get(), 1);
+            // The blocked 'a', the release's zero, then the re-assert: zero.
+            assert_eq!(
+                sink.sent(),
+                [
+                    SET_MODE.to_vec(),
+                    KBD_ZERO.to_vec(),
+                    kbd(0x04).to_vec(),
+                    KBD_ZERO.to_vec(),
+                    KBD_ZERO.to_vec(),
+                ]
+            );
+            drive.abort();
+        });
     }
 }

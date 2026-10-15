@@ -910,77 +910,83 @@ mod tests {
 
     /// The driver ticks the core at its next deadline with no event to
     /// bring it — and not before (§7.4's timers are the driver's).
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn the_driver_fires_a_timer_at_its_deadline() {
-        LocalSet::new()
-            .run_until(async {
-                let mut r = rig();
-                r.start();
-                tokio::task::spawn_local(r.s.clone().run_driver());
-                r.press(0x1E);
-                tokio::time::sleep(Duration::from_millis(9_990)).await;
-                assert_eq!(r.metrics.release_all.get("key_repeat"), 0, "early");
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                assert_eq!(r.metrics.release_all.get("key_repeat"), 1);
-                assert!(r.holds_nothing());
-                // Re-armed by a later press, after the driver slept on
-                // nothing armed.
-                r.release(0x1E);
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                r.press(0x30);
-                tokio::time::sleep(Duration::from_millis(10_010)).await;
-                assert_eq!(r.metrics.release_all.get("key_repeat"), 2);
-                assert!(r.holds_nothing());
-            })
-            .await;
+    #[test]
+    fn the_driver_fires_a_timer_at_its_deadline() {
+        // PD9 review I5: a real-time bound on the paused clock.
+        crate::testkit::paused_within(crate::testkit::PAUSED_WATCHDOG, || async {
+            LocalSet::new()
+                .run_until(async {
+                    let mut r = rig();
+                    r.start();
+                    tokio::task::spawn_local(r.s.clone().run_driver());
+                    r.press(0x1E);
+                    tokio::time::sleep(Duration::from_millis(9_990)).await;
+                    assert_eq!(r.metrics.release_all.get("key_repeat"), 0, "early");
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    assert_eq!(r.metrics.release_all.get("key_repeat"), 1);
+                    assert!(r.holds_nothing());
+                    // Re-armed by a later press, after the driver slept on
+                    // nothing armed.
+                    r.release(0x1E);
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    r.press(0x30);
+                    tokio::time::sleep(Duration::from_millis(10_010)).await;
+                    assert_eq!(r.metrics.release_all.get("key_repeat"), 2);
+                    assert!(r.holds_nothing());
+                })
+                .await;
+        });
     }
 
     /// The driver types a paste at pace 0 as the writer drains the queue
     /// (DD6: never more than the queue's room), and the paste completes.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn the_driver_types_a_paste_as_the_queue_drains() {
-        LocalSet::new()
-            .run_until(async {
-                // The least queue config allows (carry 5): typing never
-                // overflows it.
-                let mut r = rig_with_queue(TYPIST_ROOM + 1);
-                r.start();
-                tokio::task::spawn_local(r.s.clone().run_driver());
-                r.s.clipboard_available(true);
-                r.chord();
-                assert_eq!(r.requests(), 1);
-                r.s.clipboard_text(utf16("hello world"));
-                r.unchord();
-                let mut typed = Vec::new();
-                for _ in 0..200 {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    assert!(r.hid.queued() <= TYPIST_ROOM + 1, "past DD6's budget");
-                    for f in r.write() {
-                        if let HidFrame::Keyboard { keys, .. } = f
-                            && keys[0] != 0
-                        {
-                            typed.push(keys[0]);
+    #[test]
+    fn the_driver_types_a_paste_as_the_queue_drains() {
+        // PD9 review I5: a real-time bound on the paused clock.
+        crate::testkit::paused_within(crate::testkit::PAUSED_WATCHDOG, || async {
+            LocalSet::new()
+                .run_until(async {
+                    // The least queue config allows (carry 5): typing never
+                    // overflows it.
+                    let mut r = rig_with_queue(TYPIST_ROOM + 1);
+                    r.start();
+                    tokio::task::spawn_local(r.s.clone().run_driver());
+                    r.s.clipboard_available(true);
+                    r.chord();
+                    assert_eq!(r.requests(), 1);
+                    r.s.clipboard_text(utf16("hello world"));
+                    r.unchord();
+                    let mut typed = Vec::new();
+                    for _ in 0..200 {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                        assert!(r.hid.queued() <= TYPIST_ROOM + 1, "past DD6's budget");
+                        for f in r.write() {
+                            if let HidFrame::Keyboard { keys, .. } = f
+                                && keys[0] != 0
+                            {
+                                typed.push(keys[0]);
+                            }
+                        }
+                        if r.metrics.paste_events.get("done") == 1 {
+                            break;
                         }
                     }
-                    if r.metrics.paste_events.get("done") == 1 {
-                        break;
-                    }
-                }
-                assert_eq!(r.metrics.paste_events.get("done"), 1);
-                assert_eq!(
-                    typed,
-                    [
-                        0x0B, 0x08, 0x0F, 0x0F, 0x12, 0x2C, 0x1A, 0x12, 0x15, 0x0F, 0x07
-                    ]
-                );
-                assert_eq!(
-                    r.metrics.hid_resyncs.get(),
-                    0,
-                    "typing overflowed the queue"
-                );
-                assert!(r.holds_nothing());
-            })
-            .await;
+                    assert_eq!(r.metrics.paste_events.get("done"), 1);
+                    assert_eq!(
+                        typed,
+                        [
+                            0x0B, 0x08, 0x0F, 0x0F, 0x12, 0x2C, 0x1A, 0x12, 0x15, 0x0F, 0x07
+                        ]
+                    );
+                    assert_eq!(
+                        r.metrics.hid_resyncs.get(),
+                        0,
+                        "typing overflowed the queue"
+                    );
+                    assert!(r.holds_nothing());
+                })
+                .await;
+        });
     }
 
     /// PD9 carry 2 (PD7): a session change ends an active paste, and its
