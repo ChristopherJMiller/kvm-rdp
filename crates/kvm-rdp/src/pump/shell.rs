@@ -370,8 +370,11 @@ impl PumpShell {
                 }
             }
             // Task 4.1 routes these to the input core, under the same slot
-            // gate as `Fatal`; until then nothing types them.
-            RdpInput::ClipboardAvailable { .. } | RdpInput::ClipboardText { .. } => {}
+            // and generation gate as `Fatal` (a failure ends the waiting
+            // paste); until then nothing types them.
+            RdpInput::ClipboardAvailable { .. }
+            | RdpInput::ClipboardText { .. }
+            | RdpInput::ClipboardFailed { .. } => {}
             RdpInput::Updates => {
                 // PC17: the reactivation's Setup, same window as `OnReady`.
                 if self.link_ended() {
@@ -2012,6 +2015,7 @@ mod tests {
                         bytes: vec![0x41, 0],
                     })
                     .unwrap();
+                t.rdp.send(RdpInput::ClipboardFailed { slot: 1 }).unwrap();
                 assert!(
                     t.quiet(Duration::from_millis(300)).await,
                     "another slot's clipboard closed the session"
@@ -2031,6 +2035,35 @@ mod tests {
                 assert_eq!(t.metrics.disconnects.total(), 0);
                 assert_eq!(t.metrics.release_all.get("closing"), 0);
                 t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
+            })
+            .await;
+    }
+
+    /// PD8 review I1, the Preempt ordering: the evicted session's backend
+    /// sends `Fatal`, then IronRDP runs that session's `on_disconnected`
+    /// and the winner's `on_connection_info` before the shell reads it. A
+    /// generation *is* current by then — the winner's — but not the link's:
+    /// no close and no `clipboard_oversize` counted for a session the
+    /// client left (D17). (A gate asking "is any generation current" passes
+    /// every other case here.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_evicted_sessions_fatal_read_after_the_winner_began_is_dropped() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = shell(|_| {});
+                t.start();
+                t.event().await; // the Setup
+                t.rdp
+                    .send(RdpInput::Fatal {
+                        slot: 1,
+                        cause: Cause::ClipboardOversize,
+                    })
+                    .unwrap();
+                t.gens.end(); // the evicted session's on_disconnected
+                t.gens.begin(); // the winner's on_connection_info, its SessionStart not yet read
+                assert!(t.quiet(Duration::from_millis(300)).await);
+                assert_eq!(t.metrics.disconnects.total(), 0);
+                assert_eq!(t.metrics.release_all.get("closing"), 0);
             })
             .await;
     }

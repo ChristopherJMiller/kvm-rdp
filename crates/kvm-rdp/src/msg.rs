@@ -241,6 +241,13 @@ pub enum RdpInput {
         slot: u64,
         bytes: Vec<u8>,
     },
+    /// A clipboard response failed (CB_RESPONSE_FAIL): the client's, or
+    /// one IronRDP synthesized (its 64-pending overflow, a failed file-list
+    /// parse). No text is coming for the request it answers; Task 4.1
+    /// ends the waiting paste at once (PD8 review (b)).
+    ClipboardFailed {
+        slot: u64,
+    },
     /// The slot's session must end with `cause` (`clipboard_oversize`,
     /// §8): the shell steps it as `Input::UpstreamFatal` for its current
     /// generation only, and the pump's `close` counts it (D17).
@@ -273,6 +280,7 @@ impl std::fmt::Debug for RdpInput {
             RdpInput::GfxClosed { .. } => "GfxClosed",
             RdpInput::ClipboardAvailable { .. } => "ClipboardAvailable",
             RdpInput::ClipboardText { .. } => "ClipboardText",
+            RdpInput::ClipboardFailed { .. } => "ClipboardFailed",
             RdpInput::Fatal { .. } => "Fatal",
             RdpInput::Updates => "Updates",
             RdpInput::Shutdown { .. } => "Shutdown",

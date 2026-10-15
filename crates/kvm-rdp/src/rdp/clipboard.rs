@@ -12,10 +12,12 @@
 //! the backend sees it (§8 accepts that bound); the backend checks its
 //! length against `paste.max_bytes` before it copies a byte. Over the cap
 //! the session ends (`clipboard_oversize`, through `RdpInput::Fatal`) and
-//! the backend says nothing more. A response the bridge never asked for
-//! reaches the input core like any other, which types one only for a
-//! pending paste that has no text yet (DD4). The data is never logged or
-//! Debug-formatted (§9.2).
+//! the backend says nothing more. A failed response is `ClipboardFailed`.
+//! A response the bridge never asked for reaches the input core like any
+//! other, which types one only for a pending paste that has no text yet
+//! (DD4). A list that names CF_UNICODETEXT as its file list offers no text
+//! (IronRDP would take the answer as a file list, past the cap). The data
+//! is never logged or Debug-formatted (§9.2).
 //!
 //! The callbacks run inside IronRDP's channel processing on the RDP
 //! thread: they only push to the pump's channel — no lock, no call into
@@ -24,8 +26,8 @@ use crate::msg::{Cause, Gen, Generations, RdpInput};
 use crate::pump::Input;
 use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
+    FileContentsRequest, FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
 };
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -162,13 +164,29 @@ impl CliprdrBackend for ClipBackend {
     /// — the one format the bridge requests — is there (D18). A client
     /// that offers only ANSI text gets a `no_text` refusal at once, not a
     /// wait that ends in `modifier_wait`.
+    ///
+    /// Not when the list's first format *named* `FileGroupDescriptorW` has
+    /// CF_UNICODETEXT's id (PD8 review I2). IronRDP takes that first name
+    /// as the client's file list whatever its id (ironrdp-cliprdr
+    /// lib.rs:810–821) and parses the answer to a request for it as a file
+    /// list, bypassing `on_format_data_response` and with it §8's cap; a
+    /// benign client never names a standard format. `formats` is the very
+    /// list IronRDP reads, in its order, so the two cannot disagree.
     fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
         if self.ended {
             return;
         }
-        let text = formats
+        let file_list = formats
             .iter()
-            .any(|f| f.id() == ClipboardFormatId::CF_UNICODETEXT);
+            .find(|f| {
+                f.name()
+                    .is_some_and(|n| n.value() == ClipboardFormatName::FILE_LIST.value())
+            })
+            .map(ClipboardFormat::id);
+        let text = file_list != Some(ClipboardFormatId::CF_UNICODETEXT)
+            && formats
+                .iter()
+                .any(|f| f.id() == ClipboardFormatId::CF_UNICODETEXT);
         let _ = self.to_pump.send(RdpInput::ClipboardAvailable {
             slot: self.slot,
             text,
@@ -183,10 +201,18 @@ impl CliprdrBackend for ClipBackend {
     /// IronRDP forwards just the same. Its length is checked before a byte
     /// is copied: over `paste.max_bytes` → fatal `clipboard_oversize`
     /// (§8), counted once by the pump's `close` (D17); the backend counts
-    /// nothing and says nothing more. A CB_RESPONSE_FAIL types nothing.
-    /// Never logged.
+    /// nothing and says nothing more. A CB_RESPONSE_FAIL — the client's, or
+    /// IronRDP's own for a request it could not send — types nothing: it
+    /// is `ClipboardFailed`, so the paste waiting on it can end at once
+    /// (PD8 review (b)). Never logged.
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
-        if self.ended || response.is_error() {
+        if self.ended {
+            return;
+        }
+        if response.is_error() {
+            let _ = self
+                .to_pump
+                .send(RdpInput::ClipboardFailed { slot: self.slot });
             return;
         }
         let data = response.data();
@@ -340,9 +366,10 @@ mod tests {
     /// A text response under the cap becomes `ClipboardText`; an oversize
     /// one becomes `Fatal(ClipboardOversize)` (§8), and the data is never
     /// Debug-formatted (§9.2: assert by construction — no Debug call here).
-    /// An error response types nothing. (Its order differs from the
-    /// brief's: a backend says nothing after its `Fatal`, so the error
-    /// response comes first, where its silence means something.)
+    /// An error response types nothing: it becomes `ClipboardFailed`, so
+    /// the paste waiting on it can end at once (PD8 review (b); Task 4.1
+    /// acts on it). (Its order differs from the brief's: a backend says
+    /// nothing after its `Fatal`, so the error response comes first.)
     #[test]
     fn a_response_routes_text_or_a_fatal_oversize() {
         let (f, _slot, mut rx, _) = factory_with(8);
@@ -351,8 +378,12 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes }) if bytes == utf16z("hi"))
         );
-        // An error response types nothing.
+        // An error response types nothing; it is reported as a failure.
         b.on_format_data_response(FormatDataResponse::new_error());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardFailed { slot: 1 })
+        ));
         assert!(rx.try_recv().is_err());
         b.on_format_data_response(FormatDataResponse::new_unicode_string("far too long"));
         assert!(matches!(
@@ -397,6 +428,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(RdpInput::Fatal { slot: 1, .. })));
         b.on_format_data_response(FormatDataResponse::new_data(vec![0; 5]));
         b.on_format_data_response(FormatDataResponse::new_data(vec![0x41, 0]));
+        b.on_format_data_response(FormatDataResponse::new_error());
         b.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
         assert!(rx.try_recv().is_err());
     }
@@ -442,6 +474,8 @@ mod tests {
         queued: Vec<ClipboardMessage>,
         /// Its answer to a data request (`None`: CB_RESPONSE_FAIL).
         answer: Option<Vec<u8>>,
+        /// It never answers a data request (a client that stopped).
+        silent: bool,
         /// Data requests the server sent.
         asked: usize,
         /// Format lists the server offered (§8: never).
@@ -497,6 +531,9 @@ mod tests {
         fn on_format_data_request(&mut self, _: FormatDataRequest) {
             let mut s = self.state();
             s.asked += 1;
+            if s.silent {
+                return;
+            }
             let r = match &s.answer {
                 Some(b) => OwnedFormatDataResponse::new_data(b.clone()),
                 None => OwnedFormatDataResponse::new_error(),
@@ -654,7 +691,7 @@ mod tests {
 
     /// §8: an answer over `paste.max_bytes` once IronRDP has reassembled
     /// its chunks ends the session (`clipboard_oversize`); an unasked one
-    /// too. A CB_RESPONSE_FAIL answer types nothing.
+    /// too. A CB_RESPONSE_FAIL answer types nothing: `ClipboardFailed`.
     #[test]
     fn an_oversize_answer_reassembled_from_chunks_is_fatal() {
         let (f, _slot, mut rx, _) = factory_with(64 * 1024);
@@ -671,7 +708,11 @@ mod tests {
         let mut w = Wire::start(&f, None);
         let _ = rx.try_recv();
         w.request_text();
-        assert!(rx.try_recv().is_err(), "an error answer reached the pump");
+        assert!(
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardFailed { slot: 2 })),
+            "a CB_RESPONSE_FAIL answer was not reported as a failure"
+        );
+        assert!(rx.try_recv().is_err());
         w.unasked(vec![0x41; 64 * 1024 + 1]);
         assert!(matches!(
             rx.try_recv(),
@@ -680,6 +721,76 @@ mod tests {
                 cause: Cause::ClipboardOversize
             })
         ));
+    }
+
+    /// PD8 review (b): the failures IronRDP synthesizes itself reach the
+    /// pump too. A client that stops answering fills IronRDP's 64 pending
+    /// requests; the 65th is never sent, and IronRDP fails it to the
+    /// backend at once (ironrdp-cliprdr lib.rs:942–951) — a
+    /// `ClipboardFailed`, not a paste that waits out `modifier_wait`.
+    #[test]
+    fn ironrdps_own_failure_for_an_unanswered_request_reaches_the_pump() {
+        let (f, _slot, mut rx) = factory();
+        let mut w = Wire::start(&f, None);
+        let _ = rx.try_recv(); // its availability
+        w.state.lock().unwrap().silent = true;
+        for _ in 0..64 {
+            w.request_text();
+        }
+        assert_eq!(w.state.lock().unwrap().asked, 64);
+        assert!(rx.try_recv().is_err(), "nothing answered yet");
+        w.request_text();
+        assert_eq!(w.state.lock().unwrap().asked, 64, "the 65th went out");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardFailed { slot: 1 })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// PD8 review I2: IronRDP takes the first format *named*
+    /// `FileGroupDescriptorW` as the client's file list (ironrdp-cliprdr
+    /// lib.rs:810–821), whatever its id, and parses the answer to a request
+    /// for that id as a file list — never through `on_format_data_response`,
+    /// so §8's cap would never fire. A list whose first such name sits on
+    /// CF_UNICODETEXT therefore offers no text: the core refuses `no_text`
+    /// and never asks. Any other arrangement leaves CF_UNICODETEXT IronRDP's
+    /// plain format, and is text as before. The names cross the real wire,
+    /// so the unnamed control proves they arrive.
+    #[test]
+    fn unicode_text_named_as_the_file_list_is_not_text() {
+        let (f, _slot, mut rx) = factory();
+        let mut w = Wire::start(&f, Some(utf16z("x")));
+        let _ = rx.try_recv();
+        let text = || ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT);
+        let named = |id| ClipboardFormat::new(id).with_name(ClipboardFormatName::FILE_LIST);
+        let other = ClipboardFormatId::new(0xC0FF);
+        let cases = [
+            (vec![named(ClipboardFormatId::CF_UNICODETEXT)], false),
+            (
+                vec![named(ClipboardFormatId::CF_UNICODETEXT), text()],
+                false,
+            ),
+            (
+                vec![text(), named(ClipboardFormatId::CF_UNICODETEXT)],
+                false,
+            ),
+            (vec![named(other), text()], true),
+            (
+                vec![named(other), named(ClipboardFormatId::CF_UNICODETEXT)],
+                true,
+            ),
+            (vec![text()], true),
+        ];
+        for (i, (formats, want)) in cases.into_iter().enumerate() {
+            let msgs = w.client_does(ClipboardMessage::SendInitiateCopy(formats));
+            w.settle(Vec::new(), msgs);
+            assert!(
+                matches!(rx.try_recv(), Ok(RdpInput::ClipboardAvailable { slot: 1, text }) if text == want),
+                "case {i}: want text = {want}"
+            );
+        }
+        assert!(rx.try_recv().is_err());
     }
 
     /// What a hostile client may send the server besides its answer — a
