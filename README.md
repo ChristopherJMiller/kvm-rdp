@@ -1,11 +1,12 @@
 # kvm-rdp
 
-An RDP server for a commodity IP-KVM. It logs in to the KVM, passes the KVM's
-H.264 video through to the RDP client untouched (EGFX AVC420, via
-[IronRDP](https://github.com/Devolutions/IronRDP)), and turns the client's
-keyboard and mouse into the KVM's USB-HID frames. Any RDP client — Windows
-App on macOS included — can then drive whatever machine the KVM is plugged
-into, with no browser and no re-encode.
+An RDP server for a commodity IP-KVM, being built to log in to the KVM,
+pass the KVM's H.264 video through to the RDP client untouched (EGFX
+AVC420, via [IronRDP](https://github.com/Devolutions/IronRDP)), and turn
+the client's keyboard and mouse into the KVM's USB-HID frames — so that an
+RDP client, Windows App on macOS the first, can drive whatever machine the
+KVM is plugged into, with no browser and no re-encode. Not all of that is
+built yet: see the status below.
 
 The first target is the Angeet/Yeeso ES3 ("ONE KVM").
 
@@ -13,9 +14,11 @@ The first target is the Angeet/Yeeso ES3 ("ONE KVM").
 with EGFX AVC420 passthrough of the KVM's H.264, one session at a time (a
 new authenticated client takes over), the KVM's control websocket and HID
 writer, admin endpoints and a graceful shutdown — tested against `kvm-sim`
-with an in-process IronRDP client. Keyboard and mouse mapping, paste and
-clipboard come next (Milestone 3b), after the hardware checks they depend
-on; the bridge has not yet driven the real device.
+with an in-process IronRDP client. Client input is not mapped yet: keyboard
+and mouse events are counted and dropped. Keyboard and mouse mapping, paste
+and clipboard come next (Milestone 3b), after the hardware checks they
+depend on. The bridge has not yet driven the real device, and Windows App
+has not yet been run against it (the owner's acceptance checks).
 
 The design, and every decision behind it, is
 [the spec](docs/superpowers/specs/2026-10-05-kvm-rdp-design.md).
