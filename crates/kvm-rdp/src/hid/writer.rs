@@ -33,8 +33,11 @@
 //! loop's top, so no busy arm of the `select!` can starve it (D21); and if
 //! reports keep the queue from ever draining (motion under backpressure),
 //! it goes `reassert_after` past its deadline after one queued frame (PD9
-//! review m1): it is the newest state, so the frames queued behind it only
-//! pass through older states on the way back to it.
+//! review m1) — only while no keyboard report waits, and without its pointer
+//! part while pointer reports wait (re-review R-I1): the newest state written
+//! ahead of a queued report would type a key early and again, or break a
+//! drag. The queue's pointer reports each carry the current buttons, so
+//! the stale press this guards against is the keyboard's.
 use crate::hid::{HidControl, ReleaseTrigger};
 use crate::kvm::endpoint::{KvmEndpoint, SocketHandle};
 use crate::kvm::error::FailClass;
@@ -299,22 +302,31 @@ impl WsTask {
                 // m1: reports arriving as fast as the KVM takes them (motion
                 // under backpressure) keep the queue from ever emptying at
                 // the loop top; past `reassert_by` the re-assert goes after
-                // this one queued frame instead of waiting for a lull.
-                if reassert_by.is_some_and(|by| tokio::time::Instant::now() >= by) {
-                    if !self.reassert(&mut sink).await {
-                        return Exit::Failed;
+                // this one queued frame instead of waiting for a lull — but
+                // only while no keyboard report waits, and with the pointer
+                // part only while no pointer report does (R-I1): the newest
+                // state written ahead of them would type a key early and
+                // again, or break a drag.
+                if reassert_by.is_some_and(|by| tokio::time::Instant::now() >= by)
+                    && !self.hid.keyboard_queued()
+                {
+                    match self.reassert(&mut sink).await {
+                        Some(false) => return Exit::Failed,
+                        Some(true) => (reassert_at, reassert_by) = (None, None),
+                        None => {}
                     }
-                    (reassert_at, reassert_by) = (None, None);
                 }
                 continue;
             }
             // D21: checked here, with the release and the queue served
             // first, whatever arm of the `select!` below is ready.
             if reassert_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
-                if !self.reassert(&mut sink).await {
-                    return Exit::Failed;
+                match self.reassert(&mut sink).await {
+                    Some(false) => return Exit::Failed,
+                    Some(true) => (reassert_at, reassert_by) = (None, None),
+                    // A report pushed since the queue drained: serve it first.
+                    None => {}
                 }
-                (reassert_at, reassert_by) = (None, None);
                 continue;
             }
             let reassert_wake = reassert_at;
@@ -397,16 +409,23 @@ impl WsTask {
         }
     }
 
-    /// PC9 fix 2: write the full current state (the queue's resync state)
-    /// once, and count it; false if a write failed (a reconnect).
-    async fn reassert<S: Sink<Message, Error = WsError> + Unpin>(&self, sink: &mut S) -> bool {
-        for f in self.hid.current_state_frames() {
+    /// PC9 fix 2: write the current state (the queue's resync state) once,
+    /// and count it — less what would overtake a queued report
+    /// (`HidControl::reassert_frames`, R-I1). `None`: a keyboard report
+    /// waits, so nothing is written yet; `Some(false)`: a write failed (a
+    /// reconnect).
+    async fn reassert<S: Sink<Message, Error = WsError> + Unpin>(
+        &self,
+        sink: &mut S,
+    ) -> Option<bool> {
+        let frames = self.hid.reassert_frames()?;
+        for f in frames {
             if !self.write(sink, f).await {
-                return false;
+                return Some(false);
             }
         }
         self.metrics.hid_reasserts.inc();
-        true
+        Some(true)
     }
 
     /// One write on a websocket that stays in service: a failure ends it
@@ -1638,5 +1657,166 @@ mod tests {
         assert_eq!(exit, Exit::Failed, "the sink ended the drive");
         assert_eq!(hid.metrics.hid_reasserts.get(), 1, "deferred forever");
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    }
+
+    /// What a `Backlog` sink pushed and saw written.
+    #[derive(Default)]
+    struct Log {
+        pushed: Vec<HidFrame>,
+        written: Vec<Vec<u8>>,
+    }
+
+    /// A sink each write of which brings up to two more reports from
+    /// `script` (frame `i`, its `motion_only`), keeping a backlog of about
+    /// 32 queued — input faster than the KVM drains — until `stop_at`.
+    /// Never yields; the test bounds the drive.
+    struct Backlog {
+        hid: Arc<HidControl>,
+        script: fn(u64) -> HidFrame,
+        i: u64,
+        stop_at: Instant,
+        log: Arc<Mutex<Log>>,
+    }
+
+    impl Sink<Message> for Backlog {
+        type Error = WsError;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(mut self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
+            if let Message::Binary(b) = item {
+                self.log.lock().unwrap().written.push(b);
+            }
+            for _ in 0..2 {
+                if Instant::now() >= self.stop_at || self.hid.queued() >= 32 {
+                    break;
+                }
+                let f = (self.script)(self.i);
+                self.i += 1;
+                let _ = self.hid.push(f, false);
+                self.log.lock().unwrap().pushed.push(f);
+            }
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Drive `script` as a backlog for 300 ms past a 50 ms re-assert (so
+    /// well past `reassert_by`), then let it drain; what was pushed and
+    /// written. Real time, bounded at 1.5 s.
+    async fn backlog_run(script: fn(u64) -> HidFrame) -> Log {
+        let hid = Arc::new(HidControl::new(256, Arc::new(Metrics::default())));
+        let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
+        t.reassert_after = Duration::from_millis(50);
+        let log = Arc::new(Mutex::new(Log::default()));
+        let sink = Backlog {
+            hid: hid.clone(),
+            script,
+            i: 0,
+            stop_at: Instant::now() + Duration::from_millis(300),
+            log: log.clone(),
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_millis(1_500),
+            t.drive(sink, futures_util::stream::pending()),
+        )
+        .await;
+        assert_eq!(hid.metrics.hid_reasserts.get(), 1, "no re-assert at all");
+        Arc::try_unwrap(log).ok().unwrap().into_inner().unwrap()
+    }
+
+    /// The written frames after the session start (`SET_MODE`, `KBD_ZERO`)
+    /// are the pushed ones, in their order — a re-assert may only repeat
+    /// the newest state once the backlog has drained, at the end.
+    fn assert_in_order(log: &Log) {
+        let body = &log.written[2..];
+        let pushed: Vec<Vec<u8>> = log.pushed.iter().map(HidFrame::to_vec).collect();
+        assert!(pushed.len() > 100, "no backlog: {} pushed", pushed.len());
+        let n = body.len().min(pushed.len());
+        for k in 0..n {
+            assert_eq!(
+                body[k], pushed[k],
+                "frame {k} written out of order (a re-assert overtook the queue)"
+            );
+        }
+        for extra in &body[n..] {
+            assert!(
+                pushed.last() == Some(extra),
+                "a frame after the drain that is not the newest state"
+            );
+        }
+    }
+
+    /// PD9 re-review R-I1: typing faster than the KVM drains, past
+    /// `reassert_by`. The bounded re-assert must not write the newest
+    /// keyboard state ahead of queued keyboard reports — that typed a
+    /// letter early and then again in order (the reviewer's S4). It waits
+    /// for the keyboard reports to go out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reassert_never_overtakes_queued_keyboard_reports() {
+        fn typing(i: u64) -> HidFrame {
+            let k = 0x04 + u8::try_from((i / 2) % 26).unwrap();
+            if i.is_multiple_of(2) { kbd(k) } else { kbd(0) }
+        }
+        assert_in_order(&backlog_run(typing).await);
+    }
+
+    /// R-I1, the pointer: a drag (press, moves, release) queued past the
+    /// bound is never overtaken by the newest pointer state — that would
+    /// drop the drag and re-press it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_reassert_never_overtakes_a_queued_drag() {
+        fn drag(i: u64) -> HidFrame {
+            let n = u16::try_from(i % 6).unwrap();
+            let buttons = u8::from(n < 4);
+            HidFrame::abs_mouse(buttons, 100 + n, 100 + n)
+        }
+        assert_in_order(&backlog_run(drag).await);
+    }
+
+    /// R-I1's rule, directly: nothing while a keyboard report waits (in the
+    /// queue or a resync's output); the keyboard state alone while pointer
+    /// reports wait; both once nothing does.
+    #[test]
+    fn what_a_reassert_may_write_never_overtakes_a_queued_report() {
+        let hid = HidControl::new(2, Arc::new(Metrics::default()));
+        assert_eq!(hid.reassert_frames(), Some(vec![]));
+        hid.push(kbd(0x04), false);
+        hid.push(HidFrame::abs_mouse(1, 5, 5), false);
+        assert!(hid.keyboard_queued());
+        assert_eq!(hid.reassert_frames(), None);
+        assert_eq!(hid.next_frame(), Some(kbd(0x04)));
+        assert!(!hid.keyboard_queued());
+        assert_eq!(
+            hid.reassert_frames(),
+            Some(vec![kbd(0x04)]),
+            "pointer waits"
+        );
+        assert_eq!(hid.next_frame(), Some(HidFrame::abs_mouse(1, 5, 5)));
+        assert_eq!(
+            hid.reassert_frames(),
+            Some(vec![kbd(0x04), HidFrame::abs_mouse(1, 5, 5)])
+        );
+        // A pending resync re-sends the newest state itself: a re-assert
+        // ahead of it writes the same frames, overtaking nothing.
+        hid.push(kbd(0x05), false);
+        hid.push(kbd(0x06), false);
+        hid.push(kbd(0x07), false); // past the capacity of 2: a resync
+        assert_eq!(
+            hid.reassert_frames(),
+            Some(vec![kbd(0x07), HidFrame::abs_mouse(1, 5, 5)])
+        );
+        // Once the resync's frames are out, the one still waiting counts.
+        assert_eq!(hid.next_frame(), Some(kbd(0x07)));
+        assert_eq!(
+            hid.reassert_frames(),
+            Some(vec![kbd(0x07)]),
+            "its pointer frame waits"
+        );
     }
 }

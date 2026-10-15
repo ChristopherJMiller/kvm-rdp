@@ -170,6 +170,36 @@ impl HidQueue {
         v
     }
 
+    /// Whether a frame matching `f` waits to be written (queued, or in a
+    /// resync's output).
+    fn waiting(&self, f: impl Fn(&HidFrame) -> bool) -> bool {
+        self.items.iter().any(|r| f(&r.frame)) || self.out.iter().any(&f)
+    }
+
+    /// A keyboard report waits to be written.
+    #[must_use]
+    pub fn keyboard_queued(&self) -> bool {
+        self.waiting(|f| matches!(f, HidFrame::Keyboard { .. }))
+    }
+
+    /// What a re-assert may write now without overtaking a queued report
+    /// (PD9 re-review R-I1): `None` while a keyboard report waits — the
+    /// newest keyboard state written ahead of it would type a key early and
+    /// then again in order; else the newest keyboard state, and the newest
+    /// pointer state unless pointer reports wait (each carries the current
+    /// buttons; the newest written ahead of them would break a drag).
+    #[must_use]
+    pub fn reassert_frames(&self) -> Option<Vec<HidFrame>> {
+        if self.keyboard_queued() {
+            return None;
+        }
+        let mut v: Vec<HidFrame> = self.latest_kbd.into_iter().collect();
+        if !self.waiting(|f| matches!(f, HidFrame::AbsMouse { .. } | HidFrame::Wheel { .. })) {
+            v.extend(self.latest_mouse);
+        }
+        Some(v)
+    }
+
     /// Release-all: nothing queued survives; the remembered state becomes
     /// "nothing pressed" at the same position.
     pub fn release(&mut self) {
@@ -304,6 +334,19 @@ impl HidControl {
     #[must_use]
     pub fn current_state_frames(&self) -> Vec<HidFrame> {
         self.q().current_state()
+    }
+
+    /// A keyboard report waits to be written (PD9 re-review R-I1).
+    #[must_use]
+    pub fn keyboard_queued(&self) -> bool {
+        self.q().keyboard_queued()
+    }
+
+    /// What a re-assert may write now (`HidQueue::reassert_frames`), read
+    /// under one queue lock.
+    #[must_use]
+    pub fn reassert_frames(&self) -> Option<Vec<HidFrame>> {
+        self.q().reassert_frames()
     }
 
     /// Reports queued and not yet taken by the writer: the input shell's
