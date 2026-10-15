@@ -110,6 +110,24 @@ mod tests {
         assert!(PAGE.contains("if(c){if(!t)f=performance.now();l=performance.now();t+=c}"));
     }
 
+    /// PD3 R-I1: the page resets on a Right Ctrl tap (a `ControlRight`
+    /// keydown), never on Esc. In zsh a lone ESC is a prefix with no
+    /// timeout, so an Esc reset followed by the pattern's 'a' is ESC-a,
+    /// accept-and-hold, which runs the command line if a terminal has
+    /// focus; Right Ctrl alone sends nothing to a terminal and does nothing
+    /// on macOS. The reset key is marked held before the reset, so a Right
+    /// Ctrl the Mac thinks is down still shows in `held`.
+    #[test]
+    fn the_page_resets_on_a_right_ctrl_tap_never_on_esc() {
+        assert!(PAGE.contains(
+            r#"e.preventDefault();d[e.code]=1;if(e.code=="ControlRight"){t="";n=0;r=0;f=0;l=0;s();return}"#
+        ));
+        assert!(
+            !PAGE.contains("Escape"),
+            "the page still treats Esc specially"
+        );
+    }
+
     /// The page's hash is FNV-1a 32 over UTF-16 code units, as `h()` in
     /// the page computes it.
     #[test]

@@ -109,3 +109,68 @@ async fn a_release_is_confirmed_only_by_an_answered_close_frame() {
         assert_eq!(data_frames.load(Ordering::SeqCst), 2, "answer={answer}");
     }
 }
+
+/// A websocket stub for any number of connections that answers every
+/// close frame — a KVM that confirms releases. Records each connection's
+/// data-frame count once it closes.
+async fn answering_stub() -> (u16, String, Arc<std::sync::Mutex<Vec<usize>>>) {
+    let (acceptor, pin_hex) = support::tls_acceptor_and_pin();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let closed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = closed.clone();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, log) = (acceptor.clone(), log.clone());
+            tokio::spawn(async move {
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(mut ws) = tokio_tungstenite::accept_async(tls).await else {
+                    return;
+                };
+                let mut frames = 0;
+                // After the client's Close, the next read flushes the
+                // queued answer and ends the stream.
+                while let Ok(Some(Ok(m))) = tokio::time::timeout(T, ws.next()).await {
+                    if m.is_binary() || m.is_text() {
+                        frames += 1;
+                    }
+                }
+                let _ = ws.get_mut().shutdown().await;
+                log.lock().unwrap().push(frames);
+            });
+        }
+    });
+    (port, pin_hex, closed)
+}
+
+/// PD3 R-m1: a failed body whose releases the KVM confirmed ends with the
+/// body's own error. KEY MAY BE HELD is for a failed run whose releases
+/// nobody confirmed (the kvm-sim case, which answers no close frame).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_body_whose_releases_are_confirmed_keeps_its_own_error() {
+    use kvm_probe::l4::hid::{self, HidWs};
+    use kvm_proto::hid::HidFrame;
+    let (port, pin, closed) = answering_stub().await;
+    let t = target(port);
+    let mut irq = hid::Interrupts::new().unwrap();
+    let r: Result<(), _> = hid::guarded(&t, Some(&pin), "0.1", None, &mut irq, async {
+        let mut w = HidWs::open(&t, Some(&pin), "0.1", T).await?;
+        w.send(HidFrame::Keyboard {
+            modifiers: 0,
+            keys: [0x04, 0, 0, 0, 0],
+        })
+        .await?;
+        Err(kvm_probe::kvm::KvmError::Io("the body failed".to_owned()))
+    })
+    .await;
+    let e = format!("{:?}", r.unwrap_err());
+    assert!(e.contains("the body failed"), "{e}");
+    assert!(!e.contains("KEY MAY BE HELD"), "{e}");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The body's websocket (its 3 frames) and both releases (2 each).
+    let mut got = closed.lock().unwrap().clone();
+    got.sort_unstable();
+    assert_eq!(got, [2, 2, 3]);
+}

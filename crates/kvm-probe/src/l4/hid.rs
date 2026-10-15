@@ -16,14 +16,16 @@
 //!
 //! What is typed is only ever `page::pattern`, bounded in length, pace,
 //! runs and paces (`MAX_CHARS`, `MAX_PACE`, `MAX_RUNS`, `MAX_PACES`): no
-//! burst is unbounded, and neither is one command's typing.
+//! burst is unbounded, and neither is one command's typing. Nothing typed
+//! is ever Esc or carries Alt/Option or Cmd: the test page resets on a
+//! Right Ctrl tap (`reset_page`, PD3 R-I1).
 use super::{RefusalForm, escaped, ws};
 use crate::captures::CaptureDir;
 use crate::kvm::{self, BoxedIo, KvmError};
 use crate::request::{KvmTarget, Scheme};
 use futures_util::{FutureExt as _, SinkExt as _, StreamExt as _};
 use kvm_proto::hid::HidFrame;
-use kvm_proto::keymap::{MOD_LSHIFT, Stroke, USAGE_ESC, us_stroke};
+use kvm_proto::keymap::{MOD_LSHIFT, MOD_RCTRL, Stroke, us_stroke};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpSocket, TcpStream};
@@ -41,13 +43,6 @@ pub const RELEASE_WINDOW: Duration = Duration::from_secs(30);
 /// had already received from the abandoned websocket may still be read
 /// after the first release's zero report.
 pub const SECOND_RELEASE_AFTER: Duration = Duration::from_secs(5);
-/// The gap between the Esc pair that resets the test page and the first
-/// typed character (PD3 I3). Esc then a key within a shell's key-sequence
-/// timeout is a command — in zsh's emacs keymap (macOS's default shell)
-/// ESC-a is accept-and-hold, which runs the command line — so the gap is
-/// past zsh's 0.4 s `KEYTIMEOUT` and readline's 0.5 s `keyseq-timeout`,
-/// with margin: should a terminal have focus, Esc and 'a' stay two keys.
-pub const ESC_GAP: Duration = Duration::from_millis(1200);
 /// The most characters one `type_text` types: at pace 0 that is a burst
 /// of 2 × 500 + 2 reports, under DD8's ~1 800-report estimate of the
 /// KVM's receive window, so no burst is unbounded. Task 1.6 types 200.
@@ -73,6 +68,21 @@ pub const KBD_ZERO: HidFrame = HidFrame::Keyboard {
     modifiers: 0,
     keys: [0; 5],
 };
+
+/// The test page's reset (PD3 R-I1): Right Ctrl alone — a modifier-only
+/// report, released by `KBD_ZERO` at once. Never Esc: in zsh's emacs
+/// keymap (macOS's default shell) a lone ESC is a prefix with no timeout,
+/// so Esc and then the pattern's 'a', however far apart, is ESC-a —
+/// accept-and-hold, which runs the command line if a terminal has focus.
+/// Right Ctrl alone sends no byte to a terminal, has no macOS or Edge
+/// action, and still fires the page's `ControlRight` keydown.
+pub const RESET_TAP: HidFrame = HidFrame::Keyboard {
+    modifiers: MOD_RCTRL,
+    keys: [0; 5],
+};
+/// After the reset tap, before the first character: the page redraws (the
+/// plan's original 200 ms).
+const RESET_SETTLE: Duration = Duration::from_millis(200);
 
 /// One line on stderr that can never panic (PD3 I2): after SIGHUP (a
 /// closed terminal, EIO) or an agent's tool timeout (a closed pipe, EPIPE)
@@ -329,11 +339,20 @@ impl std::fmt::Display for TypeReport {
     }
 }
 
+/// Reset the test page (D7a): the Right Ctrl tap — `RESET_TAP`, then
+/// `KBD_ZERO` — and `RESET_SETTLE` for the page to redraw (PD3 R-I1: never
+/// Esc). Task 1.5's `hid-stale` resets the same way.
+pub async fn reset_page(w: &mut HidWs) -> Result<(), KvmError> {
+    w.send(RESET_TAP).await?;
+    w.send(KBD_ZERO).await?;
+    tokio::time::sleep(RESET_SETTLE).await;
+    Ok(())
+}
+
 /// Type `text` (US layout; characters without a stroke are left out) as
-/// press/release pairs, `pace` after every report (§8). First an Esc press
-/// and release, which the test page reads as "start over" (D7a), then
-/// `ESC_GAP` (1.2 s, PD3 I3) so that Esc and the first character are never
-/// one key sequence; those two reports are not counted or timed. More than
+/// press/release pairs, `pace` after every report (§8). First `reset_page`
+/// (the Right Ctrl tap the test page reads as "start over", D7a, PD3
+/// R-I1); those two reports are not counted or timed. More than
 /// `MAX_CHARS` characters, or a pace past `MAX_PACE`, is refused before
 /// anything is sent.
 pub async fn type_text(w: &mut HidWs, text: &str, pace: Duration) -> Result<TypeReport, KvmError> {
@@ -350,13 +369,7 @@ pub async fn type_text(w: &mut HidWs, text: &str, pace: Duration) -> Result<Type
             "a HID run's pace is at most {MAX_PACE:?} (a key is held for one pace); got {pace:?}"
         )));
     }
-    w.send(press(Stroke {
-        usage: USAGE_ESC,
-        shift: false,
-    }))
-    .await?;
-    w.send(KBD_ZERO).await?;
-    tokio::time::sleep(ESC_GAP).await;
+    reset_page(w).await?;
     let t0 = Instant::now();
     let (mut reports, mut burst_capacity, mut max_write, mut bursting) =
         (0u64, 0u64, Duration::ZERO, true);
@@ -621,7 +634,8 @@ impl Interrupts {
 /// Run a HID subcommand's `body`, then release — after success, failure,
 /// a panic (caught; the panic is the error) or an interrupt (`irq`). A
 /// body that ran and did not end Ok is released again
-/// `SECOND_RELEASE_AFTER` later (PD3 I1). A failed release is the error,
+/// `SECOND_RELEASE_AFTER` later (PD3 I1); if the KVM confirmed neither
+/// release, the error is KEY MAY BE HELD (PD3 R-m1). A failed release is the error,
 /// whatever the body returned, and ends the section at once. An interrupt
 /// that came before the section skips its body — which then left nothing
 /// to land late — but never its release. (A release build aborts on panic,
@@ -663,12 +677,40 @@ async fn guarded_with<T>(
             }),
         },
     };
-    report(release_loop(t, pin, r, pointer).await?);
-    if out.is_err() && ran.get() {
+    let first = release_loop(t, pin, r, pointer).await?;
+    report(first);
+    if let Err(e) = &out
+        && ran.get()
+    {
         tokio::time::sleep(SECOND_RELEASE_AFTER).await;
-        report(release_loop(t, pin, r, pointer).await?);
+        let second = release_loop(t, pin, r, pointer).await?;
+        report(second);
+        // PD3 R-m1: the KVM confirmed neither release after a body that
+        // failed mid-stream — its backlog may still land after both (a stall
+        // outlasting them). That is the one case no client-side order can
+        // prevent, so it is loud: KEY MAY BE HELD, the body's error inside.
+        if matches!(
+            (first, second),
+            (Released::Unconfirmed(_), Released::Unconfirmed(_))
+        ) {
+            return Err(KvmError::Io(format!(
+                "KEY MAY BE HELD on the Mac (neither release was confirmed): run `kvm-probe hid-release` and check `held -`. The run failed: {}",
+                escaped(what(e).as_bytes(), 80)
+            )));
+        }
     }
     out
+}
+
+/// An error's own text, without its variant.
+fn what(e: &KvmError) -> &str {
+    match e {
+        KvmError::Connect(s)
+        | KvmError::Tls(s)
+        | KvmError::Http(s)
+        | KvmError::Login(s)
+        | KvmError::Io(s) => s,
+    }
 }
 
 /// `hid-type --snapshot`: after each run and `settle`, a snapshot named
@@ -811,5 +853,29 @@ mod tests {
     fn an_unwinding_build_needs_no_abort_warning() {
         const { assert!(cfg!(panic = "unwind")) };
         assert_eq!(abort_build_warning(), None);
+    }
+
+    /// PD3 R-I1: the reports `type_text` builds — the reset tap and every
+    /// character of the pattern — carry no Esc (0x29) and no modifier but
+    /// Left Shift with a key; the tap is Right Ctrl alone.
+    #[test]
+    fn the_reset_tap_and_every_pattern_press_are_safe_reports() {
+        assert_eq!(
+            RESET_TAP,
+            HidFrame::Keyboard {
+                modifiers: kvm_proto::keymap::MOD_RCTRL,
+                keys: [0; 5]
+            }
+        );
+        for c in super::super::page::pattern(500).chars() {
+            let Some(s) = us_stroke(c) else {
+                panic!("{c:?} has no stroke")
+            };
+            let HidFrame::Keyboard { modifiers, keys } = press(s) else {
+                panic!("not a keyboard report")
+            };
+            assert!(modifiers == 0 || modifiers == MOD_LSHIFT, "{c:?}");
+            assert!(!keys.contains(&0x29), "{c:?} is Esc");
+        }
     }
 }

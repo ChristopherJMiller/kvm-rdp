@@ -367,9 +367,53 @@ fn session_start() -> [Vec<u8>; 2] {
     [HidFrame::SetMode { hid_type: 0 }.to_vec(), kbd(0, 0)]
 }
 
-/// §3.3's session start, the Esc pair that resets the test page, then one
-/// press and one all-zero release per character, Shift in the press for a
-/// shifted one (§8's report sequence). `reports` counts the text only.
+/// The test page's reset (PD3 R-I1): a Right Ctrl tap — a modifier-only
+/// report, then an all-zero one. Never Esc.
+fn reset_tap() -> [Vec<u8>; 2] {
+    [kbd(0x10, 0), kbd(0, 0)]
+}
+
+/// PD3 R-I1: nothing the probe types can be a shell key sequence or a
+/// shortcut. In zsh a lone ESC is a prefix with no timeout, so ESC then a
+/// character is a command whatever the gap (ESC-a, accept-and-hold, runs
+/// the command line); Alt/Option then a character is the same sequence in
+/// a terminal set to send Meta as ESC. So across every keyboard report of
+/// a stream: no Esc (usage 0x29) anywhere; no Alt/Option or Cmd bit ever;
+/// Ctrl only in the reset tap — with no key, and released by the very
+/// next report; a key only with no modifier or Left Shift.
+fn assert_safe_typing(frames: &[Vec<u8>]) {
+    const ALT_GUI: u8 = 0x04 | 0x40 | 0x08 | 0x80;
+    const CTRL: u8 = 0x01 | 0x10;
+    let kb: Vec<(u8, [u8; 5])> = frames
+        .iter()
+        .filter_map(|f| match HidFrame::decode(f) {
+            Ok(HidFrame::Keyboard { modifiers, keys }) => Some((modifiers, keys)),
+            _ => None,
+        })
+        .collect();
+    assert!(!kb.is_empty(), "no keyboard report to check");
+    for (i, &(m, keys)) in kb.iter().enumerate() {
+        assert!(!keys.contains(&0x29), "Esc in report {i}: {kb:?}");
+        assert_eq!(m & ALT_GUI, 0, "Alt/Option or Cmd in report {i}");
+        let key = keys.iter().any(|&k| k != 0);
+        if m & CTRL != 0 {
+            assert!(!key, "Ctrl with a key in report {i}");
+            assert_eq!(
+                kb.get(i + 1),
+                Some(&(0, [0; 5])),
+                "the Ctrl tap in report {i} is not released by the next report"
+            );
+        }
+        if key {
+            assert_eq!(m & !0x02, 0, "a key with modifiers {m:#04x} in report {i}");
+        }
+    }
+}
+
+/// §3.3's session start, the Right Ctrl tap that resets the test page,
+/// then one press and one all-zero release per character, Shift in the
+/// press for a shifted one (§8's report sequence). `reports` counts the
+/// text only. Never an Esc, never an Alt/Option prefix (PD3 R-I1).
 #[tokio::test]
 async fn a_hid_websocket_starts_the_session_and_types_press_release_pairs() {
     let sim = sim_with(|_| {}).await;
@@ -389,7 +433,7 @@ async fn a_hid_websocket_starts_the_session_and_types_press_release_pairs() {
         [
             HidFrame::SetMode { hid_type: 0 }.to_vec(),
             kbd(0, 0),
-            kbd(0, 0x29),
+            kbd(0x10, 0),
             kbd(0, 0),
             kbd(0, 0x04),
             kbd(0, 0),
@@ -399,18 +443,7 @@ async fn a_hid_websocket_starts_the_session_and_types_press_release_pairs() {
             kbd(0, 0),
         ]
     );
-    // PD3 I3: Esc and the first character are never a key sequence. In
-    // zsh's emacs keymap ESC-a is accept-and-hold, which runs the command
-    // line (zsh waits 0.4 s for the second key; readline 0.5 s), so at least
-    // 1 s separates the Esc pair from the first typed character, as the KVM
-    // reads them.
-    let at: Vec<std::time::Instant> = sim
-        .stamped_events()
-        .into_iter()
-        .filter_map(|(at, e)| matches!(e, SimEvent::Hid { .. }).then_some(at))
-        .collect();
-    let gap = at[4].saturating_duration_since(at[3]);
-    assert!(gap >= Duration::from_secs(1), "Esc pair to 'a': {gap:?}");
+    assert_safe_typing(&got);
     w.end(End::CloseFrame).await;
     no_logout(&sim);
 }
@@ -636,8 +669,14 @@ async fn guarded_releases_twice_after_a_failed_body_so_its_tail_never_lands_last
         hid::guarded::<()>(&t, pin, &token, None, &mut irq, body),
         resume
     );
-    let e = r.unwrap_err();
-    assert!(format!("{e:?}").contains("longer than"), "{e:?}");
+    // PD3 R-m1: kvm-sim answers neither release's close frame, so after a
+    // failed body the result is KEY MAY BE HELD, the body's error inside it.
+    let e = format!("{:?}", r.unwrap_err());
+    assert!(
+        e.contains("KEY MAY BE HELD") && e.contains("hid-release"),
+        "{e}"
+    );
+    assert!(e.contains("longer than"), "{e}");
     all_closed(&sim).await;
     assert_eq!(ws_opens(&sim), 3, "{:?}", sim.stats());
     assert_eq!(hid_on_ws(&sim, 2), session_start());
@@ -873,19 +912,12 @@ async fn type_text_refuses_an_unbounded_burst_before_sending_anything() {
     all_closed(&sim).await;
     let want = 4 + 2 * hid::MAX_CHARS;
     let got = hid_on_ws(&sim, 0);
-    // The refused calls sent nothing: the session start, then the one Esc
-    // pair of the call that typed.
+    // The refused calls sent nothing: the session start, then the one reset
+    // tap of the call that typed.
     assert_eq!(got.len(), want);
-    assert_eq!(
-        got[..4],
-        [
-            session_start()[0].clone(),
-            kbd(0, 0),
-            kbd(0, 0x29),
-            kbd(0, 0)
-        ]
-    );
+    assert_eq!(got[..4], [session_start(), reset_tap()].concat());
     assert_eq!(got[4], kbd(0, 0x04));
+    assert_safe_typing(&got);
     no_logout(&sim);
 }
 
@@ -897,7 +929,9 @@ async fn hid_type_runs_type_each_run_on_its_own_websocket_and_release_after_each
     let sim = sim_with(|_| {}).await;
     let token = login(&sim).await;
     let mut irq = hid::Interrupts::new().unwrap();
-    let plan = hid::TypePlan::new(3, &[0, 1], 2);
+    // 30 characters: lower case, then upper case (Shift) from the 27th.
+    let plan = hid::TypePlan::new(30, &[0, 1], 2);
+    let text = page::pattern(30);
     let mut lines = Vec::new();
     hid::type_runs(
         &target(&sim),
@@ -918,23 +952,20 @@ async fn hid_type_runs_type_each_run_on_its_own_websocket_and_release_after_each
     ]) {
         assert!(line.starts_with(want), "{line}");
         assert!(
-            line.contains(&format!("expect page: text 3 {:x}", page::fnv1a32("abc"))),
+            line.contains(&format!("expect page: text 30 {:x}", page::fnv1a32(&text))),
             "{line}"
         );
     }
-    let typed: Vec<Vec<u8>> = [
-        session_start().to_vec(),
-        vec![kbd(0, 0x29), kbd(0, 0)],
-        vec![
-            kbd(0, 0x04),
-            kbd(0, 0),
-            kbd(0, 0x05),
-            kbd(0, 0),
-            kbd(0, 0x06),
-            kbd(0, 0),
-        ],
-    ]
-    .concat();
+    // The US layout's strokes, built here (not with `hid::press`): Shift
+    // (0x02) and nothing else with a shifted character.
+    let strokes: Vec<Vec<u8>> = text
+        .chars()
+        .flat_map(|c| {
+            let s = kvm_proto::keymap::us_stroke(c).unwrap();
+            [kbd(if s.shift { 0x02 } else { 0 }, s.usage), kbd(0, 0)]
+        })
+        .collect();
+    let typed: Vec<Vec<u8>> = [session_start().to_vec(), reset_tap().to_vec(), strokes].concat();
     all_closed(&sim).await;
     for run in 0..4 {
         assert_eq!(hid_on_ws(&sim, 2 * run), typed, "run {run}");
@@ -945,6 +976,9 @@ async fn hid_type_runs_type_each_run_on_its_own_websocket_and_release_after_each
         );
     }
     assert_eq!(ws_opens(&sim), 8);
+    // PD3 R-I1: no stream hid-type sends — runs and releases — holds an Esc
+    // or an Alt/Option prefix.
+    assert_safe_typing(&all_hid(&sim));
     assert_eq!(sim.stats().logins_ok, 1);
     no_logout(&sim);
 }
@@ -1151,7 +1185,7 @@ async fn mid_typing_child(name: &str) {
     // lands in the first run's typing.
     let plan = hid::TypePlan::new(50, &[100], 3);
     let ready = async {
-        // The session start, the Esc pair and the first press are out.
+        // The session start, the reset tap and the first press are out.
         hid_count(&sim, 0, 5).await;
         println!("READY");
     };
@@ -1168,6 +1202,7 @@ async fn mid_typing_child(name: &str) {
     assert_eq!(hid_on_ws(&sim, 2), session_start());
     assert!(hid_on_ws(&sim, 0).len() < 102, "the run went on typing");
     assert_eq!(all_hid(&sim).last(), Some(&kbd(0, 0)));
+    assert_safe_typing(&all_hid(&sim));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(ws_opens(&sim), 3, "a run started after the signal");
     no_logout(&sim);
