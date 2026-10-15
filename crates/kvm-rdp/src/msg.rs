@@ -374,4 +374,50 @@ mod tests {
     fn the_kvm_stream_holds_at_least_the_hard_cap() {
         assert_eq!(kvm_stream_capacity(60), 68);
     }
+
+    /// §4.5, §9.2 (PD10 review m6): an `RdpInput` carries clipboard bytes
+    /// as sensitive as a password; its `Debug` names the variant and
+    /// nothing else — not the slot, not the bytes, not their length.
+    #[test]
+    fn rdp_input_debug_names_the_variant_only() {
+        let text: Vec<u8> = "paste-canary-3e7a"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let cases = [
+            (
+                RdpInput::ClipboardText {
+                    slot: 7,
+                    bytes: text,
+                    answer: Answer::detached(),
+                },
+                "ClipboardText",
+            ),
+            (
+                RdpInput::ClipboardAvailable {
+                    slot: 7,
+                    offer: Offer::detached(true),
+                },
+                "ClipboardAvailable",
+            ),
+            (
+                RdpInput::ClipboardFailed {
+                    slot: 7,
+                    answer: Answer::detached(),
+                },
+                "ClipboardFailed",
+            ),
+            (
+                RdpInput::Fatal {
+                    slot: 7,
+                    cause: Cause::ClipboardOversize,
+                },
+                "Fatal",
+            ),
+        ];
+        for (input, name) in cases {
+            assert_eq!(format!("{input:?}"), name);
+            assert_eq!(format!("{input:#?}"), name);
+        }
+    }
 }
