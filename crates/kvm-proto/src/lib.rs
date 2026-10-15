@@ -19,6 +19,7 @@ pub mod flv;
 pub mod fuzzing;
 pub mod h264;
 pub mod hid;
+pub mod keymap;
 pub mod login;
 pub mod video;
 pub use login::{LoginError, Token, parse_login_token};
