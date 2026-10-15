@@ -175,15 +175,20 @@ struct Bin {
     out: Arc<Mutex<Vec<String>>>,
     /// The two pipe readers (P10): `output` joins them.
     readers: Vec<std::thread::JoinHandle<()>>,
-    ready: Option<std::sync::mpsc::Receiver<SocketAddr>>,
+    ready: Option<std::sync::mpsc::Receiver<(SocketAddr, SocketAddr)>>,
+    /// The admin address from the `kvm-rdp ready` line, once `ready` saw it.
+    admin: Option<SocketAddr>,
 }
 
-fn ready_addr(line: &str) -> Option<SocketAddr> {
+/// The RDP and admin addresses from the `kvm-rdp ready` line.
+fn ready_addr(line: &str) -> Option<(SocketAddr, SocketAddr)> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     if v["fields"]["message"] != "kvm-rdp ready" {
         return None;
     }
-    v["fields"]["rdp"].as_str()?.parse().ok()
+    let rdp = v["fields"]["rdp"].as_str()?.parse().ok()?;
+    let admin = v["fields"]["admin"].as_str()?.parse().ok()?;
+    Some((rdp, admin))
 }
 
 fn message(line: &str) -> Option<String> {
@@ -231,16 +236,25 @@ impl Bin {
             out,
             readers: vec![r1, r2],
             ready: Some(rx),
+            admin: None,
         }
     }
 
-    /// The RDP address from the `kvm-rdp ready` line.
+    /// The RDP address from the `kvm-rdp ready` line (its admin address is
+    /// kept: `admin`).
     async fn ready(&mut self) -> SocketAddr {
         let rx = self.ready.take().unwrap();
-        tokio::task::spawn_blocking(move || rx.recv_timeout(T))
+        let (rdp, admin) = tokio::task::spawn_blocking(move || rx.recv_timeout(T))
             .await
             .unwrap()
-            .expect("the bridge never got ready")
+            .expect("the bridge never got ready");
+        self.admin = Some(admin);
+        rdp
+    }
+
+    /// The admin listener's address, from the ready line.
+    fn admin(&self) -> SocketAddr {
+        self.admin.expect("`ready` first")
     }
 
     fn sigterm(&self) {
@@ -303,17 +317,260 @@ fn press_frame(c: char) -> Vec<u8> {
     .to_vec()
 }
 
-/// What may never reach a log or a `{:?}` for a typed `text` (DC9): the
-/// text, and each of its keystrokes' 12-byte keyboard frames as lowercase
-/// hex and as Rust prints the bytes.
-fn forbidden_for(text: &str) -> Vec<String> {
-    let mut v = vec![text.to_owned()];
-    for c in text.chars() {
-        let f = press_frame(c);
-        v.push(f.iter().map(|b| format!("{b:02x}")).collect());
-        v.push(format!("{f:?}"));
+/// Every way bridge code could print a byte string: Rust's `{:?}`,
+/// `{:x?}`, `{:02x?}` and the uppercase hex forms, and the bytes as hex
+/// (lower and upper case) and decimal, joined by nothing (hex only), a
+/// space, a comma, `", "`, a colon or a dash.
+fn byte_encodings(bytes: &[u8]) -> Vec<String> {
+    let mut v = vec![
+        format!("{bytes:?}"),
+        format!("{bytes:x?}"),
+        format!("{bytes:02x?}"),
+        format!("{bytes:X?}"),
+        format!("{bytes:02X?}"),
+    ];
+    let lower: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let upper: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
+    let dec: Vec<String> = bytes.iter().map(u8::to_string).collect();
+    for sep in ["", " ", ",", ", ", ":", "-"] {
+        v.push(lower.join(sep));
+        v.push(upper.join(sep));
+        if !sep.is_empty() {
+            v.push(dec.join(sep));
+        }
     }
     v
+}
+
+/// What may never appear for one keystroke of `c` (DC9; PD10 review I1):
+/// its 12-byte keyboard frame and its five key slots in every
+/// `byte_encodings` form — which covers `HidFrame`'s, `KeyReport`'s and
+/// tracing's `keys: [22, 0, 0, 0, 0]` / `"keys":"[…]"` shapes — and its
+/// usage code as a field with its value, in decimal and hex
+/// (`usage: 22`, `usage=0x16`, `"usage":22`, …), as `Stroke` or a log
+/// field would show it. `typed`: it came as a scancode, whose
+/// `code: 31`-style shapes are forbidden too (`Event::KeyPressed`'s).
+fn keystroke_encodings(c: char, typed: bool) -> Vec<String> {
+    let s = us_stroke(c).unwrap();
+    let mut v = byte_encodings(&press_frame(c));
+    v.extend(byte_encodings(&[s.usage, 0, 0, 0, 0]));
+    let mut fields = vec![("usage", s.usage)];
+    if typed {
+        fields.push(("code", scancode(c)));
+    }
+    for (name, n) in fields {
+        for value in [n.to_string(), format!("{n:#04x}"), format!("{n:#x}")] {
+            v.push(format!("{name}: {value}"));
+            v.push(format!("{name}={value}"));
+            v.push(format!("\"{name}\":{value}"));
+            v.push(format!("\"{name}\":\"{value}\""));
+        }
+    }
+    v
+}
+
+/// What may never appear for a piece of input text (DC9; PD10 review I1):
+/// the text; its `{:?}`; its characters in `{:?}` and one by one with each
+/// separator; its UTF-16 code units in `{:?}` and hex; and its UTF-8
+/// bytes and its CF_UNICODETEXT bytes (UTF-16LE, with and without the NUL
+/// terminator) in every `byte_encodings` form.
+fn text_encodings(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let utf16: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+    let mut with_nul = utf16.clone();
+    with_nul.extend([0, 0]);
+    let mut v = vec![
+        text.to_owned(),
+        format!("{text:?}"),
+        format!("{chars:?}"),
+        format!("{units:?}"),
+        format!("{units:x?}"),
+        format!("{units:04x?}"),
+    ];
+    let one_by_one: Vec<String> = chars.iter().map(char::to_string).collect();
+    for sep in [" ", ",", ", ", ":"] {
+        v.push(one_by_one.join(sep));
+    }
+    v.extend(byte_encodings(text.as_bytes()));
+    v.extend(byte_encodings(&utf16));
+    v.extend(byte_encodings(&with_nul));
+    v
+}
+
+/// Everything DC9 forbids for the sentinel (typed as scancodes) and the
+/// canary (pasted, then typed by the Typist), deduplicated.
+fn forbidden_input() -> Vec<String> {
+    let mut v = text_encodings(SENTINEL);
+    v.extend(text_encodings(CANARY));
+    v.extend(SENTINEL.chars().flat_map(|c| keystroke_encodings(c, true)));
+    v.extend(CANARY.chars().flat_map(|c| keystroke_encodings(c, false)));
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// `needle` occurs in `hay` as a whole: an occurrence counts only if it is
+/// not the middle of a longer word or number — the character before it
+/// (when the needle starts with a letter or digit) and the one after it
+/// (when it ends with one) are not letters or digits. So `"code":4` never
+/// matches `"code":401`, and `[4, 0, 0, 0, 0]` never matches inside
+/// `[14, 0, 0, 0, 0]`.
+fn appears(hay: &str, needle: &str) -> bool {
+    let alnum = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    let check_before = alnum(needle.chars().next());
+    let check_after = alnum(needle.chars().last());
+    hay.match_indices(needle).any(|(i, m)| {
+        let joined_before = check_before && alnum(hay[..i].chars().last());
+        let joined_after = check_after && alnum(hay[i + m.len()..].chars().next());
+        !joined_before && !joined_after
+    })
+}
+
+/// The decimal and hex forms of every usage and scancode the sentinel and
+/// the canary's keystrokes have: no metric name or label may hold one as a
+/// number of its own (`key_16`, `usage22`).
+fn code_tokens() -> Vec<String> {
+    let mut codes: Vec<u8> = SENTINEL
+        .chars()
+        .chain(CANARY.chars())
+        .map(|c| us_stroke(c).unwrap().usage)
+        .chain(SENTINEL.chars().map(scancode))
+        .collect();
+    codes.sort_unstable();
+    codes.dedup();
+    codes
+        .iter()
+        .flat_map(|n| [n.to_string(), format!("{n:02x}"), format!("{n:x}")])
+        .collect()
+}
+
+/// A metric name or label value is the bridge's own vocabulary: parts
+/// joined by `_`, each lowercase letters and digits starting with a letter
+/// (`clipboard_oversize`, `no_avc420`, the frame type `p`). Label values
+/// are `&'static str` from bridge code (metrics.rs), so input can reach one
+/// only through a bug — and then a pasted word (`paste-canary-3e7a`) or a
+/// keystroke's code (`key_16`, `key_0c`) breaks this shape. (A single
+/// letter of input as its own part, `key_s`, would not: the vocabulary has
+/// one, `p`.)
+fn vocabulary(s: &str) -> bool {
+    s.split('_').all(|p| {
+        p.starts_with(|c: char| c.is_ascii_lowercase())
+            && p.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    })
+}
+
+/// PD10 review I1(b): `/metrics` holds no input — no `forbidden` string
+/// anywhere in the body; every metric name and label (but the histograms'
+/// `le` bounds, numbers by design) in the bridge's `vocabulary`, with no
+/// run of digits in one equal to a sentinel or canary code (`code_tokens`,
+/// two digits or more: `usage22`); every sample value a number.
+fn assert_metrics_hold_no_input(what: &str, body: &str, forbidden: &[String]) {
+    for f in forbidden {
+        assert!(!appears(body, f), "{what}: {f:?} is in /metrics");
+    }
+    let codes = code_tokens();
+    let check = |s: &str| {
+        assert!(vocabulary(s), "{what}: /metrics has {s:?}");
+        for digits in s.split(|c: char| !c.is_ascii_digit()) {
+            assert!(
+                digits.len() < 2 || !codes.iter().any(|t| t == digits),
+                "{what}: /metrics has {s:?}, holding a keystroke's code"
+            );
+        }
+    };
+    let mut samples = 0;
+    for line in body
+        .lines()
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+    {
+        let (series, value) = line
+            .rsplit_once(' ')
+            .unwrap_or_else(|| panic!("{what}: a /metrics line with no value: {line}"));
+        assert!(
+            value == "+Inf" || value.parse::<f64>().is_ok(),
+            "{what}: a /metrics value that is not a number: {line}"
+        );
+        let (name, labels) = match series.split_once('{') {
+            Some((n, rest)) => (n, rest.strip_suffix('}').unwrap_or(rest)),
+            None => (series, ""),
+        };
+        check(name);
+        for pair in labels.split(',').filter(|p| !p.is_empty()) {
+            let (key, v) = pair
+                .split_once('=')
+                .unwrap_or_else(|| panic!("{what}: a /metrics label with no value: {line}"));
+            if key != "le" {
+                check(key);
+                check(v.trim_matches('"'));
+            }
+        }
+        samples += 1;
+    }
+    assert!(samples > 0, "{what}: /metrics was empty");
+}
+
+/// The targets of the input path (core, keys, pointer, paste, the shell,
+/// the CLIPRDR backend, the HID queue and writer), and the only lines they
+/// may log — (target, message, field names): §8's "no text" refusal.
+/// Content-independent (PD10 review I1(c)): a new log line on the input
+/// path fails here until it is reviewed and listed, whatever it formats.
+const INPUT_TARGETS: [&str; 4] = [
+    "kvm_rdp::input",
+    "kvm_rdp::rdp::input",
+    "kvm_rdp::rdp::clipboard",
+    "kvm_rdp::hid",
+];
+const INPUT_LINES: [(&str, &str, &[&str]); 1] = [(
+    "kvm_rdp::rdp::input",
+    "paste chord with no text on the clipboard",
+    &[],
+)];
+
+fn assert_input_path_lines_allowed(what: &str, v: &serde_json::Value, line: &str) {
+    let target = v["target"].as_str().unwrap_or("");
+    if !INPUT_TARGETS
+        .iter()
+        .any(|t| target == *t || target.starts_with(&format!("{t}::")))
+    {
+        return;
+    }
+    let message = v["fields"]["message"].as_str().unwrap_or("");
+    let mut fields: Vec<&str> = v["fields"]
+        .as_object()
+        .map(|o| {
+            o.keys()
+                .map(String::as_str)
+                .filter(|k| *k != "message")
+                .collect()
+        })
+        .unwrap_or_default();
+    fields.sort_unstable();
+    assert!(
+        INPUT_LINES
+            .iter()
+            .any(|(t, m, f)| *t == target && *m == message && *f == fields.as_slice()),
+        "{what}: an input-path log line no one has reviewed: {line}"
+    );
+}
+
+/// `GET path` on `addr`: the body.
+async fn http_get(addr: SocketAddr, path: &str) -> String {
+    let mut s = admin_connect(addr).await;
+    s.write_all(format!("GET {path} HTTP/1.1\r\nHost: l2\r\nConnection: close\r\n\r\n").as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    tokio::time::timeout(T, s.read_to_end(&mut buf))
+        .await
+        .expect("an admin answer within T")
+        .unwrap();
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    assert!(text.starts_with("HTTP/1.1 200"), "GET {path}: {text}");
+    text.split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default()
 }
 
 /// `frames` holds `text`'s presses in order (anything may lie between:
@@ -471,26 +728,27 @@ fn no_debug_shows_input() {
     for (a, b) in real.iter().zip(&other) {
         assert_eq!(a, b, "a Debug shows what was typed or pasted");
     }
-    let forbidden: Vec<String> = forbidden_for(SENTINEL)
-        .into_iter()
-        .chain(forbidden_for(CANARY))
-        .collect();
+    let forbidden = forbidden_input();
     for line in &real {
         for f in &forbidden {
-            assert!(!line.contains(f.as_str()), "{f:?} is in a Debug: {line}");
+            assert!(!appears(line, f), "{f:?} is in a Debug: {line}");
         }
     }
 }
 
 /// §11.3 secrets hygiene, both filters: an NLA session whose password is
 /// the canary, a keystroke sentinel typed and a paste canary pasted through
-/// it (DC9), then SIGTERM. Neither canary, the sentinel, their keystrokes'
-/// frame bytes, the KVM password, NTLM (raw or base64) nor a token query
-/// reaches stdout or stderr; no DEBUG or TRACE line from
+/// it (DC9), then SIGTERM. In stdout and stderr: neither the sentinel nor
+/// the paste canary in any encoding (`forbidden_input`: the text, its
+/// characters, bytes and code units, each keystroke's frame, key slots and
+/// codes; PD10 review I1), nor the NLA canary, the KVM password, NTLM (raw
+/// or base64) or a token query; no line from the input path but the
+/// reviewed ones (`INPUT_LINES`); no DEBUG or TRACE line from
 /// `ironrdp_*`/`sspi`; at least one TRACE line from bridge code;
 /// `SSLKEYLOGFILE` is never created. The shutdown's own lines are in the
-/// log checked (P10). Nor does any `{:?}` the input path could emit show
-/// the input (`no_debug_shows_input`).
+/// log checked (P10). `/metrics`, read before the SIGTERM, holds none of it
+/// either (`assert_metrics_hold_no_input`). Nor does any `{:?}` the input
+/// path could emit show the input (`no_debug_shows_input`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secrets_never_reach_the_logs() {
     no_debug_shows_input();
@@ -537,6 +795,8 @@ async fn secrets_never_reach_the_logs() {
                 hid_on(&l, ws)
             )
         });
+        // PD10 review I1(b): what a scrape would show, while it holds input.
+        let metrics = http_get(bin.admin(), "/metrics").await;
         bin.sigterm();
         assert!(bin.wait(T).await.success(), "{filter}");
         let out = bin.output();
@@ -546,16 +806,21 @@ async fn secrets_never_reach_the_logs() {
             "{filter}: the shutdown's last lines are not in the log checked (P10)"
         );
         let all = out.join("\n");
-        let fixed = [NLA, sim.password(), "NTLMSSP", "TlRMTVNTUA", "token="].map(str::to_owned);
-        let input = forbidden_for(SENTINEL)
-            .into_iter()
-            .chain(forbidden_for(CANARY));
-        for secret in fixed.into_iter().chain(input) {
+        // Anywhere, even inside a word.
+        for secret in [NLA, sim.password(), "NTLMSSP", "TlRMTVNTUA", "token="] {
             assert!(
-                !all.contains(secret.as_str()),
+                !all.contains(secret) && !metrics.contains(secret),
+                "{filter}: {secret:?} reached the logs or /metrics"
+            );
+        }
+        let input = forbidden_input();
+        for secret in &input {
+            assert!(
+                !appears(&all, secret),
                 "{filter}: {secret:?} reached the logs"
             );
         }
+        assert_metrics_hold_no_input(filter, &metrics, &input);
         let mut bridge_trace = false;
         for line in &out {
             let v: serde_json::Value = serde_json::from_str(line)
@@ -567,6 +832,7 @@ async fn secrets_never_reach_the_logs() {
             if target.starts_with("ironrdp") || target.starts_with("sspi") {
                 assert!(!matches!(level, "DEBUG" | "TRACE"), "{filter}: {line}");
             }
+            assert_input_path_lines_allowed(filter, &v, line);
             bridge_trace |= level == "TRACE" && target.starts_with("kvm_rdp");
         }
         assert!(
