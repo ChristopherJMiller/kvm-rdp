@@ -98,11 +98,18 @@ async fn read_head(sock: &mut TcpStream) -> std::io::Result<Head> {
             return Ok(Head::Closed);
         }
         buf.extend_from_slice(chunk.get(..n).unwrap_or(&[]));
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            return Ok(Head::Complete(buf));
-        }
-        if buf.len() > MAX_REQUEST_HEAD {
-            return Ok(Head::TooLarge);
+        // The size before the terminator (final review Minor 6): a head
+        // whose `\r\n\r\n` ends past 2 KiB is too large even when it arrived
+        // in the read that crossed the limit.
+        let end = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .map(|at| at.saturating_add(4));
+        match end {
+            Some(len) if len <= MAX_REQUEST_HEAD => return Ok(Head::Complete(buf)),
+            Some(_) => return Ok(Head::TooLarge),
+            None if buf.len() > MAX_REQUEST_HEAD => return Ok(Head::TooLarge),
+            None => {}
         }
     }
 }
@@ -256,5 +263,27 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(n, 0, "the silent connection is closed by the server");
+    }
+
+    /// Final review Minor 6 (§4.5): a head over 2 KiB is answered 431 even
+    /// when its terminator arrives in the read that crosses the limit (one
+    /// 512-byte read past 2 KiB); a head of exactly 2 KiB is served.
+    #[tokio::test]
+    async fn a_head_over_2_kib_is_always_431() {
+        let (addr, _, _) = start(Duration::from_secs(10)).await;
+        let head = |len: usize| {
+            let mut h = b"GET /livez HTTP/1.1\r\nX-Pad: ".to_vec();
+            let pad = len - h.len() - 4;
+            h.extend(std::iter::repeat_n(b'a', pad));
+            h.extend_from_slice(b"\r\n\r\n");
+            assert_eq!(h.len(), len);
+            h
+        };
+        let r = raw(addr, &head(MAX_REQUEST_HEAD)).await;
+        assert!(r.starts_with("HTTP/1.1 200"), "{r}");
+        for len in [MAX_REQUEST_HEAD + 1, 2100, MAX_REQUEST_HEAD + 511] {
+            let r = raw(addr, &head(len)).await;
+            assert!(r.starts_with("HTTP/1.1 431"), "{len} bytes: {r}");
+        }
     }
 }

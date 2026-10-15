@@ -34,6 +34,7 @@ amended passage below is marked "rev 6.2". One line per change:
 - DC15 (§4.4, §9.1): `security.accept_rate` counts admitted attempts only; refusals are logged once, then at most once per 10 s with a count.
 - DC16 (§4.5): `/readyz` means "TLS identity loaded and `GetLocalAddr` answered".
 - §4.5 (P17, PC4 M1): the admin listener serves at most 32 connections at once and drops the rest unanswered.
+- §4.5 (final review Minor 6): a request head is over 2 KiB by where its blank line ends, so one whose terminator arrives in the read that crosses the limit is still answered 431.
 - DC17 (§11.2): the L1 rig decodes `GraphicsPipelineServer`'s output with IronRDP's own PDU types, not `GraphicsPipelineClient`.
 - DC18 (§5.2, §8, §9.3, §11.6, §12, §15): §11.6's five L4 hardware checks move to Plan D's first task; Plan C adds four more to that list (§11.6).
 - DC19 (§12): CI gains a job timeout and a tracked-secrets gate ahead of Plan E.
@@ -520,7 +521,9 @@ Windows App run retunes (§12):
   at 1 s). `/readyz` succeeds
   once the TLS identity is loaded and the RDP listener is bound (rev 6.2: `ServerEvent::GetLocalAddr` answered); it never
   checks the KVM. Each request head is bounded (rev 6.2): over 2 KiB is
-  answered 431, one not complete within 2 s is dropped, and at most 32
+  answered 431 (final review Minor 6: measured to the end of its blank
+  line, whatever read that arrives in), one not complete within 2 s is
+  dropped, and at most 32
   connections are served at once — past that a connection is dropped
   unanswered rather than queued, so a scanner on 9464 cannot grow work on the
   KVM runtime the listener shares with the session actor; `/livez` answers
