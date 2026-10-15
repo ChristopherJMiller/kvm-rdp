@@ -2831,6 +2831,36 @@ mod tests {
             "a Return was typed: {}",
             show(&out)
         );
+        // PD7 review m1 through the core: the same line with one odd byte
+        // appended and no terminator (a hostile client) types the line, and
+        // never a Return; the odd byte is the one skip.
+        let mut r = Rig::new();
+        r.room = 8;
+        let mut bytes = utf16le("ls\r\n");
+        bytes.push(0x41);
+        hold_chord(&mut r);
+        r.step(chord_event());
+        for code in [0x2F, 0x1D, 0x38, 0x2A] {
+            r.step(Event::KeyReleased {
+                code,
+                extended: false,
+            });
+        }
+        let out = r.step(Event::ClipboardText(bytes));
+        assert_eq!(
+            outcomes(&out),
+            [&PasteOutcome::Done {
+                typed: 2,
+                skipped: 1
+            }],
+            "{}",
+            show(&out)
+        );
+        assert!(
+            !pushes_usage(&out, 0x28),
+            "a Return was typed: {}",
+            show(&out)
+        );
     }
 
     /// D9c: a new session forgets the paste and the clipboard's

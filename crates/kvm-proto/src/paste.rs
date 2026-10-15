@@ -94,13 +94,23 @@ pub struct Skips {
 /// refuse any text that still holds a break; turn CRLF/CR/LF into one
 /// Return each and keep Tab; skip other controls and characters the US
 /// layout cannot type (counted per Unicode scalar); cap at `max_chars`.
+///
+/// "Trailing" looks past what the skip step drops (PD7 review m1): a break
+/// followed only by skipped scalars — an ill-formed unit's U+FFFD, a
+/// control, a zero-width space — is the trailing break, so one appended
+/// ill-formed unit can never turn a copied line's break into a typed
+/// Enter. The skipped tail is still counted, after the text.
 #[must_use]
 pub fn prepare(text: &str, policy: &PastePolicy) -> (Prepared, Skips) {
-    let trimmed = text
+    // The text up to its last typeable scalar or line break ('\r' has no
+    // stroke of its own); the rest is skipped whatever happens to it.
+    let body = text.trim_end_matches(|c: char| c != '\r' && us_stroke(c).is_none());
+    let tail = text.get(body.len()..).unwrap_or("");
+    let trimmed = body
         .strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .or_else(|| text.strip_suffix('\r'))
-        .unwrap_or(text);
+        .or_else(|| body.strip_suffix('\n'))
+        .or_else(|| body.strip_suffix('\r'))
+        .unwrap_or(body);
     if policy.multiline_refuse && trimmed.contains(['\n', '\r']) {
         return (
             Prepared::RefusedMultiline,
@@ -114,7 +124,7 @@ pub fn prepare(text: &str, policy: &PastePolicy) -> (Prepared, Skips) {
     let unified = trimmed.replace("\r\n", "\n").replace('\r', "\n");
     let mut kept: Vec<char> = Vec::new();
     let mut skipped = 0usize;
-    for c in unified.chars() {
+    for c in unified.chars().chain(tail.chars()) {
         if kept.len() >= policy.max_chars {
             break;
         }
@@ -353,6 +363,79 @@ mod tests {
         assert_eq!(prepare(&s, &policy(false, 4096)).1.skipped, 1);
     }
 
+    /// PD7 review m1: a trailing line break followed only by what §8 skips
+    /// — an odd byte or a lone surrogate (each a U+FFFD), a zero-width or a
+    /// no-break space, a control — is still the trailing break: removed,
+    /// never typed as a Return, and never refused as multiline. A hostile
+    /// client cannot turn a copied line's break into an Enter by appending
+    /// one ill-formed unit. What the tail holds is still skipped and counted.
+    #[test]
+    fn a_trailing_break_followed_only_by_skipped_units_is_still_trimmed() {
+        let mut bytes: Vec<u8> = "ls\r\n".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let golden = |bytes: &[u8], what: &str| {
+            let (text, bad) = decode_utf16le(bytes);
+            for refuse in [false, true] {
+                let (p, s) = prepare(&text, &policy(refuse, 4096));
+                assert_eq!(p, Prepared::Text(vec!['l', 's']), "{what}, refuse={refuse}");
+                assert_eq!(
+                    s,
+                    Skips {
+                        kept: 2,
+                        skipped: 1
+                    },
+                    "{what}"
+                );
+            }
+            bad
+        };
+        // The review's case: "ls\r\n" and one odd byte, no terminator.
+        let mut odd = bytes.clone();
+        odd.push(0x41);
+        assert_eq!(golden(&odd, "an odd byte"), 1);
+        // A lone surrogate tail, either half.
+        for half in [0xD8u8, 0xDC] {
+            let mut lone = bytes.clone();
+            lone.extend_from_slice(&[0x00, half]);
+            assert_eq!(golden(&lone, "a lone surrogate"), 1);
+        }
+        // A skipped-scalar tail: well-formed, but untypeable.
+        for tail in ["\u{200B}", "\u{A0}", "\u{1F600}", "\u{7}", "\u{FEFF}"] {
+            let mut t: Vec<u8> = tail.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            t.splice(0..0, bytes.iter().copied());
+            assert_eq!(golden(&t, tail), 0);
+        }
+        // Several skipped units, and a bare LF or CR before them.
+        bytes = "ls\n\u{200B}\u{A0}"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        bytes.push(0x41);
+        let (p, s) = prepare(&decode_utf16le(&bytes).0, &policy(true, 4096));
+        assert_eq!((p, s.skipped), (Prepared::Text(vec!['l', 's']), 3));
+        assert_eq!(
+            prepare("ls\r\u{7}", &policy(true, 4096)).0,
+            Prepared::Text(vec!['l', 's'])
+        );
+        // What is typeable after the break — a Tab, a space, a letter — is
+        // text: the break is inside it, and is typed (or refused).
+        for tail in ["\t", " ", "x"] {
+            let text = format!("ls\r\n{tail}");
+            let (p, _) = prepare(&text, &policy(false, 4096));
+            let mut want = vec!['l', 's', '\n'];
+            want.extend(tail.chars());
+            assert_eq!(p, Prepared::Text(want), "{tail:?}");
+            assert_eq!(
+                prepare(&text, &policy(true, 4096)).0,
+                Prepared::RefusedMultiline
+            );
+        }
+        // Only one trailing break goes, skipped tail or not.
+        assert_eq!(
+            prepare("a\r\n\r\n\u{200B}", &policy(false, 4096)).0,
+            Prepared::Text(vec!['a', '\n'])
+        );
+    }
+
     /// §8: CR, LF and CRLF are one Return each inside the text; only one
     /// trailing break is removed, and multiline = refuse sees what is left.
     #[test]
@@ -513,6 +596,14 @@ mod tests {
             let max = (rng.next() % 40) as usize;
             let refuse = rng.next().is_multiple_of(2);
             let (p, s) = prepare(&text, &policy(refuse, max));
+            // m1: appending what §8 skips never changes what is typed or
+            // refused — only the count (when the cap left room for it).
+            let tails = ["\u{FFFD}", "\u{200B}", "\u{7}", "\u{1F600}\u{A0}"];
+            let tail = tails[(rng.next() % 4) as usize];
+            let (p2, s2) = prepare(&format!("{text}{tail}"), &policy(refuse, max));
+            assert_eq!(p2, p, "round {round}: a skipped tail changed the text");
+            assert_eq!(s2.kept, s.kept, "round {round}");
+            assert!(s2.skipped >= s.skipped, "round {round}");
             let chars = match p {
                 Prepared::RefusedMultiline => {
                     assert!(refuse, "round {round}");
