@@ -258,6 +258,15 @@ impl Keyboard {
         true
     }
 
+    /// m6 (PD5 review): forget every released-by-bridge mark. Only a
+    /// Synchronize does this — the client has resynced (MS-RDPBCGR: "all
+    /// keys up", then key-downs for what is still held), so a stale mark
+    /// must not swallow the next fresh press (a Cmd lost, Cmd+C typed as
+    /// 'c').
+    pub fn forget_released_by_bridge(&mut self) {
+        self.rbb.clear();
+    }
+
     /// §7.4: everything up, zeroed. Held keys AND held modifiers (D3a)
     /// become released-by-bridge, so their repeats are ignored until the
     /// client releases them; `dropped` if `MAX_RBB` could not hold one.

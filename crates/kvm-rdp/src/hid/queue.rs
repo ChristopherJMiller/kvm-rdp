@@ -25,6 +25,12 @@ pub enum ReleaseTrigger {
     Shutdown,
     WebsocketReconnect,
     Suppression,
+    /// The client's `Synchronize` (§7.4), raised by the input core.
+    Synchronize,
+    /// `key_repeat_timeout` (§7.4), raised by the input core's timer.
+    KeyRepeat,
+    /// `modifier_idle_timeout` (§7.4), raised by the input core's timer.
+    ModifierIdle,
 }
 
 impl ReleaseTrigger {
@@ -38,6 +44,9 @@ impl ReleaseTrigger {
             ReleaseTrigger::Shutdown => "shutdown",
             ReleaseTrigger::WebsocketReconnect => "websocket_reconnect",
             ReleaseTrigger::Suppression => "suppression",
+            ReleaseTrigger::Synchronize => "synchronize",
+            ReleaseTrigger::KeyRepeat => "key_repeat",
+            ReleaseTrigger::ModifierIdle => "modifier_idle",
         }
     }
 }
@@ -388,6 +397,24 @@ mod tests {
             ]
         );
         assert_eq!(c.metrics.hid_reports_coalesced.get(), 1);
+    }
+
+    /// §10.4: the input core's three triggers (Task 2.2) widen the
+    /// `release_all{trigger}` family, each under its own label.
+    #[test]
+    fn the_input_cores_triggers_are_counted_under_their_labels() {
+        let c = ctl(4);
+        for (t, label) in [
+            (ReleaseTrigger::Synchronize, "synchronize"),
+            (ReleaseTrigger::KeyRepeat, "key_repeat"),
+            (ReleaseTrigger::ModifierIdle, "modifier_idle"),
+        ] {
+            assert_eq!(t.label(), label);
+            let before = c.epoch();
+            c.release_all(t);
+            assert_eq!(c.epoch(), before + 1);
+            assert_eq!(c.metrics.release_all.get(label), 1);
+        }
     }
 
     /// §7.3: release-all bumps the epoch; nothing queued before it is sent

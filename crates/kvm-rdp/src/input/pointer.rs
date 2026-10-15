@@ -121,6 +121,25 @@ impl Pointer {
         self.buttons = 0;
     }
 
+    /// m6 (PD5 review): forget the released-by-bridge buttons — only on a
+    /// Synchronize, after which the client re-sends what it still holds.
+    pub fn forget_released_by_bridge(&mut self) {
+        self.rbb_buttons = 0;
+    }
+
+    /// The buttons held (bits 0/1/2, §7.2).
+    #[must_use]
+    pub fn held_buttons(&self) -> u8 {
+        self.buttons
+    }
+
+    /// `b` was released by the bridge and its client release has not come
+    /// (§7.4, D3b) — `Keyboard::is_released_by_bridge`'s counterpart.
+    #[must_use]
+    pub fn is_released_by_bridge(&self, b: Button) -> bool {
+        self.rbb_buttons & b.bit() != 0
+    }
+
     /// RDP's ±120-per-notch rotation accumulated; one wheel frame per whole
     /// notch (§7.2, §3.3), with the current button mask.
     pub fn wheel(&mut self, units: i16) -> Vec<HidFrame> {
