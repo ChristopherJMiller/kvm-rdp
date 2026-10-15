@@ -13,6 +13,7 @@ use crate::msg::{Generations, KvmCommand, KvmEvent, RdpInput, kvm_stream_capacit
 use crate::pump::PumpConfig;
 use crate::pump::shell::{PumpShell, ShellDeps};
 use crate::rdp::accept::{AcceptRate, HANDSHAKE_GRACE, Handshakes};
+use crate::rdp::clipboard::{ClipFactory, ClipSlot, ServerEvents};
 use crate::rdp::display::{BridgeDisplay, DisplayShared};
 use crate::rdp::gfx::{GfxFactory, GfxSlot};
 use crate::rdp::handler::Lifecycle;
@@ -23,7 +24,7 @@ use ironrdp_server::ServerEvent;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::signal::unix::{Signal, SignalKind};
@@ -245,6 +246,10 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
     let suppressed = Arc::new(AtomicBool::new(false));
     let rtt = Arc::new(AtomicU32::new(u32::MAX));
     let gfx_slot = GfxSlot::default();
+    let clip_slot = ClipSlot::default();
+    // IronRDP's `ServerEvent` sender, filled inside `RdpServer::new` (D9a);
+    // Task 4.1 hands a clone to the input shell too.
+    let server_events = ServerEvents::default();
     let pump_cfg = PumpConfig::from_config(&cfg);
     let (to_kvm, kvm_cmds) = mpsc::unbounded_channel();
     let (kvm_tx, kvm_events) = mpsc::channel(kvm_stream_capacity(pump_cfg.hard_cap));
@@ -329,11 +334,19 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
                 pump_cfg.hard_cap,
                 metrics.clone(),
             ),
+            cliprdr: ClipFactory::new(
+                Arc::new(AtomicU64::new(0)),
+                clip_slot.clone(),
+                to_pump.clone(),
+                cfg.paste.max_bytes,
+                server_events,
+            ),
             lifecycle: Lifecycle {
                 gens: gens.clone(),
                 accepting: accepting.clone(),
                 rate: AcceptRate::new(cfg.security.accept_rate, cfg.security.accept_window),
                 gfx: gfx_slot,
+                clip: clip_slot,
                 hid: hid.clone(),
                 metrics: metrics.clone(),
                 to_pump: to_pump.clone(),

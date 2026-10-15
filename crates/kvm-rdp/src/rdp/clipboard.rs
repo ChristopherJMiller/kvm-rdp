@@ -1,0 +1,864 @@
+//! Clipboard paste (§8), server side: IronRDP's `CliprdrServer` with a
+//! backend that advertises nothing, records only whether Unicode text is
+//! offered, and hands a format-data response to the input shell. One
+//! backend per connection, tagged with its slot as the GFX handle is
+//! (§4.3): `build_cliprdr_backend` mints the slot and records it as the
+//! latest, `on_connection_info` binds it into the session's `SessionStart`,
+//! and the pump shell drops a word from any other slot or from an ended
+//! generation. One way only: nothing reads the Mac's clipboard, and no
+//! request from the client is answered.
+//!
+//! The client is untrusted (§9.3). IronRDP reassembles a response before
+//! the backend sees it (§8 accepts that bound); the backend checks its
+//! length against `paste.max_bytes` before it copies a byte. Over the cap
+//! the session ends (`clipboard_oversize`, through `RdpInput::Fatal`) and
+//! the backend says nothing more. A response the bridge never asked for
+//! reaches the input core like any other, which types one only for a
+//! pending paste that has no text yet (DD4). The data is never logged or
+//! Debug-formatted (§9.2).
+//!
+//! The callbacks run inside IronRDP's channel processing on the RDP
+//! thread: they only push to the pump's channel — no lock, no call into
+//! IronRDP.
+use crate::msg::{Cause, Gen, Generations, RdpInput};
+use crate::pump::Input;
+use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory};
+use ironrdp_cliprdr::pdu::{
+    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
+    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+};
+use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use tokio::sync::mpsc::UnboundedSender;
+
+/// The latest connection's CLIPRDR backend slot.
+pub type ClipSlot = Arc<Mutex<Option<u64>>>;
+
+/// IronRDP's `ServerEvent` sender. It exists only once `RdpServer::new`
+/// has run (it calls `set_sender` on this factory, server.rs:1647–1648),
+/// after `ServerParts` is built, so the input shell reads it from this
+/// shared cell (D9a).
+pub type ServerEvents = Arc<OnceLock<UnboundedSender<ServerEvent>>>;
+
+/// `on_connection_info`: take the slot of the backend built for this
+/// connection (IronRDP builds it in `attach_channels`, beside the GFX
+/// handle, before that connection's `on_connection_info`).
+#[must_use]
+pub fn take_latest_clip(slot: &ClipSlot) -> Option<u64> {
+    slot.lock().unwrap_or_else(PoisonError::into_inner).take()
+}
+
+/// What the pump shell steps for an `RdpInput::Fatal` from its current
+/// link's clip slot, given that link's generation — as
+/// `rdp::gfx::closed_channel_input` is for EGFX. While the generation is
+/// current, the session closes with `cause`. Once `on_disconnected` has
+/// ended it (its `SessionStop` still queued behind this word), the client
+/// has gone already: `None`, or the pump would count a
+/// `clipboard_oversize` disconnect that never happens (D17).
+#[must_use]
+pub fn fatal_input(gens: &Generations, generation: Gen, cause: Cause) -> Option<Input> {
+    gens.is_current(generation)
+        .then_some(Input::UpstreamFatal(cause))
+}
+
+pub struct ClipFactory {
+    slot_src: Arc<AtomicU64>,
+    latest: ClipSlot,
+    to_pump: UnboundedSender<RdpInput>,
+    max_bytes: usize,
+    events: ServerEvents,
+}
+
+impl ClipFactory {
+    #[must_use]
+    pub fn new(
+        slot_src: Arc<AtomicU64>,
+        latest: ClipSlot,
+        to_pump: UnboundedSender<RdpInput>,
+        max_bytes: usize,
+        events: ServerEvents,
+    ) -> ClipFactory {
+        ClipFactory {
+            slot_src,
+            latest,
+            to_pump,
+            max_bytes,
+            events,
+        }
+    }
+}
+
+impl ServerEventSender for ClipFactory {
+    /// Called once, inside `RdpServer::new`: keep the sender for the input
+    /// shell's `SendInitiatePaste` (Task 4.1). A second call keeps the
+    /// first.
+    fn set_sender(&mut self, sender: UnboundedSender<ServerEvent>) {
+        let _ = self.events.set(sender);
+    }
+}
+
+impl CliprdrBackendFactory for ClipFactory {
+    fn build_cliprdr_backend(&self) -> Box<dyn CliprdrBackend> {
+        let slot = self
+            .slot_src
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+            .max(1);
+        *self.latest.lock().unwrap_or_else(PoisonError::into_inner) = Some(slot);
+        Box::new(ClipBackend {
+            slot,
+            to_pump: self.to_pump.clone(),
+            max_bytes: self.max_bytes,
+            ended: false,
+        })
+    }
+}
+
+impl CliprdrServerFactory for ClipFactory {}
+
+struct ClipBackend {
+    slot: u64,
+    to_pump: UnboundedSender<RdpInput>,
+    max_bytes: usize,
+    /// It sent its `Fatal`: the session is ending, and nothing more from
+    /// this connection's clipboard goes anywhere.
+    ended: bool,
+}
+
+// `CliprdrBackend: AsAny + Debug + Send`, and `AsAny` has no blanket impl
+// (ironrdp-core as_any.rs) — D1c.
+ironrdp_core::impl_as_any!(ClipBackend);
+
+impl std::fmt::Debug for ClipBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never clipboard contents (§9.2). This backend holds none, but a
+        // derive would become a leak the day a field did.
+        f.debug_struct("ClipBackend")
+            .field("slot", &self.slot)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CliprdrBackend for ClipBackend {
+    fn temporary_directory(&self) -> &str {
+        "." // The client role's; no file transfer (§8 non-goals).
+    }
+
+    /// §8: the server advertises no clipboard capabilities of its own.
+    fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+        ClipboardGeneralCapabilityFlags::empty()
+    }
+
+    fn on_ready(&mut self) {}
+
+    /// Only a client is asked for its format list (a hostile client's
+    /// Monitor Ready lands here): the server offers nothing.
+    fn on_request_format_list(&mut self) {}
+
+    fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
+
+    /// The client announced its formats: record only whether Unicode text
+    /// — the one format the bridge requests — is there (D18). A client
+    /// that offers only ANSI text gets a `no_text` refusal at once, not a
+    /// wait that ends in `modifier_wait`.
+    fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
+        if self.ended {
+            return;
+        }
+        let text = formats
+            .iter()
+            .any(|f| f.id() == ClipboardFormatId::CF_UNICODETEXT);
+        let _ = self.to_pump.send(RdpInput::ClipboardAvailable {
+            slot: self.slot,
+            text,
+        });
+    }
+
+    /// The client asks for the server's clipboard: never answered (§8, one
+    /// way).
+    fn on_format_data_request(&mut self, _request: FormatDataRequest) {}
+
+    /// A response to the bridge's request — or one nobody asked for, which
+    /// IronRDP forwards just the same. Its length is checked before a byte
+    /// is copied: over `paste.max_bytes` → fatal `clipboard_oversize`
+    /// (§8), counted once by the pump's `close` (D17); the backend counts
+    /// nothing and says nothing more. A CB_RESPONSE_FAIL types nothing.
+    /// Never logged.
+    fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        if self.ended || response.is_error() {
+            return;
+        }
+        let data = response.data();
+        if data.len() > self.max_bytes {
+            self.ended = true;
+            let _ = self.to_pump.send(RdpInput::Fatal {
+                slot: self.slot,
+                cause: Cause::ClipboardOversize,
+            });
+            return;
+        }
+        let _ = self.to_pump.send(RdpInput::ClipboardText {
+            slot: self.slot,
+            bytes: data.to_vec(),
+        });
+    }
+
+    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
+
+    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
+
+    fn on_lock(&mut self, _data_id: LockDataId) {}
+
+    fn on_unlock(&mut self, _data_id: LockDataId) {}
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic
+    )]
+    use super::*;
+    use crate::input::{Ctx, Event, InputCore, Out, PasteOutcome};
+    use ironrdp_cliprdr::backend::ClipboardMessage;
+    use ironrdp_cliprdr::pdu::{ClipboardPdu, FileContentsFlags, OwnedFormatDataResponse};
+    use ironrdp_cliprdr::{Cliprdr, CliprdrClient, CliprdrServer};
+    use ironrdp_svc::{StaticVirtualChannel, SvcMessage};
+    use kvm_proto::hid::HidFrame;
+    use kvm_proto::keymap::Chord;
+    use std::time::{Duration, Instant};
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    fn factory_with(
+        max_bytes: usize,
+    ) -> (
+        ClipFactory,
+        ClipSlot,
+        UnboundedReceiver<RdpInput>,
+        ServerEvents,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let latest = ClipSlot::default();
+        let events = ServerEvents::default();
+        let f = ClipFactory::new(
+            Arc::new(AtomicU64::new(0)),
+            latest.clone(),
+            tx,
+            max_bytes,
+            events.clone(),
+        );
+        (f, latest, rx, events)
+    }
+
+    fn factory() -> (ClipFactory, ClipSlot, UnboundedReceiver<RdpInput>) {
+        let (f, slot, rx, _) = factory_with(64 * 1024);
+        (f, slot, rx)
+    }
+
+    fn utf16z(s: &str) -> Vec<u8> {
+        let mut b: Vec<u8> = s.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        b.extend([0, 0]);
+        b
+    }
+
+    /// The backend advertises nothing of its own (§8: the server advertises
+    /// no clipboard capabilities).
+    #[test]
+    fn the_backend_advertises_no_capabilities() {
+        let (f, _slot, _rx) = factory();
+        let b = f.build_cliprdr_backend();
+        assert!(b.client_capabilities().is_empty());
+    }
+
+    /// `build_cliprdr_backend` mints a slot and records it as the latest,
+    /// as the GFX factory does; the backend tags its inputs with it. Only
+    /// CF_UNICODETEXT — the one format the bridge requests — is text (D18).
+    #[test]
+    fn a_backend_mints_and_records_its_slot() {
+        let (f, slot, mut rx) = factory();
+        let mut b = f.build_cliprdr_backend();
+        assert_eq!(take_latest_clip(&slot), Some(1));
+        b.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardAvailable {
+                slot: 1,
+                text: true
+            })
+        ));
+        b.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_BITMAP)]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardAvailable {
+                slot: 1,
+                text: false
+            })
+        ));
+        b.on_remote_copy(&[
+            ClipboardFormat::new(ClipboardFormatId::CF_TEXT),
+            ClipboardFormat::new(ClipboardFormatId::CF_OEMTEXT),
+        ]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardAvailable {
+                slot: 1,
+                text: false
+            })
+        ));
+        // A second connection's backend gets the next slot, and is latest.
+        let mut b2 = f.build_cliprdr_backend();
+        assert_eq!(take_latest_clip(&slot), Some(2));
+        assert_eq!(take_latest_clip(&slot), None, "taken once");
+        b2.on_remote_copy(&[]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardAvailable {
+                slot: 2,
+                text: false
+            })
+        ));
+    }
+
+    /// D9a: IronRDP hands the factory its `ServerEvent` sender; the input
+    /// shell reads it from the shared cell. Set once: a second sender does
+    /// not replace the first.
+    #[test]
+    fn set_sender_fills_the_shared_cell_once() {
+        let (mut f, _slot, _rx, events) = factory_with(64);
+        assert!(events.get().is_none());
+        let (tx, _erx) = tokio::sync::mpsc::unbounded_channel();
+        f.set_sender(tx.clone());
+        assert!(events.get().is_some());
+        let (other, _orx) = tokio::sync::mpsc::unbounded_channel();
+        f.set_sender(other);
+        assert!(events.get().unwrap().same_channel(&tx));
+    }
+
+    /// A text response under the cap becomes `ClipboardText`; an oversize
+    /// one becomes `Fatal(ClipboardOversize)` (§8), and the data is never
+    /// Debug-formatted (§9.2: assert by construction — no Debug call here).
+    /// An error response types nothing. (Its order differs from the
+    /// brief's: a backend says nothing after its `Fatal`, so the error
+    /// response comes first, where its silence means something.)
+    #[test]
+    fn a_response_routes_text_or_a_fatal_oversize() {
+        let (f, _slot, mut rx, _) = factory_with(8);
+        let mut b = f.build_cliprdr_backend();
+        b.on_format_data_response(FormatDataResponse::new_unicode_string("hi"));
+        assert!(
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes }) if bytes == utf16z("hi"))
+        );
+        // An error response types nothing.
+        b.on_format_data_response(FormatDataResponse::new_error());
+        assert!(rx.try_recv().is_err());
+        b.on_format_data_response(FormatDataResponse::new_unicode_string("far too long"));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::Fatal {
+                slot: 1,
+                cause: Cause::ClipboardOversize
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// §8's cap is `paste.max_bytes` after reassembly: exactly that many
+    /// bytes are text, one more ends the session. The length is checked
+    /// before a byte is copied.
+    #[test]
+    fn exactly_max_bytes_is_text_and_one_byte_more_is_fatal() {
+        let (f, _slot, mut rx, _) = factory_with(6);
+        let mut b = f.build_cliprdr_backend();
+        b.on_format_data_response(FormatDataResponse::new_data(utf16z("hi")));
+        assert!(
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes }) if bytes == utf16z("hi"))
+        );
+        b.on_format_data_response(FormatDataResponse::new_data(vec![0x41; 7]));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::Fatal {
+                slot: 1,
+                cause: Cause::ClipboardOversize
+            })
+        ));
+    }
+
+    /// A hostile client can repeat its oversize response: the session ends
+    /// once — one `Fatal` — and the backend says nothing more, so no text
+    /// reaches a paste while the session closes.
+    #[test]
+    fn after_its_fatal_a_backend_sends_nothing_more() {
+        let (f, _slot, mut rx, _) = factory_with(4);
+        let mut b = f.build_cliprdr_backend();
+        b.on_format_data_response(FormatDataResponse::new_data(vec![0; 5]));
+        assert!(matches!(rx.try_recv(), Ok(RdpInput::Fatal { slot: 1, .. })));
+        b.on_format_data_response(FormatDataResponse::new_data(vec![0; 5]));
+        b.on_format_data_response(FormatDataResponse::new_data(vec![0x41, 0]));
+        b.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// §8 is one way: what the client asks of the server's clipboard (data,
+    /// file contents, a lock) is never answered, and the channel's own life
+    /// (ready, capabilities, a format list request) sends nothing.
+    #[test]
+    fn the_backend_answers_no_request_and_offers_nothing() {
+        let (f, _slot, mut rx) = factory();
+        let mut b = f.build_cliprdr_backend();
+        b.on_ready();
+        b.on_request_format_list();
+        b.on_process_negotiated_capabilities(ClipboardGeneralCapabilityFlags::all());
+        b.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        b.on_file_contents_request(FileContentsRequest {
+            stream_id: 1,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 1 << 20,
+            data_id: None,
+        });
+        b.on_file_contents_response(FileContentsResponse::new_error(1));
+        b.on_lock(LockDataId(1));
+        b.on_unlock(LockDataId(1));
+        b.on_format_list_response(true);
+        assert!(rx.try_recv().is_err());
+        // The backend's Debug names its slot and nothing else.
+        assert_eq!(format!("{b:?}"), "ClipBackend { slot: 1, .. }");
+    }
+
+    // ---- A real CLIPRDR exchange: IronRDP's client against IronRDP's
+    // server hosting the bridge's backend, through the SVC chunking and
+    // reassembly the server runs (1 600-byte chunks).
+
+    /// What the client end saw and was asked.
+    #[derive(Default)]
+    struct ClientState {
+        /// What the client's backend asked its event loop to do, in order.
+        queued: Vec<ClipboardMessage>,
+        /// Its answer to a data request (`None`: CB_RESPONSE_FAIL).
+        answer: Option<Vec<u8>>,
+        /// Data requests the server sent.
+        asked: usize,
+        /// Format lists the server offered (§8: never).
+        offered: usize,
+        /// The capabilities negotiated with the server.
+        negotiated: Option<ClipboardGeneralCapabilityFlags>,
+    }
+
+    /// The client end, as a real client runs it: its backend announces
+    /// CF_UNICODETEXT when the server's Monitor Ready asks for its format
+    /// list (D9b: from `on_request_format_list`; `on_ready` comes only
+    /// after the server's `FormatListResponse`), and answers a data request
+    /// with `answer`.
+    struct ClientClip(Arc<Mutex<ClientState>>);
+
+    ironrdp_core::impl_as_any!(ClientClip);
+
+    impl std::fmt::Debug for ClientClip {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("ClientClip")
+        }
+    }
+
+    impl ClientClip {
+        fn state(&self) -> std::sync::MutexGuard<'_, ClientState> {
+            self.0.lock().unwrap()
+        }
+    }
+
+    impl CliprdrBackend for ClientClip {
+        fn temporary_directory(&self) -> &str {
+            "."
+        }
+        fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+            ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES
+                | ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
+                | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA
+        }
+        fn on_ready(&mut self) {}
+        fn on_request_format_list(&mut self) {
+            self.state()
+                .queued
+                .push(ClipboardMessage::SendInitiateCopy(vec![
+                    ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
+                ]));
+        }
+        fn on_process_negotiated_capabilities(&mut self, c: ClipboardGeneralCapabilityFlags) {
+            self.state().negotiated = Some(c);
+        }
+        fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {
+            self.state().offered += 1;
+        }
+        fn on_format_data_request(&mut self, _: FormatDataRequest) {
+            let mut s = self.state();
+            s.asked += 1;
+            let r = match &s.answer {
+                Some(b) => OwnedFormatDataResponse::new_data(b.clone()),
+                None => OwnedFormatDataResponse::new_error(),
+            };
+            s.queued.push(ClipboardMessage::SendFormatData(r));
+        }
+        fn on_format_data_response(&mut self, _: FormatDataResponse<'_>) {}
+        fn on_file_contents_request(&mut self, _: FileContentsRequest) {}
+        fn on_file_contents_response(&mut self, _: FileContentsResponse<'_>) {}
+        fn on_lock(&mut self, _: LockDataId) {}
+        fn on_unlock(&mut self, _: LockDataId) {}
+    }
+
+    struct Wire {
+        server: StaticVirtualChannel,
+        client: StaticVirtualChannel,
+        state: Arc<Mutex<ClientState>>,
+    }
+
+    /// Chunk `msgs` as IronRDP writes them and hand every chunk to `to`;
+    /// its replies.
+    fn deliver(to: &mut StaticVirtualChannel, msgs: Vec<SvcMessage>) -> Vec<SvcMessage> {
+        let mut replies = Vec::new();
+        for chunk in StaticVirtualChannel::chunkify(msgs).unwrap() {
+            replies.extend(to.process(chunk.filled()).unwrap());
+        }
+        replies
+    }
+
+    impl Wire {
+        /// Both ends of one connection's channel, started: the server's
+        /// capabilities and Monitor Ready, the client's capabilities,
+        /// temporary directory and format list, the server's response.
+        fn start(f: &ClipFactory, answer: Option<Vec<u8>>) -> Wire {
+            let state = Arc::new(Mutex::new(ClientState {
+                answer,
+                ..ClientState::default()
+            }));
+            let server: CliprdrServer = Cliprdr::new(f.build_cliprdr_backend());
+            let client: CliprdrClient = Cliprdr::new(Box::new(ClientClip(state.clone())));
+            let mut w = Wire {
+                server: StaticVirtualChannel::new(server),
+                client: StaticVirtualChannel::new(client),
+                state,
+            };
+            let s = w.server.start().unwrap();
+            let c = w.client.start().unwrap();
+            w.settle(s, c);
+            w
+        }
+
+        /// The client's event loop carrying out what its backend queued.
+        fn client_does(&mut self, m: ClipboardMessage) -> Vec<SvcMessage> {
+            let c = self
+                .client
+                .channel_processor_downcast_mut::<CliprdrClient>()
+                .unwrap();
+            match m {
+                ClipboardMessage::SendInitiateCopy(formats) => {
+                    c.initiate_copy(&formats).unwrap().into()
+                }
+                ClipboardMessage::SendFormatData(r) => c.submit_format_data(r).unwrap().into(),
+                other => panic!("the test client never sends {other:?}"),
+            }
+        }
+
+        /// Run the exchange until both ends are quiet (bounded).
+        fn settle(&mut self, mut to_client: Vec<SvcMessage>, mut to_server: Vec<SvcMessage>) {
+            for _ in 0..64 {
+                if !to_client.is_empty() {
+                    let msgs = std::mem::take(&mut to_client);
+                    to_server.extend(deliver(&mut self.client, msgs));
+                }
+                let queued = std::mem::take(&mut self.state.lock().unwrap().queued);
+                for m in queued {
+                    to_server.extend(self.client_does(m));
+                }
+                if !to_server.is_empty() {
+                    let msgs = std::mem::take(&mut to_server);
+                    to_client.extend(deliver(&mut self.server, msgs));
+                }
+                if to_client.is_empty()
+                    && to_server.is_empty()
+                    && self.state.lock().unwrap().queued.is_empty()
+                {
+                    return;
+                }
+            }
+            panic!("the CLIPRDR exchange never settled");
+        }
+
+        /// What IronRDP's server does with the bridge's request,
+        /// `ServerEvent::Clipboard(SendInitiatePaste(CF_UNICODETEXT))`
+        /// (server.rs:3412; Task 4.1 sends it).
+        fn request_text(&mut self) {
+            let msgs = self
+                .server
+                .channel_processor_downcast_mut::<CliprdrServer>()
+                .unwrap()
+                .initiate_paste(ClipboardFormatId::CF_UNICODETEXT)
+                .unwrap()
+                .into();
+            self.settle(msgs, Vec::new());
+        }
+
+        /// The client sends a format data response nobody asked for.
+        fn unasked(&mut self, bytes: Vec<u8>) {
+            let msgs = self.client_does(ClipboardMessage::SendFormatData(
+                OwnedFormatDataResponse::new_data(bytes),
+            ));
+            self.settle(Vec::new(), msgs);
+        }
+
+        /// A raw PDU straight to the server, as a hostile client may send.
+        fn raw(&mut self, pdu: ClipboardPdu<'static>) {
+            self.settle(Vec::new(), vec![SvcMessage::from(pdu)]);
+        }
+    }
+
+    /// §8 steps 1 and 3 on the wire: a real client's format list reaches
+    /// the bridge as `ClipboardAvailable(true)`; the bridge's request
+    /// reaches the client once, and its CF_UNICODETEXT answer comes back
+    /// as `ClipboardText`, NUL terminator and all (D4: the core drops it).
+    /// The server advertises no capability of its own — nothing the client
+    /// offers is negotiated — and never offers its own clipboard (one way).
+    #[test]
+    fn a_real_client_offers_text_and_answers_the_bridges_request() {
+        let (f, _slot, mut rx) = factory();
+        let mut w = Wire::start(&f, Some(utf16z("hi")));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::ClipboardAvailable {
+                slot: 1,
+                text: true
+            })
+        ));
+        assert!(rx.try_recv().is_err());
+        w.request_text();
+        assert!(
+            matches!(rx.try_recv(), Ok(RdpInput::ClipboardText { slot: 1, bytes }) if bytes == utf16z("hi"))
+        );
+        let s = w.state.lock().unwrap();
+        assert_eq!(s.asked, 1);
+        assert_eq!(s.offered, 0, "the server offered a clipboard");
+        // The client offered file streams and locking; the bridge adds no
+        // capability, so neither is negotiated. Long format names are
+        // IronRDP's own format-list encoding, which every CLIPRDR end it
+        // builds advertises (ironrdp-cliprdr lib.rs:603), not a clipboard
+        // feature.
+        assert_eq!(
+            s.negotiated,
+            Some(ClipboardGeneralCapabilityFlags::USE_LONG_FORMAT_NAMES)
+        );
+    }
+
+    /// §8: an answer over `paste.max_bytes` once IronRDP has reassembled
+    /// its chunks ends the session (`clipboard_oversize`); an unasked one
+    /// too. A CB_RESPONSE_FAIL answer types nothing.
+    #[test]
+    fn an_oversize_answer_reassembled_from_chunks_is_fatal() {
+        let (f, _slot, mut rx, _) = factory_with(64 * 1024);
+        let mut w = Wire::start(&f, Some(vec![0x41; 64 * 1024 + 1]));
+        let _ = rx.try_recv(); // its availability
+        w.request_text();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::Fatal {
+                slot: 1,
+                cause: Cause::ClipboardOversize
+            })
+        ));
+        let mut w = Wire::start(&f, None);
+        let _ = rx.try_recv();
+        w.request_text();
+        assert!(rx.try_recv().is_err(), "an error answer reached the pump");
+        w.unasked(vec![0x41; 64 * 1024 + 1]);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::Fatal {
+                slot: 2,
+                cause: Cause::ClipboardOversize
+            })
+        ));
+    }
+
+    /// What a hostile client may send the server besides its answer — a
+    /// Monitor Ready, a request for the server's data, locks, a file
+    /// contents request — reaches nothing: no input for the pump, no
+    /// format list or data offered back. Each format list is one bounded
+    /// `ClipboardAvailable` (a bool; nothing of the list is kept).
+    #[test]
+    fn hostile_cliprdr_traffic_reaches_nothing() {
+        let (f, _slot, mut rx) = factory();
+        let mut w = Wire::start(&f, Some(utf16z("x")));
+        let _ = rx.try_recv();
+        w.raw(ClipboardPdu::MonitorReady);
+        w.raw(ClipboardPdu::FormatDataRequest(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        }));
+        for id in 0..200 {
+            w.raw(ClipboardPdu::LockData(LockDataId(id)));
+        }
+        w.raw(ClipboardPdu::UnlockData(LockDataId(3)));
+        w.raw(ClipboardPdu::FileContentsRequest(FileContentsRequest {
+            stream_id: 7,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: u32::MAX,
+            data_id: None,
+        }));
+        assert!(rx.try_recv().is_err(), "hostile traffic reached the pump");
+        assert_eq!(w.state.lock().unwrap().offered, 0);
+        for i in 0..200u32 {
+            let formats = if i % 2 == 0 {
+                vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]
+            } else {
+                vec![ClipboardFormat::new(ClipboardFormatId::new(0xC000 + i))]
+            };
+            let msgs = w.client_does(ClipboardMessage::SendInitiateCopy(formats));
+            w.settle(Vec::new(), msgs);
+        }
+        for i in 0..200u32 {
+            assert!(
+                matches!(rx.try_recv(), Ok(RdpInput::ClipboardAvailable { slot: 1, text }) if text == (i % 2 == 0))
+            );
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn ctx(now: Instant) -> Ctx {
+        Ctx {
+            now,
+            epoch: 0,
+            generation: 1,
+            surface: (1920, 1080),
+            mac_remap: false,
+            key_repeat_timeout: Duration::from_secs(10),
+            modifier_idle_timeout: Duration::from_secs(30),
+            chord: Chord::parse("ctrl+option+shift+v").unwrap(),
+            pace: Duration::ZERO,
+            modifier_wait: Duration::from_secs(5),
+            multiline_refuse: false,
+            max_chars: 4096,
+            queue_room: 8,
+        }
+    }
+
+    /// The pump's input as Task 4.1 hands it to the input core: this
+    /// slot's clipboard words only.
+    fn as_event(i: RdpInput, slot: u64) -> Option<Event> {
+        match i {
+            RdpInput::ClipboardAvailable { slot: s, text } if s == slot => {
+                Some(Event::ClipboardAvailable(text))
+            }
+            RdpInput::ClipboardText { slot: s, bytes } if s == slot => {
+                Some(Event::ClipboardText(bytes))
+            }
+            _ => None,
+        }
+    }
+
+    /// Step every clipboard word the backend has sent into `core`.
+    fn feed(core: &mut InputCore, rx: &mut UnboundedReceiver<RdpInput>, now: Instant) -> Vec<Out> {
+        let mut out = Vec::new();
+        while let Ok(i) = rx.try_recv() {
+            if let Some(e) = as_event(i, 1) {
+                core.step(&ctx(now), e, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The keyboard usages the outs pressed, in order.
+    fn typed(out: &[Out]) -> Vec<u8> {
+        out.iter()
+            .filter_map(|o| match o {
+                Out::Push {
+                    frame: HidFrame::Keyboard { keys, .. },
+                    ..
+                } if keys[0] != 0 => Some(keys[0]),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The request/response path that feeds paste (§8, DD4), a real
+    /// client's bytes into the real core: a response types only for the
+    /// paste that asked for it. One sent before any chord types nothing;
+    /// one sent while the asking paste already has its text does not
+    /// replace it; one after the paste ended types nothing. The answer's
+    /// NUL terminator is never typed as a Return (D4).
+    #[test]
+    fn a_response_types_only_for_the_paste_that_asked() {
+        let (f, _slot, mut rx) = factory();
+        let mut w = Wire::start(&f, Some(utf16z("hi")));
+        let mut core = InputCore::new();
+        core.on_generation(1);
+        let mut now = Instant::now();
+        let mut out = feed(&mut core, &mut rx, now); // the format list: text
+        w.unasked(utf16z("zz"));
+        assert!(
+            typed(&feed(&mut core, &mut rx, now)).is_empty(),
+            "unasked text typed"
+        );
+
+        for code in [0x1D, 0x38, 0x2A, 0x2F] {
+            core.step(
+                &ctx(now),
+                Event::KeyPressed {
+                    code,
+                    extended: false,
+                },
+                &mut out,
+            );
+        }
+        assert!(out.iter().any(|o| matches!(o, Out::RequestClipboard)));
+        w.request_text(); // what Task 4.1 does with `Out::RequestClipboard`
+        assert_eq!(w.state.lock().unwrap().asked, 1);
+        out.extend(feed(&mut core, &mut rx, now));
+        w.unasked(utf16z("zz")); // the paste has its text already
+        out.extend(feed(&mut core, &mut rx, now));
+        for code in [0x2F, 0x1D, 0x38, 0x2A] {
+            core.step(
+                &ctx(now),
+                Event::KeyReleased {
+                    code,
+                    extended: false,
+                },
+                &mut out,
+            );
+        }
+        let ended = |out: &[Out]| {
+            out.iter()
+                .filter(|o| matches!(o, Out::Paste(p) if *p != PasteOutcome::Started))
+                .count()
+        };
+        // Pace 0 and room for 8 may type it all in the last release's step.
+        for _ in 0..16 {
+            if ended(&out) > 0 {
+                break;
+            }
+            now += Duration::from_millis(1);
+            core.step(&ctx(now), Event::Tick, &mut out);
+        }
+        assert!(
+            out.iter().any(|o| matches!(
+                o,
+                Out::Paste(PasteOutcome::Done {
+                    typed: 2,
+                    skipped: 0
+                })
+            )),
+            "the paste did not type its two characters: {out:?}"
+        );
+        assert_eq!(ended(&out), 1);
+        // h = 0x0B, i = 0x0C; never z (0x1D) or Return (0x28).
+        assert_eq!(typed(&out), [0x0B, 0x0C]);
+        w.unasked(utf16z("zz")); // a late answer
+        assert!(
+            typed(&feed(&mut core, &mut rx, now)).is_empty(),
+            "a late answer typed"
+        );
+    }
+}

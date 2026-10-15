@@ -3,8 +3,10 @@
 //! security modes (`with_tls`, `with_no_security`) are never called — with
 //! Preempt, the callbacks of Task 5.2 (the connection handler installed:
 //! without one IronRDP admits every connection), the suppression and RTT
-//! handles the shell samples, and auto-detect enabled (§6.6).
+//! handles the shell samples, auto-detect enabled (§6.6), and CLIPRDR for
+//! paste (§8).
 use crate::config::Secret;
+use crate::rdp::clipboard::ClipFactory;
 use crate::rdp::display::BridgeDisplay;
 use crate::rdp::gfx::GfxFactory;
 use crate::rdp::handler::Lifecycle;
@@ -23,6 +25,10 @@ pub struct ServerParts {
     pub input: InputStub,
     pub display: BridgeDisplay,
     pub gfx: GfxFactory,
+    /// Concrete, as `gfx` is: `CliprdrServerFactory` has no `Send`
+    /// supertrait, and these parts move to the RDP thread (D1d). Boxed
+    /// only in `build`, on that thread.
+    pub cliprdr: ClipFactory,
     pub lifecycle: Lifecycle,
     pub suppressed: Arc<AtomicBool>,
     pub rtt: Arc<AtomicU32>,
@@ -42,6 +48,7 @@ pub fn build(p: ServerParts) -> RdpServer {
         .with_input_handler(p.input)
         .with_display_handler(p.display)
         .with_gfx_factory(Some(Box::new(p.gfx)))
+        .with_cliprdr_factory(Some(Box::new(p.cliprdr)))
         .with_connection_policy(ConnectionPolicy::Preempt)
         .with_connection_handler(Some(Box::new(p.lifecycle)))
         .with_display_suppressed_handle(p.suppressed)

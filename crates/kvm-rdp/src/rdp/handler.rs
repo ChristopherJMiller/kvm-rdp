@@ -1,16 +1,18 @@
 //! The §5.1 lifecycle as IronRDP's `ConnectionHandler`. `on_accept` runs
 //! before anything else (the accept rate; refuse once shutdown began,
 //! DC13); `on_connection_info` — once per connection, after NLA — mints
-//! the generation, binds it to this connection's GFX handle and abort
-//! handle, and starts the KVM side; `on_disconnected` ends the generation
-//! before it returns. Under Preempt the evicted session's
-//! `on_disconnected` runs before the winner's `on_connection_info`.
-//! Nothing here calls into IronRDP with a lock held: the GFX slot's lock
-//! is released before the abort handle or a channel is touched.
+//! the generation, binds it to this connection's GFX handle, CLIPRDR
+//! backend and abort handle, and starts the KVM side; `on_disconnected`
+//! ends the generation before it returns. Under Preempt the evicted
+//! session's `on_disconnected` runs before the winner's
+//! `on_connection_info`. Nothing here calls into IronRDP with a lock held:
+//! the GFX and clipboard slots' locks are released before the abort handle
+//! or a channel is touched.
 use crate::hid::{HidControl, ReleaseTrigger};
 use crate::metrics::Metrics;
 use crate::msg::{Generations, KvmCommand, RdpInput};
 use crate::rdp::accept::{AcceptRate, Handshakes};
+use crate::rdp::clipboard::{ClipSlot, take_latest_clip};
 use crate::rdp::gfx::{GfxSlot, take_latest};
 use ironrdp_server::{ConnectionHandler, ConnectionInfo, PostConnectionAction, ServerError};
 use std::net::SocketAddr;
@@ -25,6 +27,8 @@ pub struct Lifecycle {
     pub accepting: Arc<AtomicBool>,
     pub rate: AcceptRate,
     pub gfx: GfxSlot,
+    /// The latest CLIPRDR backend's slot (`rdp::clipboard::ClipFactory`).
+    pub clip: ClipSlot,
     pub hid: Arc<HidControl>,
     pub metrics: Arc<Metrics>,
     pub to_pump: UnboundedSender<RdpInput>,
@@ -71,6 +75,9 @@ impl ConnectionHandler for Lifecycle {
             abort.abort();
             return;
         };
+        // Built beside the GFX handle in `attach_channels`, so it is this
+        // connection's (§4.3): its words reach the session only under it.
+        let clip_slot = take_latest_clip(&self.clip);
         let generation = self.gens.begin();
         // After `begin`: the certificate watcher reads the handshakes first,
         // so it never sees this client in neither (DC21, m4). An aborted
@@ -85,6 +92,7 @@ impl ConnectionHandler for Lifecycle {
             gfx,
             counter,
             abort,
+            clip_slot,
         });
         let _ = self.to_kvm.send(KvmCommand::Start { generation });
         tracing::info!(generation, "session start");
@@ -131,7 +139,9 @@ mod tests {
     use crate::pump::rig::{census_caps, cfg};
     use crate::pump::{Command, Input, Pump, State};
     use crate::rdp::accept::HANDSHAKE_GRACE;
+    use crate::rdp::clipboard::{ClipFactory, ServerEvents};
     use crate::rdp::gfx::{GfxFactory, closed_channel_input};
+    use ironrdp_cliprdr::backend::CliprdrBackendFactory as _;
     use ironrdp_core::encode_vec;
     use ironrdp_dvc::DvcProcessor as _;
     use ironrdp_egfx::pdu::{
@@ -144,6 +154,8 @@ mod tests {
     struct Rig {
         h: Lifecycle,
         factory: GfxFactory,
+        /// The clipboard factory, over `h.clip` and the pump's channel.
+        clips: ClipFactory,
         pump: mpsc::UnboundedReceiver<RdpInput>,
         kvm: mpsc::UnboundedReceiver<KvmCommand>,
         metrics: Arc<Metrics>,
@@ -163,11 +175,14 @@ mod tests {
         let (ptx, pump) = mpsc::unbounded_channel();
         let (ktx, kvm) = mpsc::unbounded_channel();
         let factory = GfxFactory::new(latest.clone(), ptx.clone(), 60, metrics.clone());
+        let clip = ClipSlot::default();
+        let clips = clip_factory(&clip, &ptx);
         let h = Lifecycle {
             gens: gens.clone(),
             accepting: accepting.clone(),
             rate: AcceptRate::new(rate, Duration::from_secs(60)),
             gfx: latest,
+            clip,
             hid: hid.clone(),
             metrics: metrics.clone(),
             to_pump: ptx,
@@ -177,6 +192,7 @@ mod tests {
         Rig {
             h,
             factory,
+            clips,
             pump,
             kvm,
             metrics,
@@ -185,6 +201,17 @@ mod tests {
             accepting,
             handshakes,
         }
+    }
+
+    /// A clipboard factory recording into `latest`, pushing to `to_pump`.
+    fn clip_factory(latest: &ClipSlot, to_pump: &UnboundedSender<RdpInput>) -> ClipFactory {
+        ClipFactory::new(
+            Arc::new(AtomicU64::new(0)),
+            latest.clone(),
+            to_pump.clone(),
+            64 << 10,
+            ServerEvents::default(),
+        )
     }
 
     fn info() -> ConnectionInfo {
@@ -279,6 +306,39 @@ mod tests {
         assert_eq!(r.metrics.sessions.get(), 1);
         assert_eq!(r.metrics.release_all.get("session_start"), 1);
         assert_eq!(r.hid.epoch(), 1);
+    }
+
+    /// §4.3, design decision 8: the CLIPRDR backend built for this
+    /// connection — the latest, as for the GFX handle — is bound into its
+    /// `SessionStart`, and taken: a connection that had none built gets
+    /// none, never an earlier connection's.
+    #[test]
+    fn connection_info_binds_the_latest_clipboard_backend() {
+        let mut r = rig(30);
+        r.factory.build_server_with_handle().unwrap();
+        let _first = r.clips.build_cliprdr_backend();
+        let _second = r.clips.build_cliprdr_backend();
+        r.h.on_connection_info(&info());
+        let Ok(RdpInput::SessionStart { clip_slot, .. }) = r.pump.try_recv() else {
+            panic!("no SessionStart")
+        };
+        assert_eq!(clip_slot, Some(2));
+        r.h.on_disconnected(peer(), Duration::from_secs(1), None);
+        assert!(matches!(
+            r.pump.try_recv(),
+            Ok(RdpInput::SessionStop { generation: 1 })
+        ));
+        r.factory.build_server_with_handle().unwrap();
+        r.h.on_connection_info(&info());
+        let Ok(RdpInput::SessionStart {
+            generation: 2,
+            clip_slot,
+            ..
+        }) = r.pump.try_recv()
+        else {
+            panic!("no second SessionStart")
+        };
+        assert_eq!(clip_slot, None, "an earlier connection's backend was bound");
     }
 
     /// §4.3: `on_disconnected` invalidates the generation before it returns.
@@ -667,13 +727,14 @@ mod tests {
             Some(framed)
         }
 
-        /// Serve one real client with `lifecycle` (and `gfx`, if any) while
-        /// `watch` runs. `Some(result)` when the server ended within
-        /// `SERVE_BOUND` although the client held the connection open — an
-        /// abort — and `None` when it was still serving.
+        /// Serve one real client with `lifecycle` (and `gfx` and `clip`, if
+        /// any) while `watch` runs. `Some(result)` when the server ended
+        /// within `SERVE_BOUND` although the client held the connection
+        /// open — an abort — and `None` when it was still serving.
         async fn serve_one(
             lifecycle: Lifecycle,
             gfx: Option<GfxFactory>,
+            clip: Option<ClipFactory>,
             watch: impl Future<Output = ()>,
         ) -> Option<ServerResult<()>> {
             tls::install_crypto_provider();
@@ -696,6 +757,9 @@ mod tests {
                 .with_connection_handler(Some(Box::new(lifecycle)))
                 .with_gfx_factory(
                     gfx.map(|g| -> Box<dyn ironrdp_server::GfxServerFactory> { Box::new(g) }),
+                )
+                .with_cliprdr_factory(
+                    clip.map(|c| -> Box<dyn ironrdp_server::CliprdrServerFactory> { Box::new(c) }),
                 )
                 .build();
             server.set_credentials(Some(Credentials {
@@ -741,7 +805,7 @@ mod tests {
             let (h, mut pump, mut kvm, gens) = lifecycle();
             h.accepting.store(false, Ordering::SeqCst);
             let gfx = GfxFactory::new(h.gfx.clone(), h.to_pump.clone(), 60, h.metrics.clone());
-            let served = serve_one(h, Some(gfx), async {}).await;
+            let served = serve_one(h, Some(gfx), None, async {}).await;
             assert!(
                 matches!(served, Some(Ok(()))),
                 "the connection was not aborted (still served after {SERVE_BOUND:?}, or failed before NLA)"
@@ -755,7 +819,7 @@ mod tests {
         #[tokio::test(flavor = "current_thread")]
         async fn a_connection_without_an_egfx_handle_is_aborted() {
             let (h, mut pump, mut kvm, gens) = lifecycle();
-            let served = serve_one(h, None, async {}).await;
+            let served = serve_one(h, None, None, async {}).await;
             assert!(
                 matches!(served, Some(Ok(()))),
                 "the connection was not aborted (still served after {SERVE_BOUND:?}, or failed before NLA)"
@@ -767,29 +831,34 @@ mod tests {
         /// The control: the same rig with a GFX factory and `accepting`
         /// starts a session after NLA (§5.1) — so the two cases above reach
         /// `on_connection_info` — and its `SessionStart` carries this
-        /// connection's real abort handle, which ends it.
+        /// connection's real abort handle, which ends it. With the
+        /// clipboard factory installed as the bridge installs it, IronRDP
+        /// has built this connection's backend by then (`attach_channels`),
+        /// so the session is bound to its slot (design decision 8).
         #[tokio::test(flavor = "current_thread")]
         async fn a_real_client_through_nla_starts_a_session_with_a_live_abort_handle() {
             let (h, mut pump, mut kvm, gens) = lifecycle();
             let gfx = GfxFactory::new(h.gfx.clone(), h.to_pump.clone(), 60, h.metrics.clone());
+            let clip = clip_factory(&h.clip, &h.to_pump);
             let mut started = None;
             let watch = async {
                 if let Ok(Some(RdpInput::SessionStart {
                     generation,
                     slot,
                     abort,
+                    clip_slot,
                     ..
                 })) = tokio::time::timeout(SERVE_BOUND, pump.recv()).await
                 {
-                    started = Some((generation, slot, gens.current()));
+                    started = Some((generation, slot, gens.current(), clip_slot));
                     abort.abort();
                 }
             };
-            let served = serve_one(h, Some(gfx), watch).await;
+            let served = serve_one(h, Some(gfx), Some(clip), watch).await;
             assert_eq!(
                 started,
-                Some((1, 1, Some(1))),
-                "no session started after NLA"
+                Some((1, 1, Some(1), Some(1))),
+                "no session started after NLA, or not bound to its clipboard backend"
             );
             assert!(
                 matches!(served, Some(Ok(()))),

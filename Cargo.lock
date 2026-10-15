@@ -1942,6 +1942,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ironrdp-async",
+ "ironrdp-cliprdr",
  "ironrdp-connector",
  "ironrdp-core",
  "ironrdp-dvc",

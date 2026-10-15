@@ -43,6 +43,10 @@ ironrdp-dvc = { git = "https://github.com/ChristopherJMiller/IronRDP.git", rev =
 ironrdp-svc = { git = "https://github.com/ChristopherJMiller/IronRDP.git", rev = "c99eece22338e26ee6839ee89c29617bbcadbb65" }
 ironrdp-pdu = { git = "https://github.com/ChristopherJMiller/IronRDP.git", rev = "c99eece22338e26ee6839ee89c29617bbcadbb65" }
 ironrdp-core = { git = "https://github.com/ChristopherJMiller/IronRDP.git", rev = "c99eece22338e26ee6839ee89c29617bbcadbb65" }
+# CLIPRDR for paste (§8, Plan D Task 3.3): already compiled inside
+# ironrdp-server's graph (it depends on it unconditionally), so naming it
+# adds no compile unit.
+ironrdp-cliprdr = { git = "https://github.com/ChristopherJMiller/IronRDP.git", rev = "c99eece22338e26ee6839ee89c29617bbcadbb65" }
 # Used only by tests (the L1 decoder and the L2 client). All but
 # ironrdp-session are already in ironrdp-server's own graph (connector,
 # async, graphics, tokio with reqwest, tls through rdpeudp-tokio), so only

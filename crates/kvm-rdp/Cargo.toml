@@ -29,6 +29,7 @@ ironrdp-dvc = { workspace = true }
 ironrdp-svc = { workspace = true }
 ironrdp-pdu = { workspace = true }
 ironrdp-core = { workspace = true }
+ironrdp-cliprdr = { workspace = true }
 bytes = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }

@@ -26,6 +26,7 @@ use crate::metrics::Metrics;
 use crate::msg::{Cause, Gen, Generations, KvmCommand, KvmEvent, RdpInput};
 use crate::pump::core::Pump;
 use crate::pump::types::{Command, DvcBatch, Input, PumpConfig};
+use crate::rdp::clipboard::fatal_input;
 use crate::rdp::display::DisplayShared;
 use crate::rdp::gfx::closed_channel_input;
 use ironrdp_dvc::encode_dvc_messages;
@@ -73,6 +74,9 @@ struct Link {
     gfx: GfxServerHandle,
     counter: Arc<AtomicU64>,
     abort: ConnectionAbortHandle,
+    /// This connection's CLIPRDR backend: only its words are this
+    /// session's (design decision 8).
+    clip_slot: Option<u64>,
     caps: Vec<String>,
     /// The client closed its EGFX channel mid-session (the `no_avc420`
     /// close is then not about its capability sets).
@@ -223,6 +227,13 @@ impl PumpShell {
         self.link.as_mut().filter(|l| l.slot == slot)
     }
 
+    /// The link whose CLIPRDR backend is `slot`: another connection's
+    /// clipboard (a Preempt candidate's, an evicted session's) is never
+    /// this session's.
+    fn link_for_clip(&self, slot: u64) -> Option<&Link> {
+        self.link.as_ref().filter(|l| l.clip_slot == Some(slot))
+    }
+
     /// The link's generation has ended: `on_disconnected` ran, and its
     /// `SessionStop` is queued behind the input being read.
     fn link_ended(&self) -> bool {
@@ -239,6 +250,7 @@ impl PumpShell {
                 gfx,
                 counter,
                 abort,
+                clip_slot,
             } => {
                 if let Some(old) = self.link.as_ref().map(|l| l.generation) {
                     // `on_disconnected` always comes first; never let two
@@ -253,6 +265,7 @@ impl PumpShell {
                     gfx,
                     counter,
                     abort,
+                    clip_slot,
                     caps: Vec::new(),
                     egfx_closed: false,
                     sent: 0,
@@ -343,6 +356,22 @@ impl PumpShell {
                     self.exec(cmds).await;
                 }
             }
+            RdpInput::Fatal { slot, cause } => {
+                // Only this session's clipboard ends it (§4.3): another
+                // slot is a stale or rival connection's, and an ended
+                // generation's client has gone already — stepping it would
+                // count a disconnect that never happens (D17).
+                let Some(generation) = self.link_for_clip(slot).map(|l| l.generation) else {
+                    return;
+                };
+                if let Some(input) = fatal_input(&self.d.gens, generation, cause) {
+                    let cmds = self.step([input]);
+                    self.exec(cmds).await;
+                }
+            }
+            // Task 4.1 routes these to the input core, under the same slot
+            // gate as `Fatal`; until then nothing types them.
+            RdpInput::ClipboardAvailable { .. } | RdpInput::ClipboardText { .. } => {}
             RdpInput::Updates => {
                 // PC17: the reactivation's Setup, same window as `OnReady`.
                 if self.link_ended() {
@@ -642,8 +671,11 @@ mod tests {
     use crate::msg::FlvOrigin;
     use crate::pump::rig::{self, CHAN, ES3, Null, P480};
     use crate::rdp::accept::AcceptRate;
+    use crate::rdp::clipboard::{ClipFactory, ClipSlot, ServerEvents};
     use crate::rdp::gfx::{GfxFactory, GfxSlot};
     use crate::rdp::handler::Lifecycle;
+    use ironrdp_cliprdr::backend::CliprdrBackendFactory as _;
+    use ironrdp_cliprdr::pdu::FormatDataResponse;
     use ironrdp_core::encode_vec;
     // `start` and `process` are `DvcProcessor` methods on the GFX server,
     // and `SvcProcessor` methods on IronRDP's DVC server.
@@ -800,6 +832,7 @@ mod tests {
                     gfx: self.gfx.clone(),
                     counter: self.counter.clone(),
                     abort,
+                    clip_slot: Some(1),
                 })
                 .unwrap();
             generation
@@ -1011,12 +1044,15 @@ mod tests {
     }
 
     /// The bridge's wiring around the shell, as Task 5.4 assembles it:
-    /// `Lifecycle` and the GFX factory's callbacks push into the shell's
-    /// RDP-side channel and send to the same KVM-command channel the shell
-    /// does. The shell is spawned but not yet polled when this returns.
+    /// `Lifecycle` and the GFX and clipboard factories' callbacks push into
+    /// the shell's RDP-side channel and send to the same KVM-command
+    /// channel the shell does. The shell is spawned but not yet polled
+    /// when this returns.
     struct W {
         h: Lifecycle,
         factory: GfxFactory,
+        /// The clipboard factory, `paste.max_bytes` = `CLIP_MAX`.
+        clips: ClipFactory,
         rdp: mpsc::UnboundedSender<RdpInput>,
         kvm: mpsc::Sender<KvmEvent>,
         events: mpsc::UnboundedReceiver<ServerEvent>,
@@ -1036,11 +1072,20 @@ mod tests {
         let (ktx, cmds) = mpsc::unbounded_channel();
         let latest = GfxSlot::default();
         let factory = GfxFactory::new(latest.clone(), rdp.clone(), cfg.hard_cap, metrics.clone());
+        let clip = ClipSlot::default();
+        let clips = ClipFactory::new(
+            Arc::new(AtomicU64::new(0)),
+            clip.clone(),
+            rdp.clone(),
+            CLIP_MAX,
+            ServerEvents::default(),
+        );
         let h = Lifecycle {
             gens: gens.clone(),
             accepting: Arc::new(AtomicBool::new(true)),
             rate: AcceptRate::new(30, Duration::from_secs(60)),
             gfx: latest,
+            clip,
             hid: hid.clone(),
             metrics: metrics.clone(),
             to_pump: rdp.clone(),
@@ -1065,6 +1110,7 @@ mod tests {
         W {
             h,
             factory,
+            clips,
             rdp,
             kvm,
             events,
@@ -1072,6 +1118,9 @@ mod tests {
             metrics,
         }
     }
+
+    /// The wired rig's `paste.max_bytes`.
+    const CLIP_MAX: usize = 16;
 
     /// The client's end of one connection's EGFX channel, through IronRDP's
     /// own DVC server hosting the factory's bridge as `RdpServer` hosts it.
@@ -1899,6 +1948,160 @@ mod tests {
                     "the teardown counted the close again"
                 );
                 assert_eq!(w.metrics.disconnects.total(), 1);
+            })
+            .await;
+    }
+
+    /// §8, §6.9: a `Fatal` from this session's CLIPRDR backend closes it —
+    /// release (closing), then `Disconnect` with 0x7 — counted once, by
+    /// the pump's `close` (D17).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_clipboard_oversize_from_this_sessions_backend_closes_it() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = shell(|_| {});
+                t.start();
+                t.event().await; // the Setup
+                t.rdp
+                    .send(RdpInput::Fatal {
+                        slot: 1,
+                        cause: Cause::ClipboardOversize,
+                    })
+                    .unwrap();
+                match t.event().await {
+                    ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+                        P::ServerDeniedConnection,
+                    )) => {}
+                    other => panic!("{other:?}"),
+                }
+                assert_eq!(t.metrics.disconnects.get("clipboard_oversize"), 1);
+                assert_eq!(t.metrics.disconnects.total(), 1);
+                assert_eq!(t.metrics.release_all.get("closing"), 1);
+            })
+            .await;
+    }
+
+    /// §4.3, design decision 8: a `Fatal` from another clip slot (a stale
+    /// or rival connection's backend) or for an ended generation (read
+    /// after `on_disconnected`) is dropped, as `GfxClosed` is; and until
+    /// Task 4.1 the clipboard's other words reach nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_slots_or_an_ended_sessions_clipboard_fatal_is_dropped() {
+        LocalSet::new()
+            .run_until(async {
+                let mut t = shell(|_| {});
+                let generation = t.start();
+                t.event().await; // the Setup
+                for slot in [0, 2, u64::MAX] {
+                    t.rdp
+                        .send(RdpInput::Fatal {
+                            slot,
+                            cause: Cause::ClipboardOversize,
+                        })
+                        .unwrap();
+                }
+                t.rdp
+                    .send(RdpInput::ClipboardAvailable {
+                        slot: 1,
+                        text: true,
+                    })
+                    .unwrap();
+                t.rdp
+                    .send(RdpInput::ClipboardText {
+                        slot: 1,
+                        bytes: vec![0x41, 0],
+                    })
+                    .unwrap();
+                assert!(
+                    t.quiet(Duration::from_millis(300)).await,
+                    "another slot's clipboard closed the session"
+                );
+                assert_eq!(t.metrics.disconnects.total(), 0);
+                t.gens.end(); // on_disconnected ran; its SessionStop not yet sent
+                t.rdp
+                    .send(RdpInput::Fatal {
+                        slot: 1,
+                        cause: Cause::ClipboardOversize,
+                    })
+                    .unwrap();
+                assert!(
+                    t.quiet(Duration::from_millis(300)).await,
+                    "an ended generation's clipboard sent a Disconnect"
+                );
+                assert_eq!(t.metrics.disconnects.total(), 0);
+                assert_eq!(t.metrics.release_all.get("closing"), 0);
+                t.rdp.send(RdpInput::SessionStop { generation }).unwrap();
+            })
+            .await;
+    }
+
+    /// Design decision 8 through the wiring: the backend IronRDP built for
+    /// this connection is the one `on_connection_info` binds, so an
+    /// oversize answer from it closes the session — and one from an
+    /// earlier connection's backend (built, then the connection never got
+    /// a session) does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversize_answer_closes_only_the_session_it_belongs_to() {
+        LocalSet::new()
+            .run_until(async {
+                let mut w = wired();
+                let mut stale = w.clips.build_cliprdr_backend();
+                let mut ours = w.clips.build_cliprdr_backend();
+                let (chan, _) = w.live().await;
+                let big = || FormatDataResponse::new_data(vec![0x41; CLIP_MAX + 1]);
+                stale.on_format_data_response(big());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(300), w.events.recv())
+                        .await
+                        .is_err(),
+                    "a stale backend's answer closed the session"
+                );
+                assert_eq!(w.metrics.disconnects.total(), 0);
+                ours.on_format_data_response(big());
+                loop {
+                    match recv(&mut w.events).await {
+                        ServerEvent::Disconnect(ErrorInfo::ProtocolIndependentCode(
+                            P::ServerDeniedConnection,
+                        )) => break,
+                        ServerEvent::Egfx(_) => {}
+                        other => panic!("{other:?}"),
+                    }
+                }
+                assert_eq!(w.metrics.disconnects.get("clipboard_oversize"), 1);
+                w.teardown(chan);
+                w.settled().await;
+                assert_eq!(w.metrics.disconnects.total(), 1);
+            })
+            .await;
+    }
+
+    /// D17 through the wiring: IronRDP can process an oversize answer and
+    /// then the client's disconnect before the shell next runs. The
+    /// `Fatal` is then read after `on_disconnected` ended its generation:
+    /// no close, no `Disconnect`, no `clipboard_oversize` counted for a
+    /// session the client ended.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_oversize_read_after_its_session_ended_is_not_counted() {
+        LocalSet::new()
+            .run_until(async {
+                let mut w = wired();
+                let mut ours = w.clips.build_cliprdr_backend();
+                let (chan, _) = w.live().await;
+                ours.on_format_data_response(FormatDataResponse::new_data(vec![
+                    0x41;
+                    CLIP_MAX + 1
+                ]));
+                w.teardown(chan); // before the shell reads the Fatal
+                w.settled().await;
+                assert_eq!(
+                    w.metrics.disconnects.total(),
+                    0,
+                    "a disconnect was counted for a session the client ended"
+                );
+                assert_eq!(w.metrics.release_all.get("closing"), 0);
+                while let Ok(ev) = w.events.try_recv() {
+                    assert!(!matches!(ev, ServerEvent::Disconnect(_)), "{ev:?}");
+                }
             })
             .await;
     }

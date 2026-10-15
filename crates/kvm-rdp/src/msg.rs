@@ -190,8 +190,9 @@ pub enum KvmCommand {
 }
 
 /// IronRDP's callbacks → the pump (unbounded: they run under the GFX lock
-/// and may only push, §4.3). `slot` names the GFX handle a callback came
-/// from; a stale slot is dropped.
+/// and may only push, §4.3). `slot` names the GFX handle — or, for the
+/// clipboard's words, the CLIPRDR backend — a callback came from; a stale
+/// slot is dropped.
 pub enum RdpInput {
     SessionStart {
         generation: Gen,
@@ -199,6 +200,9 @@ pub enum RdpInput {
         gfx: GfxServerHandle,
         counter: Arc<AtomicU64>,
         abort: ConnectionAbortHandle,
+        /// This connection's CLIPRDR backend (`rdp::clipboard`), bound with
+        /// its GFX handle; `None` if none was built.
+        clip_slot: Option<u64>,
     },
     SessionStop {
         generation: Gen,
@@ -223,6 +227,27 @@ pub enum RdpInput {
     GfxClosed {
         slot: u64,
     },
+    /// The client's format list said whether CF_UNICODETEXT is on its
+    /// clipboard (§8 step 1, D18): the input core's availability (D9c).
+    ClipboardAvailable {
+        slot: u64,
+        text: bool,
+    },
+    /// A clipboard response's CF_UNICODETEXT bytes, at most
+    /// `paste.max_bytes` (§8). As sensitive as a password: never logged,
+    /// never Debug-formatted (§9.2) — this enum's `Debug` names the variant
+    /// only.
+    ClipboardText {
+        slot: u64,
+        bytes: Vec<u8>,
+    },
+    /// The slot's session must end with `cause` (`clipboard_oversize`,
+    /// §8): the shell steps it as `Input::UpstreamFatal` for its current
+    /// generation only, and the pump's `close` counts it (D17).
+    Fatal {
+        slot: u64,
+        cause: Cause,
+    },
     /// `RdpServerDisplay::updates()` ran: an activation or reactivation.
     Updates,
     /// Close the live session with cause `shutdown` (§5.2).
@@ -246,6 +271,9 @@ impl std::fmt::Debug for RdpInput {
             RdpInput::OnReady { .. } => "OnReady",
             RdpInput::FrameAck { .. } => "FrameAck",
             RdpInput::GfxClosed { .. } => "GfxClosed",
+            RdpInput::ClipboardAvailable { .. } => "ClipboardAvailable",
+            RdpInput::ClipboardText { .. } => "ClipboardText",
+            RdpInput::Fatal { .. } => "Fatal",
             RdpInput::Updates => "Updates",
             RdpInput::Shutdown { .. } => "Shutdown",
             RdpInput::Stall(_) => "Stall",

@@ -2,6 +2,7 @@
 //! rate, IronRDP's callbacks, and the server's assembly. Callbacks run on
 //! the RDP runtime and only push (§4.3).
 pub mod accept;
+pub mod clipboard;
 pub mod display;
 pub mod gfx;
 pub mod handler;
