@@ -1,8 +1,9 @@
 //! Logging (spec §4.5): `tracing` JSON lines on stdout. `log.filter` is one
 //! `EnvFilter` (parsed from config, never from `RUST_LOG`); a second,
 //! independent `Targets` filter holds the libraries that log credentials or
-//! payloads at INFO, combined with `FilterExt::and`, so nothing in config can
-//! raise them. Bridge code logs no keystrokes, HID frames, pasted text,
+//! payloads at INFO (and those whose WARNs carry client-chosen data at
+//! ERROR), combined with `FilterExt::and`, so nothing in config can raise
+//! them. Bridge code logs no keystrokes, HID frames, pasted text,
 //! tokens or passwords, and no per-frame event above `trace`.
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::{EnvFilter, FilterExt as _, LevelFilter, Targets};
@@ -24,7 +25,6 @@ pub const CAPPED_TARGETS: &[&str] = &[
     "ironrdp_pdu",
     "ironrdp_tokio",
     "ironrdp_async",
-    "ironrdp_cliprdr",
     "ironrdp_displaycontrol",
     "ironrdp_graphics",
     "sspi",
@@ -39,6 +39,13 @@ pub const CAPPED_TARGETS: &[&str] = &[
     "rustls",
     "tokio_rustls",
 ];
+
+/// Targets held at ERROR whatever `log.filter` says (PD8 review m4): their
+/// WARNs carry client-chosen data — ironrdp-cliprdr's file-list sanitiser
+/// logs the client's file names — and fire once per hostile PDU, so a
+/// client could flood them. The more specific target wins over
+/// `CAPPED_TARGETS`' `ironrdp` prefix.
+pub const ERROR_CAPPED_TARGETS: &[&str] = &["ironrdp_cliprdr"];
 
 #[derive(Debug)]
 pub struct LogError(pub String);
@@ -62,10 +69,18 @@ where
     let user = EnvFilter::builder()
         .parse(filter)
         .map_err(|e| LogError(format!("log.filter: {e}")))?;
-    let cap = CAPPED_TARGETS.iter().fold(
-        Targets::new().with_default(LevelFilter::TRACE),
-        |t, name| t.with_target(*name, LevelFilter::INFO),
-    );
+    let cap = CAPPED_TARGETS
+        .iter()
+        .map(|name| (*name, LevelFilter::INFO))
+        .chain(
+            ERROR_CAPPED_TARGETS
+                .iter()
+                .map(|name| (*name, LevelFilter::ERROR)),
+        )
+        .fold(
+            Targets::new().with_default(LevelFilter::TRACE),
+            |t, (name, level)| t.with_target(name, level),
+        );
     let layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(writer)
@@ -161,6 +176,39 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("bridge-trace"), "{out}");
+    }
+
+    /// PD8 review m4: `ironrdp_cliprdr` is held at ERROR whatever
+    /// `log.filter` says. Its WARNs carry client-chosen file names (the
+    /// file-list sanitiser) and fire once per hostile PDU (unknown stream,
+    /// unnegotiated file contents, a refused format list).
+    #[test]
+    fn ironrdp_cliprdr_is_capped_at_error_whatever_the_filter() {
+        // Each keeps `trace` for everything else, so the control line
+        // (another IronRDP crate at INFO) passes the user filter.
+        for filter in [
+            "trace",
+            "trace,ironrdp_cliprdr=trace",
+            "trace,ironrdp_cliprdr::pdu=trace",
+        ] {
+            let buf = Buf::default();
+            let sub = subscriber(filter, buf.clone()).unwrap();
+            tracing::subscriber::with_default(sub, || {
+                tracing::info!(target: "ironrdp_cliprdr", "cliprdr-info");
+                tracing::warn!(target: "ironrdp_cliprdr", "cliprdr-warn");
+                tracing::warn!(target: "ironrdp_cliprdr::pdu", "cliprdr-pdu-warn");
+                tracing::error!(target: "ironrdp_cliprdr", "cliprdr-error");
+                tracing::info!(target: "ironrdp_server::server", "ironrdp-info");
+            });
+            let out = buf.text();
+            for hidden in ["cliprdr-info", "cliprdr-warn", "cliprdr-pdu-warn"] {
+                assert!(!out.contains(hidden), "{filter}: {hidden} leaked: {out}");
+            }
+            // ERROR still shows, and the other IronRDP crates keep INFO.
+            for shown in ["cliprdr-error", "ironrdp-info"] {
+                assert!(out.contains(shown), "{filter}: {shown} missing: {out}");
+            }
+        }
     }
 
     #[test]
