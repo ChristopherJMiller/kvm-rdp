@@ -12,7 +12,7 @@ use kvm_probe::captures::{self, CaptureDir};
 use kvm_probe::cli::{Cli, Cmd, Conn, Port, SchemeArg};
 use kvm_probe::kvm::KvmError;
 use kvm_probe::request::{KvmTarget, Scheme};
-use kvm_probe::{capture, fingerprint, kvm, report, sandbox, secret, trial, wsprobe};
+use kvm_probe::{capture, fingerprint, kvm, l4, report, sandbox, secret, trial, wsprobe};
 
 /// The repo-root `/captures/` directory (gitignored, §11.5) — anchored at
 /// build time via `CARGO_MANIFEST_DIR`, never relative to the operator's
@@ -204,6 +204,128 @@ async fn run(cli: Cli) -> Result<(), String> {
             .and_then(|opened| opened)
             .map_err(|e| format!("{e:?}"))?;
             println!("websocket upgrade: {} ms", d.as_millis());
+        }
+        Cmd::ConcurrentFlv { conn, trials, gop } => {
+            let pw = password(&conn)?;
+            let t = target(&conn);
+            let plan = l4::flv::ConcurrentPlan {
+                trials,
+                gop,
+                timeout: Duration::from_secs(5),
+                pause: Duration::from_millis(2500),
+            };
+            let report = session(&conn, &pw, async |tok: &str| {
+                l4::flv::concurrent_flv(&t, conn.pin_for(Port::Video), tok, &plan, |n, tr| {
+                    println!("trial {n}/{trials}: {tr:?}");
+                })
+                .await
+            })
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))?
+            .map_err(|e| kvm::bounded_debug(&e))?;
+            println!("{}", l4::flv::summary(&report));
+        }
+        Cmd::RefusalForms { conn } => {
+            let t = target(&conn);
+            let wait = Duration::from_secs(5);
+            for (what, token) in [
+                ("never-issued token", Some(l4::NEVER_ISSUED)),
+                ("no token", None),
+            ] {
+                let flv = match l4::flv::open(&t, conn.pin_for(Port::Video), token, wait).await {
+                    Ok(l4::flv::FlvOpen::Stream(_)) => "served an FLV".to_owned(),
+                    Ok(l4::flv::FlvOpen::Refused(f)) => format!("refused: {f}"),
+                    Err(e) => format!("failed: {}", kvm::bounded_debug(&e)),
+                };
+                println!("av.flv, {what}: {flv}");
+                let ws = match l4::ws::upgrade(&t, conn.pin_for(Port::Control), token, wait).await {
+                    Ok(l4::ws::Upgrade::Accepted(_)) => "upgraded".to_owned(),
+                    Ok(l4::ws::Upgrade::Refused(f)) => format!("refused: {f}"),
+                    Err(e) => format!("failed: {}", kvm::bounded_debug(&e)),
+                };
+                println!("websocket, {what}: {ws}");
+            }
+        }
+        Cmd::WsClose { conn, idle_secs } => {
+            let pw = password(&conn)?;
+            let t = target(&conn);
+            let report = session(&conn, &pw, async |tok: &str| {
+                match l4::ws::upgrade(
+                    &t,
+                    conn.pin_for(Port::Control),
+                    Some(tok),
+                    Duration::from_secs(10),
+                )
+                .await
+                {
+                    Ok(l4::ws::Upgrade::Accepted(w)) => Ok(l4::ws::close_form(
+                        *w,
+                        Duration::from_secs(idle_secs),
+                        Duration::from_secs(5),
+                    )
+                    .await),
+                    Ok(l4::ws::Upgrade::Refused(f)) => Err(format!("refused: {f}")),
+                    Err(e) => Err(kvm::bounded_debug(&e)),
+                }
+            })
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))??;
+            println!("{report:?}");
+        }
+        Cmd::TokenLife { conn, minutes } => {
+            let pw = password(&conn)?;
+            let ages: Vec<Duration> = minutes
+                .iter()
+                .map(|m| Duration::from_secs(m.saturating_mul(60)))
+                .collect();
+            let probes = l4::session::token_life(
+                &target(&conn),
+                conn.pin_for(Port::Web),
+                conn.pin_for(Port::Control),
+                &pw,
+                &ages,
+                Duration::from_secs(10),
+                |p| println!("age {} s: {:?}", p.age.as_secs(), p.outcome),
+            )
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))?;
+            println!("{} tokens probed", probes.len());
+        }
+        Cmd::SessionCap { conn, max } => {
+            eprintln!(
+                "kvm-probe: session-cap can end other sessions if the KVM evicts its oldest; run it only with the owner's consent"
+            );
+            let pw = password(&conn)?;
+            let r = l4::session::session_cap(
+                &target(&conn),
+                conn.pin_for(Port::Web),
+                conn.pin_for(Port::Control),
+                &pw,
+                max,
+                Duration::from_secs(10),
+                |i, line| println!("login {i}: {line}"),
+            )
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))?;
+            println!("logins={} stopped={:?}", r.logins, r.stopped);
+        }
+        Cmd::LogoutWatch { conn, max_secs } => {
+            let pw = password(&conn)?;
+            let r = l4::session::logout_watch(
+                &target(&conn),
+                conn.pin_for(Port::Web),
+                conn.pin_for(Port::Video),
+                conn.pin_for(Port::Control),
+                &pw,
+                l4::session::WatchPlan {
+                    max: Duration::from_secs(max_secs),
+                    poll: Duration::from_secs(2),
+                },
+                || println!("READY: log out of the KVM web UI now"),
+            )
+            .await
+            .map_err(|e| kvm::bounded_debug(&e))?;
+            println!("{r:?}");
         }
         Cmd::SampleRange {
             name,

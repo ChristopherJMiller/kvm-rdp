@@ -45,6 +45,12 @@ impl Cli {
                 (conn, &[Port::Web, Port::Video])
             }
             Cmd::WsOpen { conn } => (conn, &[Port::Web, Port::Control]),
+            Cmd::ConcurrentFlv { conn, .. } => (conn, &[Port::Web, Port::Video]),
+            Cmd::RefusalForms { conn } => (conn, &[Port::Video, Port::Control]),
+            Cmd::WsClose { conn, .. }
+            | Cmd::TokenLife { conn, .. }
+            | Cmd::SessionCap { conn, .. } => (conn, &[Port::Web, Port::Control]),
+            Cmd::LogoutWatch { conn, .. } => (conn, &[Port::Web, Port::Video, Port::Control]),
             Cmd::Fingerprint { .. } | Cmd::SampleRange { .. } | Cmd::Summarize { .. } => {
                 return Ok(());
             }
@@ -193,6 +199,61 @@ pub enum Cmd {
     WsOpen {
         #[command(flatten)]
         conn: Conn,
+    },
+    /// L4 (§11.6): side FLVs on the main FLV's own token — served or
+    /// refused (with the form), the main FLV's forced-IDR latency, and how
+    /// many AUs a ReconnectFlv swap would replay. No HID, no logout.
+    ConcurrentFlv {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, default_value_t = 20)]
+        trials: u32,
+        /// The main FLV's GOP in frames (60 on the ES3, census Leg A).
+        #[arg(long, default_value_t = 60)]
+        gop: u32,
+    },
+    /// L4: how the KVM refuses an FLV and a websocket with a never-issued
+    /// token and with none (status, Content-Type, body prefix). No login.
+    RefusalForms {
+        #[command(flatten)]
+        conn: Conn,
+    },
+    /// L4: open the control websocket, read for --idle-secs sending
+    /// nothing, send a close frame, and report the KVM's answer and how its
+    /// TCP connection ends. Never logs out.
+    WsClose {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, default_value_t = 10)]
+        idle_secs: u64,
+    },
+    /// L4: log in once per --minutes value now, then probe each token once,
+    /// at that age, with a bare websocket upgrade. Never logs out.
+    TokenLife {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, value_delimiter = ',', default_value = "1,5,15,30,60")]
+        minutes: Vec<u64>,
+    },
+    /// L4: log in up to --max times, checking after each that the first and
+    /// the newest token still work. If the KVM evicts its oldest session at
+    /// a cap, this can end the owner's web-UI session: run it only with the
+    /// owner's consent. Never logs out.
+    SessionCap {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, default_value_t = 16)]
+        max: u32,
+    },
+    /// L4 [OWNER, optional]: log in, open the control websocket and an FLV,
+    /// print READY, and watch while the OWNER logs out in the vendor web UI
+    /// (controller ruling 1). The probe never sends a logout. Only after
+    /// the owner confirms nobody else is using the KVM.
+    LogoutWatch {
+        #[command(flatten)]
+        conn: Conn,
+        #[arg(long, default_value_t = 300)]
+        max_secs: u64,
     },
     /// Decode one frame of captures/<name> in the sandbox; report native Y min/max.
     ///
@@ -476,6 +537,12 @@ mod tests {
             vec!["ws-open"],
             vec!["capture", "--name", "c.flv"],
             vec!["first-idr"],
+            vec!["concurrent-flv"],
+            vec!["refusal-forms"],
+            vec!["ws-close"],
+            vec!["token-life"],
+            vec!["session-cap"],
+            vec!["logout-watch"],
         ] {
             let mut argv = vec!["kvm-probe"];
             argv.extend(&sub);
@@ -489,6 +556,81 @@ mod tests {
                 "{sub:?}"
             );
         }
+    }
+
+    /// The L4 subcommands' defaults (Task 1.6 runs them as written), and
+    /// each one's https pin check covers the ports it touches.
+    #[test]
+    fn l4_subcommands_parse_with_their_defaults() {
+        let parse = |sub: &str| {
+            let c = Cli::try_parse_from([
+                "kvm-probe",
+                sub,
+                "--host",
+                "h",
+                "--pin",
+                "ab",
+                "--password-file",
+                "/tmp/pw",
+            ])
+            .unwrap();
+            assert!(c.validate().is_ok(), "{sub}");
+            c.cmd
+        };
+        assert!(matches!(
+            parse("concurrent-flv"),
+            Cmd::ConcurrentFlv {
+                trials: 20,
+                gop: 60,
+                ..
+            }
+        ));
+        assert!(matches!(parse("refusal-forms"), Cmd::RefusalForms { .. }));
+        assert!(matches!(
+            parse("ws-close"),
+            Cmd::WsClose { idle_secs: 10, .. }
+        ));
+        assert!(matches!(
+            parse("token-life"),
+            Cmd::TokenLife { minutes, .. } if minutes == [1, 5, 15, 30, 60]
+        ));
+        assert!(matches!(
+            parse("session-cap"),
+            Cmd::SessionCap { max: 16, .. }
+        ));
+        assert!(matches!(
+            parse("logout-watch"),
+            Cmd::LogoutWatch { max_secs: 300, .. }
+        ));
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "token-life",
+            "--host",
+            "h",
+            "--pin",
+            "ab",
+            "--password-file",
+            "/tmp/pw",
+            "--minutes",
+            "2,7",
+        ])
+        .unwrap();
+        assert!(matches!(c.cmd, Cmd::TokenLife { minutes, .. } if minutes == [2, 7]));
+        // `logout-watch` touches all three ports; without --pin, https fails.
+        let c = Cli::try_parse_from([
+            "kvm-probe",
+            "logout-watch",
+            "--host",
+            "h",
+            "--video-pin",
+            "v",
+            "--control-pin",
+            "c",
+            "--password-file",
+            "/tmp/pw",
+        ])
+        .unwrap();
+        assert!(c.validate().is_err());
     }
 
     #[test]

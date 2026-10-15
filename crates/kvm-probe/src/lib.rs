@@ -3,6 +3,7 @@ pub mod captures;
 pub mod cli;
 pub mod fingerprint;
 pub mod kvm;
+pub mod l4;
 pub mod pin;
 pub mod record;
 pub mod report;

@@ -28,7 +28,7 @@ serde_json = "1"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "logging"] }
 rustls-pki-types = "1"
 x509-parser = "0.16"
-tokio = { version = "1", features = ["rt-multi-thread", "rt", "net", "io-util", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "net", "io-util", "macros", "time", "sync"] }
 clap = { version = "4", features = ["derive"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 hyper = { version = "1", features = ["client", "http1"] }
@@ -37,6 +37,7 @@ http-body-util = "0.1"
 kvm-proto = { path = "../kvm-proto" }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 libc = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 
 [dev-dependencies]
 rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }  # default features would pull in ring (§4.2)
