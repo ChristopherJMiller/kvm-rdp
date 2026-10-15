@@ -1891,4 +1891,22 @@ mod tests {
             .unwrap();
         assert_eq!(r.sim.stats().logouts, 0);
     }
+
+    /// Task 4.2 (D10a): `input.reassert_after` reaches the websocket task
+    /// through `SessionConfig`, as the other `input.*` keys do.
+    #[test]
+    fn the_reassert_wait_comes_from_the_config() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("kvm.pass"), "kvm-secret\n").unwrap();
+        std::fs::write(d.path().join("nla.pass"), "session-test-nla-password\n").unwrap();
+        let toml = "[rdp]\nnla_password_file = \"nla.pass\"\ntls_cert_file = \"cert.pem\"\n\
+                    tls_key_file = \"key.pem\"\n[kvm]\nhost = \"192.168.0.50\"\n\
+                    spki_sha256 = \"F94841875EC7FA56220D48FFADAA5C0F2D84FFBBD1BEEB060245DED1419B614F\"\n\
+                    password_file = \"kvm.pass\"\n[input]\nreassert_after = \"750ms\"\n";
+        let c = Config::from_toml(toml, d.path()).unwrap();
+        assert_eq!(
+            SessionConfig::from_config(&c).reassert_after,
+            Duration::from_millis(750)
+        );
+    }
 }
