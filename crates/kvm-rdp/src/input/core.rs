@@ -636,9 +636,10 @@ impl InputCore {
 
     /// I2: retire every request `request_retire` old, counted `unanswered`.
     /// One ahead of the Pending paste's own leaves one fewer to wait for.
-    /// The paste's own is retired only once the paste is past its own wait
-    /// (at most half that age) and no step has ended it yet: it ends now,
-    /// `modifier_wait`, as its next step would have ended it.
+    /// The paste's own is that old only once the paste is past its own wait
+    /// (at most half that age) with no step since to end it: this step's
+    /// `paste_step` ends it (`modifier_wait`), and no answer can reach it —
+    /// none is outstanding after its own.
     fn retire(&mut self, ctx: &Ctx, out: &mut Vec<Out>) {
         let after = request_retire(ctx.modifier_wait);
         while let Some(at) = self.requests.front().copied() {
@@ -647,20 +648,11 @@ impl InputCore {
             }
             let _ = self.requests.pop_front();
             out.push(Out::ClipboardDiscarded("unanswered"));
-            let own = match &mut self.paste {
-                State::Pending {
-                    ahead, text: None, ..
-                } => match ahead.checked_sub(1) {
-                    Some(a) => {
-                        *ahead = a;
-                        false
-                    }
-                    None => true,
-                },
-                _ => false,
-            };
-            if own {
-                self.end_paste(ctx, PasteOutcome::Aborted("modifier_wait"), out);
+            if let State::Pending {
+                ahead, text: None, ..
+            } = &mut self.paste
+            {
+                *ahead = ahead.saturating_sub(1);
             }
         }
     }
