@@ -121,6 +121,29 @@ impl Pointer {
         self.buttons = 0;
     }
 
+    /// A button released with no position of its own — a relative release
+    /// (PD9 review I4, controller ruling 3: a release is honoured from any
+    /// event; relative presses and motion stay dropped, DD7). Its
+    /// released-by-bridge mark clears; a held button is released where the
+    /// pointer is (held means a press placed it). `None`: it was not held,
+    /// and nothing need be sent.
+    pub fn button_up(&mut self, b: Button) -> Option<PointerReport> {
+        let bit = b.bit();
+        self.rbb_buttons &= !bit;
+        if self.buttons & bit == 0 {
+            return None;
+        }
+        self.buttons &= !bit;
+        let (x, y) = self.pos?;
+        Some(PointerReport {
+            frame: HidFrame::AbsMouse {
+                buttons: self.buttons,
+                x,
+                y,
+            },
+        })
+    }
+
     /// m6 (PD5 review): forget the released-by-bridge buttons — only on a
     /// Synchronize, after which the client re-sends what it still holds.
     pub fn forget_released_by_bridge(&mut self) {
@@ -455,5 +478,32 @@ mod tests {
                 "seed {seed}: a button was left held"
             );
         }
+    }
+
+    /// PD9 review I4 (controller ruling 3): a button-up with no position (a
+    /// relative release) releases a held button where the pointer is and
+    /// clears its released-by-bridge mark; with the button not held it
+    /// sends nothing — a release is always safe.
+    #[test]
+    fn a_button_up_releases_where_the_pointer_is() {
+        let mut p = Pointer::default();
+        assert_eq!(p.button_up(Button::Left), None, "nothing held");
+        p.button(Button::Left, true, 960, 540).unwrap();
+        p.button(Button::Right, true, 960, 540).unwrap();
+        let r = p.button_up(Button::Left).unwrap();
+        assert_eq!(r.frame, abs(0x02, 16_392, 16_398), "{}", bytes(r.frame));
+        assert_eq!(p.held_buttons(), 0x02);
+        assert_eq!(p.button_up(Button::Left), None, "already up");
+        p.release_all();
+        assert!(p.is_released_by_bridge(Button::Right));
+        assert_eq!(p.button_up(Button::Right), None, "the KVM's is up");
+        assert!(
+            !p.is_released_by_bridge(Button::Right),
+            "the mark is cleared"
+        );
+        assert!(
+            p.button(Button::Right, true, 1, 1).is_some(),
+            "a fresh press"
+        );
     }
 }

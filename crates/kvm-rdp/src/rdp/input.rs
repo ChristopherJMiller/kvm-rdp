@@ -404,6 +404,7 @@ fn is_client_input(e: &Event) -> bool {
             | Event::Synchronize { .. }
             | Event::MouseMove { .. }
             | Event::MouseButton { .. }
+            | Event::ButtonUp { .. }
             | Event::Wheel { .. }
     )
 }
@@ -437,8 +438,15 @@ fn to_mouse_event(e: MouseEvent) -> Option<Event> {
             y,
         }),
         MouseEvent::VerticalScroll { value } => Some(Event::Wheel { units: value }),
-        // DD7: relative motion (a `ButtonRel` included), horizontal and
-        // ainput scroll are dropped and counted by the caller.
+        // PD9 review I4 (controller ruling 3): a release is honoured from
+        // any event — a relative one releases where the pointer is.
+        MouseEvent::ButtonRel {
+            button,
+            pressed: false,
+            ..
+        } => button_for(button).map(|b| Event::ButtonUp { button: b }),
+        // DD7: relative motion and presses, horizontal and ainput scroll
+        // are dropped and counted by the caller.
         _ => None,
     }
 }
@@ -1457,5 +1465,94 @@ mod tests {
         assert_eq!(r.metrics.paste_events.get("done"), 5);
         assert_eq!(r.metrics.clipboard_discarded.get("unanswered"), 1);
         assert_eq!(r.metrics.clipboard_discarded.get("late"), 0);
+    }
+
+    fn rel(button: MouseButton, pressed: bool) -> MouseEvent {
+        MouseEvent::ButtonRel {
+            x: 3,
+            y: -4,
+            button,
+            pressed,
+        }
+    }
+
+    /// I4 (controller ruling 3): a button pressed with an absolute event
+    /// and released with a relative one ends released on the KVM — at the
+    /// pointer's place, the relative delta ignored (DD7) — and the release
+    /// is not counted as dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_relative_release_ends_an_absolute_press() {
+        let mut r = rig();
+        r.start();
+        r.s.mouse(MouseEvent::Button {
+            x: 960,
+            y: 540,
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        let _ = r.write();
+        assert_eq!(r.buttons, 1);
+        r.s.mouse(rel(MouseButton::Left, false));
+        assert_eq!(
+            r.write(),
+            [HidFrame::AbsMouse {
+                buttons: 0,
+                x: 16_392,
+                y: 16_398
+            }]
+        );
+        assert_eq!(r.metrics.input_events_ignored.get(), 0);
+    }
+
+    /// I4: a relative press (and relative motion) stays dropped and counted
+    /// (DD7): it pushes nothing; a relative release with nothing held
+    /// pushes nothing either.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_relative_press_is_dropped() {
+        let mut r = rig();
+        r.start();
+        let _ = r.write();
+        r.s.mouse(rel(MouseButton::Left, true));
+        r.s.mouse(MouseEvent::RelMove { x: 5, y: 5 });
+        assert_eq!(r.metrics.input_events_ignored.get(), 2);
+        r.s.mouse(rel(MouseButton::Right, false));
+        // No pointer frame (the one zero keyboard report is the session
+        // start's epoch step, m4).
+        assert_eq!(r.write(), [KBD_ZERO]);
+        assert_eq!(r.buttons, 0);
+        assert_eq!(r.metrics.input_events_ignored.get(), 2);
+    }
+
+    /// I4: a relative release of a button the bridge released clears its
+    /// mark, so the next absolute press goes through.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_relative_release_clears_a_released_by_bridge_mark() {
+        let mut r = rig();
+        r.start();
+        let down = MouseEvent::Button {
+            x: 10,
+            y: 10,
+            button: MouseButton::Middle,
+            pressed: true,
+        };
+        r.s.mouse(down);
+        r.hid.release_all(ReleaseTrigger::Suppression);
+        r.s.mouse(MouseEvent::Button {
+            x: 10,
+            y: 10,
+            button: MouseButton::Middle,
+            pressed: true,
+        }); // a repeat of a released button: nothing
+        let _ = r.write();
+        assert_eq!(r.buttons, 0);
+        r.s.mouse(rel(MouseButton::Middle, false));
+        r.s.mouse(MouseEvent::Button {
+            x: 10,
+            y: 10,
+            button: MouseButton::Middle,
+            pressed: true,
+        });
+        let _ = r.write();
+        assert_eq!(r.buttons, 0x04, "the fresh press was swallowed");
     }
 }

@@ -113,6 +113,11 @@ pub enum Event {
         x: u16,
         y: u16,
     },
+    /// A button released with no position (a relative release, PD9 review
+    /// I4): released where the pointer is, if held.
+    ButtonUp {
+        button: Button,
+    },
     Wheel {
         units: i16,
     },
@@ -167,6 +172,7 @@ impl std::fmt::Debug for Event {
             Event::Synchronize { .. } => "Synchronize",
             Event::MouseMove { .. } => "MouseMove",
             Event::MouseButton { .. } => "MouseButton",
+            Event::ButtonUp { .. } => "ButtonUp",
             Event::Wheel { .. } => "Wheel",
             Event::ClipboardText(_) => "ClipboardText",
             Event::ClipboardFailed => "ClipboardFailed",
@@ -544,6 +550,16 @@ impl InputCore {
                     });
                 }
             }
+            // I4: `None`: it was not held (its mark, if any, is cleared).
+            Event::ButtonUp { button } => {
+                if let Some(r) = self.pointer.button_up(button) {
+                    out.push(Out::Push {
+                        frame: r.frame,
+                        motion_only: false,
+                        stamp: ctx.epoch,
+                    });
+                }
+            }
             Event::Wheel { units } => {
                 for frame in self.pointer.wheel(units) {
                     out.push(Out::Push {
@@ -743,7 +759,7 @@ impl InputCore {
                 self.end_paste(ctx, PasteOutcome::Aborted("key"), out);
                 Some(event)
             }
-            Event::MouseButton { .. } if active => {
+            Event::MouseButton { .. } | Event::ButtonUp { .. } if active => {
                 self.end_paste(ctx, PasteOutcome::Aborted("mouse"), out);
                 Some(event) // the click itself goes through
             }
@@ -1097,6 +1113,7 @@ mod tests {
                 x,
                 y,
             } => format!("MouseButton({button:?}, pressed={pressed}, {x}, {y})"),
+            Event::ButtonUp { button } => format!("ButtonUp({button:?})"),
             Event::Wheel { units } => format!("Wheel({units})"),
             Event::ClipboardText(b) => format!("ClipboardText({:02x?})", b),
             Event::ClipboardFailed => "ClipboardFailed".to_owned(),
@@ -4241,7 +4258,9 @@ mod tests {
             fired: [0; 14],
         };
         let (mut typing_steps, mut roomless_steps) = (0usize, 0usize);
-        for seed in 1..=64u64 {
+        // 96 seeds: every outcome fires 20 times over with a margin (PD9 fix
+        // round 1 added the relative release, which moved the stream).
+        for seed in 1..=96u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let s = usize::try_from(seed).unwrap();
             let (krt, mit) = timeouts[s % timeouts.len()];
@@ -4388,11 +4407,16 @@ mod tests {
                         if pressed {
                             sent_buttons.push(b);
                         }
-                        Event::MouseButton {
-                            button: b,
-                            pressed,
-                            x: rng.pick(&coords),
-                            y: rng.pick(&coords),
+                        // I4: now and then a release with no position (relative).
+                        if !pressed && rng.below(4) == 0 {
+                            Event::ButtonUp { button: b }
+                        } else {
+                            Event::MouseButton {
+                                button: b,
+                                pressed,
+                                x: rng.pick(&coords),
+                                y: rng.pick(&coords),
+                            }
                         }
                     }
                     13 => Event::Wheel {
@@ -4761,7 +4785,8 @@ mod tests {
                         button,
                         pressed: false,
                         ..
-                    } => owed_buttons &= !button_bit(button),
+                    }
+                    | Event::ButtonUp { button } => owed_buttons &= !button_bit(button),
                     _ => {}
                 }
                 // Whatever was held at a release or swallowed stays up until
