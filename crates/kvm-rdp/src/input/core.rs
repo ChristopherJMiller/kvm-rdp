@@ -2139,9 +2139,18 @@ mod tests {
         let mut r = Rig::new();
         r.room = 0;
         assert!(pushes(&start_paste(&mut r, "abcd")).is_empty());
+        // PD7 review m2: the look again is 2 ms off — never now, which
+        // would spin the driver while the queue stays full.
+        assert_eq!(crate::input::paste::ROOM_POLL, Duration::from_millis(2));
         assert_eq!(
             r.core.next_deadline(),
-            Some(r.now + crate::input::paste::ROOM_POLL)
+            Some(r.now + Duration::from_millis(2))
+        );
+        r.advance(Duration::from_millis(1));
+        assert!(r.step(Event::Tick).is_empty(), "no room: nothing, no spin");
+        assert_eq!(
+            r.core.next_deadline(),
+            Some(r.now + Duration::from_millis(2))
         );
         r.room = 3;
         r.advance(crate::input::paste::ROOM_POLL);
@@ -2360,6 +2369,86 @@ mod tests {
 
     // ---- Beyond the plan's listing: ruling 8, the bounds, and every
     // outcome through a real `HidControl`.
+
+    /// PD7 review I1 (§8's wait, §11.1's "does not happen before"): a
+    /// pending paste waits the whole `paste.modifier_wait` — a Tick a
+    /// nanosecond short of its deadline leaves it Pending with no outcome,
+    /// and the Tick at the deadline ends it — whether or not its text has
+    /// come (here the modifiers are still held).
+    #[test]
+    fn modifier_wait_ends_a_pending_paste_at_its_deadline_and_not_before() {
+        for with_text in [false, true] {
+            let mut r = Rig::new();
+            hold_chord(&mut r);
+            let t0 = r.now;
+            r.step(chord_event());
+            if with_text {
+                r.step(Event::ClipboardText(utf16le("ab")));
+            }
+            let at = t0 + Duration::from_secs(5);
+            assert_eq!(r.core.paste.deadline(), Some(at), "with_text={with_text}");
+            r.now = at - Duration::from_nanos(1);
+            let out = r.step(Event::Tick);
+            assert!(
+                outcomes(&out).is_empty(),
+                "with_text={with_text}: {}",
+                show(&out)
+            );
+            assert!(
+                matches!(r.core.paste, State::Pending { .. }),
+                "with_text={with_text}"
+            );
+            r.now = at;
+            let out = r.step(Event::Tick);
+            assert!(
+                matches!(
+                    outcomes(&out).as_slice(),
+                    [PasteOutcome::Aborted("modifier_wait")]
+                ),
+                "with_text={with_text}: {}",
+                show(&out)
+            );
+            assert!(!r.core.paste.is_active(), "with_text={with_text}");
+        }
+    }
+
+    /// PD7 review I2 (DD4 in Windows App's Unicode mode, Review Focus 2): a
+    /// fresh Unicode press while Pending cancels the paste and goes through
+    /// — 'x' is usage 0x1B, with the modifiers the KVM already holds — and
+    /// the repeat of a unit held since before the chord does nothing.
+    #[test]
+    fn a_fresh_unicode_press_while_pending_cancels_and_goes_through() {
+        let x = u16::from(b'x');
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let out = r.step(Event::UnicodePressed(x));
+        assert!(
+            matches!(outcomes(&out).as_slice(), [PasteOutcome::Aborted("key")]),
+            "{}",
+            show(&out)
+        );
+        assert_eq!(pushes(&out), [(kbd(0x07, 0x1B), 0)], "{}", show(&out));
+        assert!(!r.core.paste.is_active());
+        // A unit held (and sent) before the chord: its repeat is a repeat.
+        let mut r = Rig::new();
+        assert_eq!(
+            pushes(&r.step(Event::UnicodePressed(x))),
+            [(kbd(0, 0x1B), 0)]
+        );
+        hold_chord(&mut r);
+        assert!(matches!(
+            outcomes(&r.step(chord_event())).as_slice(),
+            [PasteOutcome::Started]
+        ));
+        let out = r.step(Event::UnicodePressed(x));
+        assert!(
+            outcomes(&out).is_empty() && pushes(&out).is_empty(),
+            "{}",
+            show(&out)
+        );
+        assert!(r.core.paste.is_active());
+    }
 
     /// Controller ruling 8 (1): while Pending, releases still go out — the
     /// chord's modifier presses reached the KVM, so their releases must,
@@ -3904,9 +3993,27 @@ mod tests {
                     assert_eq!(phase(&core), Phase::Idle, "{at}: a trigger left a paste");
                 }
                 // The paste: outcomes well-sequenced and matching the phase.
+                let pending_deadline = paste.pending_deadline;
                 paste.see(&outs, now, modifier_wait, &at);
                 let post_phase = phase(&core);
                 assert_eq!(paste.open, post_phase != Phase::Idle, "{at}");
+                // PD7 review I1: modifier_wait ends a paste at its deadline,
+                // never before, and no paste is still Pending at or past it.
+                if outs
+                    .iter()
+                    .any(|o| matches!(o, Out::Paste(PasteOutcome::Aborted("modifier_wait"))))
+                {
+                    assert!(
+                        pending_deadline.is_some_and(|d| now >= d),
+                        "{at}: modifier_wait fired early"
+                    );
+                }
+                if post_phase == Phase::Pending {
+                    assert!(
+                        paste.pending_deadline.is_some_and(|d| now < d),
+                        "{at}: still pending past modifier_wait"
+                    );
+                }
                 // D3c: a swallowed press is marked; typing's start marks
                 // what the client still holds (never a modifier: typing
                 // waits for every one to be up).
@@ -3956,6 +4063,7 @@ mod tests {
                     if room == 0 {
                         roomless_steps += 1;
                         assert!(d >= now + crate::input::paste::ROOM_POLL, "{at}: a spin");
+                        assert!(d > now, "{at}: a spin (ROOM_POLL is 0)");
                     }
                 }
                 if post_phase == Phase::Pending {
