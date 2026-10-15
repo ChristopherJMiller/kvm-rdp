@@ -4,6 +4,8 @@
 //! carries the reports out through `HidControl` (DD2).
 pub mod core;
 pub mod keys;
+pub mod paste;
 pub mod pointer;
 
 pub use core::{Ctx, Event, InputCore, Out};
+pub use paste::{PasteOutcome, PasteRefusal};

@@ -1,13 +1,13 @@
-//! The input state machine (§7), sans-IO: `step(now, ctx, event)` appends
-//! `Out`s, `next_deadline` says when a timer next needs a `Tick`. The
-//! release epoch is the release channel: a step whose `ctx.epoch` moved
-//! since the last one releases first (every held key and button becomes
-//! released-by-bridge), and every report it then builds carries `ctx.epoch`
-//! as its stamp, so the shell's `push_at(stamp, …)` drops it if a release
-//! raced it (design decision 6; §7.3, §7.4). The two timers and
-//! `Synchronize` are the triggers the core raises itself; the shell's own
-//! triggers (session start/end, suppression, reconnect, Closing, shutdown)
-//! reach the core only as a bumped epoch.
+//! The input state machine (§7, §8), sans-IO: `step(now, ctx, event)`
+//! appends `Out`s, `next_deadline` says when a timer or the paste next
+//! needs a `Tick`. The release epoch is the release channel: a step whose
+//! `ctx.epoch` moved since the last one releases first (every held key and
+//! button becomes released-by-bridge, a paste ends), and every report it
+//! then builds carries `ctx.epoch` as its stamp, so the shell's
+//! `push_at(stamp, …)` drops it if a release raced it (design decision 6;
+//! §7.3, §7.4). The two timers and `Synchronize` are the triggers the core
+//! raises itself; the shell's own triggers (session start/end, suppression,
+//! reconnect, Closing, shutdown) reach the core only as a bumped epoch.
 //!
 //! The timers fire only on a `Tick`, and a release the core raises is the
 //! last out of its step: no report is ever built after it in the same step,
@@ -17,18 +17,28 @@
 //! that steps a `Tick` first when `next_deadline() <= now` gets the
 //! deadline exactly (the release, then the event at the new epoch).
 //!
+//! Paste (§8, design decision 7) is `input::paste`'s state, stepped here:
+//! the chord (raw scancode, raw held bits, before any remap) starts it;
+//! Pending waits, bounded by `paste.modifier_wait`, for the clipboard text
+//! and for every modifier to release; Typing types through the Typist at
+//! `paste.pace`, never more reports per step than `ctx.queue_room` (DD6).
+//! Every key the paste swallows is released by the bridge (D3c).
+//!
 //! Every type here that holds input (`Event`, `Out`, `InputCore`) has a
-//! redacted `Debug` (PD5 ruling, §4.5): kinds, counts and flags only.
+//! redacted `Debug` (PD5 ruling, §4.5): kinds, counts and flags only —
+//! pasted text included (PD7 rule).
 use crate::hid::ReleaseTrigger;
 use crate::input::keys::{KeyReport, Keyboard};
+use crate::input::paste::{PasteOutcome, PasteRefusal, ROOM_POLL, State};
 use crate::input::pointer::{Button, Pointer};
 use crate::msg::Gen;
 use kvm_proto::hid::HidFrame;
-use kvm_proto::keymap::{modifier_bit, us_stroke, usage_for_scancode};
+use kvm_proto::keymap::{Chord, USAGE_ESC, modifier_bit, us_stroke, usage_for_scancode};
+use kvm_proto::paste::{PastePolicy, Prepared, RELEASE, Typist, decode_utf16le, prepare};
 use std::time::{Duration, Instant};
 
 /// What the shell knows at one step (no input state: a derived `Debug` is
-/// safe).
+/// safe — the chord and the paste settings are config).
 #[derive(Debug, Clone)]
 pub struct Ctx {
     pub now: Instant,
@@ -38,9 +48,23 @@ pub struct Ctx {
     pub mac_remap: bool,
     pub key_repeat_timeout: Duration,
     pub modifier_idle_timeout: Duration,
+    /// `paste.chord` (§8, DD11).
+    pub chord: Chord,
+    /// `paste.pace`: the least time between two Typist reports (DD6).
+    pub pace: Duration,
+    /// `paste.modifier_wait`: how long a pending paste waits for its text
+    /// and for the modifiers to release (DD4).
+    pub modifier_wait: Duration,
+    /// `paste.multiline = "refuse"`.
+    pub multiline_refuse: bool,
+    /// `paste.max_chars`.
+    pub max_chars: usize,
+    /// The HID queue's free room, `8 - queued` (DD6, D2b): the most Typist
+    /// reports one step may push.
+    pub queue_room: usize,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Event {
     KeyPressed {
         code: u8,
@@ -70,6 +94,11 @@ pub enum Event {
     Wheel {
         units: i16,
     },
+    /// The reassembled `CF_UNICODETEXT` bytes of a clipboard response.
+    ClipboardText(Vec<u8>),
+    /// A format list said Unicode text is (or is not) on the clipboard: the
+    /// core's only availability signal (D9c).
+    ClipboardAvailable(bool),
     Tick,
 }
 
@@ -83,11 +112,16 @@ pub enum Out {
     Release(ReleaseTrigger),
     /// One dropped input, counted as `input_events_ignored` (DD7, DD9).
     Ignored,
+    /// Ask the client for its `CF_UNICODETEXT` (a paste is pending).
+    RequestClipboard,
+    /// A paste outcome, for the shell to count (§8).
+    Paste(PasteOutcome),
 }
 
-/// §4.5 (PD5 ruling): an event is a keystroke, a typed unit or the
-/// pointer's state — `Debug` names its kind only (never a code, a unit,
-/// Caps Lock, a position, a button or a wheel turn).
+/// §4.5 (PD5 ruling; PD7: pasted text is as sensitive as a password): an
+/// event is a keystroke, a typed unit, the pointer's state or clipboard
+/// text — `Debug` names its kind only (never a code, a unit, Caps Lock, a
+/// position, a button, a wheel turn, a byte of text or its availability).
 impl std::fmt::Debug for Event {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self {
@@ -99,6 +133,8 @@ impl std::fmt::Debug for Event {
             Event::MouseMove { .. } => "MouseMove",
             Event::MouseButton { .. } => "MouseButton",
             Event::Wheel { .. } => "Wheel",
+            Event::ClipboardText(_) => "ClipboardText",
+            Event::ClipboardAvailable(_) => "ClipboardAvailable",
             Event::Tick => "Tick",
         };
         f.debug_struct("Event")
@@ -108,7 +144,8 @@ impl std::fmt::Debug for Event {
 }
 
 /// §4.5 (PD5 ruling): a report shows only `HidFrame`'s redacted kind, with
-/// its flag and stamp; a release shows its trigger.
+/// its flag and stamp; a release shows its trigger; a paste outcome its
+/// label and counts (never text).
 impl std::fmt::Debug for Out {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -124,6 +161,8 @@ impl std::fmt::Debug for Out {
                 .finish(),
             Out::Release(t) => f.debug_tuple("Release").field(&t.label()).finish(),
             Out::Ignored => f.write_str("Ignored"),
+            Out::RequestClipboard => f.write_str("RequestClipboard"),
+            Out::Paste(p) => f.debug_tuple("Paste").field(p).finish(),
         }
     }
 }
@@ -143,11 +182,15 @@ pub struct InputCore {
     /// `next_deadline` needs no `Ctx`.
     key_repeat_at: Option<Instant>,
     modifier_idle_at: Option<Instant>,
+    /// The paste's state (§8).
+    paste: State,
+    /// The last format list offered Unicode text (D9c).
+    clipboard_text: bool,
 }
 
-/// §4.5 (PD5 ruling): the keyboard's and pointer's redacted `Debug`s, the
-/// generation and epoch, and whether each timer is armed — never a key,
-/// a position or a keystroke's time.
+/// §4.5 (PD5 ruling): the keyboard's, pointer's and paste's redacted
+/// `Debug`s, the generation and epoch, and whether each timer is armed —
+/// never a key, a position, a keystroke's time or pasted text.
 impl std::fmt::Debug for InputCore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InputCore")
@@ -157,6 +200,8 @@ impl std::fmt::Debug for InputCore {
             .field("seen_epoch", &self.seen_epoch)
             .field("key_repeat_armed", &self.key_repeat_at.is_some())
             .field("modifier_idle_armed", &self.modifier_idle_at.is_some())
+            .field("paste", &self.paste)
+            .field("clipboard_text", &self.clipboard_text)
             .finish()
     }
 }
@@ -179,6 +224,8 @@ impl InputCore {
             last_kbd_event: None,
             key_repeat_at: None,
             modifier_idle_at: None,
+            paste: State::Idle,
+            clipboard_text: false,
         }
     }
 
@@ -188,7 +235,8 @@ impl InputCore {
     }
 
     /// A new session: reset everything (its keys are released by the
-    /// shell's own trigger). The release epoch it has seen is kept — it is
+    /// shell's own trigger), the paste and the clipboard's availability
+    /// included (D9c). The release epoch it has seen is kept — it is
     /// `HidControl`'s, not the session's.
     pub fn on_generation(&mut self, g: Gen) {
         self.keys = Keyboard::default();
@@ -198,6 +246,8 @@ impl InputCore {
         self.last_kbd_event = None;
         self.key_repeat_at = None;
         self.modifier_idle_at = None;
+        self.paste = State::Idle;
+        self.clipboard_text = false;
     }
 
     #[must_use]
@@ -205,13 +255,17 @@ impl InputCore {
         self.keys.caps_lock_on()
     }
 
-    /// The sooner of the two armed timer deadlines.
+    /// The soonest of the two armed timer deadlines and the paste's.
     #[must_use]
     pub fn next_deadline(&self) -> Option<Instant> {
-        [self.key_repeat_at, self.modifier_idle_at]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.key_repeat_at,
+            self.modifier_idle_at,
+            self.paste.deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// The two timer deadlines from the state: each is armed only while
@@ -254,15 +308,27 @@ impl InputCore {
                 stamp: ctx.epoch,
             });
         }
-        self.handle(ctx, event, out);
+        if let Some(event) = self.paste_filter(ctx, event, out) {
+            self.handle(ctx, event, out);
+        }
+        self.paste_step(ctx, out);
         self.arm(ctx);
     }
 
     /// §7.4's release of the core's own state: keys and modifiers (D3a) and
-    /// buttons (D3b) become released-by-bridge; both timers disarm. Every
-    /// release path — the epoch step, `Synchronize`, both timers — comes
-    /// through here.
-    fn release_state(&mut self) -> KeyReport {
+    /// buttons (D3b) become released-by-bridge; both timers disarm; an
+    /// active paste ends (§8, D3c). Every release path — the epoch step,
+    /// `Synchronize`, both timers — comes through here. The aborted paste
+    /// pushes nothing of its own: the release's zero (the epoch step's
+    /// report, or the shell's `release_all` for the core's own triggers)
+    /// clears whatever the Typist left on the KVM, and a report pushed here
+    /// would only be a second zero — or, ahead of a core trigger, one
+    /// `push_at` drops.
+    fn release_state(&mut self, out: &mut Vec<Out>) -> KeyReport {
+        if self.paste.is_active() {
+            self.paste = State::Idle;
+            out.push(Out::Paste(PasteOutcome::Aborted("release")));
+        }
         let r = self.keys.release_all();
         self.pointer.release_all();
         self.last_key_activity = None;
@@ -273,7 +339,7 @@ impl InputCore {
     /// A release that keeps its marks (the epoch step and both timers): a
     /// held key `MAX_RBB` had no room for is one dropped input (DD9).
     fn release_marked(&mut self, out: &mut Vec<Out>) -> HidFrame {
-        let r = self.release_state();
+        let r = self.release_state(out);
         if r.dropped {
             out.push(Out::Ignored);
         }
@@ -325,10 +391,7 @@ impl InputCore {
             Event::UnicodePressed(u) => {
                 self.last_kbd_event = Some(ctx.now);
                 let r = self.keys.unicode_press(u);
-                let usage = char::from_u32(u32::from(u))
-                    .and_then(us_stroke)
-                    .map(|s| s.usage);
-                self.note_key_activity(ctx, usage);
+                self.note_key_activity(ctx, unit_usage(u));
                 if let Some(r) = r {
                     Self::push_key(ctx, r, out);
                 }
@@ -348,8 +411,8 @@ impl InputCore {
                 // after an earlier release) would otherwise swallow the next
                 // fresh press: Cmd+C reaching the Mac as a typed 'c'. The
                 // marks are forgotten at once, so one `MAX_RBB` had no room
-                // for drops nothing.
-                let _ = self.release_state();
+                // for drops nothing. A paste ends (§8, D3c).
+                let _ = self.release_state(out);
                 self.keys.forget_released_by_bridge();
                 self.pointer.forget_released_by_bridge();
                 self.keys.set_caps_lock(caps_lock);
@@ -387,6 +450,8 @@ impl InputCore {
                     });
                 }
             }
+            Event::ClipboardAvailable(text) => self.clipboard_text = text,
+            Event::ClipboardText(bytes) => self.clipboard_text_arrived(ctx, &bytes, out),
             Event::Tick => self.timers(ctx, out),
         }
     }
@@ -394,7 +459,8 @@ impl InputCore {
     /// §7.4's two timers, from the state as it is now (an epoch release at
     /// the top of this step has already disarmed both). One release covers
     /// everything, so at most one fires; the key-repeat timer first. The
-    /// release is the last out of the step.
+    /// release is the last out of the step (it ends any paste, so the
+    /// paste's step after it pushes nothing).
     fn timers(&mut self, ctx: &Ctx, out: &mut Vec<Out>) {
         let (key_repeat, modifier_idle) = self.deadlines(ctx);
         let trigger = if key_repeat.is_some_and(|at| ctx.now >= at) {
@@ -407,6 +473,289 @@ impl InputCore {
         let _ = self.release_marked(out);
         out.push(Out::Release(trigger));
     }
+
+    // ---- Paste (§8).
+
+    /// §8's input rules around a paste: DD4's while Pending, §8's "while
+    /// typing" list while Typing. `None`: the event was swallowed.
+    fn paste_filter(&mut self, ctx: &Ctx, event: Event, out: &mut Vec<Out>) -> Option<Event> {
+        let active = self.paste.is_active();
+        let typing = matches!(self.paste, State::Typing { .. });
+        match event {
+            // The chord starts a paste; a second one meanwhile is swallowed.
+            Event::KeyPressed { code, extended } if self.is_chord(ctx, code, extended) => {
+                self.last_kbd_event = Some(ctx.now);
+                self.swallow_press(usage_for_scancode(code, extended), out);
+                if !active {
+                    self.start_paste(ctx, out);
+                }
+                None
+            }
+            // A fresh Esc aborts, Pending or Typing, and is itself
+            // swallowed. A repeat of an Esc held since before the chord is a
+            // repeat (it falls through and changes nothing): swallowing it
+            // would mark a key that is still down.
+            Event::KeyPressed { code, extended }
+                if active
+                    && usage_for_scancode(code, extended) == Some(USAGE_ESC)
+                    && self.is_fresh_press(USAGE_ESC) =>
+            {
+                self.last_kbd_event = Some(ctx.now);
+                self.swallow_press(Some(USAGE_ESC), out);
+                self.end_paste(ctx, PasteOutcome::Aborted("esc"), out);
+                None
+            }
+            // Typing: every client press is swallowed and released by the
+            // bridge; a release updates the state (all-zero since typing
+            // began) and sends nothing (§8, D3c). An unmapped or untypeable
+            // key is counted on its press, once (the PD5 carry).
+            Event::KeyPressed { code, extended } if typing => {
+                self.last_kbd_event = Some(ctx.now);
+                self.swallow_press(usage_for_scancode(code, extended), out);
+                None
+            }
+            Event::UnicodePressed(unit) if typing => {
+                self.last_kbd_event = Some(ctx.now);
+                self.swallow_press(unit_usage(unit), out);
+                None
+            }
+            Event::KeyReleased { code, extended } if typing => {
+                self.last_kbd_event = Some(ctx.now);
+                let _ = self.keys.release(code, extended);
+                None
+            }
+            Event::UnicodeReleased(unit) if typing => {
+                self.last_kbd_event = Some(ctx.now);
+                let _ = self.keys.unicode_release(unit);
+                None
+            }
+            // Pending: a fresh non-modifier press cancels and goes through
+            // (DD4). Modifier presses, repeats and releases fall through to
+            // `handle` as ever, so the KVM's state follows the client's —
+            // the chord's modifiers reached the KVM, so their releases must
+            // (controller ruling 8).
+            Event::KeyPressed { code, extended }
+                if active && self.is_fresh(usage_for_scancode(code, extended)) =>
+            {
+                self.end_paste(ctx, PasteOutcome::Aborted("key"), out);
+                Some(event)
+            }
+            Event::UnicodePressed(unit) if active && self.is_fresh(unit_usage(unit)) => {
+                self.end_paste(ctx, PasteOutcome::Aborted("key"), out);
+                Some(event)
+            }
+            Event::MouseButton { .. } if active => {
+                self.end_paste(ctx, PasteOutcome::Aborted("mouse"), out);
+                Some(event) // the click itself goes through
+            }
+            other => Some(other),
+        }
+    }
+
+    /// The chord: matched on the raw scancode and the raw held bits (§8),
+    /// and only on a fresh press of its key — never on a repeat of a key the
+    /// bridge released (a swallowed V), nor of one the client holds (a V
+    /// pressed, and sent, before the modifiers).
+    fn is_chord(&self, ctx: &Ctx, code: u8, extended: bool) -> bool {
+        usage_for_scancode(code, extended).is_some_and(|u| self.is_fresh_press(u))
+            && ctx
+                .chord
+                .matches(code, extended, self.keys.held_modifier_bits())
+    }
+
+    /// A press that is not a typematic repeat: its key is neither held nor
+    /// released by the bridge. Only such a press is swallowed while
+    /// Pending, so a usage is never both down and marked.
+    fn is_fresh_press(&self, usage: u8) -> bool {
+        !self.keys.is_down(usage) && !self.keys.is_released_by_bridge(usage)
+    }
+
+    /// A new press of a non-modifier key: not a modifier, not a repeat of a
+    /// held key, not a released-by-bridge key's repeat.
+    fn is_fresh(&self, usage: Option<u8>) -> bool {
+        usage.is_some_and(|u| modifier_bit(u).is_none() && self.is_fresh_press(u))
+    }
+
+    /// A swallowed press is released by the bridge (D3c): its repeats after
+    /// the paste are not fresh presses. Unmapped or unremembered: counted.
+    fn swallow_press(&mut self, usage: Option<u8>, out: &mut Vec<Out>) {
+        if !usage.is_some_and(|u| self.keys.mark_released_by_bridge(u)) {
+            out.push(Out::Ignored);
+        }
+    }
+
+    fn start_paste(&mut self, ctx: &Ctx, out: &mut Vec<Out>) {
+        let refusal = if !self.clipboard_text {
+            Some(PasteRefusal::NoText)
+        } else if self.keys.caps_lock_on() {
+            Some(PasteRefusal::CapsLock)
+        } else {
+            None
+        };
+        if let Some(why) = refusal {
+            out.push(Out::Paste(PasteOutcome::Refused(why)));
+            return;
+        }
+        self.paste = State::Pending {
+            deadline: deadline(ctx.now, ctx.modifier_wait),
+            text: None,
+            skipped: 0,
+        };
+        out.push(Out::Paste(PasteOutcome::Started));
+        out.push(Out::RequestClipboard);
+    }
+
+    /// DD4: only a paste that is Pending and has no text yet takes a
+    /// response; any other response types nothing. Each ill-formed unit is
+    /// one U+FFFD that `prepare` skips and counts, so `prepare`'s count is
+    /// the whole skip count (adding `decode_utf16le`'s would count each
+    /// twice).
+    fn clipboard_text_arrived(&mut self, ctx: &Ctx, bytes: &[u8], out: &mut Vec<Out>) {
+        if !matches!(self.paste, State::Pending { text: None, .. }) {
+            return;
+        }
+        let (decoded, _ill_formed) = decode_utf16le(bytes);
+        let policy = PastePolicy {
+            multiline_refuse: ctx.multiline_refuse,
+            max_chars: ctx.max_chars,
+        };
+        match prepare(&decoded, &policy) {
+            (Prepared::RefusedMultiline, _) => {
+                self.end_paste(ctx, PasteOutcome::Refused(PasteRefusal::Multiline), out);
+            }
+            (Prepared::Text(chars), s) => {
+                if let State::Pending { text, skipped, .. } = &mut self.paste {
+                    *text = Some(chars);
+                    *skipped = s.skipped;
+                }
+            }
+        }
+    }
+
+    /// End an active paste with `outcome`. If it was typing, the Typist may
+    /// have left a press on the KVM: an all-zero report follows, stamped
+    /// with the step's epoch (the core's keyboard state is all-zero while
+    /// typing, so the two agree; §8: "abort and completion both end with an
+    /// all-zero keyboard report"). A Pending paste sent nothing of its own:
+    /// the KVM already holds exactly the core's state.
+    fn end_paste(&mut self, ctx: &Ctx, outcome: PasteOutcome, out: &mut Vec<Out>) {
+        let was_typing = matches!(self.paste, State::Typing { .. });
+        self.paste = State::Idle;
+        out.push(Out::Paste(outcome));
+        if was_typing {
+            out.push(Out::Push {
+                frame: RELEASE,
+                motion_only: false,
+                stamp: ctx.epoch,
+            });
+        }
+    }
+
+    /// Every step's tail: Pending's deadline and its move to Typing, then
+    /// Typing's paced, room-bounded reports (DD6, D2b).
+    fn paste_step(&mut self, ctx: &Ctx, out: &mut Vec<Out>) {
+        self.paste = match std::mem::replace(&mut self.paste, State::Idle) {
+            State::Pending {
+                text: Some(chars),
+                skipped,
+                ..
+            } if self.keys.held_modifier_bits() == 0 => {
+                // From here the Typist is the only keyboard source: what the
+                // client still holds is released by the bridge (D3c). Its
+                // zero goes out now, not with the Typist's first report:
+                // the Typist may push nothing (an empty text, or no room),
+                // and a key the core no longer holds — whose client Released
+                // will send nothing — must never stay held on the KVM
+                // (§7.4). A release is never withheld for room; it takes one
+                // unit of it when there is some.
+                let held = self.keys.held_nonmodifier_usages() > 0;
+                let r = self.keys.release_all();
+                if r.dropped {
+                    out.push(Out::Ignored);
+                }
+                self.last_key_activity = None;
+                let mut room = ctx.queue_room;
+                if held {
+                    out.push(Out::Push {
+                        frame: r.frame,
+                        motion_only: false,
+                        stamp: ctx.epoch,
+                    });
+                    room = room.saturating_sub(1);
+                }
+                Self::type_some(ctx, room, Typist::new(&chars), 0, skipped, ctx.now, out)
+            }
+            State::Pending { deadline, .. } if ctx.now >= deadline => {
+                out.push(Out::Paste(PasteOutcome::Aborted("modifier_wait")));
+                State::Idle
+            }
+            State::Typing {
+                typist,
+                typed,
+                skipped,
+                next_report_at,
+            } => Self::type_some(
+                ctx,
+                ctx.queue_room,
+                typist,
+                typed,
+                skipped,
+                next_report_at,
+                out,
+            ),
+            other => other,
+        };
+    }
+
+    /// At most `room` (the queue's, `ctx.queue_room`, less what this step
+    /// already pushed) reports, each only when its time has come; after
+    /// each, the next is `pace` from now (no catch-up burst). With no room,
+    /// look again `ROOM_POLL` from now.
+    fn type_some(
+        ctx: &Ctx,
+        mut room: usize,
+        mut typist: Typist,
+        mut typed: usize,
+        skipped: usize,
+        mut next_report_at: Instant,
+        out: &mut Vec<Out>,
+    ) -> State {
+        if room == 0 {
+            next_report_at = next_report_at.max(deadline(ctx.now, ROOM_POLL));
+        }
+        while room > 0 && ctx.now >= next_report_at {
+            let Some(frame) = typist.next() else {
+                break;
+            };
+            if frame != RELEASE {
+                typed = typed.saturating_add(1);
+            }
+            out.push(Out::Push {
+                frame,
+                motion_only: false,
+                stamp: ctx.epoch,
+            });
+            room = room.saturating_sub(1);
+            next_report_at = deadline(ctx.now, ctx.pace);
+        }
+        if typist.is_done() {
+            out.push(Out::Paste(PasteOutcome::Done { typed, skipped }));
+            return State::Idle;
+        }
+        State::Typing {
+            typist,
+            typed,
+            skipped,
+            next_report_at,
+        }
+    }
+}
+
+/// A Unicode unit's US-layout usage (`None`: untypeable or a surrogate).
+fn unit_usage(unit: u16) -> Option<u8> {
+    char::from_u32(u32::from(unit))
+        .and_then(us_stroke)
+        .map(|s| s.usage)
 }
 
 impl Default for InputCore {
@@ -425,10 +774,16 @@ mod tests {
     )]
     use super::*;
     use crate::hid::HidControl;
+    use crate::input::paste::{PasteOutcome, PasteRefusal};
     use crate::metrics::Metrics;
     use kvm_proto::hid::HidFrame;
-    use kvm_proto::keymap::{modifier_bit, us_stroke, usage_for_scancode};
+    use kvm_proto::keymap::{Chord, MOD_LSHIFT, modifier_bit, us_stroke, usage_for_scancode};
     use std::sync::Arc;
+
+    /// The default chord, `ctrl+option+shift+v`.
+    fn chord() -> Chord {
+        Chord::parse("ctrl+option+shift+v").unwrap()
+    }
 
     fn kbd(modifiers: u8, k: u8) -> HidFrame {
         HidFrame::Keyboard {
@@ -441,15 +796,21 @@ mod tests {
         core: InputCore,
         now: Instant,
         epoch: u64,
+        /// The HID queue's free room the ctx reports (DD6).
+        room: usize,
     }
 
     impl Rig {
+        /// A clean core that has seen a format list offering text (D9c).
         fn new() -> Rig {
-            Rig {
+            let mut r = Rig {
                 core: InputCore::new(),
                 now: Instant::now(),
                 epoch: 0,
-            }
+                room: 1,
+            };
+            r.step(Event::ClipboardAvailable(true));
+            r
         }
         fn ctx(&self) -> Ctx {
             Ctx {
@@ -460,6 +821,12 @@ mod tests {
                 mac_remap: false,
                 key_repeat_timeout: Duration::from_secs(10),
                 modifier_idle_timeout: Duration::from_secs(30),
+                chord: chord(),
+                pace: Duration::ZERO,
+                modifier_wait: Duration::from_secs(5),
+                multiline_refuse: false,
+                max_chars: 4096,
+                queue_room: self.room,
             }
         }
         /// Step and return the outs; a `Release` out bumps the rig's epoch,
@@ -509,7 +876,7 @@ mod tests {
 
     /// An event in full, for failure messages (`Event`'s `Debug` is
     /// redacted).
-    fn describe(e: Event) -> String {
+    fn describe(e: &Event) -> String {
         match e {
             Event::KeyPressed { code, extended } => {
                 format!("KeyPressed({code:#04x}, ext={extended})")
@@ -528,6 +895,8 @@ mod tests {
                 y,
             } => format!("MouseButton({button:?}, pressed={pressed}, {x}, {y})"),
             Event::Wheel { units } => format!("Wheel({units})"),
+            Event::ClipboardText(b) => format!("ClipboardText({:02x?})", b),
+            Event::ClipboardAvailable(a) => format!("ClipboardAvailable({a})"),
             Event::Tick => "Tick".to_owned(),
         }
     }
@@ -542,6 +911,8 @@ mod tests {
                 } => format!("Push({} motion={motion_only} @{stamp})", bytes(*frame)),
                 Out::Release(t) => format!("Release({})", t.label()),
                 Out::Ignored => "Ignored".to_owned(),
+                Out::RequestClipboard => "RequestClipboard".to_owned(),
+                Out::Paste(p) => format!("Paste({p:?})"),
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -1456,6 +1827,12 @@ mod tests {
             mac_remap: true,
             key_repeat_timeout: Duration::from_secs(10),
             modifier_idle_timeout: Duration::from_secs(30),
+            chord: chord(),
+            pace: Duration::ZERO,
+            modifier_wait: Duration::from_secs(5),
+            multiline_refuse: false,
+            max_chars: 4096,
+            queue_room: 8,
         };
         let mut step = |ctx: &Ctx, e| {
             let mut out = Vec::new();
@@ -1623,6 +2000,1180 @@ mod tests {
         );
     }
 
+    // ---- Paste (§8, Task 3.2).
+
+    fn chord_event() -> Event {
+        // The chord is ctrl+option+shift+v; press V (0x2F) with them held.
+        Event::KeyPressed {
+            code: 0x2F,
+            extended: false,
+        }
+    }
+
+    fn hold_chord(r: &mut Rig) {
+        for code in [0x1D, 0x38, 0x2A] {
+            // LCtrl, LAlt, LShift
+            r.step(Event::KeyPressed {
+                code,
+                extended: false,
+            });
+        }
+    }
+
+    fn outcomes(out: &[Out]) -> Vec<&PasteOutcome> {
+        out.iter()
+            .filter_map(|o| if let Out::Paste(p) = o { Some(p) } else { None })
+            .collect()
+    }
+
+    fn utf16le(s: &str) -> Vec<u8> {
+        s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// The chord, its release, and `text` arriving: typing has begun. The
+    /// outs of the step the text arrived in.
+    fn start_paste(r: &mut Rig, text: &str) -> Vec<Out> {
+        hold_chord(r);
+        r.step(chord_event());
+        for code in [0x2F, 0x1D, 0x38, 0x2A] {
+            r.step(Event::KeyReleased {
+                code,
+                extended: false,
+            });
+        }
+        r.step(Event::ClipboardText(utf16le(text)))
+    }
+
+    /// Ticks until the paste ends; its outcome.
+    fn finish(r: &mut Rig) -> PasteOutcome {
+        for _ in 0..64 {
+            r.advance(Duration::from_millis(1));
+            let o = r.step(Event::Tick);
+            if let Some(p) = outcomes(&o).first() {
+                return (*p).clone();
+            }
+        }
+        panic!("the paste never ended");
+    }
+
+    /// A keyboard push whose first slot holds `usage`.
+    fn pushes_usage(out: &[Out], usage: u8) -> bool {
+        pushes(out)
+            .iter()
+            .any(|(f, _)| matches!(f, HidFrame::Keyboard { keys, .. } if keys[0] == usage))
+    }
+
+    /// §8: the chord (matched before any remap) with text available starts
+    /// a paste and requests the clipboard; the chord's key never reaches
+    /// the KVM.
+    #[test]
+    fn the_chord_starts_a_paste_and_swallows_its_key() {
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        let before = r.now;
+        let out = r.step(chord_event());
+        assert!(matches!(outcomes(&out).as_slice(), [PasteOutcome::Started]));
+        assert!(out.iter().any(|o| matches!(o, Out::RequestClipboard)));
+        // No keyboard push carries V's usage (0x19).
+        assert!(!pushes_usage(&out, 0x19), "{}", show(&out));
+        assert_eq!(
+            r.core.next_deadline(),
+            Some(before + Duration::from_secs(5))
+        );
+    }
+
+    #[test]
+    fn a_chord_with_no_text_is_swallowed_and_refused() {
+        let mut r = Rig::new();
+        r.step(Event::ClipboardAvailable(false));
+        hold_chord(&mut r);
+        let out = r.step(chord_event());
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Refused(PasteRefusal::NoText)]
+        ));
+        assert!(!out.iter().any(|o| matches!(o, Out::RequestClipboard)));
+        assert!(!pushes_usage(&out, 0x19), "{}", show(&out));
+        // V's typematic repeat is not a second chord.
+        assert!(outcomes(&r.step(chord_event())).is_empty());
+    }
+
+    /// §8: once the modifiers release and the text arrives, the Typist
+    /// types it; a client key mid-typing never reaches the KVM (D2b).
+    #[test]
+    fn a_paste_types_the_text_once_modifiers_release() {
+        let mut r = Rig::new();
+        let out = start_paste(&mut r, "Hi");
+        let typed: Vec<HidFrame> = pushes(&out).into_iter().map(|(f, _)| f).collect();
+        assert_eq!(
+            typed,
+            [kbd(MOD_LSHIFT, 0x0B)],
+            "'H' — one report: the rig's queue room is 1"
+        );
+        assert!(!pushes_usage(
+            &r.step(Event::KeyPressed {
+                code: 0x10,
+                extended: false
+            }),
+            0x14
+        ));
+        assert_eq!(
+            finish(&mut r),
+            PasteOutcome::Done {
+                typed: 2,
+                skipped: 0
+            }
+        );
+    }
+
+    /// DD6 (D2b): a step pushes at most `queue_room` Typist reports; with
+    /// no room it pushes none and looks again ROOM_POLL later (no spin).
+    #[test]
+    fn the_typist_never_pushes_more_than_the_queue_room() {
+        let mut r = Rig::new();
+        assert!(pushes(&start_paste(&mut r, "abcd")).len() <= 1);
+        for _ in 0..3 {
+            r.advance(Duration::from_millis(1));
+            assert!(pushes(&r.step(Event::Tick)).len() <= 1);
+        }
+        let mut r = Rig::new();
+        r.room = 0;
+        assert!(pushes(&start_paste(&mut r, "abcd")).is_empty());
+        assert_eq!(
+            r.core.next_deadline(),
+            Some(r.now + crate::input::paste::ROOM_POLL)
+        );
+        r.room = 3;
+        r.advance(crate::input::paste::ROOM_POLL);
+        assert_eq!(pushes(&r.step(Event::Tick)).len(), 3);
+    }
+
+    #[test]
+    fn caps_lock_refuses_the_paste() {
+        let mut r = Rig::new();
+        r.step(Event::Synchronize { caps_lock: true });
+        hold_chord(&mut r);
+        let out = r.step(chord_event());
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Refused(PasteRefusal::CapsLock)]
+        ));
+    }
+
+    /// DD5 (D8c): a Caps Lock press after a Synchronize is tracked.
+    #[test]
+    fn a_caps_lock_press_after_a_synchronize_is_tracked() {
+        let mut r = Rig::new();
+        r.step(Event::Synchronize { caps_lock: false });
+        r.step(Event::KeyPressed {
+            code: 0x3A,
+            extended: false,
+        });
+        r.step(Event::KeyReleased {
+            code: 0x3A,
+            extended: false,
+        });
+        hold_chord(&mut r);
+        let out = r.step(chord_event());
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Refused(PasteRefusal::CapsLock)]
+        ));
+    }
+
+    /// Review Focus 1 / §8: Esc aborts (and is swallowed), an all-zero
+    /// report clears the Typist's press, and Esc's repeats stay silent
+    /// until its Released.
+    #[test]
+    fn esc_aborts_and_the_typists_keys_do_not_leak() {
+        let mut r = Rig::new();
+        start_paste(&mut r, "abc");
+        let out = r.step(Event::KeyPressed {
+            code: 0x01,
+            extended: false,
+        }); // Esc
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("esc")]
+        ));
+        assert_eq!(pushes(&out), [(kbd(0, 0), 0)]);
+        assert!(
+            pushes(&r.step(Event::KeyPressed {
+                code: 0x01,
+                extended: false
+            }))
+            .is_empty()
+        );
+        assert!(
+            pushes(&r.step(Event::KeyReleased {
+                code: 0x01,
+                extended: false
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            pushes(&r.step(Event::KeyPressed {
+                code: 0x01,
+                extended: false
+            })),
+            [(kbd(0, 0x29), 0)]
+        );
+    }
+
+    /// D3c: a key pressed mid-typing is released by the bridge — after the
+    /// paste, its repeats push nothing until its Released.
+    #[test]
+    fn a_key_swallowed_during_a_paste_stays_released_after_it() {
+        let mut r = Rig::new();
+        start_paste(&mut r, "ab");
+        r.step(Event::KeyPressed {
+            code: 0x10,
+            extended: false,
+        }); // q, mid-typing
+        assert!(matches!(finish(&mut r), PasteOutcome::Done { .. }));
+        assert!(
+            pushes(&r.step(Event::KeyPressed {
+                code: 0x10,
+                extended: false
+            }))
+            .is_empty()
+        );
+        assert!(
+            pushes(&r.step(Event::KeyReleased {
+                code: 0x10,
+                extended: false
+            }))
+            .is_empty()
+        );
+        assert_eq!(
+            pushes(&r.step(Event::KeyPressed {
+                code: 0x10,
+                extended: false
+            })),
+            [(kbd(0, 0x14), 0)]
+        );
+    }
+
+    /// §8 (D3c): a §7.4 trigger aborts typing — a bumped epoch and a
+    /// Synchronize each end it, with an all-zero report at the epoch.
+    #[test]
+    fn a_bumped_epoch_or_synchronize_aborts_typing() {
+        let mut r = Rig::new();
+        start_paste(&mut r, "abc");
+        r.epoch = 7;
+        let out = r.step(Event::MouseMove { x: 1, y: 1 });
+        assert!(
+            matches!(
+                outcomes(&out).as_slice(),
+                [PasteOutcome::Aborted("release")]
+            ),
+            "{}",
+            show(&out)
+        );
+        assert!(pushes(&out).contains(&(kbd(0, 0), 7)));
+        r.advance(Duration::from_millis(1));
+        assert!(
+            pushes(&r.step(Event::Tick)).is_empty(),
+            "nothing more is typed"
+        );
+        let mut r = Rig::new();
+        start_paste(&mut r, "abc");
+        let out = r.step(Event::Synchronize { caps_lock: false });
+        assert!(
+            matches!(
+                outcomes(&out).as_slice(),
+                [PasteOutcome::Aborted("release")]
+            ),
+            "{}",
+            show(&out)
+        );
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Out::Release(ReleaseTrigger::Synchronize)))
+        );
+    }
+
+    /// Review Focus 5 / DD4: a paste pending past modifier_wait with no
+    /// response ends; a late or unasked response then types nothing.
+    #[test]
+    fn a_late_or_unasked_clipboard_response_types_nothing() {
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        r.advance(Duration::from_secs(6)); // past modifier_wait (5 s)
+        let out = r.step(Event::Tick);
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("modifier_wait")]
+        ));
+        assert!(pushes(&r.step(Event::ClipboardText(utf16le("x")))).is_empty());
+    }
+
+    /// DD4: while pending, a fresh non-modifier press cancels the paste and
+    /// goes through (with the modifiers the KVM already holds); a second
+    /// chord meanwhile is swallowed.
+    #[test]
+    fn a_fresh_key_while_pending_cancels_and_goes_through() {
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let out = r.step(Event::KeyPressed {
+            code: 0x2D,
+            extended: false,
+        }); // x
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("key")]
+        ));
+        assert_eq!(pushes(&out), [(kbd(0x07, 0x1B), 0)]);
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        r.step(Event::KeyReleased {
+            code: 0x2F,
+            extended: false,
+        });
+        let out = r.step(chord_event());
+        assert!(
+            outcomes(&out).is_empty() && pushes(&out).is_empty(),
+            "{}",
+            show(&out)
+        );
+    }
+
+    #[test]
+    fn a_mouse_button_aborts_a_paste() {
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let out = r.step(Event::MouseButton {
+            button: Button::Left,
+            pressed: true,
+            x: 0,
+            y: 0,
+        });
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("mouse")]
+        ));
+    }
+
+    // ---- Beyond the plan's listing: ruling 8, the bounds, and every
+    // outcome through a real `HidControl`.
+
+    /// Controller ruling 8 (1): while Pending, releases still go out — the
+    /// chord's modifier presses reached the KVM, so their releases must,
+    /// or a paste that ends untyped leaves Ctrl+Option+Shift held. A
+    /// modifier's own repeat changes nothing, and typing waits until every
+    /// modifier is up (§8).
+    #[test]
+    fn releases_while_pending_go_out_and_typing_waits_for_every_modifier() {
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        assert!(
+            pushes(&r.step(Event::KeyPressed {
+                code: 0x2A,
+                extended: false
+            }))
+            .is_empty(),
+            "LShift's repeat"
+        );
+        assert!(
+            pushes(&r.step(Event::ClipboardText(utf16le("ab")))).is_empty(),
+            "three modifiers still held"
+        );
+        assert_eq!(
+            pushes(&r.step(Event::KeyReleased {
+                code: 0x2A,
+                extended: false
+            })),
+            [(kbd(0x05, 0), 0)]
+        );
+        assert_eq!(
+            pushes(&r.step(Event::KeyReleased {
+                code: 0x38,
+                extended: false
+            })),
+            [(kbd(0x01, 0), 0)]
+        );
+        // The last modifier up: its release goes out, then the Typist.
+        assert_eq!(
+            pushes(&r.step(Event::KeyReleased {
+                code: 0x1D,
+                extended: false
+            })),
+            [(kbd(0, 0), 0), (kbd(0, 0x04), 0)]
+        );
+        assert_eq!(
+            finish(&mut r),
+            PasteOutcome::Done {
+                typed: 2,
+                skipped: 0
+            }
+        );
+    }
+
+    /// Only a fresh press of the chord's key starts a paste: a repeat of a V
+    /// held (and sent) before the modifiers is a repeat, not a chord, and
+    /// a repeat of a swallowed V is not a second one.
+    #[test]
+    fn a_repeat_of_a_held_v_is_not_a_chord() {
+        let mut r = Rig::new();
+        assert_eq!(pushes(&r.step(chord_event())), [(kbd(0, 0x19), 0)]); // V alone
+        hold_chord(&mut r);
+        let out = r.step(chord_event()); // V's repeat, the modifiers held
+        assert!(outcomes(&out).is_empty(), "{}", show(&out));
+        assert!(pushes(&out).is_empty(), "a repeat changes nothing");
+        assert!(!r.core.keys.is_released_by_bridge(0x19));
+        assert!(r.core.keys.is_down(0x19));
+    }
+
+    /// Found by the property test: only a fresh Esc aborts. The repeat of
+    /// an Esc held (and sent) since before the chord is a repeat — the paste
+    /// stays pending and Esc is never both held and marked; its release and
+    /// a fresh press then abort as ever.
+    #[test]
+    fn a_repeat_of_a_held_esc_does_not_abort() {
+        let mut r = Rig::new();
+        let esc = |pressed| {
+            if pressed {
+                Event::KeyPressed {
+                    code: 0x01,
+                    extended: false,
+                }
+            } else {
+                Event::KeyReleased {
+                    code: 0x01,
+                    extended: false,
+                }
+            }
+        };
+        assert_eq!(pushes(&r.step(esc(true))), [(kbd(0, 0x29), 0)]);
+        hold_chord(&mut r);
+        assert!(matches!(
+            outcomes(&r.step(chord_event())).as_slice(),
+            [PasteOutcome::Started]
+        ));
+        let out = r.step(esc(true)); // Esc's repeat
+        assert!(out.is_empty(), "{}", show(&out));
+        assert!(r.core.paste.is_active());
+        assert!(r.core.keys.is_down(0x29) && !r.core.keys.is_released_by_bridge(0x29));
+        assert_eq!(pushes(&r.step(esc(false))), [(kbd(0x07, 0), 0)]);
+        let out = r.step(esc(true));
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("esc")]
+        ));
+        assert!(pushes(&out).is_empty(), "swallowed: {}", show(&out));
+    }
+
+    /// §8 (D3c): every press while typing — scancode, Unicode, a modifier, a
+    /// second chord — is swallowed and released by the bridge; an unmapped
+    /// key or an untypeable unit is one dropped input, counted on its press
+    /// only (the PD5 carry), and its release sends nothing.
+    #[test]
+    fn every_press_while_typing_is_swallowed_and_counted_once() {
+        let mut r = Rig::new();
+        start_paste(&mut r, "abcdef");
+        r.room = 0; // nothing of the Typist's in the way
+        let presses = [
+            Event::KeyPressed {
+                code: 0x1D,
+                extended: false,
+            }, // LCtrl
+            Event::KeyPressed {
+                code: 0x10,
+                extended: false,
+            }, // q
+            Event::UnicodePressed(u16::from(b'Z')),
+            chord_event(),
+        ];
+        for e in presses {
+            let d = describe(&e);
+            let out = r.step(e);
+            assert!(out.is_empty(), "{d}: {}", show(&out));
+        }
+        for u in [0xE0, 0x14, 0x1D, 0x19] {
+            assert!(r.core.keys.is_released_by_bridge(u), "{u:#x}");
+        }
+        assert!(r.holds_nothing());
+        assert_eq!(
+            r.step(Event::KeyPressed {
+                code: 0x54,
+                extended: false
+            }),
+            [Out::Ignored]
+        );
+        assert_eq!(r.step(Event::UnicodePressed(0xE9)), [Out::Ignored]);
+        for e in [
+            Event::KeyReleased {
+                code: 0x54,
+                extended: false,
+            },
+            Event::UnicodeReleased(0xE9),
+            Event::KeyReleased {
+                code: 0x10,
+                extended: false,
+            },
+            Event::KeyReleased {
+                code: 0x1D,
+                extended: false,
+            },
+        ] {
+            let d = describe(&e);
+            let out = r.step(e);
+            assert!(out.is_empty(), "{d}: {}", show(&out));
+        }
+        // The swallowed releases updated the state: q and LCtrl are fresh.
+        assert!(!r.core.keys.is_released_by_bridge(0x14));
+        assert!(!r.core.keys.is_released_by_bridge(0xE0));
+    }
+
+    /// DD9 meets D3c: once the 32 released-by-bridge marks are full, a key
+    /// the paste swallows cannot be remembered — it is one dropped input,
+    /// and it still never reaches the KVM: a press while typing, Esc, and
+    /// the chord's own V (killed mutants Q1, Q9: the mark alone had been
+    /// keeping a passed-through V or Esc out of the reports).
+    #[test]
+    fn a_swallowed_key_never_reaches_the_kvm_even_with_no_mark_left() {
+        let in_frame = |out: &[Out], usage: u8| {
+            pushes(out)
+                .iter()
+                .any(|(f, _)| matches!(f, HidFrame::Keyboard { keys, .. } if keys.contains(&usage)))
+        };
+        let mut r = Rig::new();
+        start_paste(&mut r, &"acdefghijk".repeat(4)); // no b, no v
+        // 32 presses mid-typing, all swallowed: every mark is taken.
+        let codes: Vec<u8> = (0x02..=0x0B)
+            .chain(0x10..=0x19)
+            .chain(0x1E..=0x26)
+            .chain([0x2C, 0x2D, 0x2E])
+            .collect();
+        assert_eq!(codes.len(), 32);
+        for code in &codes {
+            let out = r.step(Event::KeyPressed {
+                code: *code,
+                extended: false,
+            });
+            assert!(!out.contains(&Out::Ignored), "{code:#x}: {}", show(&out));
+        }
+        assert!(codes.iter().all(|c| {
+            let u = usage_for_scancode(*c, false).unwrap();
+            r.core.keys.is_released_by_bridge(u)
+        }));
+        // A 33rd: no room for its mark — counted, and not sent.
+        let out = r.step(Event::KeyPressed {
+            code: 0x30,
+            extended: false,
+        }); // b
+        assert!(out.contains(&Out::Ignored), "{}", show(&out));
+        assert!(
+            !r.core.keys.is_down(0x05) && !in_frame(&out, 0x05),
+            "{}",
+            show(&out)
+        );
+        // Esc: counted, aborts, and only the all-zero report goes out.
+        let out = r.step(Event::KeyPressed {
+            code: 0x01,
+            extended: false,
+        });
+        assert!(out.contains(&Out::Ignored), "{}", show(&out));
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Aborted("esc")]
+        ));
+        assert_eq!(pushes(&out), [(kbd(0, 0), 0)], "{}", show(&out));
+        // The chord's V: counted, starts a paste, and never goes out.
+        hold_chord(&mut r);
+        let out = r.step(chord_event());
+        assert!(out.contains(&Out::Ignored), "{}", show(&out));
+        assert!(matches!(outcomes(&out).as_slice(), [PasteOutcome::Started]));
+        assert!(!in_frame(&out, 0x19), "{}", show(&out));
+        assert!(!r.core.keys.is_down(0x19));
+    }
+
+    /// D3c: a key the client holds when typing begins is released by the
+    /// bridge, and its zero goes out at once (it takes the step's one unit
+    /// of room) — the Typist's reports never carry it, and after the paste
+    /// its repeats stay silent until its Released.
+    #[test]
+    fn a_key_held_when_typing_begins_is_released_by_the_bridge() {
+        let mut r = Rig::new();
+        r.step(Event::KeyPressed {
+            code: 0x1E,
+            extended: false,
+        }); // 'a' held throughout
+        let out = start_paste(&mut r, "x");
+        assert_eq!(pushes(&out), [(kbd(0, 0), 0)], "{}", show(&out));
+        assert!(r.core.keys.is_released_by_bridge(0x04));
+        assert_eq!(
+            finish(&mut r),
+            PasteOutcome::Done {
+                typed: 1,
+                skipped: 0
+            }
+        );
+        let a = Event::KeyPressed {
+            code: 0x1E,
+            extended: false,
+        };
+        assert!(pushes(&r.step(a.clone())).is_empty(), "a's repeat");
+        r.step(Event::KeyReleased {
+            code: 0x1E,
+            extended: false,
+        });
+        assert_eq!(pushes(&r.step(a)), [(kbd(0, 0x04), 0)]);
+    }
+
+    /// Found by the property test (§7.4): when typing begins with a key
+    /// held and the Typist pushes nothing — an empty text, or a full queue
+    /// — the release's zero still goes out. Otherwise the KVM keeps a key
+    /// the core has marked released, and the client's own Released then
+    /// sends nothing: a stuck key.
+    #[test]
+    fn typing_begins_by_zeroing_what_the_client_held_even_with_nothing_to_type() {
+        for (text, room) in [("", 1), ("\r\n", 1), ("é", 1), ("x", 0), ("", 0)] {
+            let mut r = Rig::new();
+            r.room = room;
+            r.step(Event::KeyPressed {
+                code: 0x01,
+                extended: false,
+            }); // Esc held (and sent) since before the chord
+            let out = start_paste(&mut r, text);
+            assert_eq!(
+                pushes(&out).first(),
+                Some(&(kbd(0, 0), 0)),
+                "{text:?} room {room}: {}",
+                show(&out)
+            );
+            assert!(r.core.keys.is_released_by_bridge(0x29));
+            if r.core.paste.is_active() {
+                r.room = 1;
+                finish(&mut r);
+            }
+            assert!(!r.core.paste.is_active(), "{text:?}");
+            // Esc's client Released sends nothing — the KVM has it up.
+            assert!(
+                pushes(&r.step(Event::KeyReleased {
+                    code: 0x01,
+                    extended: false
+                }))
+                .is_empty()
+            );
+        }
+        // Nothing held: no extra report.
+        let mut r = Rig::new();
+        let out = start_paste(&mut r, "");
+        assert!(pushes(&out).is_empty(), "{}", show(&out));
+        assert!(matches!(
+            outcomes(&out).as_slice(),
+            [PasteOutcome::Done {
+                typed: 0,
+                skipped: 0
+            }]
+        ));
+    }
+
+    /// DD6: with a pace, one report per `pace` and no catch-up burst after
+    /// a late step; the paste's next report is the core's deadline.
+    #[test]
+    fn the_typist_keeps_its_pace_without_a_catch_up_burst() {
+        let mut r = Rig::new();
+        r.room = 8;
+        let pace = Duration::from_millis(15);
+        let mut ctx = r.ctx();
+        ctx.pace = pace;
+        let step = |r: &mut Rig, ctx: &mut Ctx, e: Event| {
+            ctx.now = r.now;
+            ctx.epoch = r.epoch;
+            let mut out = Vec::new();
+            r.core.step(ctx, e, &mut out);
+            out
+        };
+        hold_chord(&mut r);
+        r.step(chord_event());
+        for code in [0x2F, 0x1D, 0x38, 0x2A] {
+            r.step(Event::KeyReleased {
+                code,
+                extended: false,
+            });
+        }
+        let out = step(&mut r, &mut ctx, Event::ClipboardText(utf16le("abc")));
+        assert_eq!(pushes(&out), [(kbd(0, 0x04), 0)]);
+        assert_eq!(r.core.next_deadline(), Some(r.now + pace));
+        r.advance(pace - Duration::from_nanos(1));
+        assert!(pushes(&step(&mut r, &mut ctx, Event::Tick)).is_empty());
+        r.advance(Duration::from_nanos(1));
+        assert_eq!(
+            pushes(&step(&mut r, &mut ctx, Event::Tick)),
+            [(kbd(0, 0), 0)]
+        );
+        r.advance(Duration::from_secs(1)); // a late step
+        assert_eq!(
+            pushes(&step(&mut r, &mut ctx, Event::Tick)),
+            [(kbd(0, 0x05), 0)],
+            "one report, not a burst"
+        );
+        assert_eq!(r.core.next_deadline(), Some(r.now + pace));
+    }
+
+    /// DD4: only a pending paste with no text yet takes a response — a
+    /// second response types nothing more, and one before any chord
+    /// types nothing.
+    #[test]
+    fn only_the_first_response_to_a_pending_paste_is_typed() {
+        let mut r = Rig::new();
+        assert!(r.step(Event::ClipboardText(utf16le("unasked"))).is_empty());
+        hold_chord(&mut r);
+        r.step(chord_event());
+        r.step(Event::ClipboardText(utf16le("ab")));
+        r.step(Event::ClipboardText(utf16le("WXYZ")));
+        for code in [0x2F, 0x1D, 0x38, 0x2A] {
+            r.step(Event::KeyReleased {
+                code,
+                extended: false,
+            });
+        }
+        assert_eq!(
+            finish(&mut r),
+            PasteOutcome::Done {
+                typed: 2,
+                skipped: 0
+            }
+        );
+    }
+
+    /// §8's limits through the core: multiline = refuse refuses an inner
+    /// break (ending the pending paste), max_chars caps what is typed, and
+    /// skipped characters plus ill-formed units are counted (D4: the
+    /// terminator ends the text, so nothing after it is typed or counted).
+    #[test]
+    fn the_section_8_limits_apply_in_the_core() {
+        let mut r = Rig::new();
+        hold_chord(&mut r);
+        r.step(chord_event());
+        let mut ctx = r.ctx();
+        ctx.multiline_refuse = true;
+        let mut out = Vec::new();
+        r.core
+            .step(&ctx, Event::ClipboardText(utf16le("a\nb")), &mut out);
+        assert!(
+            matches!(
+                outcomes(&out).as_slice(),
+                [PasteOutcome::Refused(PasteRefusal::Multiline)]
+            ),
+            "{}",
+            show(&out)
+        );
+        assert!(pushes(&out).is_empty());
+        assert_eq!(r.core.paste.deadline(), None);
+        // max_chars, skips and the terminator.
+        let mut r = Rig::new();
+        r.room = 8;
+        hold_chord(&mut r);
+        r.step(chord_event());
+        for code in [0x2F, 0x1D, 0x38, 0x2A] {
+            r.step(Event::KeyReleased {
+                code,
+                extended: false,
+            });
+        }
+        let mut ctx = r.ctx();
+        ctx.max_chars = 2;
+        // 'é' (skipped), a lone D800 (one U+FFFD, skipped once), "abc\n"
+        // (c is past the cap of 2), the terminator, then 'z' (not text).
+        let bytes = vec![
+            0xE9, 0, 0x00, 0xD8, b'a', 0, b'b', 0, b'c', 0, b'\n', 0, 0, 0, b'z', 0,
+        ];
+        let mut out = Vec::new();
+        r.core.step(&ctx, Event::ClipboardText(bytes), &mut out);
+        assert_eq!(
+            outcomes(&out),
+            [&PasteOutcome::Done {
+                typed: 2,
+                skipped: 2
+            }],
+            "{}",
+            show(&out)
+        );
+        assert!(
+            !pushes_usage(&out, 0x06),
+            "c is past max_chars: {}",
+            show(&out)
+        );
+        // D4 through the core: a copied line as every client sends it —
+        // NUL-terminated — types the line and never a trailing Return.
+        let mut r = Rig::new();
+        r.room = 8;
+        let mut bytes = utf16le("ls\r\n");
+        bytes.extend_from_slice(&[0, 0]);
+        hold_chord(&mut r);
+        r.step(chord_event());
+        for code in [0x2F, 0x1D, 0x38, 0x2A] {
+            r.step(Event::KeyReleased {
+                code,
+                extended: false,
+            });
+        }
+        let out = r.step(Event::ClipboardText(bytes));
+        assert_eq!(
+            outcomes(&out),
+            [&PasteOutcome::Done {
+                typed: 2,
+                skipped: 0
+            }],
+            "{}",
+            show(&out)
+        );
+        assert!(
+            !pushes_usage(&out, 0x28),
+            "a Return was typed: {}",
+            show(&out)
+        );
+    }
+
+    /// D9c: a new session forgets the paste and the clipboard's
+    /// availability — a chord before the new session's format list is
+    /// refused for no text.
+    #[test]
+    fn a_new_generation_ends_the_paste_and_forgets_the_clipboard() {
+        let mut r = Rig::new();
+        start_paste(&mut r, "abc");
+        r.core.on_generation(2);
+        assert_eq!(r.core.next_deadline(), None);
+        r.advance(Duration::from_millis(5));
+        assert!(r.step(Event::Tick).is_empty(), "nothing more is typed");
+        hold_chord(&mut r);
+        assert!(matches!(
+            outcomes(&r.step(chord_event())).as_slice(),
+            [PasteOutcome::Refused(PasteRefusal::NoText)]
+        ));
+    }
+
+    /// §4.5, §9.2 (PD7 rule: pasted text is as sensitive as a password):
+    /// a clipboard event, the paste state and its outs print kinds and
+    /// counts only — never a byte of the text or a typed usage.
+    #[test]
+    fn debug_never_prints_the_pasted_text() {
+        let values = [0x5A, 0x71, 0x7E, 0x1D, 0x14, 0x35, 0x41, 0x42, 0x43, 0x04];
+        crate::testkit::assert_debug_redacted(
+            &Event::ClipboardText(utf16le("Zq~")),
+            &Event::ClipboardText(utf16le("ABC")),
+            &values,
+        );
+        let mut a = Rig::new();
+        let mut b = Rig::new();
+        let oa = start_paste(&mut a, "Zq~");
+        let ob = start_paste(&mut b, "abc");
+        crate::testkit::assert_debug_redacted(&oa, &ob, &values);
+        crate::testkit::assert_debug_redacted(&a.core, &b.core, &values);
+        crate::testkit::assert_debug_redacted(&a.core.paste, &b.core.paste, &values);
+        let s = format!("{:?}", a.core);
+        assert!(s.contains("Typing"), "{s}");
+        let (fa, fb) = (finish(&mut a), finish(&mut b));
+        assert_eq!(format!("{fa:?}"), format!("{fb:?}"));
+        // Pending with its text arrived (the modifiers still held).
+        let mut a = Rig::new();
+        let mut b = Rig::new();
+        for (r, text) in [(&mut a, "Zq~"), (&mut b, "abc")] {
+            hold_chord(r);
+            r.step(chord_event());
+            r.step(Event::ClipboardText(utf16le(text)));
+        }
+        let s = format!("{:?}", a.core.paste);
+        assert!(s.contains("Pending") && s.contains("Some(3)"), "{s}");
+        crate::testkit::assert_debug_redacted(&a.core, &b.core, &values);
+        crate::testkit::assert_debug_redacted(&a.core.paste, &b.core.paste, &values);
+    }
+
+    /// A core wired to a real `HidControl` and the writer's loop (the
+    /// shell's carry, Task 4.1), to see what the device ends up holding.
+    struct Wired {
+        core: InputCore,
+        hid: HidControl,
+        dev: Device,
+        now: Instant,
+        pace: Duration,
+        modifier_wait: Duration,
+        multiline_refuse: bool,
+        /// Every outcome so far.
+        outcomes: Vec<PasteOutcome>,
+    }
+
+    impl Wired {
+        fn new() -> Wired {
+            let mut w = Wired {
+                core: InputCore::new(),
+                hid: HidControl::new(64, Arc::new(Metrics::default())),
+                dev: Device::default(),
+                now: Instant::now(),
+                pace: Duration::from_millis(15),
+                modifier_wait: Duration::from_secs(5),
+                multiline_refuse: false,
+                outcomes: Vec::new(),
+            };
+            w.core.on_generation(1);
+            w.step(Event::ClipboardAvailable(true));
+            w
+        }
+
+        fn step(&mut self, e: Event) -> Vec<Out> {
+            let ctx = Ctx {
+                now: self.now,
+                epoch: self.hid.epoch(),
+                generation: 1,
+                surface: (1920, 1080),
+                mac_remap: false,
+                key_repeat_timeout: Duration::from_secs(10),
+                modifier_idle_timeout: Duration::from_secs(30),
+                chord: chord(),
+                pace: self.pace,
+                modifier_wait: self.modifier_wait,
+                multiline_refuse: self.multiline_refuse,
+                max_chars: 4096,
+                queue_room: 8,
+            };
+            let mut out = Vec::new();
+            self.core.step(&ctx, e, &mut out);
+            carry(&self.hid, &out);
+            drain(&self.hid, &mut self.dev);
+            self.outcomes.extend(outcomes(&out).into_iter().cloned());
+            out
+        }
+
+        fn key(&mut self, code: u8, pressed: bool) {
+            let extended = false;
+            self.step(if pressed {
+                Event::KeyPressed { code, extended }
+            } else {
+                Event::KeyReleased { code, extended }
+            });
+        }
+
+        /// The chord pressed and V released: a paste is pending.
+        fn chord(&mut self) {
+            for code in [0x1D, 0x38, 0x2A, 0x2F] {
+                self.key(code, true);
+            }
+            self.key(0x2F, false);
+        }
+
+        /// The chord, every modifier up, then `text`: typing.
+        fn typing(&mut self, text: &str) {
+            self.chord();
+            for code in [0x1D, 0x38, 0x2A] {
+                self.key(code, false);
+            }
+            self.step(Event::ClipboardText(utf16le(text)));
+            assert!(
+                matches!(self.core.paste, crate::input::paste::State::Typing { .. }),
+                "precondition: typing"
+            );
+        }
+
+        /// The device holds no key the core does not (§7.4).
+        fn device_follows_the_core(&self, what: &str) {
+            if let Some(HidFrame::Keyboard { modifiers, keys }) = self.dev.kbd {
+                for k in keys.iter().filter(|k| **k != 0) {
+                    assert!(self.core.keys.is_down(*k), "{what}: device holds {k:#x}");
+                }
+                assert_eq!(
+                    modifiers,
+                    self.core.keys.held_modifier_bits(),
+                    "{what}: the device's modifiers"
+                );
+            }
+        }
+
+        /// The client lets go of `keys` and every button, and goes silent:
+        /// a Tick at each deadline until none is armed. Then nothing is
+        /// held anywhere.
+        fn settle(&mut self, keys: &[u8], what: &str) {
+            for code in keys {
+                self.key(*code, false);
+            }
+            for button in [Button::Left, Button::Right, Button::Middle] {
+                self.step(Event::MouseButton {
+                    button,
+                    pressed: false,
+                    x: 1,
+                    y: 1,
+                });
+            }
+            for _ in 0..10_000 {
+                let Some(at) = self.core.next_deadline() else {
+                    break;
+                };
+                self.now = self.now.max(at);
+                self.step(Event::Tick);
+            }
+            assert_eq!(self.core.next_deadline(), None, "{what}");
+            assert!(!self.core.paste.is_active(), "{what}");
+            assert_eq!(held(&self.core), (Vec::new(), 0), "{what}");
+            assert!(
+                !self.dev.holds_a_key() && self.dev.buttons == 0,
+                "{what}: the device holds"
+            );
+        }
+    }
+
+    /// §8 / §7.4: EVERY paste outcome leaves nothing held — not the
+    /// Typist's last key, not the chord's own modifiers (their releases
+    /// went out while Pending, ruling 8), not a key swallowed meanwhile.
+    /// Each outcome is driven through a real `HidControl`; at the outcome
+    /// the device holds no key the core does not, and once the client lets
+    /// go, nothing is held anywhere.
+    #[test]
+    fn every_paste_outcome_leaves_nothing_held() {
+        type Drive = fn(&mut Wired) -> Vec<u8>;
+        let cases: [(&str, PasteOutcome, Drive); 15] = [
+            (
+                "no text",
+                PasteOutcome::Refused(PasteRefusal::NoText),
+                |w| {
+                    w.step(Event::ClipboardAvailable(false));
+                    w.chord();
+                    vec![0x1D, 0x38, 0x2A]
+                },
+            ),
+            (
+                "caps lock",
+                PasteOutcome::Refused(PasteRefusal::CapsLock),
+                |w| {
+                    w.step(Event::Synchronize { caps_lock: true });
+                    w.chord();
+                    vec![0x1D, 0x38, 0x2A]
+                },
+            ),
+            (
+                "multiline",
+                PasteOutcome::Refused(PasteRefusal::Multiline),
+                |w| {
+                    w.multiline_refuse = true;
+                    w.chord();
+                    w.step(Event::ClipboardText(utf16le("a\nb")));
+                    vec![0x1D, 0x38, 0x2A]
+                },
+            ),
+            ("esc pending", PasteOutcome::Aborted("esc"), |w| {
+                w.chord();
+                w.key(0x01, true);
+                vec![0x1D, 0x38, 0x2A, 0x01]
+            }),
+            ("esc typing", PasteOutcome::Aborted("esc"), |w| {
+                w.typing("abcdef");
+                w.key(0x10, true); // q, swallowed
+                w.key(0x01, true);
+                vec![0x10, 0x01]
+            }),
+            ("key pending", PasteOutcome::Aborted("key"), |w| {
+                w.chord();
+                w.key(0x2D, true);
+                vec![0x1D, 0x38, 0x2A, 0x2D]
+            }),
+            ("mouse pending", PasteOutcome::Aborted("mouse"), |w| {
+                w.chord();
+                w.step(Event::MouseButton {
+                    button: Button::Left,
+                    pressed: true,
+                    x: 5,
+                    y: 5,
+                });
+                vec![0x1D, 0x38, 0x2A]
+            }),
+            ("mouse typing", PasteOutcome::Aborted("mouse"), |w| {
+                w.typing("abcdef");
+                w.step(Event::MouseButton {
+                    button: Button::Right,
+                    pressed: true,
+                    x: 5,
+                    y: 5,
+                });
+                vec![]
+            }),
+            ("epoch typing", PasteOutcome::Aborted("release"), |w| {
+                w.typing("abcdef");
+                w.hid.release_all(ReleaseTrigger::WebsocketReconnect);
+                drain(&w.hid, &mut w.dev);
+                w.step(Event::Tick);
+                vec![]
+            }),
+            ("epoch pending", PasteOutcome::Aborted("release"), |w| {
+                w.chord();
+                w.hid.release_all(ReleaseTrigger::Suppression);
+                drain(&w.hid, &mut w.dev);
+                w.step(Event::MouseMove { x: 3, y: 3 });
+                vec![0x1D, 0x38, 0x2A]
+            }),
+            (
+                "synchronize typing",
+                PasteOutcome::Aborted("release"),
+                |w| {
+                    w.typing("abcdef");
+                    w.step(Event::Synchronize { caps_lock: false });
+                    vec![]
+                },
+            ),
+            (
+                "synchronize pending",
+                PasteOutcome::Aborted("release"),
+                |w| {
+                    w.chord();
+                    w.step(Event::Synchronize { caps_lock: false });
+                    vec![0x1D, 0x38, 0x2A]
+                },
+            ),
+            ("timer pending", PasteOutcome::Aborted("release"), |w| {
+                w.modifier_wait = Duration::from_secs(60);
+                w.chord();
+                w.now += Duration::from_secs(30); // modifier_idle_timeout
+                w.step(Event::Tick);
+                vec![0x1D, 0x38, 0x2A]
+            }),
+            (
+                "modifier wait",
+                PasteOutcome::Aborted("modifier_wait"),
+                |w| {
+                    w.chord();
+                    w.now += Duration::from_secs(5);
+                    w.step(Event::Tick);
+                    vec![0x1D, 0x38, 0x2A]
+                },
+            ),
+            (
+                "done",
+                PasteOutcome::Done {
+                    typed: 6,
+                    skipped: 0,
+                },
+                |w| {
+                    w.key(0x1E, true); // 'a', held through the paste
+                    w.typing("abcdef");
+                    w.key(0x10, true); // q, swallowed
+                    for _ in 0..64 {
+                        w.now += w.pace;
+                        w.step(Event::Tick);
+                    }
+                    vec![0x1E, 0x10]
+                },
+            ),
+        ];
+        for (what, want, drive) in cases {
+            let mut w = Wired::new();
+            let held = drive(&mut w);
+            let ends: Vec<_> = w
+                .outcomes
+                .iter()
+                .filter(|o| !matches!(o, PasteOutcome::Started))
+                .collect();
+            assert_eq!(ends, [&want], "{what}");
+            assert!(!w.core.paste.is_active(), "{what}");
+            w.device_follows_the_core(what);
+            w.settle(&held, what);
+        }
+    }
+
     // ---- The property: no event or time sequence ends with a key held.
 
     /// xorshift64*: a fixed, seedable sequence for the property test.
@@ -1707,16 +3258,16 @@ mod tests {
     /// with its stamp, every release through `HidControl::release_all`.
     fn carry(hid: &HidControl, outs: &[Out]) {
         for o in outs {
-            match *o {
+            match o {
                 Out::Push {
                     frame,
                     motion_only,
                     stamp,
                 } => {
-                    let _ = hid.push_at(stamp, frame, motion_only);
+                    let _ = hid.push_at(*stamp, *frame, *motion_only);
                 }
-                Out::Release(t) => hid.release_all(t),
-                Out::Ignored => {}
+                Out::Release(t) => hid.release_all(*t),
+                Out::Ignored | Out::RequestClipboard | Out::Paste(_) => {}
             }
         }
     }
@@ -1731,28 +3282,137 @@ mod tests {
         (usages, core.pointer.held_buttons())
     }
 
-    /// The property (§7.4, "a key must never end held"), over random
+    /// The paste's phase, for the property's oracle.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Phase {
+        Idle,
+        Pending,
+        Typing,
+    }
+
+    fn phase(core: &InputCore) -> Phase {
+        match core.paste {
+            State::Idle => Phase::Idle,
+            State::Pending { .. } => Phase::Pending,
+            State::Typing { .. } => Phase::Typing,
+        }
+    }
+
+    /// Every outcome's label, for the coverage count.
+    const OUTCOMES: [&str; 10] = [
+        "started",
+        "no_text",
+        "caps_lock",
+        "multiline",
+        "done",
+        "esc",
+        "key",
+        "mouse",
+        "release",
+        "modifier_wait",
+    ];
+
+    fn label(p: &PasteOutcome) -> &'static str {
+        match p {
+            PasteOutcome::Started => "started",
+            PasteOutcome::Refused(PasteRefusal::NoText) => "no_text",
+            PasteOutcome::Refused(PasteRefusal::CapsLock) => "caps_lock",
+            PasteOutcome::Refused(PasteRefusal::Multiline) => "multiline",
+            PasteOutcome::Refused(PasteRefusal::Oversize) => "oversize",
+            PasteOutcome::Done { .. } => "done",
+            PasteOutcome::Aborted(why) => why,
+        }
+    }
+
+    /// The oracle's paste bookkeeping: a `Started` is open until exactly
+    /// one end (`Done`, an `Aborted`, `Refused(Multiline)`); a refusal at
+    /// the chord (`NoText`, `CapsLock`) opens nothing; `Started` is followed
+    /// at once by `RequestClipboard`; `Oversize` is never the core's.
+    struct PasteOracle {
+        open: bool,
+        /// The pending paste's deadline: its chord plus `modifier_wait`.
+        pending_deadline: Option<Instant>,
+        /// The seed's `paste.max_chars`: no paste types more.
+        max_chars: usize,
+        fired: [usize; 10],
+    }
+
+    impl PasteOracle {
+        fn see(&mut self, outs: &[Out], now: Instant, modifier_wait: Duration, at: &str) {
+            for (i, o) in outs.iter().enumerate() {
+                let Out::Paste(p) = o else { continue };
+                let l = label(p);
+                let n = OUTCOMES.iter().position(|x| *x == l);
+                assert!(n.is_some(), "{at}: {l} from the core");
+                self.fired[n.unwrap()] += 1;
+                if let PasteOutcome::Done { typed, .. } = p {
+                    assert!(*typed <= self.max_chars, "{at}: past max_chars");
+                }
+                match p {
+                    PasteOutcome::Started => {
+                        assert!(!self.open, "{at}: a second Started");
+                        assert_eq!(outs.get(i + 1), Some(&Out::RequestClipboard), "{at}");
+                        self.open = true;
+                        self.pending_deadline = Some(now + modifier_wait);
+                    }
+                    PasteOutcome::Refused(PasteRefusal::NoText | PasteRefusal::CapsLock) => {
+                        assert!(!self.open, "{at}: a chord refused while a paste is open");
+                    }
+                    _ => {
+                        assert!(self.open, "{at}: {l} ends no paste");
+                        self.open = false;
+                        self.pending_deadline = None;
+                    }
+                }
+            }
+            assert_eq!(
+                outs.iter()
+                    .filter(|o| matches!(o, Out::RequestClipboard))
+                    .count(),
+                outs.iter()
+                    .filter(|o| matches!(o, Out::Paste(PasteOutcome::Started)))
+                    .count(),
+                "{at}: a request without a Started"
+            );
+        }
+    }
+
+    /// The property (§7.4 "a key must never end held", and §8), over random
     /// sequences of keyboard, Unicode, mouse and Synchronize events, Ticks,
     /// time jumps (to a deadline, a nanosecond short of one, or past both
     /// timeouts), the shell's own releases (a moved epoch, a new session),
-    /// lost client releases, remap and surface changes, and a stalled
-    /// writer whose queue overflows — carried out through the real
-    /// `HidControl` and drained as the writer does:
+    /// lost client releases, remap and surface changes, a stalled writer
+    /// whose queue overflows — and pastes: chords (sought on purpose), Esc,
+    /// clipboard responses asked and unasked (single-line, multiline,
+    /// untypeable, long, NUL-terminated with junk after), availability
+    /// changes, at a pace of 0, 1 or 15 ms, a 300 ms or 5 s modifier wait,
+    /// multiline refused or not, and a 5-character cap — carried out
+    /// through the real `HidControl` and drained as the writer does, with
+    /// the HID queue's room as the shell computes it:
     /// - every report carries its step's epoch, and a release is always the
     ///   last out of its step;
     /// - a release fires exactly when its oracle says (Synchronize on a
     ///   Synchronize; at a Tick, the key-repeat timer when a held non-
     ///   modifier saw no accepted press for its timeout, else the modifier-
     ///   idle timer when a held modifier saw no keyboard event for its own),
-    ///   and `next_deadline` is exactly the sooner armed deadline;
+    ///   and `next_deadline` is exactly the soonest of the armed deadlines
+    ///   and the paste's (Pending: its chord plus `modifier_wait`);
     /// - after any trigger or timer expiry nothing is held, in the core or
-    ///   on the device; a moved epoch's step starts with the zero report;
-    /// - whatever was held at a release stays up until the client's own
-    ///   Released (or a Synchronize, m6);
+    ///   on the device, and no paste is active; a moved epoch's step pushes
+    ///   the zero report first;
+    /// - whatever was held at a release, and every key a paste swallowed or
+    ///   released when typing began, stays up until the client's own
+    ///   Released (or a Synchronize, m6) — and the marks are exactly these;
+    /// - paste outcomes are well-sequenced (one end per Started, a request
+    ///   with each Started) and match the core's phase;
+    /// - a typing step pushes at most the queue's room (DD6), and with no
+    ///   room looks again no sooner than ROOM_POLL;
     /// - whenever the core holds a key or modifier a deadline is armed, and
-    ///   the device never holds what the core does not;
-    /// - at the end the client goes silent: one Tick at the deadline leaves
-    ///   no key held, and once the client lets go the device holds nothing.
+    ///   the device never holds what the core does not — while typing, only
+    ///   the Typist's one key (with at most Shift) or keys already marked;
+    /// - at the end the client goes silent: Ticks at each deadline end any
+    ///   paste and leave no key held, and once the client lets go the
+    ///   device holds nothing.
     #[test]
     fn no_event_or_time_sequence_leaves_a_key_held() {
         let codes: [(u8, bool); 18] = [
@@ -1775,7 +3435,23 @@ mod tests {
             (0x4D, true),  // Right
             (0x54, false), // unmapped
         ];
+        const ESC: (u8, bool) = (0x01, false);
+        let chord_mods: [[(u8, bool); 2]; 3] = [
+            [(0x1D, false), (0x1D, true)],  // Ctrl
+            [(0x38, false), (0x38, true)],  // Alt / Option
+            [(0x2A, false), (0x36, false)], // Shift
+        ];
         let units: Vec<u16> = "AaCc1!".encode_utf16().chain([0xD800, 0x00E9]).collect();
+        let texts = [
+            "",
+            "x",
+            "Hi there\r\n",
+            "a\nb",
+            "é€z",
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            "\t \r\n\r\n",
+            "ls -la",
+        ];
         let coords = [0u16, 10, 960, 1919, 5000, u16::MAX];
         let spans = [(1920u16, 1080u16), (1280, 720), (1, 1), (0, 0)];
         let advances = [0u64, 1, 200, 900, 2_000, 9_000, 11_000, 31_000];
@@ -1785,6 +3461,12 @@ mod tests {
             (Duration::from_secs(1), Duration::from_secs(3)),
             (Duration::from_secs(10), Duration::from_secs(3)),
         ];
+        let paces = [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(15),
+        ];
+        let waits = [Duration::from_millis(300), Duration::from_secs(5)];
         let shell_triggers = [
             ReleaseTrigger::SessionStart,
             ReleaseTrigger::WebsocketReconnect,
@@ -1792,9 +3474,21 @@ mod tests {
             ReleaseTrigger::Closing,
         ];
         let mut fired = [0usize; 3]; // synchronize, key_repeat, modifier_idle
+        let mut paste = PasteOracle {
+            open: false,
+            pending_deadline: None,
+            max_chars: 4096,
+            fired: [0; 10],
+        };
+        let (mut typing_steps, mut roomless_steps) = (0usize, 0usize);
         for seed in 1..=64u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            let (krt, mit) = timeouts[usize::try_from(seed).unwrap() % timeouts.len()];
+            let s = usize::try_from(seed).unwrap();
+            let (krt, mit) = timeouts[s % timeouts.len()];
+            let pace = paces[s % paces.len()];
+            let modifier_wait = waits[(s / 3) % waits.len()];
+            let multiline_refuse = (s / 2) % 2 == 0;
+            let max_chars = if s % 5 == 0 { 5 } else { 4096 };
             let hid = HidControl::new(rng.pick(&[4usize, 64]), Arc::new(Metrics::default()));
             let mut dev = Device::default();
             let mut core = InputCore::new();
@@ -1804,43 +3498,88 @@ mod tests {
             let mut generation = 1;
             let (mut remap, mut surface) = (false, (1920, 1080));
             let mut stalled = false;
+            // What sits in the HID queue since the writer last drained it:
+            // the shell's room is 8 less that (DD6).
+            let mut queued = 0usize;
+            paste.open = false;
+            paste.pending_deadline = None;
+            paste.max_chars = max_chars;
             // The client's side: what it has sent a Pressed for and not a
             // Released (a lost release stays here, never sent).
             let mut sent_codes: Vec<(u8, bool)> = Vec::new();
             let mut sent_units: Vec<u16> = Vec::new();
             let mut sent_buttons: Vec<Button> = Vec::new();
             // The oracle: the timers' bases (D8e; "any keyboard event"), and
-            // what was held at a marking release and is still owed its
-            // client Released (§7.4).
+            // what was held at a marking release, or swallowed by a paste,
+            // and is still owed its client Released (§7.4, D3c).
             let mut key_activity: Option<Instant> = None;
             let mut kbd_event: Option<Instant> = None;
             let mut owed: Vec<u8> = Vec::new();
             let mut owed_buttons = 0u8;
-            let mk =
-                |now: Instant, epoch: u64, generation: Gen, remap: bool, surface: (u16, u16)| Ctx {
-                    now,
-                    epoch,
-                    generation,
-                    surface,
-                    mac_remap: remap,
-                    key_repeat_timeout: krt,
-                    modifier_idle_timeout: mit,
-                };
+            let mk = |now: Instant,
+                      epoch: u64,
+                      generation: Gen,
+                      remap: bool,
+                      surface: (u16, u16),
+                      queue_room: usize| Ctx {
+                now,
+                epoch,
+                generation,
+                surface,
+                mac_remap: remap,
+                key_repeat_timeout: krt,
+                modifier_idle_timeout: mit,
+                chord: chord(),
+                pace,
+                modifier_wait,
+                multiline_refuse,
+                max_chars,
+                queue_room,
+            };
+            let press = |sent_codes: &mut Vec<(u8, bool)>, c: (u8, bool)| {
+                if !sent_codes.contains(&c) {
+                    sent_codes.push(c);
+                }
+                Event::KeyPressed {
+                    code: c.0,
+                    extended: c.1,
+                }
+            };
+            let release = |sent_codes: &mut Vec<(u8, bool)>, c: (u8, bool)| {
+                sent_codes.retain(|d| *d != c);
+                Event::KeyReleased {
+                    code: c.0,
+                    extended: c.1,
+                }
+            };
+            let clipboard = |rng: &mut Rng| {
+                let mut b = utf16le(rng.pick(&texts));
+                if rng.below(4) != 0 {
+                    b.extend_from_slice(&[0, 0]); // CF_UNICODETEXT's terminator
+                    if rng.below(2) == 0 {
+                        b.extend_from_slice(&utf16le("\r\njunk")); // not text
+                    }
+                }
+                Event::ClipboardText(b)
+            };
             for i in 0..2_000 {
-                let event = match rng.below(26) {
+                // Pastes are driven on more often than not once one is
+                // pending or typing, and sought now and then when idle;
+                // otherwise any event.
+                let branch = match phase(&core) {
+                    Phase::Pending if rng.below(4) != 0 => 31,
+                    Phase::Typing if rng.below(8) != 0 => 31,
+                    Phase::Idle if rng.below(6) == 0 => 26,
+                    _ => rng.below(34),
+                };
+                let event = match branch {
                     0..=4 => {
                         let c = if !sent_codes.is_empty() && rng.below(2) == 0 {
                             rng.pick(&sent_codes) // a typematic repeat
                         } else {
                             rng.pick(&codes)
                         };
-                        if !sent_codes.contains(&c) {
-                            sent_codes.push(c);
-                        }
-                        Event::KeyPressed {
-                            code: c.0,
-                            extended: c.1,
-                        }
+                        press(&mut sent_codes, c)
                     }
                     5..=7 => {
                         let c = if !sent_codes.is_empty() && rng.below(4) != 0 {
@@ -1848,11 +3587,7 @@ mod tests {
                         } else {
                             rng.pick(&codes) // a stray release
                         };
-                        sent_codes.retain(|d| *d != c);
-                        Event::KeyReleased {
-                            code: c.0,
-                            extended: c.1,
-                        }
+                        release(&mut sent_codes, c)
                     }
                     8 => {
                         let u = rng.pick(&units);
@@ -1918,6 +3653,7 @@ mod tests {
                     20 => {
                         // The shell's own release (§7.4's other triggers).
                         hid.release_all(rng.pick(&shell_triggers));
+                        queued = 0;
                         drain(&hid, &mut dev);
                         assert!(
                             !dev.holds_a_key() && dev.buttons == 0,
@@ -1928,10 +3664,13 @@ mod tests {
                             core.on_generation(generation);
                             assert_eq!(held(&core), (Vec::new(), 0), "seed {seed} step {i}");
                             assert_eq!(core.next_deadline(), None, "seed {seed} step {i}");
+                            assert_eq!(phase(&core), Phase::Idle, "seed {seed} step {i}");
                             owed.clear();
                             owed_buttons = 0;
                             key_activity = None;
                             kbd_event = None;
+                            paste.open = false;
+                            paste.pending_deadline = None;
                         }
                         continue;
                     }
@@ -1953,6 +3692,65 @@ mod tests {
                         stalled = !stalled && rng.below(2) == 0;
                         continue;
                     }
+                    26 | 27 => {
+                        // Seek the chord: drop a GUI, press a missing chord
+                        // modifier (either side), then V.
+                        let bits = core.keys.held_modifier_bits();
+                        let classes = kvm_proto::keymap::modifier_classes(bits);
+                        let missing = (0..3).find(|n| classes & [0x01, 0x04, 0x02][*n] == 0);
+                        if classes & 0x08 != 0 {
+                            let c = if bits & 0x08 != 0 {
+                                (0x5B, true)
+                            } else {
+                                (0x5C, true)
+                            };
+                            release(&mut sent_codes, c)
+                        } else if let Some(n) = missing {
+                            let c = rng.pick(&chord_mods[n]);
+                            press(&mut sent_codes, c)
+                        } else {
+                            press(&mut sent_codes, (0x2F, false))
+                        }
+                    }
+                    28 => clipboard(&mut rng),
+                    29 => Event::ClipboardAvailable(rng.below(4) != 0),
+                    30 => {
+                        if sent_codes.contains(&ESC) && rng.below(2) == 0 {
+                            release(&mut sent_codes, ESC)
+                        } else {
+                            press(&mut sent_codes, ESC)
+                        }
+                    }
+                    31 | 32 => {
+                        // Drive a paste on: its response, or the chord's
+                        // modifiers up, or the Typist's next pace.
+                        match phase(&core) {
+                            Phase::Pending
+                                if matches!(core.paste, State::Pending { text: None, .. })
+                                    && rng.below(4) != 0 =>
+                            {
+                                clipboard(&mut rng)
+                            }
+                            Phase::Pending => {
+                                let held_mod = sent_codes.iter().copied().find(|c| {
+                                    *c == (0x2F, false)
+                                        || chord_mods.iter().flatten().any(|m| m == c)
+                                });
+                                match held_mod {
+                                    Some(c) => release(&mut sent_codes, c),
+                                    None => Event::Tick,
+                                }
+                            }
+                            _ => {
+                                now += pace.max(Duration::from_millis(1));
+                                Event::Tick
+                            }
+                        }
+                    }
+                    33 => {
+                        now += Duration::from_millis(rng.pick(&[0u64, 1, 2, 15]));
+                        Event::Tick
+                    }
                     _ => {
                         now += Duration::from_millis(rng.pick(&advances));
                         Event::Tick
@@ -1961,6 +3759,7 @@ mod tests {
                 let epoch = hid.epoch();
                 let moved = epoch != seen;
                 seen = epoch;
+                let room = 8usize.saturating_sub(queued);
                 let before = held(&core);
                 let (held_nonmod, held_mod) = if moved {
                     (false, false)
@@ -1970,13 +3769,46 @@ mod tests {
                         core.keys.held_modifier_bits() != 0,
                     )
                 };
+                // The paste filter's view: a moved epoch releases first (the
+                // paste ends, the held keys are marked) — then the event.
+                let pre_phase = if moved { Phase::Idle } else { phase(&core) };
+                let is_rbb =
+                    |u: u8| core.keys.is_released_by_bridge(u) || (moved && before.0.contains(&u));
+                let is_down = |u: u8| !moved && core.keys.is_down(u);
+                let mods = if moved {
+                    0
+                } else {
+                    core.keys.held_modifier_bits()
+                };
+                // D3c: the press a paste swallows (and marks), if any.
+                let swallowed: Option<Option<u8>> = match event {
+                    Event::KeyPressed { code, extended } => {
+                        let u = usage_for_scancode(code, extended);
+                        let chord_hit = u.is_some_and(|u| !is_rbb(u) && !is_down(u))
+                            && chord().matches(code, extended, mods);
+                        let esc_hit = pre_phase != Phase::Idle
+                            && u == Some(0x29)
+                            && !is_rbb(0x29)
+                            && !is_down(0x29);
+                        (chord_hit || esc_hit || pre_phase == Phase::Typing).then_some(u)
+                    }
+                    Event::UnicodePressed(unit) if pre_phase == Phase::Typing => {
+                        Some(unit_usage(unit))
+                    }
+                    _ => None,
+                };
+                let released = match event {
+                    Event::KeyReleased { code, extended } => usage_for_scancode(code, extended),
+                    Event::UnicodeReleased(unit) => unit_usage(unit),
+                    _ => None,
+                };
                 let mut outs = Vec::new();
                 core.step(
-                    &mk(now, epoch, generation, remap, surface),
-                    event,
+                    &mk(now, epoch, generation, remap, surface, room),
+                    event.clone(),
                     &mut outs,
                 );
-                let at = format!("seed {seed} step {i} {}: {}", describe(event), show(&outs));
+                let at = format!("seed {seed} step {i} {}: {}", describe(&event), show(&outs));
                 // Every report carries its step's epoch; a release is the
                 // last out of its step.
                 for o in &outs {
@@ -1990,17 +3822,9 @@ mod tests {
                     assert!(matches!(outs.last(), Some(Out::Release(_))), "{at}");
                 }
                 // A moved epoch: everything held then is released and
-                // marked, and the step starts with the zero report.
+                // marked, and the step's first report is the zero report.
                 if moved {
-                    assert_eq!(
-                        outs.first(),
-                        Some(&Out::Push {
-                            frame: kbd(0, 0),
-                            motion_only: false,
-                            stamp: epoch
-                        }),
-                        "{at}"
-                    );
+                    assert_eq!(pushes(&outs).first(), Some(&(kbd(0, 0), epoch)), "{at}");
                     for u in &before.0 {
                         if !owed.contains(u) {
                             owed.push(*u);
@@ -2047,6 +3871,65 @@ mod tests {
                         "{at}: a trigger left something held"
                     );
                     assert_eq!(core.next_deadline(), None, "{at}");
+                    assert_eq!(phase(&core), Phase::Idle, "{at}: a trigger left a paste");
+                }
+                // The paste: outcomes well-sequenced and matching the phase.
+                paste.see(&outs, now, modifier_wait, &at);
+                let post_phase = phase(&core);
+                assert_eq!(paste.open, post_phase != Phase::Idle, "{at}");
+                // D3c: a swallowed press is marked; typing's start marks
+                // what the client still holds (never a modifier: typing
+                // waits for every one to be up).
+                if let Some(Some(u)) = swallowed
+                    && !owed.contains(&u)
+                {
+                    owed.push(u);
+                }
+                let done = outs
+                    .iter()
+                    .any(|o| matches!(o, Out::Paste(PasteOutcome::Done { .. })));
+                let began = pre_phase == Phase::Pending && (post_phase == Phase::Typing || done);
+                if began {
+                    for u in before.0.iter().filter(|u| modifier_bit(**u).is_none()) {
+                        if Some(*u) != released && !owed.contains(u) {
+                            owed.push(*u);
+                        }
+                    }
+                    assert_eq!(core.keys.held_modifier_bits(), 0, "{at}");
+                }
+                // DD6: a typing step pushes at most the room; an abort's
+                // only keyboard report is the all-zero one.
+                let kb: Vec<HidFrame> = pushes(&outs)
+                    .into_iter()
+                    .map(|(f, _)| f)
+                    .filter(|f| matches!(f, HidFrame::Keyboard { .. }))
+                    .collect();
+                if !moved && pre_phase == Phase::Typing {
+                    typing_steps += 1;
+                    let aborted = outs
+                        .iter()
+                        .any(|o| matches!(o, Out::Paste(PasteOutcome::Aborted("esc" | "mouse"))));
+                    if aborted {
+                        assert_eq!(kb, [kbd(0, 0)], "{at}");
+                    } else {
+                        assert!(kb.len() <= room, "{at}: room {room}");
+                    }
+                }
+                if began {
+                    // The event's own report, then the zero for what the client
+                    // held (it goes out even with no room) and the Typist's.
+                    assert!(kb.len() <= room.max(1) + 1, "{at}: room {room}");
+                }
+                if post_phase == Phase::Typing {
+                    let d = core.paste.deadline().unwrap();
+                    assert!(d >= now, "{at}: a typing deadline in the past");
+                    if room == 0 {
+                        roomless_steps += 1;
+                        assert!(d >= now + crate::input::paste::ROOM_POLL, "{at}: a spin");
+                    }
+                }
+                if post_phase == Phase::Pending {
+                    assert_eq!(core.paste.deadline(), paste.pending_deadline, "{at}");
                 }
                 // The event's own effects on the oracle.
                 match event {
@@ -2086,8 +3969,9 @@ mod tests {
                     } => owed_buttons &= !button_bit(button),
                     _ => {}
                 }
-                // Whatever was held at a release stays up until its own
-                // Released (§7.4); with 18 codes the marks never overflow.
+                // Whatever was held at a release or swallowed stays up until
+                // its own Released (§7.4); with 19 codes the marks never
+                // overflow.
                 for u in &owed {
                     assert!(
                         core.keys.is_released_by_bridge(*u),
@@ -2121,37 +4005,55 @@ mod tests {
                         "{at}: {b:?}'s mark"
                     );
                 }
-                // A held key or modifier always has its timer armed, at
-                // exactly the sooner deadline.
+                // A held key or modifier always has its timer armed; the
+                // core's deadline is exactly the soonest armed one.
                 let kr = (core.keys.held_nonmodifier_usages() > 0)
                     .then(|| key_activity.expect("a held key with no key-repeat base") + krt);
                 let mi = (core.keys.held_modifier_bits() != 0)
                     .then(|| kbd_event.expect("a held modifier with no idle base") + mit);
                 assert_eq!(
                     core.next_deadline(),
-                    [kr, mi].into_iter().flatten().min(),
+                    [kr, mi, core.paste.deadline()].into_iter().flatten().min(),
                     "{at}"
                 );
                 carry(&hid, &outs);
+                queued += outs
+                    .iter()
+                    .filter(|o| matches!(o, Out::Push { .. }))
+                    .count();
+                if !rel.is_empty() {
+                    queued = 0; // a release clears the queue
+                }
                 if !stalled || want.is_some() {
                     drain(&hid, &mut dev);
+                    queued = 0;
                     if want.is_some() {
                         assert!(
                             !dev.holds_a_key() && dev.buttons == 0,
                             "{at}: the device holds after a trigger"
                         );
                     }
-                    // The device never holds what the core does not.
+                    // The device never holds what the core does not; while
+                    // typing, only the Typist's press — one key in the first
+                    // slot, with at most Shift — or its all-zero release
+                    // (what the client held went to zero as typing began).
                     if let Some(HidFrame::Keyboard { modifiers, keys }) = dev.kbd {
-                        for k in keys.iter().filter(|k| **k != 0) {
-                            assert!(core.keys.is_down(*k), "{at}: device holds {k:#x}");
-                        }
-                        if modifiers != 0 {
-                            assert!(
-                                core.keys.held_modifier_bits() != 0
-                                    || core.keys.held_nonmodifier_usages() > 0,
-                                "{at}: device holds modifiers {modifiers:#x}"
-                            );
+                        let held_keys: Vec<u8> = keys.iter().copied().filter(|k| *k != 0).collect();
+                        if post_phase == Phase::Typing {
+                            let typist = keys[1..] == [0; 4]
+                                && (modifiers == 0 || (modifiers == MOD_LSHIFT && keys[0] != 0));
+                            assert!(typist, "{at}: device holds {:02x?} while typing", keys);
+                        } else {
+                            for k in &held_keys {
+                                assert!(core.keys.is_down(*k), "{at}: device holds {k:#x}");
+                            }
+                            if modifiers != 0 {
+                                assert!(
+                                    core.keys.held_modifier_bits() != 0
+                                        || core.keys.held_nonmodifier_usages() > 0,
+                                    "{at}: device holds modifiers {modifiers:#x}"
+                                );
+                            }
                         }
                     }
                     assert_eq!(
@@ -2161,28 +4063,35 @@ mod tests {
                     );
                 }
             }
-            // The client goes silent: one Tick at the deadline releases
-            // every key (each release is of everything).
+            // The client goes silent: Ticks at each deadline end any paste
+            // and release every key (each release is of everything).
             drain(&hid, &mut dev);
-            let epoch = hid.epoch();
-            if let Some(at) = core.next_deadline() {
+            for k in 0..20_000 {
+                let Some(at) = core.next_deadline() else {
+                    break;
+                };
                 now = now.max(at);
+                let epoch = hid.epoch();
                 let mut outs = Vec::new();
                 core.step(
-                    &mk(now, epoch, generation, remap, surface),
+                    &mk(now, epoch, generation, remap, surface, 8),
                     Event::Tick,
                     &mut outs,
                 );
-                assert!(
-                    epoch != seen || !releases(&outs).is_empty(),
-                    "seed {seed}: the deadline Tick released nothing: {}",
-                    show(&outs)
-                );
                 seen = epoch;
+                let at = format!("seed {seed} silent tick {k}: {}", show(&outs));
+                paste.see(&outs, now, modifier_wait, &at);
                 carry(&hid, &outs);
                 drain(&hid, &mut dev);
             }
+            let _ = seen;
             assert_eq!(core.next_deadline(), None, "seed {seed}");
+            assert_eq!(
+                phase(&core),
+                Phase::Idle,
+                "seed {seed}: a paste never ended"
+            );
+            assert!(!paste.open, "seed {seed}");
             assert_eq!(
                 held(&core).0,
                 Vec::<u8>::new(),
@@ -2202,7 +4111,7 @@ mod tests {
                     x: 1,
                     y: 1,
                 };
-                core.step(&mk(now, epoch, generation, remap, surface), e, &mut outs);
+                core.step(&mk(now, epoch, generation, remap, surface, 8), e, &mut outs);
                 carry(&hid, &outs);
             }
             drain(&hid, &mut dev);
@@ -2212,7 +4121,17 @@ mod tests {
                 "seed {seed}: the device holds"
             );
         }
-        // Every trigger the oracle knows fired, many times over.
+        // Every trigger the oracle knows fired, many times over; every
+        // paste outcome the core can give, too, and typing met a full queue.
         assert!(fired.iter().all(|n| *n > 500), "{fired:?}");
+        eprintln!(
+            "paste outcomes {:?}, typing steps {typing_steps}, roomless {roomless_steps}",
+            OUTCOMES.iter().zip(paste.fired).collect::<Vec<_>>()
+        );
+        assert!(paste.fired.iter().all(|n| *n >= 20), "{:?}", paste.fired);
+        assert!(
+            typing_steps > 1_000 && roomless_steps > 20,
+            "{typing_steps} {roomless_steps}"
+        );
     }
 }

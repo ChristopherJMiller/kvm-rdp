@@ -18,7 +18,9 @@ pub const RELEASE: HidFrame = HidFrame::Keyboard {
 /// Decode `bytes` as UTF-16LE, replacing each ill-formed unit (a lone
 /// surrogate, or a trailing odd byte) with U+FFFD and counting it. The
 /// text ends at its first U+0000 (CF_UNICODETEXT's terminator); nothing
-/// after it is text, so nothing after it is counted either (D4).
+/// after it is text, so nothing after it is counted either (D4). Each
+/// U+FFFD is one scalar `prepare` skips and counts, so a caller that counts
+/// `prepare`'s skips has every ill-formed unit counted once already.
 #[must_use]
 pub fn decode_utf16le(bytes: &[u8]) -> (String, usize) {
     let mut units: Vec<u16> = Vec::with_capacity(bytes.len() / 2);
@@ -28,13 +30,13 @@ pub fn decode_utf16le(bytes: &[u8]) -> (String, usize) {
             units.push(u16::from_le_bytes([lo, hi]));
         }
     }
-    let mut odd = usize::from(!it.remainder().is_empty());
+    let mut odd = !it.remainder().is_empty();
     if let Some(end) = units.iter().position(|&u| u == 0) {
         units.truncate(end);
-        odd = 0;
+        odd = false;
     }
-    let mut out = String::with_capacity(units.len());
-    let mut bad = odd;
+    let mut out = String::with_capacity(units.len().saturating_add(1));
+    let mut bad = 0usize;
     for r in char::decode_utf16(units) {
         match r {
             Ok(c) => out.push(c),
@@ -43,6 +45,10 @@ pub fn decode_utf16le(bytes: &[u8]) -> (String, usize) {
                 out.push('\u{FFFD}');
             }
         }
+    }
+    if odd {
+        bad = bad.saturating_add(1);
+        out.push('\u{FFFD}');
     }
     (out, bad)
 }
@@ -325,6 +331,26 @@ mod tests {
         assert_eq!(decode_utf16le(&[]), (String::new(), 0));
         // A NUL's high byte alone is not a terminator: 0x0100 is 'Ā'.
         assert_eq!(decode_utf16le(&[0, 1, 0, 0]), ("\u{100}".to_owned(), 0));
+    }
+
+    /// An ill-formed unit — a lone surrogate either half, or the trailing
+    /// odd byte (as the doc says) — is one U+FFFD: `prepare` skips and counts
+    /// it once, so a caller counting `prepare`'s skips counts it once.
+    #[test]
+    fn each_ill_formed_unit_is_one_replacement_skipped_once() {
+        let (s, bad) = decode_utf16le(&[b'a', 0, 0x00, 0xDC, 0x00, 0xD8, b'b', 0, b'c']);
+        assert_eq!(
+            (s.as_str(), bad),
+            ("a\u{FFFD}\u{FFFD}b\u{FFFD}", 3),
+            "DC00 then D800 is not a pair (high must come first): two lone halves"
+        );
+        let (p, skips) = prepare(&s, &policy(false, 4096));
+        assert_eq!(p, Prepared::Text(vec!['a', 'b']));
+        assert_eq!(skips.skipped, bad, "one count per ill-formed unit");
+        // A well-formed pair is one scalar: decoded, then skipped once.
+        let (s, bad) = decode_utf16le(&[0x3D, 0xD8, 0x00, 0xDE]);
+        assert_eq!((s.as_str(), bad), ("\u{1F600}", 0));
+        assert_eq!(prepare(&s, &policy(false, 4096)).1.skipped, 1);
     }
 
     /// §8: CR, LF and CRLF are one Return each inside the text; only one
