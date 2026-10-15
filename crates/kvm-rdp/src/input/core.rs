@@ -407,7 +407,10 @@ impl InputCore {
     pub fn step(&mut self, ctx: &Ctx, event: Event, out: &mut Vec<Out>) {
         self.pointer.set_surface(ctx.surface.0, ctx.surface.1);
         self.keys.set_mac_remap(ctx.mac_remap); // D8a: applied at report time
-        // The release channel: a moved epoch releases before the event.
+        // The release channel: a moved epoch releases before the event. Its
+        // zero report goes out whatever the event — a clipboard word or a
+        // Tick too: one extra KVM write per release, harmless (PD6 m6; PD9
+        // review m4; L2 goldens expect it).
         if ctx.epoch != self.seen_epoch {
             self.seen_epoch = ctx.epoch;
             let frame = self.release_marked(out);

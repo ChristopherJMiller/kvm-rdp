@@ -27,11 +27,14 @@
 //! stale press landing after the new session-start zeros. So every open
 //! re-asserts the full current state once, `reassert_after` past its
 //! session-start sequence (PC9 fix 2, DD8): the queue's resync state, the
-//! last keyboard and pointer reports, written only once the queue is drained
-//! and no release is pending — so it never overtakes a queued report or a
-//! release, and repeats what the KVM should hold anyway (idempotent). The
-//! deadline is checked at the loop's top, so no busy arm of the `select!`
-//! can starve it (D21).
+//! last keyboard and pointer reports, written once the queue is drained and
+//! no release is pending — so it overtakes neither, and repeats what the
+//! KVM should hold anyway (idempotent). The deadline is checked at the
+//! loop's top, so no busy arm of the `select!` can starve it (D21); and if
+//! reports keep the queue from ever draining (motion under backpressure),
+//! it goes `reassert_after` past its deadline after one queued frame (PD9
+//! review m1): it is the newest state, so the frames queued behind it only
+//! pass through older states on the way back to it.
 use crate::hid::{HidControl, ReleaseTrigger};
 use crate::kvm::endpoint::{KvmEndpoint, SocketHandle};
 use crate::kvm::error::FailClass;
@@ -278,6 +281,8 @@ impl WsTask {
         // PC9 fix 2: once, `reassert_after` past the session start (`None`
         // once done; bounded config, so the add never overflows).
         let mut reassert_at = tokio::time::Instant::now().checked_add(self.reassert_after);
+        // m1 (PD9 review): the latest it may wait for the queue to empty.
+        let mut reassert_by = reassert_at.and_then(|at| at.checked_add(self.reassert_after));
         loop {
             if self.hid.take_release() {
                 for f in self.hid.release_frames() {
@@ -291,20 +296,25 @@ impl WsTask {
                 if !self.write(&mut sink, f).await {
                     return Exit::Failed;
                 }
+                // m1: reports arriving as fast as the KVM takes them (motion
+                // under backpressure) keep the queue from ever emptying at
+                // the loop top; past `reassert_by` the re-assert goes after
+                // this one queued frame instead of waiting for a lull.
+                if reassert_by.is_some_and(|by| tokio::time::Instant::now() >= by) {
+                    if !self.reassert(&mut sink).await {
+                        return Exit::Failed;
+                    }
+                    (reassert_at, reassert_by) = (None, None);
+                }
                 continue;
             }
             // D21: checked here, with the release and the queue served
             // first, whatever arm of the `select!` below is ready.
-            if let Some(at) = reassert_at
-                && tokio::time::Instant::now() >= at
-            {
-                for f in self.hid.current_state_frames() {
-                    if !self.write(&mut sink, f).await {
-                        return Exit::Failed;
-                    }
+            if reassert_at.is_some_and(|at| tokio::time::Instant::now() >= at) {
+                if !self.reassert(&mut sink).await {
+                    return Exit::Failed;
                 }
-                self.metrics.hid_reasserts.inc();
-                reassert_at = None;
+                (reassert_at, reassert_by) = (None, None);
                 continue;
             }
             let reassert_wake = reassert_at;
@@ -385,6 +395,18 @@ impl WsTask {
                 } => {}
             }
         }
+    }
+
+    /// PC9 fix 2: write the full current state (the queue's resync state)
+    /// once, and count it; false if a write failed (a reconnect).
+    async fn reassert<S: Sink<Message, Error = WsError> + Unpin>(&self, sink: &mut S) -> bool {
+        for f in self.hid.current_state_frames() {
+            if !self.write(sink, f).await {
+                return false;
+            }
+        }
+        self.metrics.hid_reasserts.inc();
+        true
     }
 
     /// One write on a websocket that stays in service: a failure ends it
@@ -1561,5 +1583,60 @@ mod tests {
             );
             drive.abort();
         });
+    }
+
+    /// A sink each write of which brings a new pointer report — reports
+    /// arriving as fast as the KVM takes them, so the queue is never empty
+    /// at the loop top — until a re-assert has gone out (then it fails,
+    /// ending the drive) or `until` (bounded).
+    struct Refill {
+        hid: Arc<HidControl>,
+        n: u16,
+        until: Instant,
+    }
+
+    impl Sink<Message> for Refill {
+        type Error = WsError;
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            if self.hid.metrics.hid_reasserts.get() > 0 || Instant::now() > self.until {
+                Poll::Ready(Err(WsError::ConnectionClosed))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+        fn start_send(mut self: Pin<&mut Self>, _: Message) -> Result<(), WsError> {
+            self.n = self.n % 30_000 + 1;
+            let n = self.n;
+            let _ = self.hid.push(HidFrame::abs_mouse(0, n, n), true);
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), WsError>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// PD9 review m1: a queue that never empties at the loop top (continuous
+    /// motion under backpressure) defers the re-assert at most
+    /// `reassert_after` past its deadline — it then goes out after one
+    /// queued frame — rather than until the traffic pauses. Real time: the
+    /// drive never yields here, so a paused clock would never move.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_reassert_is_not_deferred_forever_by_a_queue_that_never_empties() {
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
+        t.reassert_after = Duration::from_millis(50);
+        let t0 = Instant::now();
+        let sink = Refill {
+            hid: hid.clone(),
+            n: 0,
+            until: t0 + Duration::from_secs(10),
+        };
+        let exit = t.drive(sink, futures_util::stream::pending()).await;
+        assert_eq!(exit, Exit::Failed, "the sink ended the drive");
+        assert_eq!(hid.metrics.hid_reasserts.get(), 1, "deferred forever");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
     }
 }
