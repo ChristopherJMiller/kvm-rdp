@@ -90,28 +90,32 @@ pub struct Skips {
     pub skipped: usize,
 }
 
-/// §8, in order: drop one trailing CRLF/CR/LF; with `multiline_refuse`,
+/// §8: skip the controls and characters the US layout cannot type (each
+/// Unicode scalar counted, `'\r'` excepted: it is a line break); then, on
+/// what is left, drop one trailing CRLF/CR/LF; with `multiline_refuse`,
 /// refuse any text that still holds a break; turn CRLF/CR/LF into one
-/// Return each and keep Tab; skip other controls and characters the US
-/// layout cannot type (counted per Unicode scalar); cap at `max_chars`.
+/// Return each and keep Tab; cap at `max_chars`. A skip is counted only
+/// while the cap has room (what lies past the cap is not looked at).
 ///
-/// "Trailing" looks past what the skip step drops (PD7 review m1): a break
-/// followed only by skipped scalars — an ill-formed unit's U+FFFD, a
-/// control, a zero-width space — is the trailing break, so one appended
-/// ill-formed unit can never turn a copied line's break into a typed
-/// Enter. The skipped tail is still counted, after the text.
+/// Skipping first (PD7 review m1, re-review m1-r) means no skipped scalar
+/// — an ill-formed unit's U+FFFD, a control, a zero-width space — changes
+/// which break is the trailing one, or splits a CRLF into a typed CR and a
+/// trimmed LF: appending or inserting such a unit never turns a copied
+/// line's break into a typed Enter.
 #[must_use]
 pub fn prepare(text: &str, policy: &PastePolicy) -> (Prepared, Skips) {
-    // The text up to its last typeable scalar or line break ('\r' has no
-    // stroke of its own); the rest is skipped whatever happens to it.
-    let body = text.trim_end_matches(|c: char| c != '\r' && us_stroke(c).is_none());
-    let tail = text.get(body.len()..).unwrap_or("");
-    let trimmed = body
-        .strip_suffix("\r\n")
-        .or_else(|| body.strip_suffix('\n'))
-        .or_else(|| body.strip_suffix('\r'))
-        .unwrap_or(body);
-    if policy.multiline_refuse && trimmed.contains(['\n', '\r']) {
+    let is_skipped = |c: char| c != '\r' && us_stroke(c).is_none();
+    // What survives the skip: typeable scalars and the line breaks.
+    let left: Vec<char> = text.chars().filter(|c| !is_skipped(*c)).collect();
+    let trailing = match left.as_slice() {
+        [.., '\r', '\n'] => 2,
+        [.., '\n' | '\r'] => 1,
+        _ => 0,
+    };
+    let body = left
+        .get(..left.len().saturating_sub(trailing))
+        .unwrap_or(&[]);
+    if policy.multiline_refuse && body.iter().any(|c| matches!(c, '\n' | '\r')) {
         return (
             Prepared::RefusedMultiline,
             Skips {
@@ -120,18 +124,35 @@ pub fn prepare(text: &str, policy: &PastePolicy) -> (Prepared, Skips) {
             },
         );
     }
-    // CRLF → one '\n' first, so a CRLF is not two line breaks.
-    let unified = trimmed.replace("\r\n", "\n").replace('\r', "\n");
+    // In the text's own order: the body's scalars, CRLF/CR/LF as one
+    // Return each (an LF right after a CR, skipped scalars between them or
+    // not, is that CR's), and the skips, counted while the cap has room.
     let mut kept: Vec<char> = Vec::new();
     let mut skipped = 0usize;
-    for c in unified.chars().chain(tail.chars()) {
+    let mut body_left = body.len();
+    let mut after_cr = false;
+    for c in text.chars() {
         if kept.len() >= policy.max_chars {
             break;
         }
-        if us_stroke(c).is_some() {
-            kept.push(c);
-        } else {
+        if is_skipped(c) {
             skipped = skipped.saturating_add(1);
+            continue;
+        }
+        if body_left == 0 {
+            continue; // the trailing break: dropped
+        }
+        body_left = body_left.saturating_sub(1);
+        match c {
+            '\n' if after_cr => after_cr = false, // a CRLF's LF
+            '\r' => {
+                after_cr = true;
+                kept.push('\n');
+            }
+            other => {
+                after_cr = false;
+                kept.push(other);
+            }
         }
     }
     let kept_len = kept.len();
@@ -436,6 +457,106 @@ mod tests {
         );
     }
 
+    /// PD7 re-review m1-r: a skipped unit *inside* the trailing CRLF — a
+    /// lone surrogate or an untypeable scalar between its CR and its LF —
+    /// does not split it into a typed CR and a trimmed LF. Untypeable
+    /// scalars are skipped first, so the CRLF is still one trailing break:
+    /// removed, never an Enter, never refused; the unit is still counted.
+    #[test]
+    fn a_skipped_unit_inside_the_trailing_crlf_does_not_split_it() {
+        let units = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
+        // The review's case: "ls\r" + D800 + "\n" + the terminator.
+        let mut bytes = units("ls\r");
+        bytes.extend_from_slice(&[0x00, 0xD8]);
+        bytes.extend(units("\n"));
+        bytes.extend_from_slice(&[0, 0]);
+        let (text, bad) = decode_utf16le(&bytes);
+        assert_eq!((text.as_str(), bad), ("ls\r\u{FFFD}\n", 1));
+        for refuse in [false, true] {
+            assert_eq!(
+                prepare(&text, &policy(refuse, 4096)),
+                (
+                    Prepared::Text(vec!['l', 's']),
+                    Skips {
+                        kept: 2,
+                        skipped: 1
+                    }
+                ),
+                "refuse={refuse}"
+            );
+        }
+        // CR, skipped units, LF: any number, any kind, and more after.
+        for mid in [
+            "\u{FFFD}",
+            "\u{200B}",
+            "\u{7}",
+            "\u{A0}\u{FEFF}",
+            "\u{1F600}",
+        ] {
+            let n = mid.chars().count();
+            for after in ["", "\u{200B}"] {
+                let text = format!("ls\r{mid}\n{after}");
+                let want = n + after.chars().count();
+                for refuse in [false, true] {
+                    let (p, s) = prepare(&text, &policy(refuse, 4096));
+                    assert_eq!(
+                        p,
+                        Prepared::Text(vec!['l', 's']),
+                        "{text:?} refuse={refuse}"
+                    );
+                    assert_eq!(s.skipped, want, "{text:?}");
+                }
+            }
+        }
+        // Inside, the same rule: a skipped unit between CR and LF leaves
+        // one Return, not two.
+        assert_eq!(
+            prepare("a\r\u{200B}\nb", &policy(false, 4096)).0,
+            Prepared::Text(vec!['a', '\n', 'b'])
+        );
+        // And a second trailing break around a skipped CRLF still types
+        // exactly one Return.
+        assert_eq!(
+            prepare("a\r\u{200B}\n\r\u{FFFD}\n", &policy(false, 4096)).0,
+            Prepared::Text(vec!['a', '\n'])
+        );
+    }
+
+    /// PD7 re-review m7: '\r' is a line break, never a skipped scalar — a
+    /// CR before the trailing one is a Return (refused under refuse), and a
+    /// trailing CR is trimmed, not counted.
+    #[test]
+    fn a_carriage_return_is_a_break_never_a_skip() {
+        assert_eq!(
+            prepare("a\r\r", &policy(false, 4096)),
+            (
+                Prepared::Text(vec!['a', '\n']),
+                Skips {
+                    kept: 2,
+                    skipped: 0
+                }
+            )
+        );
+        assert_eq!(
+            prepare("a\r\r", &policy(true, 4096)).0,
+            Prepared::RefusedMultiline
+        );
+        assert_eq!(
+            prepare("a\r", &policy(false, 4096)),
+            (
+                Prepared::Text(vec!['a']),
+                Skips {
+                    kept: 1,
+                    skipped: 0
+                }
+            )
+        );
+        assert_eq!(
+            prepare("a\r\n\r", &policy(false, 4096)).0,
+            Prepared::Text(vec!['a', '\n'])
+        );
+    }
+
     /// §8: CR, LF and CRLF are one Return each inside the text; only one
     /// trailing break is removed, and multiline = refuse sees what is left.
     #[test]
@@ -591,19 +712,60 @@ mod tests {
             if rng.next().is_multiple_of(3) {
                 bytes.push(rng.next() as u8);
             }
-            let (text, _) = decode_utf16le(&bytes);
+            let (mut text, _) = decode_utf16le(&bytes);
             assert!(!text.contains('\0'), "round {round}");
+            // Half the payloads end in a line break, as a copied line does.
+            if rng.next().is_multiple_of(2) {
+                text.push_str(["\r\n", "\n", "\r"][(rng.next() % 3) as usize]);
+            }
             let max = (rng.next() % 40) as usize;
             let refuse = rng.next().is_multiple_of(2);
             let (p, s) = prepare(&text, &policy(refuse, max));
-            // m1: appending what §8 skips never changes what is typed or
-            // refused — only the count (when the cap left room for it).
-            let tails = ["\u{FFFD}", "\u{200B}", "\u{7}", "\u{1F600}\u{A0}"];
-            let tail = tails[(rng.next() % 4) as usize];
-            let (p2, s2) = prepare(&format!("{text}{tail}"), &policy(refuse, max));
-            assert_eq!(p2, p, "round {round}: a skipped tail changed the text");
-            assert_eq!(s2.kept, s.kept, "round {round}");
-            assert!(s2.skipped >= s.skipped, "round {round}");
+            // m1, m1-r: what §8 skips, appended, inserted anywhere, or put
+            // before, inside or after the trailing break, never changes what
+            // is typed or refused — only the count (when the cap has room).
+            let units = ["\u{FFFD}", "\u{200B}", "\u{7}", "\u{1F600}\u{A0}"];
+            let unit = units[(rng.next() % 4) as usize];
+            let scalars: Vec<char> = text.chars().collect();
+            let n = scalars.len();
+            let mut places = vec![n, (rng.next() % (n as u64 + 1)) as usize];
+            if text.ends_with("\r\n") {
+                places.extend([n - 2, n - 1]);
+            } else if text.ends_with(['\n', '\r']) {
+                places.push(n - 1);
+            }
+            for at in places {
+                let mut v = scalars.clone();
+                v.splice(at..at, unit.chars());
+                let with: String = v.into_iter().collect();
+                let (p2, s2) = prepare(&with, &policy(refuse, max));
+                assert_eq!(
+                    p2, p,
+                    "round {round}: a skipped unit at {at} changed the text"
+                );
+                assert_eq!(s2.kept, s.kept, "round {round}");
+                assert!(s2.skipped >= s.skipped, "round {round}");
+            }
+            // A trailing line break is never typed: k trailing breaks (in
+            // what survives the skip) type k - 1 Returns at the end.
+            let left: String = text
+                .chars()
+                .filter(|c| *c == '\r' || us_stroke(*c).is_some())
+                .collect::<String>()
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
+            let breaks = left.chars().rev().take_while(|c| *c == '\n').count();
+            if let Prepared::Text(v) = &p
+                && v.len() < max
+                && breaks > 0
+            {
+                let typed = v.iter().rev().take_while(|c| **c == '\n').count();
+                assert_eq!(
+                    typed,
+                    breaks - 1,
+                    "round {round}: a trailing break was typed"
+                );
+            }
             let chars = match p {
                 Prepared::RefusedMultiline => {
                     assert!(refuse, "round {round}");
