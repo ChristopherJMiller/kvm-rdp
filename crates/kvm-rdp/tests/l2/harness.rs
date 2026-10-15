@@ -208,6 +208,20 @@ impl Env {
         *ws_opens(&log).last().unwrap()
     }
 
+    /// `hid_ready` for a websocket opened after the first `opens` (a
+    /// reopen, or a new session's): it waits for that one, never an older.
+    pub async fn hid_ready_after(&self, opens: usize) -> u64 {
+        let ready = |l: &[SimEvent]| {
+            let o = ws_opens(l);
+            o.len() > opens && o.last().is_some_and(|ws| hid_on(l, *ws).len() >= 2)
+        };
+        let log =
+            self.sim.wait_for(T, ready).await.unwrap_or_else(|l| {
+                panic!("no websocket after the first {opens} within {T:?}: {l:?}")
+            });
+        *ws_opens(&log).last().unwrap()
+    }
+
     pub async fn shutdown(&mut self) {
         if let Some(b) = self.bridge.take() {
             tokio::time::timeout(T, b.shutdown())
@@ -339,6 +353,41 @@ pub fn hid_on(log: &[SimEvent], conn: u64) -> Vec<Vec<u8>> {
             _ => None,
         })
         .collect()
+}
+
+/// Every HID frame kvm-sim received on websocket `conn`, with the instant
+/// it recorded it, in order.
+pub fn hid_stamped(sim: &KvmSim, conn: u64) -> Vec<(Instant, Vec<u8>)> {
+    sim.stamped_events()
+        .into_iter()
+        .filter_map(|(at, e)| match e {
+            SimEvent::Hid { conn: c, bytes } if c == conn => Some((at, bytes)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `pred` never holds over kvm-sim's log for `d` — `Client::never`'s rule
+/// (PC16 re-review): the last check's snapshot is taken once the deadline
+/// has passed, and no poll sleeps past it, so an event recorded in the
+/// last poll interval is judged too.
+pub async fn sim_never(sim: &KvmSim, d: Duration, pred: impl Fn(&[SimEvent]) -> bool) {
+    let t0 = Instant::now();
+    loop {
+        let last = t0.elapsed() >= d;
+        let log = sim.events();
+        assert!(
+            !pred(&log),
+            "it happened on kvm-sim; its HID frames: {:02x?}",
+            log.iter()
+                .filter(|e| matches!(e, SimEvent::Hid { .. }))
+                .collect::<Vec<_>>()
+        );
+        if last {
+            return;
+        }
+        tokio::time::sleep(ms(20).min(d.saturating_sub(t0.elapsed()))).await;
+    }
 }
 
 /// A slice NAL with any trailing zero bytes trimmed (§6.2 trims them).

@@ -3,7 +3,9 @@
 //! server PDU and acknowledges per mode — no H.264 decoder is ever an
 //! oracle — and controls to re-advertise, stop reading or close. Each
 //! client runs on its own thread and runtime and binds its own `127.0.0.N`
-//! source address (§11.1). Each case uses a subset of these helpers.
+//! source address (§11.1). It sends fast-path input (keys, Unicode units,
+//! the pointer, the wheel, Synchronize) through its `ActiveStage`, as a real
+//! client does (DC7). Each case uses a subset of these helpers.
 #![allow(dead_code)]
 use crate::harness::{NLA, T, USER};
 use ironrdp_async::FramedWrite as _;
@@ -19,6 +21,8 @@ use ironrdp_egfx::pdu::{
 };
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::zgfx::Decompressor;
+use ironrdp_pdu::input::fast_path::{FastPathInputEvent, KeyboardFlags, SynchronizeFlags};
+use ironrdp_pdu::input::mouse::{MousePdu, PointerFlags};
 use ironrdp_pdu::rdp::capability_sets::{MajorPlatformType, RailSupportLevel};
 use ironrdp_pdu::rdp::server_error_info::{ErrorInfo, ProtocolIndependentCode};
 use ironrdp_pdu::{PduResult, gcc};
@@ -154,6 +158,24 @@ enum Ctl {
     StopReading,
     Readvertise,
     Close,
+    /// Fast-path input events, sent in order (in as few PDUs as fit).
+    Input(Vec<FastPathInputEvent>),
+}
+
+/// A pointer button, as `Client::mouse_button` sends it.
+#[derive(Debug, Clone, Copy)]
+pub enum FpButton {
+    Left,
+    Right,
+    Middle,
+}
+
+fn key_flags(pressed: bool) -> KeyboardFlags {
+    if pressed {
+        KeyboardFlags::empty()
+    } else {
+        KeyboardFlags::RELEASE
+    }
 }
 
 pub struct Client {
@@ -284,6 +306,97 @@ impl Client {
 
     pub fn close(&self) {
         let _ = self.ctl.send(Ctl::Close);
+    }
+
+    // ---- Input (DC7): each sender is one fast-path input PDU, sent after
+    // everything queued before it.
+
+    fn input(&self, events: Vec<FastPathInputEvent>) {
+        let _ = self.ctl.send(Ctl::Input(events));
+    }
+
+    /// A set-1 scancode's make (`pressed`) or break.
+    pub fn key(&self, code: u8, pressed: bool) {
+        self.input(vec![FastPathInputEvent::KeyboardEvent(
+            key_flags(pressed),
+            code,
+        )]);
+    }
+
+    /// An `E0`-prefixed scancode's make or break.
+    pub fn key_extended(&self, code: u8, pressed: bool) {
+        self.input(vec![FastPathInputEvent::KeyboardEvent(
+            key_flags(pressed) | KeyboardFlags::EXTENDED,
+            code,
+        )]);
+    }
+
+    /// Scancode events `(code, pressed)` in one go, in order: as few PDUs
+    /// as `FastPathInput::MAX_EVENTS` allows (a flood, §7.3).
+    pub fn keys(&self, events: &[(u8, bool)]) {
+        self.input(
+            events
+                .iter()
+                .map(|&(code, pressed)| FastPathInputEvent::KeyboardEvent(key_flags(pressed), code))
+                .collect(),
+        );
+    }
+
+    /// A UTF-16 code unit, as a client in Unicode keyboard mode sends it.
+    pub fn unicode(&self, unit: u16, pressed: bool) {
+        self.input(vec![FastPathInputEvent::UnicodeKeyboardEvent(
+            key_flags(pressed),
+            unit,
+        )]);
+    }
+
+    pub fn mouse_move(&self, x: u16, y: u16) {
+        self.input(vec![FastPathInputEvent::MouseEvent(MousePdu {
+            flags: PointerFlags::MOVE,
+            number_of_wheel_rotation_units: 0,
+            x_position: x,
+            y_position: y,
+        })]);
+    }
+
+    /// A button press or release at the click's own position, as a real
+    /// client sends it (D8d).
+    pub fn mouse_button(&self, button: FpButton, pressed: bool, x: u16, y: u16) {
+        let mut flags = match button {
+            FpButton::Left => PointerFlags::LEFT_BUTTON,
+            FpButton::Right => PointerFlags::RIGHT_BUTTON,
+            FpButton::Middle => PointerFlags::MIDDLE_BUTTON_OR_WHEEL,
+        };
+        if pressed {
+            flags |= PointerFlags::DOWN;
+        }
+        self.input(vec![FastPathInputEvent::MouseEvent(MousePdu {
+            flags,
+            number_of_wheel_rotation_units: 0,
+            x_position: x,
+            y_position: y,
+        })]);
+    }
+
+    /// A vertical wheel turn: ±120 per notch, negative toward the user
+    /// (IronRDP encodes it as 9-bit two's complement; −120 is in range).
+    pub fn wheel(&self, units: i16) {
+        self.input(vec![FastPathInputEvent::MouseEvent(MousePdu {
+            flags: PointerFlags::VERTICAL_WHEEL,
+            number_of_wheel_rotation_units: units,
+            x_position: 0,
+            y_position: 0,
+        })]);
+    }
+
+    /// The client's lock-key state (MS-RDPBCGR's Synchronize, §7.4).
+    pub fn synchronize(&self, caps_lock: bool) {
+        let flags = if caps_lock {
+            SynchronizeFlags::CAPS_LOCK
+        } else {
+            SynchronizeFlags::empty()
+        };
+        self.input(vec![FastPathInputEvent::SyncEvent(flags)]);
     }
 }
 
@@ -511,6 +624,20 @@ fn run(
                                 }
                             }
                             Err(e) => push(&log, Ev::Closed(format!("readvertise: {e}"))),
+                        }
+                    }
+                    Some(Ctl::Input(events)) => {
+                        let out = match stage.process_fastpath_input(&mut image, &events) {
+                            Ok(o) => o,
+                            Err(e) => return push(&log, Ev::Closed(format!("input: {e}"))),
+                        };
+                        for o in out {
+                            if let ActiveStageOutput::ResponseFrame(f) = o
+                                && write_failed.is_none()
+                                && let Err(e) = framed.write_all(&f).await
+                            {
+                                write_failed = Some(e.to_string());
+                            }
                         }
                     }
                     Some(Ctl::Close) | None => {

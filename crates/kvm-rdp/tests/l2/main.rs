@@ -13,6 +13,7 @@ mod faults;
 mod flow;
 mod harness;
 mod hid;
+mod input;
 mod lifecycle;
 mod resize;
 mod sessions;
