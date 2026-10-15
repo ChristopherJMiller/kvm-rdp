@@ -463,6 +463,36 @@ fn forbidden_input() -> Vec<String> {
     v
 }
 
+/// The length of the input fragments `fragments` forbids.
+const WINDOW: usize = 6;
+
+/// Every `WINDOW`-character window of SENTINEL and CANARY (PD10 re-review
+/// I1-r2): a fragment of the input — split across a line's fields, cut to
+/// a preview — is forbidden anywhere in the output as a plain substring,
+/// whatever line or target carries it.
+fn fragments() -> Vec<String> {
+    [SENTINEL, CANARY]
+        .iter()
+        .flat_map(|t| {
+            let chars: Vec<char> = t.chars().collect();
+            chars
+                .windows(WINDOW)
+                .map(|w| w.iter().collect::<String>())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// No fragment of the input (`fragments`) anywhere in `hay`.
+fn assert_no_fragment(what: &str, place: &str, hay: &str) {
+    for f in fragments() {
+        assert!(
+            !hay.contains(&f),
+            "{what}: input fragment {f:?} is in {place}"
+        );
+    }
+}
+
 /// Needles this long or longer are matched anywhere (`appears`).
 const SUBSTRING_MIN: usize = 8;
 
@@ -517,7 +547,7 @@ fn code_tokens() -> Vec<String> {
 /// the frame type `p` — the one single-letter part the bridge has. Label
 /// values are `&'static str` from bridge code (metrics.rs), so input can
 /// reach one only through a bug — and then a pasted word
-/// (`canary-3e7a-kiwi`), a keystroke's code (`key_16`, `key_0c`) or one of
+/// (the canary), a keystroke's code (`key_16`, `key_0c`) or one of
 /// its letters (`key_s`: neither SENTINEL nor CANARY has a `p`) breaks this
 /// shape.
 fn vocabulary(s: &str) -> bool {
@@ -583,11 +613,20 @@ fn assert_metrics_hold_no_input(what: &str, body: &str, forbidden: &[String]) {
 /// the CLIPRDR backend, the HID queue and writer, and the pump shell that
 /// carries every clipboard word to the input core: shell.rs's
 /// `RdpInput::Clipboard*` arms), and the only lines they may log —
-/// (target, message, field names). Content-independent (PD10 review
-/// I1(c), re-review): a new log line on the input path fails here until it
-/// is reviewed and listed, whatever it formats. The pump shell's lines are
-/// every call site it has (shell.rs), not one run's sample, so a line that
-/// logs only on some timing never flakes this.
+/// (target, message, and each field with the shape its value must have).
+/// Content-independent (PD10 review I1(c), re-reviews): a new log line on
+/// the input path fails here until it is reviewed and listed, whatever it
+/// formats, and a listed line cannot carry free text — every field's value
+/// is an integer, a boolean or a word from a fixed list (re-review I1-r2:
+/// the canary split across a reviewed line's `width` and `height`).
+///
+/// The pump shell's lines are every call site it has (shell.rs) whose
+/// fields have such a shape, not one run's sample, so a line that logs only
+/// on some timing never flakes this. Its two lines with free text — "EGFX
+/// batch encoding failed" (`error`, an encoder's message) and "the client
+/// offered no AVC420 capability set" (`caps`, the client's sets) — are not
+/// listed: neither can happen on this case's path (a well-formed stream to
+/// an AVC420 client), and if one ever does, the case fails for review.
 const INPUT_TARGETS: [&str; 5] = [
     "kvm_rdp::input",
     "kvm_rdp::rdp::input",
@@ -595,7 +634,60 @@ const INPUT_TARGETS: [&str; 5] = [
     "kvm_rdp::hid",
     "kvm_rdp::pump::shell",
 ];
-const INPUT_LINES: [(&str, &str, &[&str]); 9] = [
+
+/// What a reviewed field's value may be: a closed set, none of which can
+/// carry free text.
+#[derive(Clone, Copy)]
+enum Shape {
+    /// A JSON integer.
+    Integer,
+    /// A JSON boolean.
+    Boolean,
+    /// One of these words exactly.
+    Word(&'static [&'static str]),
+}
+
+impl Shape {
+    fn fits(self, v: &serde_json::Value) -> bool {
+        match self {
+            Shape::Integer => v.is_u64() || v.is_i64(),
+            Shape::Boolean => v.is_boolean(),
+            Shape::Word(words) => v.as_str().is_some_and(|s| words.contains(&s)),
+        }
+    }
+}
+
+/// `pump::types::Command::kind`'s words (pump/types.rs).
+const COMMAND_KINDS: &[&str] = &[
+    "SendDvc",
+    "DisplayResize",
+    "SurfaceSize",
+    "ReleaseAll",
+    "OpenFlv",
+    "RequestIdr",
+    "ReconnectFlv",
+    "CancelIdrRequest",
+    "ProbeRtt",
+    "Disconnect",
+    "Abort",
+];
+
+/// `msg::Cause::label`'s words (msg.rs).
+const CAUSES: &[&str] = &[
+    "shutdown",
+    "kvm_unreachable",
+    "stream_corrupt",
+    "stream_incompatible",
+    "no_avc420",
+    "client_stalled",
+    "clipboard_oversize",
+    "kvm_auth_failed",
+    "kvm_cert_mismatch",
+];
+
+type Line = (&'static str, &'static str, &'static [(&'static str, Shape)]);
+
+const INPUT_LINES: [Line; 7] = [
     (
         "kvm_rdp::rdp::input",
         "paste chord with no text on the clipboard",
@@ -604,17 +696,21 @@ const INPUT_LINES: [(&str, &str, &[&str]); 9] = [
     (
         "kvm_rdp::pump::shell",
         "pump command",
-        &["current", "generation", "kind"],
+        &[
+            ("generation", Shape::Integer),
+            ("kind", Shape::Word(COMMAND_KINDS)),
+            ("current", Shape::Boolean),
+        ],
     ),
     (
         "kvm_rdp::pump::shell",
         "disconnect watchdog fired: aborting the connection",
-        &["generation"],
+        &[("generation", Shape::Integer)],
     ),
     (
         "kvm_rdp::pump::shell",
         "no display stream for a resize",
-        &["height", "width"],
+        &[("width", Shape::Integer), ("height", Shape::Integer)],
     ),
     (
         "kvm_rdp::pump::shell",
@@ -623,26 +719,19 @@ const INPUT_LINES: [(&str, &str, &[&str]); 9] = [
     ),
     (
         "kvm_rdp::pump::shell",
-        "EGFX batch encoding failed",
-        &["error"],
-    ),
-    (
-        "kvm_rdp::pump::shell",
         "the client closed its EGFX channel mid-session",
         &[],
     ),
     (
         "kvm_rdp::pump::shell",
-        "the client offered no AVC420 capability set (§6.7)",
-        &["caps"],
-    ),
-    (
-        "kvm_rdp::pump::shell",
         "disconnecting the client",
-        &["cause"],
+        &[("cause", Shape::Word(CAUSES))],
     ),
 ];
 
+/// A line from the input path's targets is a reviewed one: its target and
+/// message are listed, it has exactly the listed fields, and each value
+/// has its field's shape.
 fn assert_input_path_lines_allowed(what: &str, v: &serde_json::Value, line: &str) {
     let target = v["target"].as_str().unwrap_or("");
     if !INPUT_TARGETS
@@ -652,22 +741,29 @@ fn assert_input_path_lines_allowed(what: &str, v: &serde_json::Value, line: &str
         return;
     }
     let message = v["fields"]["message"].as_str().unwrap_or("");
-    let mut fields: Vec<&str> = v["fields"]
-        .as_object()
-        .map(|o| {
-            o.keys()
-                .map(String::as_str)
-                .filter(|k| *k != "message")
-                .collect()
-        })
-        .unwrap_or_default();
-    fields.sort_unstable();
-    assert!(
-        INPUT_LINES
-            .iter()
-            .any(|(t, m, f)| *t == target && *m == message && *f == fields.as_slice()),
-        "{what}: an input-path log line no one has reviewed: {line}"
+    let empty = serde_json::Map::new();
+    let fields = v["fields"].as_object().unwrap_or(&empty);
+    let reviewed = INPUT_LINES
+        .iter()
+        .find(|(t, m, _)| *t == target && *m == message);
+    let Some((_, _, shapes)) = reviewed else {
+        panic!("{what}: an input-path log line no one has reviewed: {line}");
+    };
+    let names = fields.keys().filter(|k| *k != "message");
+    assert_eq!(
+        names.count(),
+        shapes.len(),
+        "{what}: a reviewed input-path line with other fields: {line}"
     );
+    for (name, shape) in *shapes {
+        let value = fields
+            .get(*name)
+            .unwrap_or_else(|| panic!("{what}: a reviewed input-path line without {name}: {line}"));
+        assert!(
+            shape.fits(value),
+            "{what}: a reviewed input-path line whose {name} is not its shape: {line}"
+        );
+    }
 }
 
 /// `GET path` on `addr`: the body.
@@ -848,6 +944,7 @@ fn no_debug_shows_input() {
         for f in &forbidden {
             assert!(!appears(line, f), "{f:?} is in a Debug: {line}");
         }
+        assert_no_fragment("Debug", "a Debug", line);
     }
 }
 
@@ -856,10 +953,12 @@ fn no_debug_shows_input() {
 /// it (DC9), then SIGTERM. In stdout and stderr: neither the sentinel nor
 /// the paste canary in any encoding (`forbidden_input`: the text, its
 /// characters, bytes and code units, each keystroke's frame, key slots and
-/// codes, in hex, decimal and base64; PD10 review I1 and re-review), nor
-/// the NLA canary, the KVM password, NTLM (raw or base64) or a token query;
-/// no line from the input path but the reviewed ones (`INPUT_LINES`, the
-/// pump shell's included); no DEBUG or TRACE line from `ironrdp_*`/`sspi`;
+/// codes, in hex, decimal and base64; PD10 review I1 and re-reviews), nor
+/// any 6-character fragment of either (`fragments`), nor the NLA canary,
+/// the KVM password, NTLM (raw or base64) or a token query; no line from
+/// the input path but the reviewed ones (`INPUT_LINES`, the pump shell's
+/// included), each field of them in its value's shape (no free text); no
+/// DEBUG or TRACE line from `ironrdp_*`/`sspi`;
 /// at least one TRACE line from bridge code; `SSLKEYLOGFILE` is never
 /// created. The shutdown's own lines are in the log checked (P10).
 /// `/metrics`, read before the SIGTERM, holds none of it either
@@ -868,8 +967,17 @@ fn no_debug_shows_input() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secrets_never_reach_the_logs() {
     // No letter of either string may pass `vocabulary` as a label part of
-    // its own; the encoder agrees with the base64 a review leak logged.
+    // its own, and every key's usage hex has a letter, so no forbidden
+    // form of the input is digits only (`appears`; PD10 re-review 3); the
+    // encoder agrees with the base64 a review leak logged.
     assert!(!SENTINEL.contains('p') && !CANARY.contains('p'));
+    for c in SENTINEL.chars().chain(CANARY.chars()) {
+        let hex = format!("{:02x}", us_stroke(c).unwrap().usage);
+        assert!(
+            hex.contains(|h: char| h.is_ascii_alphabetic()),
+            "{c:?}: {hex}"
+        );
+    }
     assert_eq!(
         base64(b"paste-canary-3e7a", B64_STD, true),
         "cGFzdGUtY2FuYXJ5LTNlN2E="
@@ -943,6 +1051,8 @@ async fn secrets_never_reach_the_logs() {
                 "{filter}: {secret:?} reached the logs"
             );
         }
+        assert_no_fragment(filter, "the logs", &all);
+        assert_no_fragment(filter, "/metrics", &metrics);
         assert_metrics_hold_no_input(filter, &metrics, &input);
         let mut bridge_trace = false;
         for line in &out {

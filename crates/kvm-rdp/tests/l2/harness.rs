@@ -25,14 +25,15 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 pub const USER: &str = "kvm";
 /// The NLA password — and the secrets case's canary (§11.3).
 pub const NLA: &str = "l2-canary-7f3a9c2e5b1d4a6f8e0c";
-/// The secrets case's keystroke sentinel (DC9): typed as scancodes. Letters,
-/// digits and `-` only — no Shift — and no `p`, the one letter `/metrics`
-/// has as a label part of its own (PD10 re-review: a lone input letter
-/// as a label part must break the vocabulary).
-pub const SENTINEL: &str = "sentinel-6b1f0c9d2a";
-/// The secrets case's paste canary (DC9): pasted over CLIPRDR. No Shift,
-/// and no `p` either.
-pub const CANARY: &str = "canary-3e7a-kiwi";
+/// The secrets case's keystroke sentinel (DC9): typed as scancodes. Spelled
+/// only from keys with no Shift whose HID usage's hex has a letter (`g`–`l`,
+/// `w`–`z`, `1`, `2`, `-`: 0x0A–0x0F, 0x1A–0x1F, 0x2D), so no forbidden
+/// form of it is digits only; and no `p`, the one letter `/metrics` has as
+/// a label part of its own (PD10 re-reviews).
+pub const SENTINEL: &str = "zxkjwg-1h2l-yixz";
+/// The secrets case's paste canary (DC9): pasted over CLIPRDR. Spelled from
+/// the same keys as SENTINEL, for the same reasons.
+pub const CANARY: &str = "glyzkh-2w1x-jiky";
 /// The upper bound on anything L2 waits for.
 pub const T: Duration = Duration::from_secs(10);
 pub const SET_MODE: [u8; 4] = [0x88, 0x88, 0x01, 0x30];
