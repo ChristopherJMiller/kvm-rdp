@@ -1689,7 +1689,7 @@ mod tests {
                     .expect("the IDR was gated on a backlog already written")
                     .unwrap();
                 assert!(egfx(&idr).is_some(), "{idr:?}");
-                assert_eq!(t.metrics.frames_dropped.get("backlog"), 0);
+                assert_eq!(t.metrics.frames_dropped.get("backlog_gate"), 0);
             })
             .await;
     }
