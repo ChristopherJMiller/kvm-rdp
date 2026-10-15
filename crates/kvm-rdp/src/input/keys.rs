@@ -28,8 +28,9 @@ pub struct KeyReport {
     /// No frame need be sent: a held key's repeat, a released-by-bridge
     /// key's repeat, the release of a key not down, or a dropped event.
     pub ignored: bool,
-    /// Dropped and counted (DD7, DD9): an untypeable or surrogate Unicode
-    /// unit, a press past `MAX_TRACKED`, or (from `release_all`) a held key
+    /// Dropped and counted (DD7, DD9): the press of an untypeable or
+    /// surrogate Unicode unit (its release is only `ignored`), a press past
+    /// `MAX_TRACKED`, or (from `release_all`) a held key
     /// `MAX_RBB` had no room to remember. Always `ignored` too, except from
     /// `release_all`, whose zero frame is always sent.
     pub dropped: bool,
@@ -120,10 +121,18 @@ impl Keyboard {
         }
     }
 
-    /// A scancode press. `None` only when the key maps to nothing.
+    /// A scancode press. `None` only when the key maps to nothing. An
+    /// accepted non-modifier press is a later press than any Unicode one, so
+    /// it ends a Unicode Shift (D8b; PD5 review I1): with '!' held, Return
+    /// goes out as Return, never Shift+Return.
     pub fn press(&mut self, code: u8, extended: bool) -> Option<KeyReport> {
         let usage = usage_for_scancode(code, extended)?;
-        Some(self.press_usage(usage))
+        let r = self.press_usage(usage);
+        if !r.ignored && self.unicode_shift && modifier_bit(usage).is_none() {
+            self.unicode_shift = false;
+            return Some(self.out(false, false));
+        }
+        Some(r)
     }
 
     /// A scancode release. `None` only when the key maps to nothing.
@@ -151,10 +160,12 @@ impl Keyboard {
         Some(self.out(false, false))
     }
 
-    /// A Unicode key release, by its unit's usage. Always `Some`.
+    /// A Unicode key release, by its unit's usage. Always `Some`. The
+    /// release of an untypeable or surrogate unit is ignored but not
+    /// `dropped`: its press was counted, and one keystroke counts once (m5).
     pub fn unicode_release(&mut self, unit: u16) -> Option<KeyReport> {
         let Some(Stroke { usage, .. }) = char::from_u32(u32::from(unit)).and_then(us_stroke) else {
-            return Some(self.out(true, true));
+            return Some(self.out(true, false));
         };
         Some(self.release_usage(usage))
     }
@@ -334,6 +345,93 @@ mod tests {
         assert_eq!(sent(k.press(0x1E, false)), one(0x01, 0x04));
     }
 
+    /// §7.4, D3a (PD5 review I2): EVERY modifier — both sides of all four —
+    /// and EVERY held key, the tracked-but-unreported ones past the fifth
+    /// slot too, is released by the bridge: each one's repeat is ignored and
+    /// absent from the frame until its own release, then presses normally.
+    #[test]
+    fn release_all_marks_every_modifier_and_every_held_key() {
+        let mods: [(u8, bool); 8] = [
+            (0x1D, false), // LCtrl
+            (0x2A, false), // LShift
+            (0x38, false), // LAlt
+            (0x5B, true),  // LGUI
+            (0x1D, true),  // RCtrl
+            (0x36, false), // RShift
+            (0x38, true),  // RAlt
+            (0x5C, true),  // RGUI
+        ];
+        let keys: [u8; 7] = [0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24]; // a s d f g h j
+        let mut k = Keyboard::default();
+        for (c, e) in mods {
+            sent(k.press(c, e));
+        }
+        for c in keys {
+            sent(k.press(c, false));
+        }
+        assert_eq!(
+            (k.held_modifier_bits(), k.held_nonmodifier_usages()),
+            (0xFF, 7)
+        );
+        let r = k.release_all();
+        assert_eq!((r.frame, r.ignored, r.dropped), (one(0, 0), false, false));
+        let all: Vec<(u8, bool)> = mods.into_iter().chain(keys.map(|c| (c, false))).collect();
+        for (c, e) in all.iter().copied() {
+            assert!(k.is_released_by_bridge(usage_for_scancode(c, e).unwrap()));
+            let r = k.press(c, e).unwrap();
+            assert!(r.ignored && !r.dropped, "{c:#x}'s repeat: {r:?}");
+            assert_eq!(r.frame, one(0, 0), "{c:#x}'s repeat re-pressed it");
+        }
+        assert_eq!(
+            (k.held_modifier_bits(), k.held_nonmodifier_usages()),
+            (0, 0)
+        );
+        for (c, e) in all {
+            let usage = usage_for_scancode(c, e).unwrap();
+            assert!(ignored(k.release(c, e)), "{c:#x}: the KVM has it up");
+            assert!(!k.is_released_by_bridge(usage));
+            let want = match modifier_bit(usage) {
+                Some(bit) => one(bit, 0),
+                None => one(0, usage),
+            };
+            assert_eq!(sent(k.press(c, e)), want, "{c:#x} after its release");
+            sent(k.release(c, e));
+        }
+    }
+
+    /// DD9 (PD5 review I2): at most `MAX_RBB` marks. The next is refused; a
+    /// `release_all` that cannot mark a held key still zeroes everything,
+    /// is still sent, and says `dropped` (counted); with room again it
+    /// does not.
+    #[test]
+    fn the_released_by_bridge_marks_are_bounded() {
+        let mut k = Keyboard::default();
+        for usage in 0x04..=0x23u8 {
+            assert!(k.mark_released_by_bridge(usage), "{usage:#x}");
+        }
+        assert_eq!(k.rbb.len(), MAX_RBB);
+        assert!(!k.mark_released_by_bridge(0x24), "the 33rd mark");
+        assert!(!k.is_released_by_bridge(0x24));
+        assert!(k.mark_released_by_bridge(0x04), "an existing mark");
+        sent(k.press(0x1C, false)); // Return (0x28), not marked
+        sent(k.press(0x1D, false)); // LCtrl
+        let r = k.release_all();
+        assert_eq!((r.frame, r.ignored, r.dropped), (one(0, 0), false, true));
+        assert_eq!(
+            (k.held_modifier_bits(), k.held_nonmodifier_usages()),
+            (0, 0)
+        );
+        assert_eq!(k.rbb.len(), MAX_RBB);
+        // The key with no room is up; its repeat is a fresh press (DD9).
+        assert_eq!(sent(k.press(0x1C, false)), one(0, 0x28));
+        sent(k.release(0x1C, false));
+        assert!(ignored(k.release(0x1E, false)), "frees the mark on 'a'");
+        sent(k.press(0x1C, false));
+        let r = k.release_all();
+        assert_eq!((r.frame, r.ignored, r.dropped), (one(0, 0), false, false));
+        assert!(k.is_released_by_bridge(0x28));
+    }
+
     /// §7.1, D8b: a Unicode key types its US stroke; Shift comes only from
     /// the latest accepted Unicode press and never clears a physical Shift;
     /// repeats and released-by-bridge units are ignored; a lone surrogate
@@ -367,6 +465,11 @@ mod tests {
             let r = k.unicode_press(unit).unwrap();
             assert!(r.ignored && r.dropped, "{unit:#x}: {r:?}");
             assert_eq!(r.frame, one(0x02, 0));
+            // m5: one keystroke is counted once — its release is ignored,
+            // not dropped (and counted in `input_events_ignored`) again.
+            let r = k.unicode_release(unit).unwrap();
+            assert!(r.ignored && !r.dropped, "{unit:#x}'s release: {r:?}");
+            assert_eq!(r.frame, one(0x02, 0));
         }
     }
 
@@ -394,6 +497,38 @@ mod tests {
         );
         assert_eq!(sent(k.release(0x1E, false)), one(0x02, 0x05));
         assert_eq!(sent(k.unicode_release(u16::from(b'B'))), one(0, 0));
+    }
+
+    /// I1 (PD5 review), D8b: a Unicode key's Shift is its own. A scancode
+    /// key pressed while it is held — Return, an arrow — is a later press
+    /// and goes out unshifted: never Shift+Return (a newline in place of
+    /// "send"), never Shift+Right (a selection the next key overwrites).
+    #[test]
+    fn a_scancode_key_pressed_under_a_unicode_shift_is_not_shifted() {
+        let mut k = Keyboard::default();
+        assert_eq!(sent(k.unicode_press(u16::from(b'!'))), one(0x02, 0x1E));
+        assert_eq!(
+            sent(k.press(0x1C, false)),
+            kbd(0, [0x1E, 0x28, 0, 0, 0]),
+            "Return, not Shift+Return"
+        );
+        assert_eq!(
+            sent(k.press(0x4D, true)),
+            kbd(0, [0x1E, 0x28, 0x4F, 0, 0]),
+            "Right, not Shift+Right"
+        );
+        // A typematic repeat of a key held from before is not a later press.
+        let mut k = Keyboard::default();
+        sent(k.press(0x1E, false));
+        assert_eq!(
+            sent(k.unicode_press(u16::from(b'@'))),
+            kbd(0x02, [0x04, 0x1F, 0, 0, 0])
+        );
+        let r = k.press(0x1E, false).unwrap();
+        assert!(r.ignored, "a's repeat");
+        assert_eq!(r.frame, kbd(0x02, [0x04, 0x1F, 0, 0, 0]));
+        // Nor is a modifier: only a non-modifier key ends it (the ruling).
+        assert_eq!(sent(k.press(0x1D, false)), kbd(0x03, [0x04, 0x1F, 0, 0, 0]));
     }
 
     /// DD3 (D8a): with the remap on, Ctrl becomes GUI only beside
@@ -442,6 +577,22 @@ mod tests {
             sent(k.release(0x1D, false)),
             one(0x08, 0),
             "a real GUI stays held"
+        );
+        // m2: only the five reported slots count. C tracked as a sixth key
+        // is not in the report, so Ctrl stays Ctrl until C reaches a slot.
+        let mut k = Keyboard::default();
+        k.set_mac_remap(true);
+        sent(k.press(0x1D, false));
+        for code in [0x14, 0x15, 0x16, 0x17, 0x18] {
+            sent(k.press(code, false)); // t y u i o
+        }
+        assert_eq!(
+            sent(k.press(0x2E, false)),
+            kbd(0x01, [0x17, 0x1C, 0x18, 0x0C, 0x12])
+        );
+        assert_eq!(
+            sent(k.release(0x14, false)),
+            kbd(0x08, [0x1C, 0x18, 0x0C, 0x12, 0x06])
         );
     }
 
@@ -521,6 +672,11 @@ mod tests {
             .filter(|c| k.press(**c, false).unwrap().dropped)
             .count();
         assert_eq!((k.held_nonmodifier_usages(), dropped), (16, 24));
+        // m1: Caps Lock as the 17th key is dropped, and does not toggle —
+        // the KVM never saw it.
+        let r = k.press(0x3A, false).unwrap();
+        assert!(r.ignored && r.dropped, "{r:?}");
+        assert!(!k.caps_lock_on(), "a dropped Caps press toggled");
         assert_eq!(k.release_all().frame, one(0, 0));
     }
 
@@ -570,61 +726,173 @@ mod tests {
             .map(|s| s.usage)
     }
 
-    /// One frame against what the client holds: (1) it holds nothing the
-    /// client does not; (2) whatever it holds, `held_*` — what the core's
-    /// two timers watch (Task 2.2) — says something is held, so a timer can
-    /// always release it.
-    fn check(
-        k: &Keyboard,
-        f: HidFrame,
-        codes_down: &[(u8, bool)],
-        units_down: &[u16],
+    /// The client, as the property test drives it, and what the bridge
+    /// owes it.
+    #[derive(Default)]
+    struct Model {
+        codes: Vec<(u8, bool)>,
+        units: Vec<u16>,
         remap: bool,
-    ) {
-        let HidFrame::Keyboard { modifiers, keys } = f else {
-            panic!("{f:?}");
-        };
-        let held: Vec<u8> = codes_down
-            .iter()
-            .filter_map(|(c, e)| usage_for_scancode(*c, *e))
-            .chain(units_down.iter().filter_map(|u| unit_usage(*u)))
-            .collect();
-        let typing = units_down.iter().any(|u| unit_usage(*u).is_some());
-        for key in keys.iter().filter(|key| **key != 0) {
-            assert!(
-                held.contains(key),
-                "{key:#x} held in {f:?}, client holds {held:x?}"
-            );
-        }
-        for i in 0..8u8 {
-            let bit = 1u8 << i;
-            if modifiers & bit == 0 {
-                continue;
+        /// The latest accepted non-modifier press was a shifted Unicode
+        /// one (D8b, I1): the only time LShift may come from a unit.
+        shift: bool,
+        /// Usages held at a `release_all` and marked there: none may be
+        /// down, in the held bits or in a frame until the client releases
+        /// it (§7.4).
+        owed: Vec<u8>,
+    }
+
+    impl Model {
+        fn press(&mut self, k: &mut Keyboard, c: (u8, bool)) -> Option<KeyReport> {
+            if !self.codes.contains(&c) {
+                self.codes.push(c);
             }
-            let ok = held.contains(&(0xE0 + i))
-                || (bit == MOD_LSHIFT && typing)
-                || (remap && bit == MOD_LGUI && held.contains(&0xE0))
-                || (remap && bit == MOD_RGUI && held.contains(&0xE4));
-            assert!(ok, "{bit:#x} held in {f:?}, client holds {held:x?}");
+            let r = k.press(c.0, c.1);
+            let usage = usage_for_scancode(c.0, c.1);
+            if r.as_ref().is_some_and(|r| !r.ignored) && usage.and_then(modifier_bit).is_none() {
+                self.shift = false;
+            }
+            r
         }
-        if f != one(0, 0) {
-            assert!(
-                k.held_nonmodifier_usages() > 0 || k.held_modifier_bits() != 0,
-                "{f:?} is held but no timer would see it"
+
+        fn release(&mut self, k: &mut Keyboard, c: (u8, bool)) -> Option<KeyReport> {
+            self.codes.retain(|d| *d != c);
+            if let Some(usage) = usage_for_scancode(c.0, c.1) {
+                self.owed.retain(|u| *u != usage);
+            }
+            k.release(c.0, c.1)
+        }
+
+        fn unicode_press(&mut self, k: &mut Keyboard, unit: u16) -> KeyReport {
+            if !self.units.contains(&unit) {
+                self.units.push(unit);
+            }
+            let r = k.unicode_press(unit).unwrap();
+            if !r.ignored {
+                let stroke = char::from_u32(u32::from(unit)).and_then(us_stroke).unwrap();
+                self.shift = stroke.shift;
+            }
+            r
+        }
+
+        fn unicode_release(&mut self, k: &mut Keyboard, unit: u16) -> KeyReport {
+            self.units.retain(|d| *d != unit);
+            if let Some(usage) = unit_usage(unit) {
+                self.owed.retain(|u| *u != usage);
+            }
+            k.unicode_release(unit).unwrap()
+        }
+
+        /// `release_all`, with §7.4's bookkeeping: every usage held then is
+        /// marked, or the report says `dropped` (DD9).
+        fn release_all(&mut self, k: &mut Keyboard) -> KeyReport {
+            let mods = k.held_modifier_bits();
+            let held: Vec<u8> = (0..=255u8)
+                .filter(|u| k.is_down(*u) || modifier_bit(*u).is_some_and(|b| mods & b != 0))
+                .collect();
+            let r = k.release_all();
+            assert!(!r.ignored, "a release is always sent");
+            assert_eq!(r.frame, one(0, 0));
+            let marked: Vec<u8> = held
+                .iter()
+                .copied()
+                .filter(|u| k.is_released_by_bridge(*u))
+                .collect();
+            assert_eq!(r.dropped, marked.len() < held.len(), "dropped vs {held:x?}");
+            for u in marked {
+                if !self.owed.contains(&u) {
+                    self.owed.push(u);
+                }
+            }
+            self.shift = false;
+            r
+        }
+
+        /// One frame against the client: (1) it holds nothing the client
+        /// does not, and LShift from a unit only under D8b's rule; (2)
+        /// whatever it holds, `held_*` — what the core's two timers watch
+        /// (Task 2.2) — says something is held, so a timer can always
+        /// release it; (3) nothing released by the bridge is back before
+        /// the client's release of it.
+        fn check(&self, k: &Keyboard, f: HidFrame) {
+            let HidFrame::Keyboard { modifiers, keys } = f else {
+                panic!("{f:?}");
+            };
+            let held: Vec<u8> = self
+                .codes
+                .iter()
+                .filter_map(|(c, e)| usage_for_scancode(*c, *e))
+                .chain(self.units.iter().filter_map(|u| unit_usage(*u)))
+                .collect();
+            let typing = self.units.iter().any(|u| unit_usage(*u).is_some());
+            for key in keys.iter().filter(|key| **key != 0) {
+                assert!(
+                    held.contains(key),
+                    "{key:#x} held in {f:?}, client holds {held:x?}"
+                );
+            }
+            for i in 0..8u8 {
+                let bit = 1u8 << i;
+                if modifiers & bit == 0 {
+                    continue;
+                }
+                let ok = held.contains(&(0xE0 + i))
+                    || (bit == MOD_LSHIFT && typing && self.shift)
+                    || (self.remap && bit == MOD_LGUI && held.contains(&0xE0))
+                    || (self.remap && bit == MOD_RGUI && held.contains(&0xE4));
+                assert!(ok, "{bit:#x} held in {f:?}, client holds {held:x?}");
+            }
+            if f != one(0, 0) {
+                assert!(
+                    k.held_nonmodifier_usages() > 0 || k.held_modifier_bits() != 0,
+                    "{f:?} is held but no timer would see it"
+                );
+            }
+            for u in &self.owed {
+                assert!(k.is_released_by_bridge(*u), "{u:#x} lost its mark");
+                assert!(!k.is_down(*u), "{u:#x} re-pressed before its release");
+                let bit = modifier_bit(*u).unwrap_or(0);
+                assert_eq!(k.held_modifier_bits() & bit, 0, "{u:#x} re-pressed");
+            }
+            assert!(k.held_nonmodifier_usages() <= MAX_TRACKED);
+            assert!(k.rbb.len() <= MAX_RBB);
+        }
+
+        /// The client lets go of everything, in its own order; then the
+        /// frame must be all zero.
+        fn let_go(&mut self, k: &mut Keyboard, rng: &mut Rng, seed: u64) {
+            while !self.codes.is_empty() {
+                let c = self.codes.remove(rng.below(self.codes.len()));
+                self.codes.push(c);
+                if let Some(r) = self.release(k, c) {
+                    self.check(k, r.frame);
+                }
+            }
+            while !self.units.is_empty() {
+                let u = self.units[rng.below(self.units.len())];
+                let r = self.unicode_release(k, u);
+                self.check(k, r.frame);
+            }
+            assert_eq!(
+                (k.held_modifier_bits(), k.held_nonmodifier_usages()),
+                (0, 0)
             );
+            // F12 is never pressed: its release only reads the state.
+            let r = k.release(0x58, false).unwrap();
+            assert!(r.ignored);
+            assert_eq!(r.frame, one(0, 0), "seed {seed}: a key was left held");
         }
-        assert!(k.held_nonmodifier_usages() <= MAX_TRACKED);
     }
 
     /// The core property (§7.4: "every HID path ends released"): over any
     /// interleaving of presses, repeats, stray releases, Unicode events,
     /// releases-all, bridge marks and remap or Caps-Lock changes, every
-    /// frame passes `check`, and once the client has let go of everything
-    /// the frame is all zero.
+    /// frame passes `Model::check`, and whenever the client has let go of
+    /// everything — mid-sequence too — the frame is all zero.
     #[test]
     fn no_sequence_of_events_leaves_a_key_held() {
         // Letters (the remap's set among them), digits, both sides of every
-        // modifier, Caps Lock, extended keys, and an unmapped code.
+        // modifier, Caps Lock, Return and an arrow, and an unmapped code.
         let codes: Vec<(u8, bool)> = (0x10..=0x1B)
             .chain(0x1E..=0x26)
             .chain(0x2C..=0x32)
@@ -640,61 +908,44 @@ mod tests {
                 (0x5B, true),
                 (0x5C, true),
                 (0x3A, false),
+                (0x1C, false),
+                (0x4D, true),
                 (0x48, true),
                 (0x54, false),
             ])
             .collect();
-        let units: Vec<u16> = "AaVvZz1!\n"
+        let units: Vec<u16> = "AaVvZz1!@\n"
             .encode_utf16()
             .chain([0xD800, 0x00E9])
             .collect();
         for seed in 1..=64u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut k = Keyboard::default();
-            let mut codes_down: Vec<(u8, bool)> = Vec::new();
-            let mut units_down: Vec<u16> = Vec::new();
-            let mut remap = false;
+            let mut m = Model::default();
             for _ in 0..2_000 {
-                let r = match rng.below(16) {
-                    0..=4 => {
-                        let c = rng.pick(&codes);
-                        if !codes_down.contains(&c) {
-                            codes_down.push(c);
-                        }
-                        k.press(c.0, c.1)
-                    }
+                let r = match rng.below(17) {
+                    0..=4 => m.press(&mut k, rng.pick(&codes)),
                     5..=7 => {
                         // Mostly a held key; sometimes a stray release.
-                        let c = if !codes_down.is_empty() && rng.below(4) != 0 {
-                            rng.pick(&codes_down)
+                        let c = if !m.codes.is_empty() && rng.below(4) != 0 {
+                            rng.pick(&m.codes)
                         } else {
                             rng.pick(&codes)
                         };
-                        codes_down.retain(|d| *d != c);
-                        k.release(c.0, c.1)
+                        m.release(&mut k, c)
                     }
-                    8..=9 => {
-                        let u = rng.pick(&units);
-                        if !units_down.contains(&u) {
-                            units_down.push(u);
-                        }
-                        k.unicode_press(u)
-                    }
+                    8..=9 => Some(m.unicode_press(&mut k, rng.pick(&units))),
                     10..=11 => {
-                        let u = if !units_down.is_empty() && rng.below(4) != 0 {
-                            rng.pick(&units_down)
+                        let u = if !m.units.is_empty() && rng.below(4) != 0 {
+                            rng.pick(&m.units)
                         } else {
                             rng.pick(&units)
                         };
-                        units_down.retain(|d| *d != u);
-                        k.unicode_release(u)
+                        Some(m.unicode_release(&mut k, u))
                     }
                     12 => {
-                        // Its zero frame is always sent, dropped or not.
-                        let r = k.release_all();
-                        assert!(!r.ignored);
-                        assert_eq!(r.frame, one(0, 0));
-                        check(&k, r.frame, &codes_down, &units_down, remap);
+                        let r = m.release_all(&mut k);
+                        m.check(&k, r.frame);
                         None
                     }
                     13 => {
@@ -705,40 +956,27 @@ mod tests {
                         None
                     }
                     14 => {
-                        remap = rng.below(2) == 0;
-                        k.set_mac_remap(remap);
+                        m.remap = rng.below(2) == 0;
+                        k.set_mac_remap(m.remap);
+                        None
+                    }
+                    15 => {
+                        k.set_caps_lock(rng.below(2) == 0);
                         None
                     }
                     _ => {
-                        k.set_caps_lock(rng.below(2) == 0);
+                        if rng.below(8) == 0 {
+                            m.let_go(&mut k, &mut rng, seed);
+                        }
                         None
                     }
                 };
                 if let Some(r) = r {
                     assert!(!r.dropped || r.ignored, "dropped is always ignored: {r:?}");
-                    check(&k, r.frame, &codes_down, &units_down, remap);
+                    m.check(&k, r.frame);
                 }
             }
-            // The client lets go of everything, in its own order.
-            while !codes_down.is_empty() {
-                let c = codes_down.remove(rng.below(codes_down.len()));
-                if let Some(r) = k.release(c.0, c.1) {
-                    check(&k, r.frame, &codes_down, &units_down, remap);
-                }
-            }
-            while !units_down.is_empty() {
-                let u = units_down.remove(rng.below(units_down.len()));
-                let r = k.unicode_release(u).unwrap();
-                check(&k, r.frame, &codes_down, &units_down, remap);
-            }
-            assert_eq!(
-                (k.held_modifier_bits(), k.held_nonmodifier_usages()),
-                (0, 0)
-            );
-            // F12 is never pressed: its release only reads the state.
-            let r = k.release(0x58, false).unwrap();
-            assert!(r.ignored);
-            assert_eq!(r.frame, one(0, 0), "seed {seed}: a key was left held");
+            m.let_go(&mut k, &mut rng, seed);
         }
     }
 }

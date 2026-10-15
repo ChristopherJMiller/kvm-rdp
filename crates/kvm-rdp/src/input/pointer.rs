@@ -229,6 +229,65 @@ mod tests {
         );
     }
 
+    /// §7.4, D3b (PD5 review I2): all three buttons held at a release are
+    /// released by the bridge, each until its own release; "mouse position
+    /// is kept" (m3); and a release goes out where it was made (m4, D8d).
+    #[test]
+    fn release_all_marks_every_held_button() {
+        let all = [Button::Left, Button::Right, Button::Middle];
+        let mut p = Pointer::default();
+        for b in all {
+            p.button(b, true, 10, 10).unwrap();
+        }
+        p.release_all();
+        assert_eq!(p.last(), Some((170, 303)), "the position is kept");
+        assert_eq!(p.moved(10, 10).frame, abs(0, 170, 303));
+        for b in all {
+            assert!(p.button(b, true, 10, 10).is_none(), "{b:?} re-pressed");
+        }
+        assert_eq!(
+            p.wheel(120),
+            vec![HidFrame::Wheel {
+                buttons: 0,
+                wheel: Wheel::Up
+            }]
+        );
+        // Left's release, at a new position: it goes out there.
+        assert_eq!(
+            p.button(Button::Left, false, 20, 20).unwrap().frame,
+            abs(0, 341, 607)
+        );
+        assert_eq!(p.last(), Some((341, 607)));
+        assert_eq!(
+            p.button(Button::Left, true, 20, 20).unwrap().frame,
+            abs(0x01, 341, 607)
+        );
+        assert!(
+            p.button(Button::Right, true, 20, 20).is_none(),
+            "Right waits"
+        );
+        assert!(
+            p.button(Button::Middle, true, 20, 20).is_none(),
+            "Middle waits"
+        );
+        assert_eq!(
+            p.button(Button::Right, false, 30, 30).unwrap().frame,
+            abs(0x01, 512, 911)
+        );
+        assert_eq!(
+            p.button(Button::Right, true, 30, 30).unwrap().frame,
+            abs(0x03, 512, 911)
+        );
+        assert_eq!(
+            p.button(Button::Middle, false, 30, 30).unwrap().frame,
+            abs(0x03, 512, 911)
+        );
+        assert_eq!(
+            p.button(Button::Middle, true, 30, 30).unwrap().frame,
+            abs(0x07, 512, 911)
+        );
+    }
+
     /// xorshift64*: a fixed, seedable sequence for the property test.
     struct Rng(u64);
 
@@ -262,6 +321,9 @@ mod tests {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let mut p = Pointer::default();
             let mut down = 0u8; // what the client holds
+            // Buttons held at a release-all: absent from every frame until
+            // the client's release of each (§7.4).
+            let mut owed = 0u8;
             for _ in 0..1_000 {
                 let (x, y) = (rng.pick(&coords), rng.pick(&coords));
                 let frames: Vec<HidFrame> = match rng.below(8) {
@@ -276,6 +338,7 @@ mod tests {
                     2..=3 => {
                         let b = rng.pick(&buttons);
                         down &= !b.bit();
+                        owed &= !b.bit();
                         p.button(b, false, x, y)
                             .map(|r| r.frame)
                             .into_iter()
@@ -284,7 +347,9 @@ mod tests {
                     4 => vec![p.moved(x, y).frame],
                     5 => p.wheel(rng.pick(&[-240i16, -120, -60, 60, 120, 360])),
                     6 => {
+                        owed |= p.buttons;
                         p.release_all();
+                        assert_eq!(p.buttons, 0);
                         Vec::new()
                     }
                     _ => {
@@ -305,6 +370,11 @@ mod tests {
                         held & !down,
                         0,
                         "seed {seed}: {f:?} holds what the client does not"
+                    );
+                    assert_eq!(
+                        held & owed,
+                        0,
+                        "seed {seed}: {f:?} re-pressed a button released by the bridge"
                     );
                 }
             }
