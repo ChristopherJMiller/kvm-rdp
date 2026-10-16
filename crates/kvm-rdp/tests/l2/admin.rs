@@ -635,6 +635,44 @@ const INPUT_TARGETS: [&str; 5] = [
     "kvm_rdp::pump::shell",
 ];
 
+/// The bridge's reviewed targets outside the input path: exactly those the
+/// binary logs under on this case's path today, read from its transcripts
+/// (both filters, unloaded and under load) — the bridge's start, ready and
+/// shutdown lines, the RDP handler's session start and end, and the EGFX
+/// channel's close. Every `kvm_rdp` target in the log must be an input
+/// target (`INPUT_TARGETS`, a module or one under it) or one of these,
+/// exactly (PD10 re-review I1-r3): a new module that handles input — a
+/// `kvm_rdp::paste` logging pieces too short for `fragments` — fails the
+/// case until it is reviewed and classified, instead of escaping the shapes
+/// and the allowlist. The bridge's other logging modules (`cli`,
+/// `kvm::session`, `kvm::video`, `pump::core`) log only when something goes
+/// wrong — a failed start or KVM session, an incompatible stream, an EGFX
+/// setup refused, a task outliving its abort wait — which this case does
+/// not have; if one ever logs here, the case fails for review.
+const KNOWN_TARGETS: [&str; 3] = [
+    "kvm_rdp::bridge",
+    "kvm_rdp::rdp::gfx",
+    "kvm_rdp::rdp::handler",
+];
+
+/// `target` is the input path's: an `INPUT_TARGETS` module or one under it.
+fn input_target(target: &str) -> bool {
+    INPUT_TARGETS
+        .iter()
+        .any(|t| target == *t || target.starts_with(&format!("{t}::")))
+}
+
+/// A bridge line's target is classified: the input path's (`input_target`,
+/// whose lines `assert_input_path_lines_allowed` reviews) or a reviewed one
+/// outside it (`KNOWN_TARGETS`). Any other `kvm_rdp*` target fails, named.
+fn assert_target_classified(what: &str, target: &str, line: &str) {
+    assert!(
+        !target.starts_with("kvm_rdp") || input_target(target) || KNOWN_TARGETS.contains(&target),
+        "{what}: a bridge log target in neither INPUT_TARGETS nor KNOWN_TARGETS, \
+         {target:?}: {line}"
+    );
+}
+
 /// What a reviewed field's value may be: a closed set, none of which can
 /// carry free text.
 #[derive(Clone, Copy)]
@@ -734,10 +772,7 @@ const INPUT_LINES: [Line; 7] = [
 /// has its field's shape.
 fn assert_input_path_lines_allowed(what: &str, v: &serde_json::Value, line: &str) {
     let target = v["target"].as_str().unwrap_or("");
-    if !INPUT_TARGETS
-        .iter()
-        .any(|t| target == *t || target.starts_with(&format!("{t}::")))
-    {
+    if !input_target(target) {
         return;
     }
     let message = v["fields"]["message"].as_str().unwrap_or("");
@@ -958,6 +993,7 @@ fn no_debug_shows_input() {
 /// the KVM password, NTLM (raw or base64) or a token query; no line from
 /// the input path but the reviewed ones (`INPUT_LINES`, the pump shell's
 /// included), each field of them in its value's shape (no free text); no
+/// bridge target outside `INPUT_TARGETS` and `KNOWN_TARGETS`; no
 /// DEBUG or TRACE line from `ironrdp_*`/`sspi`;
 /// at least one TRACE line from bridge code; `SSLKEYLOGFILE` is never
 /// created. The shutdown's own lines are in the log checked (P10).
@@ -1065,6 +1101,7 @@ async fn secrets_never_reach_the_logs() {
             if target.starts_with("ironrdp") || target.starts_with("sspi") {
                 assert!(!matches!(level, "DEBUG" | "TRACE"), "{filter}: {line}");
             }
+            assert_target_classified(filter, target, line);
             assert_input_path_lines_allowed(filter, &v, line);
             bridge_trace |= level == "TRACE" && target.starts_with("kvm_rdp");
         }
