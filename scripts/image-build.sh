@@ -41,8 +41,10 @@ if [ -z "$info" ]; then
   docker buildx create --name "$builder" --driver docker-container \
     --driver-opt "image=$BUILDKIT_IMAGE" --driver-opt cpu-shares=205 --driver-opt memory=8g >/dev/null
 fi
+# One commit, one time: the image's layer timestamps and its `created`.
+epoch=$(git log -1 --pretty=%ct)
 common=(--builder "$builder" --platform linux/amd64 --provenance=false --sbom=false
-  --build-arg "SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)"
+  --build-arg "SOURCE_DATE_EPOCH=$epoch"
   --build-arg "REVISION=$revision")
 docker buildx build "${common[@]}" "$@" --output "type=oci,dest=$out,rewrite-timestamp=true" .
 docker buildx build "${common[@]}" --output "type=docker,name=kvm-rdp:ci,rewrite-timestamp=true" .
@@ -53,6 +55,23 @@ docker buildx prune --builder "$builder" --force --max-used-space 8gb >/dev/null
 manifest=$(tar -xOf "$out" index.json | jq -r '.manifests[0].digest')
 config=$(tar -xOf "$out" "blobs/sha256/${manifest#sha256:}" | jq -r '.config.digest')
 config_json=$(tar -xOf "$out" "blobs/sha256/${config#sha256:}")
+# PE10 review I1: rewrite-timestamp only clamps times newer than
+# SOURCE_DATE_EPOCH, and a cached RUN keeps the times it ran at, so a
+# builder whose cache predates the commit would ship them. The Dockerfile
+# stamps its own layer with the epoch; check every entry of that layer (the
+# manifest's last) carries exactly it.
+layer_digest=$(tar -xOf "$out" "blobs/sha256/${manifest#sha256:}" | jq -r '.layers[-1].digest')
+layer=$(mktemp)
+trap 'rm -f "$layer"' EXIT
+tar -xOf "$out" "blobs/sha256/${layer_digest#sha256:}" >"$layer"
+want_mtime=$(TZ=UTC0 date -d "@$epoch" '+%Y-%m-%d %H:%M:%S')
+listing=$(TZ=UTC0 tar -tv --full-time -f "$layer")
+stale=$(awk -v want="$want_mtime" '$4 " " $5 != want' <<<"$listing")
+if [ -z "$listing" ] || [ -n "$stale" ]; then
+  echo "image-build: the image's layer $layer_digest has entries not stamped $want_mtime UTC (SOURCE_DATE_EPOCH $epoch):" >&2
+  echo "${stale:-(an empty layer)}" >&2
+  exit 1
+fi
 # The loaded image is the archive's: the same layers and creation time —
 # what both image stores report alike. `.Id` is the config digest only in
 # the classic store (under containerd's it is the manifest's), so it is

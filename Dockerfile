@@ -37,10 +37,21 @@ RUN cargo build --release --locked -p kvm-rdp -p kvm-probe --bins \
  && install -D -m 0755 /target/release/kvm-rdp /out/usr/local/bin/kvm-rdp \
  && install -D -m 0755 /target/release/kvm-probe /out/usr/local/bin/kvm-probe \
  && rm -rf /target /usr/local/cargo/registry /usr/local/cargo/git
+# One commit, one image, whatever the builder's cache holds (PE10 review
+# I1): rewrite-timestamp only clamps times newer than SOURCE_DATE_EPOCH, and
+# BuildKit keys a COPY on content, not times — so a cached /out (or a cached
+# copy of it) from a build before the commit would ship that build's clock.
+# The binaries are stamped with the epoch in a directory named for it, which
+# no other commit's copy can match; image-build.sh checks the layer.
+ARG SOURCE_DATE_EPOCH
+RUN : "${SOURCE_DATE_EPOCH:?build with scripts/image-build.sh}" \
+ && mkdir "/out-${SOURCE_DATE_EPOCH}" && cp -a /out/. "/out-${SOURCE_DATE_EPOCH}/" \
+ && find "/out-${SOURCE_DATE_EPOCH}" -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} +
 
 FROM ${RUNTIME}
 ARG REVISION=unknown
-COPY --from=build /out/ /
+ARG SOURCE_DATE_EPOCH
+COPY --from=build /out-${SOURCE_DATE_EPOCH}/ /
 # The condition §10.1's soak runs under; glibc reads it — the bridge itself
 # reads no environment but KVM_RDP_CONFIG (§4.4).
 ENV MALLOC_ARENA_MAX=2
