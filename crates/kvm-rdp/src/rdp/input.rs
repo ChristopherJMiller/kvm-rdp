@@ -1135,6 +1135,57 @@ mod tests {
         }
     }
 
+    /// PE4 review I2: `typing` is read after the core's step. In the
+    /// paste's last step (pace 0, the writer drained between a feed's Tick
+    /// and its event), two wheel notches fill the queue and the Typist's
+    /// final release finds it full. The core is no longer typing, so that
+    /// push is `push_at`'s: §7.3's resync sends the final state, the
+    /// release. Read before the step, `typing` would push it with
+    /// `push_typing_at`, which drops it, and an Idle core has no abort to
+    /// step: the KVM would keep the Typist's last press, 'b', for good.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_resync_in_the_pastes_last_step_leaves_nothing_held() {
+        let mut r = rig_with_queue(TYPIST_ROOM + 1);
+        r.start();
+        let _ = r.write();
+        r.s.clipboard_available(true);
+        r.chord();
+        r.s.clipboard_text(utf16("ab"));
+        r.unchord(); // typing, pace 0, room 2: 'a' down, up
+        let _ = r.write();
+        let seven = |r: &Rig| {
+            for _ in 0..7 {
+                let _ = r.hid.push(
+                    HidFrame::Wheel {
+                        buttons: 0,
+                        wheel: kvm_proto::hid::Wheel::Down,
+                    },
+                    false,
+                );
+            }
+        };
+        seven(&r); // room 1: the Typist's 'b' down
+        r.s.feed(Event::Tick);
+        let _ = r.write();
+        assert_eq!(r.kbd, Some(kbd(0, 0x05)), "the KVM holds 'b'");
+        seven(&r);
+        let resyncs = r.metrics.hid_resyncs.get();
+        // One step: two notches, then the Typist's final release finds the
+        // queue full.
+        {
+            let mut core = r.s.lock();
+            r.s.step(&mut core, clock(), Event::Wheel { units: -240 });
+        }
+        assert_eq!(r.metrics.hid_resyncs.get(), resyncs + 1);
+        assert_eq!(r.metrics.paste_events.get("done"), 1);
+        let after = r.write();
+        assert!(
+            r.kbd.is_none_or(|k| k == KBD_ZERO),
+            "the KVM still holds a key after the last-step resync: {after:?}"
+        );
+        assert!(r.holds_nothing());
+    }
+
     /// PD9 carry 2 (PD7): a session change ends an active paste, and its
     /// outcome is counted (`aborted`), not dropped.
     #[tokio::test(flavor = "current_thread")]
