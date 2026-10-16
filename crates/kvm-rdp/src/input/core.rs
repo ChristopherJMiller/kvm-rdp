@@ -5038,7 +5038,7 @@ mod tests {
                             let at = format!(
                                 "seed {seed} step {i}: a {stall:?} stall, {age:?} since the last beat"
                             );
-                            if watch.step(age, || hid.newest_holds()) {
+                            if watch.step(age, || crate::hid::stale::held(&hid)) {
                                 assert!(age > RDP_STALE_RELEASE, "{at}: released early");
                                 assert!(age <= RDP_STALE_RELEASE + WATCH_EVERY, "{at}: late");
                                 assert!(!released, "{at}: released twice in one stall");
