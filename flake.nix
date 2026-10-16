@@ -78,6 +78,7 @@
             pkgs.jq
             pkgs.bubblewrap
             pkgs.openssl # census step 2: `openssl s_client -brief` per TLS port
+            pkgs.curl # scripts/image-smoke.sh's HTTP client (Plan E Task 4.1)
             pkgs.freerdp
             pkgs.xvfb-run
             pkgs.cargo-deny

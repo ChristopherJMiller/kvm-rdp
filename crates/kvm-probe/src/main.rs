@@ -19,7 +19,14 @@ use kvm_probe::{capture, fingerprint, kvm, l4, report, sandbox, secret, trial, w
 /// current directory (I5): a run from any cwd must land captures in the
 /// one place `.gitignore`'s anchored `/captures/` actually excludes,
 /// exactly as `sandbox.rs`'s `live_sample_range` test is anchored (R12).
-const CAPTURES_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../captures");
+/// The image's build names its own, `/captures` (Plan E Task 4.1, PC15):
+/// there is no repository in the image, and `--remap-path-prefix` does not
+/// rewrite an `env!` string, so the build tree's path would otherwise ship
+/// in the binary and in every captures error.
+const CAPTURES_DIR: &str = match option_env!("KVM_PROBE_CAPTURES_DIR") {
+    Some(dir) => dir,
+    None => concat!(env!("CARGO_MANIFEST_DIR"), "/../../captures"),
+};
 
 /// Cap on `summarize`'s JSONL read (I3): large enough for any real
 /// capture, but never unbounded.

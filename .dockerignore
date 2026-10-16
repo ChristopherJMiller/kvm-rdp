@@ -1,0 +1,11 @@
+# Only what `cargo build -p kvm-rdp -p kvm-probe` reads (Plan E Task 4.1).
+# An allowlist: captures/, .superpowers/, target/, spikes/ never enter the
+# build context.
+*
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!.cargo/config.toml
+!crates/
+!fixtures/slate_1080p.h264
+crates/**/target

@@ -128,6 +128,34 @@ most 64 KiB) and are never logged.
 - Exit codes: 0 after a signal or a certificate change, 1 if startup failed
   or the RDP server stopped on its own, 2 on a config or logging error.
 
+## Container image
+
+CI publishes the image from `main` only, as
+`ghcr.io/christopherjmiller/kvm-rdp:sha-<commit>` — pin it with its digest,
+`…:sha-<commit>@sha256:<digest>`. It is distroless (no shell, no package
+manager), amd64, and runs as `65532:65532` on a read-only root filesystem
+with no capabilities; it writes nothing.
+
+    docker run --read-only --cap-drop ALL -v /etc/kvm-rdp:/etc/kvm-rdp:ro \
+      -p 3389:3389 -p 9464:9464 \
+      ghcr.io/christopherjmiller/kvm-rdp:sha-<commit>@sha256:<digest> \
+      --config /etc/kvm-rdp/kvm-rdp.toml
+
+- The entrypoint is `kvm-rdp`; `kvm-probe` is at `/usr/local/bin/kvm-probe`
+  (it writes captures only under `/captures`, which the image does not have
+  unless one is mounted; its `capture` and `snapshot` decodes need ffmpeg
+  and bubblewrap, which the image does not have).
+- Mount the secrets as files and point the `*_file` keys at them by
+  absolute path. A Kubernetes Secret volume works as mounted — no `subPath`
+  — since a renewed certificate is seen through the `..data` symlink and the
+  bridge exits 0 to be restarted once no client is connected (the smoke test
+  runs the image with exactly that layout at `/run/secrets/kvm-rdp`). A
+  Secret with `defaultMode: 0400` needs `fsGroup: 65532` (or the run's UID
+  as owner) for the non-root process to read it.
+- `MALLOC_ARENA_MAX=2` is set in the image: the condition its memory figures
+  were measured under.
+- One commit builds one image (`scripts/image-build.sh`); the nightly checks it.
+
 ## Input and paste
 
 - **Keyboard and mouse.** RDP scancodes become USB-HID usages, and Unicode

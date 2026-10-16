@@ -1094,6 +1094,47 @@ mod tests {
         stop(h).await;
     }
 
+    /// Review Focus 1, the deployment design §11 (1): Kubernetes mounts a
+    /// Secret as `tls.crt -> ..data/tls.crt` with `..data -> ..<stamp>`,
+    /// and renews it by writing a new `..<stamp>` and swapping `..data` in
+    /// one rename. The watcher follows the links (`metadata`, not
+    /// `symlink_metadata`), so the swap is a renewal like any other.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kubernetes_secret_swap_is_a_renewal() {
+        use std::os::unix::fs::symlink;
+        let sim = sim().await;
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = config_for(&sim, d.path(), |_| {});
+        let secret = d.path().join("tls");
+        let generation = |stamp: &str| {
+            let g = secret.join(stamp);
+            std::fs::create_dir_all(&g).unwrap();
+            let (cert, key) = pair_in(&g);
+            std::fs::rename(cert, g.join("tls.crt")).unwrap();
+            std::fs::rename(key, g.join("tls.key")).unwrap();
+        };
+        generation("..2026_10_15_00_00_00.1");
+        symlink("..2026_10_15_00_00_00.1", secret.join("..data")).unwrap();
+        symlink("..data/tls.crt", secret.join("tls.crt")).unwrap();
+        symlink("..data/tls.key", secret.join("tls.key")).unwrap();
+        cfg.rdp.tls_cert_file = secret.join("tls.crt");
+        cfg.rdp.tls_key_file = secret.join("tls.key");
+        let mut h = start(cfg).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), h.exit_requested())
+                .await
+                .is_err(),
+            "an exit before any renewal"
+        );
+        generation("..2026_10_15_00_01_00.2");
+        symlink("..2026_10_15_00_01_00.2", secret.join("..data_tmp")).unwrap();
+        std::fs::rename(secret.join("..data_tmp"), secret.join("..data")).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), h.exit_requested())
+            .await
+            .expect("the ..data swap was not seen as a renewal");
+        stop(h).await;
+    }
+
     /// A fresh pair in `dir`: (cert, key) paths.
     fn pair_in(dir: &Path) -> (PathBuf, PathBuf) {
         let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
