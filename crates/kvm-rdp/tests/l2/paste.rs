@@ -355,6 +355,53 @@ async fn the_chord_key_never_reaches_the_kvm() {
     );
 }
 
+/// I1 (Plan D final review), §7.3, §8: a paste whose chord comes while the
+/// KVM's websocket is down — kvm-sim answering every reopen 503 — queues the
+/// chord's reports and the Typist's first ones, then waits for room. The
+/// reopen discards them, and that discard is a release: the paste aborts and
+/// types nothing, never the clipboard less its first characters (which a
+/// terminal on the Mac would run).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_paste_during_a_websocket_outage_types_nothing_partial() {
+    let text = "abcdefghijklmnopqrstuvwxyz";
+    let (env, c, _ws) = pasting(text, |c| c.paste.pace = ms(5)).await;
+    let opens = ws_opens(&env.sim.events()).len();
+    env.sim.set_policy(|p| p.ws_status = Some(503));
+    env.sim.close_websockets();
+    env.sim
+        .wait_for(T, |l| {
+            l.iter().any(|e| matches!(e, SimEvent::WsRefused { .. }))
+        })
+        .await
+        .expect("kvm-sim never refused a reopen");
+    let reconnects = env.metrics().release_all.get("websocket_reconnect");
+    paste_chord(&c, true);
+    counted(&env, "started", 1).await;
+    // The chord's reports and the Typist's first fill the queue's room.
+    assert!(
+        until(T, || env.bridge().hid().queued() > 0).await,
+        "nothing was queued while the websocket was down"
+    );
+    tokio::time::sleep(ms(300)).await;
+    env.sim.set_policy(|p| p.ws_status = None);
+    let ws = env.hid_ready_after(opens).await;
+    assert!(
+        until(T, || pasted(&env, "done") + pasted(&env, "aborted") > 0).await,
+        "the paste never ended"
+    );
+    let got = until_mark(&env, &c, ws).await;
+    let letters: Vec<u8> = (0x04..=0x1D).collect();
+    assert!(
+        !letters.iter().any(|u| carries(&got, *u)),
+        "a partial paste reached the KVM: {got:02x?}"
+    );
+    assert_eq!((pasted(&env, "done"), pasted(&env, "aborted")), (0, 1));
+    assert!(
+        env.metrics().release_all.get("websocket_reconnect") > reconnects,
+        "the reopen's discard was not counted as a release"
+    );
+}
+
 /// §8 `paste.max_bytes`: an answer one UTF-16 unit over 64 KiB (with its
 /// terminator) ends the session as `clipboard_oversize` (the client sees
 /// 0x7, ServerDeniedConnection; counted once, D17) and types nothing; a

@@ -52,6 +52,7 @@ rev 6.2's; it is added to it. One line per change:
 - §11.6, §15: every L4 check is a `kvm-probe` subcommand proven against kvm-sim; Leg D, the run on the ES3, is pending (owner), so they all stay open.
 - §11.6 (PD3): kvm-probe's HID commands are bounded — at most 500 characters a run, a 100 ms pace, 10 runs per pace and 8 paces per `hid-type` — and a bound passed is refused before anything is sent.
 - §12: planning unit D's status; owner acceptance items 12–14 and a note on item 4; one list of what is carried to Plan E.
+- §7.3, §8 (Plan D final review I1): a websocket open whose discard drops anything — a queued report or a pending resync — is a release (`release_all{websocket_reconnect}`), so a paste whose reports were queued during an outage aborts instead of typing its text less its first characters.
 
 **Rev 6.2 — Plan C (2026-10-07 to 2026-10-08).** Records what building
 Milestone 3a settled, against the code as built. DC*n* are Plan C's recorded
@@ -1387,7 +1388,15 @@ under the core lock, and only input taken on the RDP thread is fed (§4.3).
   release can never land after the zeros. A fresh press that loses that
   race is lost, never stuck.)
 - While the websocket is down, reports are discarded; reconnect sends the
-  session-start sequence.
+  session-start sequence. Rev 6.3 (Plan D final review I1): and an open
+  that discards reports is a release — when its discard drops anything (a
+  queued report, or a resync's state still to go out) it moves the epoch
+  and zeroes the resync state under the queue lock, as release-all does,
+  counted `release_all{websocket_reconnect}`. The input core then releases
+  its state on its next step: keys pressed into the outage become
+  released-by-bridge (a reconnect never re-presses anything, §7.4), and an
+  active paste aborts (§8) instead of typing the rest of its text with the
+  queued first characters gone.
 - A websocket write that takes longer than `hid_write_timeout` closes and
   reconnects the websocket (transient, §6.9) — rev 6.2: with a reset, so
   its unsent backlog is discarded, not delivered late (§3.2).
@@ -1534,6 +1543,13 @@ While typing:
   paste are not fresh presses; and when typing starts, every non-modifier
   key the client still holds is released by the bridge and zeroed at
   once, even if the Typist then has nothing to send.)
+- Rev 6.3 (Plan D final review I1): a websocket reopen that discards the
+  paste's queued reports — a chord, or typing, that met an outage — is a
+  release (§7.3), so the paste aborts (`release`) and types nothing more.
+  Without it the reopen dropped the chord's reports and the Typist's first
+  presses and typing went on: the Mac received the text less its first
+  characters, counted `done` — a lost leading `#` or `cd x &&` changes what
+  a terminal runs.
 - If the client's last `Synchronize` reported Caps Lock on, the paste is
   refused (typing would invert case). (Rev 6.3, DD5: that state is toggled
   by each fresh Caps Lock press since, as the Mac's is.)

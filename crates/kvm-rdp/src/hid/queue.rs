@@ -356,9 +356,36 @@ impl HidControl {
         self.q().len()
     }
 
-    /// Reports made while the websocket was down are discarded (§7.3).
+    /// Reports made while the websocket was down are discarded (§7.3). A
+    /// discard that drops anything — a queued report, or a resync's state
+    /// still to go out — is a release (I1, Plan D final review): the epoch
+    /// moves and the resync state is zeroed under the queue lock, as
+    /// `release_all` does, so the input core releases its state on its next
+    /// step and an active paste aborts rather than typing the rest of its
+    /// text with the first characters gone. Keys pressed into the outage
+    /// become released-by-bridge: a reconnect never re-presses anything
+    /// (§7.4). No release is left pending: the session-start frames the open
+    /// writes next are the zero reports.
     pub fn discard_queued(&self) {
-        self.q().clear();
+        let dropped = {
+            let mut q = self.q();
+            let dropped = !q.is_empty() || q.resync;
+            if dropped {
+                self.epoch.fetch_add(1, Ordering::SeqCst);
+                self.metrics
+                    .hid_epoch_discards
+                    .add(u64::try_from(q.len()).unwrap_or(u64::MAX));
+                q.release();
+            } else {
+                q.clear();
+            }
+            dropped
+        };
+        if dropped {
+            self.metrics
+                .release_all
+                .inc(ReleaseTrigger::WebsocketReconnect.label());
+        }
     }
 
     /// Resolves after a push or release (a permit is kept if none waits).
@@ -639,6 +666,40 @@ mod tests {
             c.push(kbd(k), false);
         }
         assert_eq!(drain(&c), [kbd(3), mouse(0, 9, 9)]);
+    }
+
+    /// I1 (Plan D final review), §7.3: a websocket open that discards a
+    /// queued report — or a pending resync — is a release: the epoch moves
+    /// (so the input core releases its state and ends a paste rather than
+    /// typing the rest of it), the resync state is zeroed, and it counts
+    /// `release_all{websocket_reconnect}`. An open with nothing queued
+    /// moves nothing.
+    #[test]
+    fn an_opens_discard_of_a_queued_report_is_a_release() {
+        let c = ctl(2);
+        c.discard_queued();
+        assert_eq!(c.epoch(), 0, "an empty discard moved the epoch");
+        assert_eq!(c.metrics.release_all.total(), 0);
+        c.push(kbd(4), false);
+        c.discard_queued();
+        assert_eq!(c.epoch(), 1);
+        assert_eq!(c.metrics.release_all.get("websocket_reconnect"), 1);
+        assert_eq!(drain(&c), []);
+        assert_eq!(c.current_state_frames(), [KBD_ZERO], "the held key stays");
+        // A resync whose queue was cleared by the overflow still drops state.
+        c.push(kbd(5), false);
+        c.push(kbd(6), false);
+        assert_eq!(c.push(kbd(7), false), Push::Resync);
+        c.discard_queued();
+        assert_eq!(c.epoch(), 2, "a pending resync's discard moved nothing");
+        assert_eq!(c.metrics.release_all.get("websocket_reconnect"), 2);
+        assert_eq!(drain(&c), []);
+        // A push stamped before the discard is dropped whole (`push_at`).
+        assert_eq!(c.push_at(1, kbd(8), false), Push::Discarded);
+        assert!(
+            !c.take_release(),
+            "the session-start frames are the release"
+        );
     }
 
     /// PC7 m2, §7.3 ("services it before anything else"): a release raised

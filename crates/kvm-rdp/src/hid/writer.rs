@@ -272,6 +272,8 @@ impl WsTask {
         S: Sink<Message, Error = WsError> + Unpin,
         St: Stream<Item = Result<Message, WsError>> + Unpin,
     {
+        // What was queued while down is dropped — as a release if it held
+        // anything (I1, Plan D final review): a paste then aborts.
         self.hid.discard_queued();
         // The session-start sequence is itself a release (§3.3).
         let _ = self.hid.take_release();
