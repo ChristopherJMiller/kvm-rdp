@@ -67,6 +67,23 @@ pub(crate) fn full_ladder() -> Vec<RawCapabilitySet> {
     CapabilitiesAdvertisePdu::from_typed(&Null.preferred_capabilities()).0
 }
 
+/// FreeRDP's 11-set ladder, as L3 recorded it (DC8; the fixture's first
+/// line names the FreeRDP version).
+pub(crate) fn freerdp_ladder() -> Vec<RawCapabilitySet> {
+    include_str!("../../../../fixtures/freerdp-gfx-ladder.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.is_empty())
+        .map(|l| {
+            let (v, hex) = l.split_once(':').unwrap();
+            let data = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            RawCapabilitySet::new(CapabilityVersion(u32::from_str_radix(v, 16).unwrap()), data)
+        })
+        .collect()
+}
+
 /// The spec defaults (§4.4), `side` policy.
 pub(crate) fn cfg() -> PumpConfig {
     PumpConfig {

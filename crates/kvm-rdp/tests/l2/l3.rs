@@ -22,6 +22,24 @@ const BLOCK: (u32, u32) = (40, 32);
 const FORBIDDEN: [&str; 3] = ["avc420_decompress failure", "rdpgfx_decode failed", "h264"];
 /// MS-RDPEGFX's CAPVERSION_81.
 pub const V8_1: f64 = 524_549.0;
+/// MS-RDPEGFX's CAPVERSION_107.
+pub const V10_7: f64 = 657_153.0;
+
+/// The first line `xfreerdp /version` prints: the ladder fixture's header
+/// names the FreeRDP that recorded it.
+fn freerdp_version() -> String {
+    let out = Command::new("xfreerdp")
+        .arg("/version")
+        .env_remove("LD_LIBRARY_PATH")
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
 
 /// One L3 case's processes and files. Fields drop in declaration order:
 /// FreeRDP's group (and the Xvfb under it) first, so a failing case never
@@ -127,7 +145,9 @@ impl L3 {
     /// at least 1, polled every 200 ms within `limit` (the slate is not
     /// counted, only KVM frames). Every picture wait comes after it: before
     /// it, the framebuffer is Xvfb's root or FreeRDP's empty window. On a
-    /// timeout, FreeRDP's and Xvfb's logs.
+    /// timeout, FreeRDP's, Xvfb's and the bridge's logs — a session the
+    /// bridge ends (`no_avc420`, §6.7) shows in FreeRDP's only as
+    /// ERRINFO_SERVER_DENIED_CONNECTION.
     pub async fn streaming(&self, limit: Duration) {
         let t0 = Instant::now();
         loop {
@@ -137,9 +157,10 @@ impl L3 {
             }
             assert!(
                 t0.elapsed() <= limit,
-                "the bridge sent FreeRDP no frame within {limit:?}; FreeRDP said:\n{}\nXvfb said:\n{}",
+                "the bridge sent FreeRDP no frame within {limit:?}; FreeRDP said:\n{}\nXvfb said:\n{}\nthe bridge said:\n{}",
                 self.freerdp_log(),
-                self.xvfb_log()
+                self.xvfb_log(),
+                self.bin.lines().join("\n")
             );
             tokio::time::sleep(ms(200)).await;
         }
@@ -225,6 +246,11 @@ impl L3 {
         self.freerdp.as_mut().is_some_and(Group::running)
     }
 
+    /// FreeRDP's leader's own exit (a refused connection), within `limit`.
+    pub fn freerdp_exit(&mut self, limit: Duration) -> Option<std::process::ExitStatus> {
+        self.freerdp.as_mut().and_then(|g| g.wait_exit(limit))
+    }
+
     /// End FreeRDP's group, then §11.4 oracle 1 over everything it logged.
     pub fn stop_and_check_freerdp_log(&mut self) {
         self.freerdp = None;
@@ -285,4 +311,160 @@ async fn freerdp_decodes_the_es3_stream_through_the_bridge() {
     );
     l3.stop_and_check_freerdp_log();
     assert_eq!(l3.sim.stats().logouts, 0);
+}
+
+/// §11.4's second run: `/gfx:frame-ack:off` suspends acks (§6.6). Frames
+/// keep flowing and the picture keeps moving, with the stall timer scaled
+/// to 2 s, for three times that once acks are suspended — a bridge that
+/// waited for acks would close the session as client_stalled inside it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "L3: needs xfreerdp and xvfb-run on PATH (nix build .#l3-tools)"]
+async fn freerdp_suspending_acks_keeps_the_picture_moving() {
+    let mut l3 = L3::start("stall_timeout = \"2s\"\n").await;
+    l3.freerdp(&["/sec:nla", "/gfx:AVC420,frame-ack:off"]);
+    l3.streaming(Duration::from_secs(20)).await;
+    // The 6 s window starts once the suspension is in force, not before.
+    let t0 = Instant::now();
+    while sample(&l3.metrics().await, "kvm_rdp_egfx_ack_suspended") != Some(1.0) {
+        assert!(
+            t0.elapsed() < T,
+            "acks never suspended:\n{}",
+            l3.freerdp_log()
+        );
+        tokio::time::sleep(ms(200)).await;
+    }
+    let m1 = l3.metrics().await;
+    let (b1, _) = l3.barcode_within(T).await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let (b2, t2) = l3.barcode_within(T).await;
+    let m2 = l3.metrics().await;
+    assert_eq!(
+        sample(&m2, "kvm_rdp_egfx_ack_suspended"),
+        Some(1.0),
+        "acks never suspended"
+    );
+    assert!(
+        sample(&m2, "kvm_rdp_egfx_frames_sent_total")
+            > sample(&m1, "kvm_rdp_egfx_frames_sent_total")
+    );
+    assert_ne!(b1, b2, "the picture froze");
+    assert!(l3.sim_sent(b2, t2, ms(1500)));
+    assert!(
+        l3.freerdp_running(),
+        "the session ended:\n{}",
+        l3.freerdp_log()
+    );
+    assert!(
+        !m2.contains("kvm_rdp_disconnects_total{cause=\"client_stalled\"}"),
+        "{m2}"
+    );
+    l3.stop_and_check_freerdp_log();
+}
+
+/// DC8: FreeRDP's full ladder — with no `/gfx` option (its default; census
+/// Leg C's "direct run with no `/gfx`") it advertises eleven sets, V8 to
+/// V10_7 — byte for byte the committed fixture, which the bridge confirms
+/// at V10_7 and serves AVC420 under. Not a bare `/gfx`: FreeRDP 3.32.1
+/// then advertises the same eleven versions with AVC420 off in every one
+/// (V8_1 without AVC420_ENABLED, V10+ with AVC_DISABLED), a session the
+/// bridge ends as `no_avc420` (§6.7). `KVM_RDP_L3_RECORD=1` writes the
+/// fixture instead (a new FreeRDP in flake.lock: record, review the diff,
+/// commit).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "L3: needs xfreerdp and xvfb-run on PATH (nix build .#l3-tools)"]
+async fn freerdps_full_ladder_is_the_committed_fixture() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/freerdp-gfx-ladder.txt");
+    let mut l3 = L3::start("").await; // require_tools first: its message, not "os error 2"
+    let version = format!("# {}", freerdp_version());
+    l3.freerdp(&["/sec:nla"]);
+    l3.streaming(Duration::from_secs(20)).await;
+    l3.barcode_within(T).await;
+    let sets = l3.advertised();
+    assert_eq!(sets.len(), 11, "{sets:?}");
+    if std::env::var_os("KVM_RDP_L3_RECORD").is_some() {
+        // The first line names the recording FreeRDP (`xfreerdp /version`),
+        // so a re-record after a flake.lock bump labels itself.
+        let mut text = format!(
+            "{version}\n\
+             # The flake's FreeRDP with no `/gfx` option (its default): the 11-set\n\
+             # capability ladder it advertises (census.md, Leg C; DC8), one set per\n\
+             # line in census notation (version:data, hex). Recorded by L3's\n\
+             # freerdps_full_ladder_is_the_committed_fixture with KVM_RDP_L3_RECORD=1.\n",
+        );
+        for s in &sets {
+            text.push_str(s);
+            text.push('\n');
+        }
+        std::fs::write(&fixture, text).unwrap();
+    } else {
+        let text = std::fs::read_to_string(&fixture).unwrap();
+        assert_eq!(
+            text.lines().next(),
+            Some(version.as_str()),
+            "FreeRDP changed: re-record (KVM_RDP_L3_RECORD=1) and review"
+        );
+        let want: Vec<String> = text
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            sets, want,
+            "FreeRDP's ladder changed: re-record (KVM_RDP_L3_RECORD=1) and review"
+        );
+    }
+    let m = l3.metrics().await;
+    assert_eq!(sample(&m, "kvm_rdp_egfx_capability_version"), Some(V10_7));
+    l3.stop_and_check_freerdp_log();
+}
+
+/// §9.1 and §5.1 with a real client: FreeRDP offering TLS without NLA is
+/// refused at negotiation, before any KVM traffic — kvm-sim sees no
+/// connection at all — and the bridge keeps serving. IronRDP at the pinned
+/// rev sends no RDP_NEG_FAILURE (it returns before the write), so FreeRDP
+/// sees a plain close: the refusal's one trace is the bridge's own
+/// "Connection error" line, which names the mismatch — asserted, so a
+/// FreeRDP that failed for any other reason (no display, a bad flag, a
+/// missing library) cannot pass for a refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "L3: needs xfreerdp and xvfb-run on PATH (nix build .#l3-tools)"]
+async fn freerdp_without_nla_is_refused_before_any_kvm_traffic() {
+    let mut l3 = L3::start("").await;
+    l3.freerdp(&["/sec:tls", "/gfx:AVC420"]);
+    let status = l3
+        .freerdp_exit(Duration::from_secs(20))
+        .expect("FreeRDP kept running");
+    assert!(
+        !status.success(),
+        "FreeRDP connected without NLA:\n{}",
+        l3.freerdp_log()
+    );
+    assert!(
+        l3.bin
+            .lines()
+            .iter()
+            .any(|l| l.contains("Connection error") && l.contains("security protocol mismatch")),
+        "the bridge logged no refusal; FreeRDP said:\n{}\nXvfb said:\n{}",
+        l3.freerdp_log(),
+        l3.xvfb_log()
+    );
+    // FreeRDP 3.32.1 logs `[xf_setup_x11]: failed to open display: :N`,
+    // then ERRCONNECT_PRE_CONNECT_FAILED, when it never got a display.
+    let log = l3.freerdp_log();
+    let lower = log.to_lowercase();
+    for no_display in ["failed to open display", "errconnect_pre_connect_failed"] {
+        assert!(
+            !lower.contains(no_display),
+            "FreeRDP never ran against the bridge:\n{log}"
+        );
+    }
+    let s = l3.sim.stats();
+    assert_eq!(
+        (s.accepts_web, s.accepts_video, s.accepts_control),
+        (0, 0, 0),
+        "{s:?}"
+    );
+    http_get(l3.bin.admin(), "/readyz").await; // asserts the 200 itself
+    l3.stop_and_check_freerdp_log();
 }

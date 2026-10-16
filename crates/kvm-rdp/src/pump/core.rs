@@ -1237,6 +1237,15 @@ mod tests {
         };
         assert_eq!(c.0.version, CapabilityVersion::V10_7);
         assert!(r.gfx.supports_avc420());
+        // DC8: FreeRDP's own ladder, as L3 recorded it, confirms V10_7 with
+        // AVC420 — the confirm census.md records for it (Leg C).
+        let mut r = Rig::new(cfg());
+        let c = r.advertise(freerdp_ladder());
+        let [GfxPdu::CapabilitiesConfirm(c)] = c.as_slice() else {
+            panic!("{c:?}")
+        };
+        assert_eq!(c.0.version, CapabilityVersion::V10_7);
+        assert!(r.gfx.supports_avc420());
         let mut r = Rig::new(cfg());
         r.advertise(v8_only());
         assert!(!r.gfx.supports_avc420());

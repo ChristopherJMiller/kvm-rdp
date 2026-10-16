@@ -1,0 +1,16 @@
+# This is FreeRDP version 3.32.1 (n/a)
+# The flake's FreeRDP with no `/gfx` option (its default): the 11-set
+# capability ladder it advertises (census.md, Leg C; DC8), one set per
+# line in census notation (version:data, hex). Recorded by L3's
+# freerdps_full_ladder_is_the_committed_fixture with KVM_RDP_L3_RECORD=1.
+00080004:02000000
+00080105:12000000
+000a0002:02000000
+000a0100:00000000000000000000000000000000
+000a0200:02000000
+000a0301:00000000
+000a0400:02000000
+000a0502:02000000
+000a0600:02000000
+000a0601:02000000
+000a0701:02000000

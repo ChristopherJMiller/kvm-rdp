@@ -142,6 +142,26 @@ jobs:
         # private loopback addresses in 127.128.0.0/10 — Linux routes all of
         # 127/8 to lo) and the real binary under SIGTERM.
         run: cargo test --workspace --all-features
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - name: L3 tools from the flake (FreeRDP 3.32.1 with OpenH264, xvfb-run)
+        run: |
+          nix build .#l3-tools --out-link "$RUNNER_TEMP/l3-tools"
+          "$RUNNER_TEMP/l3-tools/bin/xfreerdp" /version
+      - name: Drop the job token nix.conf now holds
+        # As in `lint`: install-nix-action writes `access-tokens =
+        # github.com=$GITHUB_TOKEN` into nix.conf with no way for the caller
+        # to unset it; nothing after this step needs it, and the
+        # repository's own code (L3, the budget script) runs next.
+        run: sudo sed -i '/^access-tokens/d' /etc/nix/nix.conf
+      - name: L3 interop (spec §11.4) — FreeRDP against the bridge, one case at a time
+        # Four cases of well under a minute each: a hung FreeRDP or Xvfb
+        # must not spend the job's 45 minutes.
+        timeout-minutes: 10
+        run: |
+          export PATH="$RUNNER_TEMP/l3-tools/bin:$PATH"
+          cargo test --workspace --all-features --test l2 -- --ignored l3:: --test-threads 1
       - name: Target budget (spec §13, DC10)
         run: scripts/target-budget.sh
 
