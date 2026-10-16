@@ -13,7 +13,10 @@
 //! websocket has sent the session-start sequence"). So a KVM that accepts
 //! the websocket and drops it at once is retried at `kvm.backoff.initial`,
 //! by the spec's rule, while one whose session-start writes fail keeps
-//! backing off.
+//! backing off. A loss while input is held reopens without the backoff
+//! (I2, Plan D final review) — at most once until a reopen has written its
+//! session start (R-I1, the re-review of the final fix wave), so a KVM
+//! that resets every websocket right after its upgrade still meets it.
 //!
 //! A websocket ends with a FIN only after a close the KVM answered with its
 //! own close frame — it read everything up to ours (a bare EOF proves
@@ -138,6 +141,13 @@ impl Drop for ResetUnlessAnswered {
 
 impl WsTask {
     pub async fn run(mut self) {
+        // R-I1 (re-review of the final fix wave): the last loss skipped the
+        // backoff, and no reopen has written its session start since. A
+        // reopen whose session-start writes fail writes nothing, so
+        // `input_held` still sees the old websocket's held key at the next
+        // loss: without this, a KVM that resets every websocket right after
+        // its upgrade was reopened as fast as it answered.
+        let mut skipped = false;
         loop {
             let Some((seq, token)) = self.wait_token(None).await else {
                 return;
@@ -179,8 +189,15 @@ impl WsTask {
                         answered: false,
                     };
                     let _ = self.events.send(WsEvent::Up { seq });
-                    let (sink, stream) = ws.split();
-                    let exit = self.drive(sink, stream).await;
+                    let (mut sink, stream) = ws.split();
+                    let exit = if self.start(&mut sink).await {
+                        // R-I1: a session start written, so the next loss
+                        // with input held may skip the backoff again.
+                        skipped = false;
+                        self.serve(sink, stream).await
+                    } else {
+                        Exit::Failed
+                    };
                     reset.answered = exit == Exit::Closed;
                     drop(reset);
                     if exit != Exit::Failed {
@@ -195,10 +212,13 @@ impl WsTask {
                     let _ = self.events.send(WsEvent::Down);
                     // I2: while input is held, the reopen skips the backoff
                     // — a KVM that keeps a key held across the loss repeats
-                    // it until the session start lands. Once per loss with
-                    // something held: a failed reopen backs off as ever,
-                    // and the reopen's session start holds nothing.
-                    if !held {
+                    // it until the session start lands. R-I1: at most once
+                    // until a reopen has written its session start; until
+                    // then every loss, and every failed open, backs off as
+                    // ever.
+                    if held && !skipped {
+                        skipped = true;
+                    } else {
                         let d = self.backoff.next_delay();
                         if !self.sleep(d).await {
                             return;
@@ -283,23 +303,43 @@ impl WsTask {
         }
     }
 
-    /// Serve one open websocket until it fails or is closed.
-    pub async fn drive<S, St>(&mut self, mut sink: S, mut stream: St) -> Exit
+    /// Serve one open websocket until it fails or is closed: its session
+    /// start (`start`), then `serve`.
+    pub async fn drive<S, St>(&mut self, mut sink: S, stream: St) -> Exit
     where
         S: Sink<Message, Error = WsError> + Unpin,
         St: Stream<Item = Result<Message, WsError>> + Unpin,
     {
+        if !self.start(&mut sink).await {
+            return Exit::Failed;
+        }
+        self.serve(sink, stream).await
+    }
+
+    /// An open websocket's session-start sequence (§3.3); true once it is
+    /// written, and then the backoff resets (§4.4).
+    async fn start<S: Sink<Message, Error = WsError> + Unpin>(&mut self, sink: &mut S) -> bool {
         // What was queued while down is dropped — as a release if it held
         // anything (I1, Plan D final review): a paste then aborts.
         self.hid.discard_queued();
         // The session-start sequence is itself a release (§3.3).
         let _ = self.hid.take_release();
         for f in self.hid.session_start_frames() {
-            if !self.write(&mut sink, f).await {
-                return Exit::Failed;
+            if !self.write(sink, f).await {
+                return false;
             }
         }
         self.backoff.reset();
+        true
+    }
+
+    /// An open websocket past its session start, until it fails or is
+    /// closed.
+    async fn serve<S, St>(&mut self, mut sink: S, mut stream: St) -> Exit
+    where
+        S: Sink<Message, Error = WsError> + Unpin,
+        St: Stream<Item = Result<Message, WsError>> + Unpin,
+    {
         // PC9 fix 2: once, `reassert_after` past the session start (`None`
         // once done; bounded config, so the add never overflows).
         let mut reassert_at = tokio::time::Instant::now().checked_add(self.reassert_after);
@@ -1186,7 +1226,8 @@ mod tests {
     /// I2 (Plan D final review): while input is held — a key written when
     /// the websocket dies — the reopen skips the backoff: a KVM that keeps
     /// the key held across the loss auto-repeats it until the session-start
-    /// sequence lands. With nothing held, the reopen backs off as ever.
+    /// sequence lands — once per loss, and again after a reopen has written
+    /// its session start. With nothing held, the reopen backs off as ever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn while_input_is_held_a_reconnect_skips_the_backoff() {
         use kvm_sim::{KvmSim, SimConfig, Source};
@@ -1246,9 +1287,15 @@ mod tests {
             }
         };
         sent(2).await;
-        hid.push(kbd(4), false); // held, and written
-        sent(3).await;
-        for (held, want_fast) in [(true, true), (false, false)] {
+        // R-I1: the skip is once per loss, not once per task — each reopen
+        // that wrote its session start lets the next loss with a key held
+        // skip it again.
+        for (held, want_fast) in [(true, true), (true, true), (false, false)] {
+            if held {
+                let n = hid.metrics.hid_reports_sent.get();
+                hid.push(kbd(4), false); // held, and written
+                sent(n + 1).await;
+            }
             assert_eq!(hid.input_held(), held);
             // R-I3 (re-review of the final fix wave): counted before the
             // close. Read after `Up`, the reopen may already have written
@@ -1274,6 +1321,65 @@ mod tests {
             .unwrap();
         drop(tok_tx);
         assert_eq!(sim.stats().logouts, 0);
+    }
+
+    /// R-I1 (re-review of the final fix wave): a hostile or failing KVM
+    /// answers every websocket upgrade and resets the connection at once,
+    /// so every session-start write fails. The previous websocket wrote a
+    /// held key, and a reopen that writes nothing never overwrites that, so
+    /// `input_held()` stays true at every loss — yet the backoff is skipped
+    /// only once until a reopen has written its session start. Without that
+    /// bound the bridge reopened as fast as the KVM answered: 909–3 206
+    /// opens in 2 s. The backoff here (50 ms doubling to 400 ms, no jitter)
+    /// allows 9 in 2 s, the one skip included.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_kvm_that_resets_every_websocket_after_its_upgrade_is_not_reopened_hot() {
+        const WATCH: Duration = Duration::from_secs(2);
+        /// The backoff's 9, with room for a session start that lands
+        /// before the reset (it resets the backoff, §4.4).
+        const MAX_OPENS: usize = 12;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let a2 = accepts.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                a2.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    if let Ok(ws) = tokio_tungstenite::accept_async(s).await {
+                        // SO_LINGER 0: the drop is a reset.
+                        let _ =
+                            socket2::SockRef::from(ws.get_ref()).set_linger(Some(Duration::ZERO));
+                        drop(ws);
+                    }
+                });
+            }
+        });
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        hid.note_sent(&kbd(4)); // the previous websocket wrote a held key
+        assert!(hid.input_held());
+        let (mut t, ctl) = task(hid.clone(), Duration::from_secs(1));
+        t.ep = Arc::new(KvmEndpoint::new(
+            Scheme::Http,
+            "127.0.0.1",
+            (port, port, port),
+            &"0".repeat(64),
+        ));
+        let token = kvm_proto::parse_login_token(br#"{"result":0,"token":"0.1"}"#).unwrap();
+        t.token = watch::channel(Some((1, token))).1;
+        let run = tokio::spawn(t.run());
+        tokio::time::sleep(WATCH).await;
+        let opens = accepts.load(Ordering::SeqCst);
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run did not end after Close")
+            .unwrap();
+        assert!(opens >= 2, "the KVM was never reopened: {opens}");
+        assert!(
+            opens <= MAX_OPENS,
+            "a hot reconnect loop: {opens} opens in {WATCH:?} (the backoff allows 9)"
+        );
     }
 
     /// Census (§3.3, §7.3, §7.4): a key held when the websocket dies is
