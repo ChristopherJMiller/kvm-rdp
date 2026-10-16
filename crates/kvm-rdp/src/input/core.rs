@@ -55,7 +55,7 @@ use crate::input::paste::{PasteOutcome, PasteRefusal, ROOM_POLL, State, TYPIST_R
 use crate::input::pointer::{Button, Pointer};
 use crate::msg::Gen;
 use kvm_proto::hid::HidFrame;
-use kvm_proto::keymap::{Chord, USAGE_ESC, modifier_bit, us_stroke, usage_for_scancode};
+use kvm_proto::keymap::{Chord, USAGE_ESC, modifier_bit, unicode_key_stroke, usage_for_scancode};
 use kvm_proto::paste::{PastePolicy, Prepared, RELEASE, Typist, decode_utf16le, prepare};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -722,10 +722,21 @@ impl InputCore {
             // A fresh Esc aborts, Pending or Typing, and is itself
             // swallowed. A repeat of an Esc held since before the chord is a
             // repeat (it falls through and changes nothing): swallowing it
-            // would mark a key that is still down.
+            // would mark a key that is still down. A Unicode ESC (U+001B)
+            // is the same key (rev 6.3, PD11b I5; PD7 m5).
             Event::KeyPressed { code, extended }
                 if active
                     && usage_for_scancode(code, extended) == Some(USAGE_ESC)
+                    && self.is_fresh_press(USAGE_ESC) =>
+            {
+                self.last_kbd_event = Some(ctx.now);
+                self.swallow_press(Some(USAGE_ESC), out);
+                self.end_paste(ctx, PasteOutcome::Aborted("esc"), out);
+                None
+            }
+            Event::UnicodePressed(unit)
+                if active
+                    && unit_usage(unit) == Some(USAGE_ESC)
                     && self.is_fresh_press(USAGE_ESC) =>
             {
                 self.last_kbd_event = Some(ctx.now);
@@ -986,10 +997,12 @@ impl InputCore {
     }
 }
 
-/// A Unicode unit's US-layout usage (`None`: untypeable or a surrogate).
+/// A Unicode unit's live-keystroke usage (`unicode_key_stroke`: the US
+/// layout, and CR, BS and ESC as Return, Backspace and Esc — rev 6.3);
+/// `None`: untypeable or a surrogate.
 fn unit_usage(unit: u16) -> Option<u8> {
     char::from_u32(u32::from(unit))
-        .and_then(us_stroke)
+        .and_then(unicode_key_stroke)
         .map(|s| s.usage)
 }
 
@@ -1012,7 +1025,9 @@ mod tests {
     use crate::input::paste::{PasteOutcome, PasteRefusal};
     use crate::metrics::Metrics;
     use kvm_proto::hid::HidFrame;
-    use kvm_proto::keymap::{Chord, MOD_LSHIFT, modifier_bit, us_stroke, usage_for_scancode};
+    use kvm_proto::keymap::{
+        Chord, MOD_LSHIFT, modifier_bit, unicode_key_stroke, usage_for_scancode,
+    };
     use std::sync::Arc;
 
     /// The default chord, `ctrl+option+shift+v`.
@@ -2428,6 +2443,201 @@ mod tests {
             outcomes(&out).as_slice(),
             [PasteOutcome::Refused(PasteRefusal::CapsLock)]
         ));
+    }
+
+    /// Rev 6.3 (PD11b I5; PD7 m5): a fresh Unicode Esc (U+001B) aborts a
+    /// paste exactly as a scancode Esc does — Pending or Typing, swallowed
+    /// and released by the bridge, so its repeats after the paste push
+    /// nothing until its release. A repeat of a Unicode Esc held since
+    /// before the chord is a repeat and aborts nothing. Outside a paste it
+    /// types Esc.
+    #[test]
+    fn a_unicode_esc_aborts_a_paste_like_a_scancode_esc() {
+        const ESC: u16 = 0x001B;
+        // Outside a paste: Esc goes out, and its release.
+        let mut r = Rig::new();
+        assert_eq!(
+            pushes(&r.step(Event::UnicodePressed(ESC))),
+            [(kbd(0, 0x29), 0)]
+        );
+        assert_eq!(
+            pushes(&r.step(Event::UnicodeReleased(ESC))),
+            [(kbd(0, 0), 0)]
+        );
+        // Pending: aborted, swallowed — nothing pushed.
+        hold_chord(&mut r);
+        assert!(matches!(
+            outcomes(&r.step(chord_event())).as_slice(),
+            [PasteOutcome::Started]
+        ));
+        let out = r.step(Event::UnicodePressed(ESC));
+        assert!(
+            matches!(outcomes(&out).as_slice(), [PasteOutcome::Aborted("esc")]),
+            "{}",
+            show(&out)
+        );
+        assert!(pushes(&out).is_empty(), "swallowed: {}", show(&out));
+        assert!(r.core.keys.is_released_by_bridge(0x29));
+        assert!(pushes(&r.step(Event::UnicodePressed(ESC))).is_empty());
+        assert!(pushes(&r.step(Event::UnicodeReleased(ESC))).is_empty());
+        assert!(!r.core.paste.is_active());
+        // Typing: aborted, swallowed, and the all-zero report goes out.
+        let mut r = Rig::new();
+        start_paste(&mut r, "abc");
+        let out = r.step(Event::UnicodePressed(ESC));
+        assert!(
+            matches!(outcomes(&out).as_slice(), [PasteOutcome::Aborted("esc")]),
+            "{}",
+            show(&out)
+        );
+        assert_eq!(pushes(&out), [(kbd(0, 0), 0)], "{}", show(&out));
+        assert!(pushes(&r.step(Event::UnicodePressed(ESC))).is_empty());
+        assert!(pushes(&r.step(Event::UnicodeReleased(ESC))).is_empty());
+        assert_eq!(
+            pushes(&r.step(Event::UnicodePressed(ESC))),
+            [(kbd(0, 0x29), 0)]
+        );
+        // Held since before the chord: its repeat aborts nothing; once it
+        // is released, a fresh press does.
+        let mut r = Rig::new();
+        assert_eq!(
+            pushes(&r.step(Event::UnicodePressed(ESC))),
+            [(kbd(0, 0x29), 0)]
+        );
+        hold_chord(&mut r);
+        assert!(matches!(
+            outcomes(&r.step(chord_event())).as_slice(),
+            [PasteOutcome::Started]
+        ));
+        let out = r.step(Event::UnicodePressed(ESC)); // its repeat
+        assert!(out.is_empty(), "{}", show(&out));
+        assert!(r.core.paste.is_active());
+        assert_eq!(
+            pushes(&r.step(Event::UnicodeReleased(ESC))),
+            [(kbd(0x07, 0), 0)]
+        );
+        let out = r.step(Event::UnicodePressed(ESC));
+        assert!(
+            matches!(outcomes(&out).as_slice(), [PasteOutcome::Aborted("esc")]),
+            "{}",
+            show(&out)
+        );
+        assert!(pushes(&out).is_empty(), "swallowed: {}", show(&out));
+        // With every released-by-bridge mark taken (DD9), the swallowed Esc
+        // cannot be marked: it is counted, and still never reaches the KVM.
+        let mut r = Rig::new();
+        let keys: Vec<u8> = (0x02..=0x0D)
+            .chain(0x10..=0x1B)
+            .chain(0x1E..=0x25)
+            .collect();
+        assert_eq!(keys.len(), 32);
+        for batch in keys.chunks(16) {
+            for &code in batch {
+                r.step(Event::KeyPressed {
+                    code,
+                    extended: false,
+                });
+            }
+            r.epoch += 1; // a release-all: the held keys become marks
+            r.step(Event::Tick);
+        }
+        hold_chord(&mut r);
+        assert!(matches!(
+            outcomes(&r.step(chord_event())).as_slice(),
+            [PasteOutcome::Started]
+        ));
+        let out = r.step(Event::UnicodePressed(ESC));
+        assert!(
+            matches!(outcomes(&out).as_slice(), [PasteOutcome::Aborted("esc")]),
+            "{}",
+            show(&out)
+        );
+        assert!(out.contains(&Out::Ignored), "{}", show(&out));
+        assert!(pushes(&out).is_empty(), "swallowed: {}", show(&out));
+    }
+
+    /// Rev 6.3 (PD11b I5): a Unicode Return (U+000D) is a held non-modifier
+    /// key like a scancode one — its repeats push nothing new but keep the
+    /// key-repeat timer from firing; with none for `key_repeat_timeout` it
+    /// is released and stays released by the bridge until its release.
+    /// And while a paste is Pending, a fresh one cancels it and goes through
+    /// (DD4).
+    #[test]
+    fn a_held_unicode_return_repeats_and_cancels_a_pending_paste() {
+        const CR: u16 = 0x000D;
+        let mut r = Rig::new();
+        assert_eq!(
+            pushes(&r.step(Event::UnicodePressed(CR))),
+            [(kbd(0, 0x28), 0)]
+        );
+        for _ in 0..30 {
+            r.advance(Duration::from_secs(1));
+            let out = r.step(Event::UnicodePressed(CR)); // its repeat
+            assert!(out.is_empty(), "{}", show(&out));
+            let out = r.step(Event::Tick);
+            assert!(releases(&out).is_empty(), "{}", show(&out));
+        }
+        assert!(r.core.keys.is_down(0x28), "30 s of repeats: still held");
+        r.advance(Duration::from_secs(10));
+        assert_eq!(releases(&r.step(Event::Tick)), [ReleaseTrigger::KeyRepeat]);
+        let out = r.step(Event::UnicodePressed(CR));
+        assert!(!pushes_usage(&out, 0x28), "re-pressed: {}", show(&out));
+        assert!(!pushes_usage(&r.step(Event::UnicodeReleased(CR)), 0x28));
+        assert_eq!(
+            pushes(&r.step(Event::UnicodePressed(CR))),
+            [(kbd(0, 0x28), 1)]
+        );
+        r.step(Event::UnicodeReleased(CR));
+        // Pending: a fresh Unicode Return cancels the paste and goes through.
+        hold_chord(&mut r);
+        assert!(matches!(
+            outcomes(&r.step(chord_event())).as_slice(),
+            [PasteOutcome::Started]
+        ));
+        let out = r.step(Event::UnicodePressed(CR));
+        assert!(
+            matches!(outcomes(&out).as_slice(), [PasteOutcome::Aborted("key")]),
+            "{}",
+            show(&out)
+        );
+        assert_eq!(pushes(&out), [(kbd(0x07, 0x28), 1)], "{}", show(&out));
+    }
+
+    /// Rev 6.3 (PD11b I5): the live Unicode mapping is not paste's (§8). A
+    /// pasted BS or ESC is skipped and counted, never typed; a pasted CR is
+    /// still a line break, typed as one Return.
+    #[test]
+    fn paste_never_types_backspace_or_esc() {
+        let mut r = Rig::new();
+        let mut frames: Vec<HidFrame> = pushes(&start_paste(&mut r, "a\u{8}b\rc\u{1B}d"))
+            .into_iter()
+            .map(|(f, _)| f)
+            .collect();
+        let mut done = None;
+        for _ in 0..64 {
+            r.advance(Duration::from_millis(1));
+            let out = r.step(Event::Tick);
+            frames.extend(pushes(&out).into_iter().map(|(f, _)| f));
+            if let Some(p) = outcomes(&out).first() {
+                done = Some((*p).clone());
+                break;
+            }
+        }
+        assert_eq!(
+            done,
+            Some(PasteOutcome::Done {
+                typed: 5,
+                skipped: 2
+            })
+        );
+        let presses: Vec<u8> = frames
+            .iter()
+            .filter_map(|f| match f {
+                HidFrame::Keyboard { keys, .. } if keys[0] != 0 => Some(keys[0]),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(presses, [0x04, 0x05, 0x28, 0x06, 0x07]);
     }
 
     /// Review Focus 1 / §8: Esc aborts (and is swallowed), an all-zero
@@ -4035,7 +4245,7 @@ mod tests {
 
     fn unit_usage(unit: u16) -> Option<u8> {
         char::from_u32(u32::from(unit))
-            .and_then(us_stroke)
+            .and_then(unicode_key_stroke)
             .map(|s| s.usage)
     }
 

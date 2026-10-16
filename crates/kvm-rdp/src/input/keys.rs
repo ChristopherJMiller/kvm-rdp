@@ -7,7 +7,7 @@
 use kvm_proto::hid::HidFrame;
 use kvm_proto::keymap::{
     CLASS_CTRL, MOD_LCTRL, MOD_LGUI, MOD_LSHIFT, MOD_RCTRL, MOD_RGUI, Stroke, USAGE_CAPS_LOCK,
-    modifier_bit, modifier_classes, us_stroke, usage_for_scancode,
+    modifier_bit, modifier_classes, unicode_key_stroke, usage_for_scancode,
 };
 
 /// At most this many non-modifier keys are tracked at once (DD9); a press
@@ -169,10 +169,12 @@ impl Keyboard {
     }
 
     /// A Unicode key event: the US-layout stroke's usage, with Shift from
-    /// this press alone (D8b). An untypeable or surrogate unit is dropped
-    /// (DD7). Always `Some`.
+    /// this press alone (D8b) — or, for CR, BS and ESC, Return, Backspace
+    /// and Esc (`unicode_key_stroke`; rev 6.3, PD11b I5). An untypeable or
+    /// surrogate unit is dropped (DD7). Always `Some`.
     pub fn unicode_press(&mut self, unit: u16) -> Option<KeyReport> {
-        let Some(Stroke { usage, shift }) = char::from_u32(u32::from(unit)).and_then(us_stroke)
+        let Some(Stroke { usage, shift }) =
+            char::from_u32(u32::from(unit)).and_then(unicode_key_stroke)
         else {
             return Some(self.out(true, true));
         };
@@ -191,7 +193,9 @@ impl Keyboard {
     /// release of an untypeable or surrogate unit is ignored but not
     /// `dropped`: its press was counted, and one keystroke counts once (m5).
     pub fn unicode_release(&mut self, unit: u16) -> Option<KeyReport> {
-        let Some(Stroke { usage, .. }) = char::from_u32(u32::from(unit)).and_then(us_stroke) else {
+        let Some(Stroke { usage, .. }) =
+            char::from_u32(u32::from(unit)).and_then(unicode_key_stroke)
+        else {
             return Some(self.out(true, false));
         };
         Some(self.release_usage(usage))
@@ -524,6 +528,35 @@ mod tests {
         }
     }
 
+    /// Rev 6.3 (PD11b I5; PD5 m7, PD7 m5): a client in its Unicode keyboard
+    /// mode may send Return, Backspace and Esc as the control units CR, BS
+    /// and ESC. Each types its key with no Shift (even after a shifted
+    /// unit), releases by its unit, and follows the released-by-bridge rule
+    /// like any other key. (LF was already Return.)
+    #[test]
+    fn unicode_return_backspace_and_esc_type_their_keys() {
+        let mut k = Keyboard::default();
+        for (unit, usage) in [(0x000Du16, 0x28u8), (0x0008, 0x2A), (0x001B, 0x29)] {
+            assert_eq!(sent(k.unicode_press(unit)), one(0, usage), "{unit:#06x}");
+            assert!(ignored(k.unicode_press(unit)), "{unit:#06x}'s repeat");
+            assert_eq!(sent(k.unicode_release(unit)), one(0, 0), "{unit:#06x}");
+            assert_eq!(k.held_nonmodifier_usages(), 0, "{unit:#06x}");
+            // Held across a release-all: its repeats are ignored until its
+            // release; then a fresh press types it again.
+            sent(k.unicode_press(unit));
+            k.release_all();
+            assert!(k.is_released_by_bridge(usage), "{unit:#06x}");
+            assert!(ignored(k.unicode_press(unit)), "{unit:#06x} re-pressed");
+            assert!(ignored(k.unicode_release(unit)));
+            assert!(!k.is_released_by_bridge(usage), "{unit:#06x}");
+            assert_eq!(sent(k.unicode_press(unit)), one(0, usage));
+            sent(k.unicode_release(unit));
+        }
+        // After a shifted unit, a Unicode Return carries no Shift of its own.
+        assert_eq!(sent(k.unicode_press(u16::from(b'A'))), one(0x02, 0x04));
+        assert_eq!(sent(k.unicode_press(0x000D)), kbd(0, [0x04, 0x28, 0, 0, 0]));
+    }
+
     /// The Unicode Shift lives only as long as a Unicode-pressed key is
     /// down, however that key comes up: a scancode release of the same
     /// usage must not leave LShift in every later report with nothing the
@@ -809,7 +842,7 @@ mod tests {
 
     fn unit_usage(unit: u16) -> Option<u8> {
         char::from_u32(u32::from(unit))
-            .and_then(us_stroke)
+            .and_then(unicode_key_stroke)
             .map(|s| s.usage)
     }
 
@@ -856,7 +889,9 @@ mod tests {
             }
             let r = k.unicode_press(unit).unwrap();
             if !r.ignored {
-                let stroke = char::from_u32(u32::from(unit)).and_then(us_stroke).unwrap();
+                let stroke = char::from_u32(u32::from(unit))
+                    .and_then(unicode_key_stroke)
+                    .unwrap();
                 self.shift = stroke.shift;
             }
             r
@@ -1005,7 +1040,7 @@ mod tests {
             .collect();
         let units: Vec<u16> = "AaVvZz1!@\n"
             .encode_utf16()
-            .chain([0xD800, 0x00E9])
+            .chain([0xD800, 0x00E9, 0x000D, 0x0008, 0x001B])
             .collect();
         for seed in 1..=64u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));

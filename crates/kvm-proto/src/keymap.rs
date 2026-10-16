@@ -19,7 +19,9 @@ pub const CLASS_SHIFT: u8 = 0x02;
 pub const CLASS_ALT: u8 = 0x04;
 pub const CLASS_GUI: u8 = 0x08;
 
+pub const USAGE_RETURN: u8 = 0x28;
 pub const USAGE_ESC: u8 = 0x29;
+pub const USAGE_BACKSPACE: u8 = 0x2A;
 pub const USAGE_CAPS_LOCK: u8 = 0x39;
 
 /// The usage for a set-1 make code; `extended` is the `E0` prefix. Pause
@@ -207,9 +209,29 @@ impl core::fmt::Debug for Stroke {
     }
 }
 
+/// The key a live Unicode key event types (§7.1, rev 6.3; PD11b I5): the US
+/// layout's stroke (`us_stroke`), plus the three control keys a client in
+/// its Unicode keyboard mode may send as units — CR as Return, BS as
+/// Backspace, ESC as Esc, each with no Shift. Paste (§8) keeps `us_stroke`:
+/// there CR is a line break and BS and ESC are skipped, never typed.
+#[must_use]
+pub fn unicode_key_stroke(c: char) -> Option<Stroke> {
+    let usage = match c {
+        '\r' => USAGE_RETURN,
+        '\u{8}' => USAGE_BACKSPACE,
+        '\u{1b}' => USAGE_ESC,
+        _ => return us_stroke(c),
+    };
+    Some(Stroke {
+        usage,
+        shift: false,
+    })
+}
+
 /// What the US layout types `c` with: printable ASCII, Tab, and `'\n'` as
 /// Return (§8 turns CR/LF/CRLF into `'\n'` first). Anything else — control
 /// characters, DEL, non-ASCII — has no stroke and is skipped by the caller.
+/// (Live Unicode key events go through `unicode_key_stroke`.)
 #[must_use]
 pub fn us_stroke(c: char) -> Option<Stroke> {
     let b = u8::try_from(c).ok()?;
@@ -556,6 +578,32 @@ mod tests {
         for c in ['\r', '\u{7f}', '\u{1b}', 'é', '€', '\u{1F600}', '\0'] {
             assert_eq!(us_stroke(c), None, "{c:?}");
         }
+    }
+
+    /// Rev 6.3 (PD11b I5): a live Unicode key event's stroke is the US
+    /// layout's, plus CR as Return, BS as Backspace and ESC as Esc (no
+    /// Shift) — and only those three: every other scalar maps exactly as
+    /// `us_stroke` does, and `us_stroke` (paste's table, §8) still has none
+    /// of the three.
+    #[test]
+    fn a_unicode_key_adds_return_backspace_and_esc_to_the_us_layout() {
+        let k = |usage, shift| Some(Stroke { usage, shift });
+        assert_eq!(unicode_key_stroke('\r'), k(0x28, false));
+        assert_eq!(unicode_key_stroke('\u{8}'), k(0x2A, false));
+        assert_eq!(unicode_key_stroke('\u{1b}'), k(0x29, false));
+        assert_eq!(unicode_key_stroke('\n'), k(0x28, false));
+        for c in ['\r', '\u{8}', '\u{1b}'] {
+            assert_eq!(us_stroke(c), None, "{c:?}: paste's table changed");
+        }
+        for c in (0u32..=0x3_0000).filter_map(char::from_u32) {
+            if !matches!(c, '\r' | '\u{8}' | '\u{1b}') {
+                assert_eq!(unicode_key_stroke(c), us_stroke(c), "{c:?}");
+            }
+        }
+        assert_eq!(
+            (USAGE_RETURN, USAGE_BACKSPACE, USAGE_ESC),
+            (0x28, 0x2A, 0x29)
+        );
     }
 
     /// PD5 ruling (§9.2): the Typist turns pasted text into strokes, so a
