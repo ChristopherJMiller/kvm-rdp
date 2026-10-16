@@ -405,9 +405,7 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
             ("certificate watcher", watcher_task),
             ("stale watch", stale_task),
         ],
-        // §4.5's cap, named: the stale watch's bound is three of it (DE16).
-        beat: (cfg.admin.liveness_timeout / 4)
-            .clamp(Duration::from_millis(10), crate::hid::stale::HEARTBEAT_MAX),
+        beat: heartbeat_period(cfg.admin.liveness_timeout),
         seam,
         #[cfg(feature = "test-hooks")]
         panic_after: cfg.test.panic_after.map(|d| (d, to_pump.clone())),
@@ -591,6 +589,13 @@ async fn first_panic(tasks: Essential) -> &'static str {
         Some(name) => name,
         None => std::future::pending().await,
     }
+}
+
+/// §4.5: the heartbeat's period, a quarter of `admin.liveness_timeout`,
+/// between 10 ms and §4.5's cap `HEARTBEAT_MAX` (1 s). The cap is named:
+/// the stale watch's 3 s bound is three of it (DE16).
+fn heartbeat_period(liveness_timeout: Duration) -> Duration {
+    (liveness_timeout / 4).clamp(Duration::from_millis(10), crate::hid::stale::HEARTBEAT_MAX)
 }
 
 /// §4.5: the RDP runtime's heartbeat for `/livez`.
@@ -1949,6 +1954,32 @@ mod tests {
             h.faults.send_replace(Some("certificate watcher"));
         })
         .await;
+    }
+
+    /// PE4 review m2 (DE16): the heartbeat the bridge runs beats every
+    /// `HEARTBEAT_MAX` (1 s) at the default `admin.liveness_timeout`, 10 s
+    /// (config's `defaults_match_the_spec_table`), and never slower whatever
+    /// the timeout — so the stale watch's 3 s bound is three of its periods
+    /// in what ships, not only in the const assert's constants.
+    #[test]
+    fn the_heartbeat_beats_at_least_every_heartbeat_max() {
+        use crate::hid::stale::{HEARTBEAT_MAX, RDP_STALE_RELEASE};
+        let s = Duration::from_secs;
+        assert_eq!(
+            heartbeat_period(s(10)),
+            s(1),
+            "the default liveness_timeout"
+        );
+        assert_eq!(HEARTBEAT_MAX, s(1));
+        for t in [s(4), s(60), s(3600)] {
+            assert_eq!(heartbeat_period(t), HEARTBEAT_MAX, "{t:?}");
+            assert!(RDP_STALE_RELEASE >= heartbeat_period(t) * 3, "{t:?}");
+        }
+        assert_eq!(heartbeat_period(s(1)), Duration::from_millis(250), "L2's");
+        assert_eq!(
+            heartbeat_period(Duration::from_millis(1)),
+            Duration::from_millis(10)
+        );
     }
 
     /// Plan E Task 1.5: the stale watch is an essential KVM-runtime task —
