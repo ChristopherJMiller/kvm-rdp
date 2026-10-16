@@ -149,8 +149,10 @@ most 64 KiB) and are never logged.
   reconnect is not pressed again by its repeats, only by a fresh press.
   A release counts only once the KVM has read it: a session that ends
   while the KVM is not reading (stalled, or its websocket down) gets one
-  more websocket, for at most 10 s, only to release, and a websocket lost
-  with a key held reconnects without waiting out its backoff.
+  more websocket, for at most 10 s, only to release; a websocket lost
+  with a key held reconnects without waiting out its backoff (once, until
+  a reopen lands); and every reopen states what is held once more after
+  the KVM answers its ping, so a reconnect during a stall ends released.
 - **Paste is one way, laptop to target, as typing.** Copy on the laptop,
   press the chord (`paste.chord`, default Ctrl+Option+Shift+V), and let go
   of the modifiers within `paste.modifier_wait` (5 s): the bridge asks the

@@ -60,6 +60,11 @@ rev 6.2's; it is added to it. One line per change:
 - §7.4 (m3, m5), §8 (m4): documented — a stalled RDP thread is healed only by `/livez`'s restart; a held mouse button arms no timer, by design (long drags); a queue overflow mid-paste drops characters and never holds a key. The first and last join the Plan E carries (§12).
 - §12 (m2): owner acceptance item 15, a focus change (Cmd+Tab away from Windows App and a click back in), with its rule.
 - §11.3 (I2): L2 cases for a session end during a KVM stall, one with the websocket down, and the release websocket's bound.
+- §7.4 (the re-review of the final fix wave, R-I1): the reopen without backoff while input is held happens at most once until a reopen has written its session start, so a KVM that resets every websocket right after its upgrade meets the backoff instead of a reconnect storm.
+- §7.3 (R-I2): every open writes a ping after its session start, with its own payload, and re-asserts once more `input.reassert_after` past the KVM's pong to it, so a reconnect or takeover during a KVM stall ends released; the timed re-assert stays for a KVM that never answers a ping, the residual being a stall longer than `reassert_after` on such a KVM.
+- §7.3, §7.4, §9.3 (r-m2): our close frame carries a reason, and only the KVM's pong or a close frame echoing ours proves the release; a close the KVM began proves nothing, and still ends with a FIN.
+- §7.4, §10.4 (r-m1): a takeover counts the release websocket it supersedes, even one aborted before it ran.
+- §11.3 (R-I2): L2 cases for a takeover and a reconnect during a KVM stall, at the production `reassert_after`.
 
 **Rev 6.2 — Plan C (2026-10-07 to 2026-10-08).** Records what building
 Milestone 3a settled, against the code as built. DC*n* are Plan C's recorded
@@ -1437,13 +1442,33 @@ under the core lock, and only input taken on the RDP thread is fed (§4.3).
   part while pointer reports wait (PD9 m1, re-review R-I1) — the newest
   state written ahead of a queued report would type a key early and then
   again, or break a drag. So it never overtakes a queued report.
+  Rev 6.3 (the re-review of Plan D's final fix wave, R-I2): a timed
+  re-assert can fire while the KVM is not reading — a reconnect or a
+  takeover during a stall opens at once, the KVM still stalled — and then
+  waits in the new websocket's buffer with the session start, read in no
+  set order against the abandoned websocket's leftovers (a reset
+  connection's data that already arrived stays readable), so the KVM can
+  end on a stale Cmd with no timer left to release it. So every open also
+  writes a ping after its session start, with its own payload (never the
+  close's, whose late pong would pass for a proof), bounded by
+  `hid_write_timeout`, and re-asserts once more `input.reassert_after`
+  past the KVM's pong to it: DD8's rule pong-gated, as the release
+  websocket's is (§7.4). Only the first such pong counts, and it proves
+  nothing about a release. The timed re-assert stays for a KVM that never
+  answers a ping; for that KVM, a reconnect or takeover during a stall
+  longer than `reassert_after` can still end on a stale report — Leg D
+  step 8 reads whether the ES3 answers pings.
 - `on_disconnected` sets release-all and then closes over the same ordered
   path, so the release is flushed before the socket closes. Rev 6.3 (Plan D
   final review I2): flushed is not read. The close writes a ping after the
-  release, and only the KVM's pong to it (or its answer to the close)
+  release, and only the KVM's pong to it (or its answer to our close)
   proves the KVM read it (`HidControl::confirm_read`); a KVM that answers
   no close frame — kvm-sim, perhaps the ES3 — still answers a ping. A
-  session end without that proof opens a release websocket (§7.4).
+  session end without that proof opens a release websocket (§7.4). Rev 6.3
+  (r-m2, the same re-review): our close frame carries a reason, and only a
+  close frame echoing it is the answer to ours; a close the KVM began may
+  cross ours before it read the release, so it proves nothing — though
+  any close frame of the KVM's still ends the websocket with a FIN.
 
 ### 7.4 Stuck-key safety
 
@@ -1517,7 +1542,8 @@ whether the ES3 keeps HID state across a websocket loss:
 - **The release websocket** (`hid::release`). The bridge tracks whether
   something held — a key, a modifier or a button — was written since the
   KVM last proved it read an all-up state: its pong to the ping written
-  after a release, or its answer to a close (`HidControl::kvm_may_hold`).
+  after a release, or its answer to our close — a close frame echoing
+  ours, not one it began (r-m2, §7.3) (`HidControl::kvm_may_hold`).
   A session that ends with that still open makes the KVM actor open one
   more websocket, bounded: the same pinned TLS, the session's token or one
   fresh login when it is refused (none after `kvm_auth_failed`, nothing at
@@ -1530,15 +1556,23 @@ whether the ES3 keeps HID state across a websocket loss:
   `release_websockets{outcome}`: `confirmed`, `unconfirmed` (written,
   never proved), `failed`, `superseded`. A new session's `Start`
   supersedes it — aborted and awaited, so the bridge holds one websocket
-  at a time, and that session's own open is the release — and a shutdown
-  waits for it only what §5.2's KVM step has left. A normal session end,
-  the KVM reading, opens nothing.
+  at a time, and that session's own open is the release (its ping and
+  pong-gated re-assert, §7.3, cover a takeover during a stall) — and a
+  shutdown waits for it only what §5.2's KVM step has left. Every run
+  counts one outcome: a takeover's, whose `Start` sits right behind its
+  `Stop` and aborts it before it ever ran, counts `superseded` (r-m1). A
+  normal session end, the KVM reading, opens nothing.
 - **No backoff while input is held.** A websocket lost mid-session while
   the last reports written (or the core's newest state) hold a key or a
   button reopens at once, not after `kvm.backoff`: a KVM that keeps a key
   held across the loss repeats it until the session-start sequence lands.
-  Once per loss: a failed reopen backs off as ever, and the reopen's own
-  session start holds nothing.
+  Rev 6.3 (R-I1, the re-review of the final fix wave): at most once until
+  a reopen has written its session start. "Held" reads what was last
+  written, and a reopen whose session-start writes fail writes nothing, so
+  a KVM that answers every upgrade and resets the connection at once
+  would otherwise see the old held key at every loss and be reopened as
+  fast as it answers (hundreds a second); it meets the backoff from the
+  second loss on, and a failed open backs off as ever.
 
 Leg D step 8 (plan Task 1.6) decides whether they are needed, and its
 rule keeps both either way: if the ES3 releases its HID state when a
@@ -1546,8 +1580,9 @@ websocket dies, they are extra releases — harmless; if it keeps a key held,
 they are required. What neither reaches: a key held while the KVM refuses
 every open or stays stalled — mid-session until a reopen lands (backing
 off up to `kvm.backoff.max` after the first), after a session end once the
-release websocket's 10 s are spent, until the next session — and a crash
-(§5.2).
+release websocket's 10 s are spent, until the next session — a crash
+(§5.2), and, on a KVM that never answers a ping, a reconnect or takeover
+during a stall longer than `input.reassert_after` (§7.3).
 
 Rev 6.3 (Plan D final review m3): **a stalled RDP thread is healed only by
 a restart.** The input core, its driver and both timers run on the RDP
@@ -1819,7 +1854,7 @@ case is the proof (§11.3).
 | A gateway token is replayed (a leaked `.rdp`) | Tokens are bound to the bridge's host; **`VerifyClientIp: true`** with `Server.TrustedProxies` = the edge and the edge stamping `X-Forwarded-For`, so a token works only from the address that fetched it — Leg C: a token minted for another address is refused (`E_PROXY_RAP_ACCESSDENIED`); NLA still applies (§9.4) | A token is reusable — Leg C opened two tunnels with one — until `exp` + 60 s (about 6 min) from the pinned address. Pinning refuses legitimate connections if `/connect` and the tunnel reach rdpgw from different addresses (split routing, NAT) |
 | rdpgw's session cookie bypasses its trusted-proxy check | **The edge strips `Set-Cookie: RDPGWSESSION`** from `/connect` responses, and `/connect` is reachable only through the auth proxy (§9.4). Leg C: the cookie from a proxied `/connect`, sent directly from an untrusted address with no identity header, got 200 and a fresh token, because rdpgw accepts an authenticated session before it checks `TrustedProxies`; IP pinning does not help, since that token carries the caller's own address | If a cookie escapes anyway, it mints tokens for its 120 s lifetime (`Max-Age=120`) |
 | A client that stops reading pins the session | `Closing` + disconnect watchdog + hard abort (§6.9) | — |
-| Bridge crash, or a session end the KVM does not read, with a key held | `panic = "abort"`; a release is sent on every orderly path — rev 6.3 (Plan D final review I2): it lands only if the KVM reads it, so a session end the KVM did not prove released (no pong to the ping after the release, nor an answer to the close) opens one bounded release websocket, and a websocket lost with input held reopens without its backoff (§7.4) | Depends on the KVM's behaviour on websocket loss (Plan D's L4, §12; rev 6.2). Rev 6.3: `kvm-probe hid-hold` measures it for a close, a FIN and a reset; Leg D has not run, so it is still unknown. Leg D step 8's rule: if the ES3 releases on websocket loss, the release websocket and the immediate reopen are harmless extra releases; if it keeps a key held, they are required — both ship either way. A crash cannot release (§5.2), nor can a release websocket the KVM never takes within its 10 s |
+| Bridge crash, or a session end the KVM does not read, with a key held | `panic = "abort"`; a release is sent on every orderly path — rev 6.3 (Plan D final review I2): it lands only if the KVM reads it, so a session end the KVM did not prove released (no pong to the ping after the release, nor an answer to our close — rev 6.3, r-m2: a close frame echoing ours) opens one bounded release websocket, and a websocket lost with input held reopens without its backoff (§7.4) | Depends on the KVM's behaviour on websocket loss (Plan D's L4, §12; rev 6.2). Rev 6.3: `kvm-probe hid-hold` measures it for a close, a FIN and a reset; Leg D has not run, so it is still unknown. Leg D step 8's rule: if the ES3 releases on websocket loss, the release websocket and the immediate reopen are harmless extra releases; if it keeps a key held, they are required — both ship either way. A crash cannot release (§5.2), nor can a release websocket the KVM never takes within its 10 s |
 | Census capture leaks or attacks the dev host | Sandbox (§12) | — |
 
 ### 9.4 Requirements on the companion spec
@@ -2020,7 +2055,7 @@ marked.
 | `kvm_rdp_paste_events_total` (rev 6.3) | counter | `outcome`: `started`, `done`, `no_text`, `caps_lock`, `multiline`, `oversize`, `backlog`, and an abort under its reason (final review m1): `aborted_esc`, `aborted_key`, `aborted_mouse`, `aborted_release` (a release-all, §7.4), `aborted_modifier_wait` (the text or a modifier's release not in time, DD4), `aborted_clipboard_failed`, `aborted_clipboard_lost` (the answer dropped in flight), `aborted_session` (its session ended) (§8). A paste that starts counts `started`, then one of `done`, `multiline`, `oversize` and the `aborted_*`; one refused at the chord counts only `no_text`, `caps_lock` or `backlog` |
 | `kvm_rdp_paste_skipped_chars_total` (rev 6.3) | counter | — (scalars §8's text handling skipped, counted when a paste is done) |
 | `kvm_rdp_clipboard_discarded_total` (rev 6.3) | counter | `reason`: `late`, `unasked` (answers no paste took), `in_flight` (dropped by the backend while another was in flight), `unanswered` (requests retired with no answer) — §8's clipboard answers |
-| `kvm_rdp_release_websockets_total` (rev 6.3, final review I2) | counter | `outcome`: `confirmed` (the KVM's pong after the release), `unconfirmed` (written, never proved), `failed` (no open carried it), `superseded` (a new session, or the exit, ended it first) — the release websocket after a session end the KVM did not prove released (§7.4) |
+| `kvm_rdp_release_websockets_total` (rev 6.3, final review I2) | counter | `outcome`: `confirmed` (the KVM's pong after the release), `unconfirmed` (written, never proved), `failed` (no open carried it), `superseded` (a new session, or the exit, ended it first — a takeover's too, even before it ran, r-m1) — the release websocket after a session end the KVM did not prove released (§7.4) |
 
 `frames_dropped` counts frames, not gate events (rev 6.2): a frame a gate
 drops counts that gate's reason — in Live, `burst_truncated` for a burst AU
@@ -2257,7 +2292,12 @@ time is budgeted for the harness itself. The video cases run once per
   ends released once it reads again; one that ends with the websocket down
   is released by the release websocket once kvm-sim takes one; and the
   release websocket gives up inside its 10 s, after at most 3 opens, never
-  logging out.
+  logging out. Rev 6.3 (the re-review of the final fix wave, R-I2): a
+  takeover, and a reconnect, while kvm-sim stalls with Cmd held — the new
+  websocket opened inside the stall, kvm-sim reading again 3 s past it, at
+  the production 1 s `reassert_after` — re-assert once kvm-sim reads again
+  and end released, the stale websocket's leftovers included; the
+  takeover counts the release websocket it superseded (r-m1).
 - **Paste**: `"a\r\nb\tc\u{1F600}\n"` → the exact report list (one Return, Tab,
   emoji skipped and counted, no trailing Return); `multiline = refuse` refuses
   `"a\nb"` but types `"a\n"`; a key pressed mid-typing never reaches kvm-sim;
