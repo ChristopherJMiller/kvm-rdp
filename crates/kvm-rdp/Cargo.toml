@@ -21,6 +21,15 @@ path = "src/main.rs"
 test = false
 bench = false
 
+[features]
+# Test seams the release image must not carry (Plan E Task 1.1, DE6): the
+# RDP-runtime stall behind `BridgeHandle::block_rdp_runtime_for` (L2's
+# /livez case), the pump shell's injected panic, and the `[test]
+# panic_after` key that fires it (§5.2's panic path, in debug and in
+# release). Every test build turns it on through the dev-dependency on this
+# package below; `cargo build --release -p kvm-rdp` (the image) never does.
+test-hooks = []
+
 [dependencies]
 kvm-proto = { path = "../kvm-proto" }
 ironrdp-server = { workspace = true }
@@ -67,6 +76,9 @@ libc = "0.2"
 # `start_paused` tests; without it `cargo test -p kvm-rdp` only builds
 # through workspace feature unification (kvm-sim enables test-util).
 tokio = { version = "1", features = ["test-util"] }
+# Turns `test-hooks` on for the lib's unit tests, L2 and the binary L2
+# spawns. Dev-dependency features never reach a non-test build (resolver 3).
+kvm-rdp = { path = ".", features = ["test-hooks"] }
 
 # The one integration-test binary (§13): every L2 case links here. `libc`
 # (L2's SIGTERM to the real binary, Task 6.6) is already a dev-dependency

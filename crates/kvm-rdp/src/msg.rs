@@ -8,7 +8,9 @@ use ironrdp_server::{ConnectionAbortHandle, ErrorInfo, GfxServerHandle};
 use kvm_proto::video::{AccessUnit, ParamClass, ParamSets};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(feature = "test-hooks")]
+use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::oneshot;
 
 pub type Gen = u64;
@@ -267,11 +269,13 @@ pub enum RdpInput {
     Shutdown {
         done: oneshot::Sender<()>,
     },
-    /// Test hook: block the RDP runtime (L2 `/livez`).
+    /// Test hook: block the RDP runtime (L2 `/livez`; DE6).
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     Stall(Duration),
-    /// Test hook (PC15 review m5): the pump shell panics, as a bug would.
-    #[cfg(test)]
+    /// Test hook: the pump shell panics, as a bug would — the lib's unit
+    /// tests (PC15 review m5) and `[test] panic_after` (Plan E, §5.2).
+    #[cfg(any(test, feature = "test-hooks"))]
     InjectedPanic,
 }
 
@@ -290,8 +294,9 @@ impl std::fmt::Debug for RdpInput {
             RdpInput::Fatal { .. } => "Fatal",
             RdpInput::Updates => "Updates",
             RdpInput::Shutdown { .. } => "Shutdown",
+            #[cfg(feature = "test-hooks")]
             RdpInput::Stall(_) => "Stall",
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             RdpInput::InjectedPanic => "InjectedPanic",
         };
         f.write_str(name)

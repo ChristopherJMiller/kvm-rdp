@@ -1172,6 +1172,32 @@ async fn shutdown_completes_with_the_kvm_unreachable() {
     assert_eq!(sim.stats().logouts, 0);
 }
 
+/// Plan E Task 1.1 (spec §5.2): a panic in a task the bridge cannot run
+/// without — the pump shell, through `test-hooks`' `[test] panic_after` —
+/// ends the binary. This is the test profile (`panic = "unwind"`): the RDP
+/// server stops, the binary exits 1, and the log names the dead task.
+/// Release's `panic = "abort"` is Task 5.3's `panic-abort` scenario.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_panicked_pump_shell_ends_the_binary_with_exit_1() {
+    let sim = KvmSim::start(es3()).await.unwrap();
+    let d = tempfile::tempdir().unwrap();
+    write_files(&sim, d.path());
+    let toml = d.path().join("kvm-rdp.toml");
+    let text = std::fs::read_to_string(&toml).unwrap();
+    std::fs::write(&toml, format!("{text}[test]\npanic_after = \"500ms\"\n")).unwrap();
+    let mut bin = Bin::spawn(d.path(), &[]);
+    bin.ready().await;
+    let status = bin.wait(T).await;
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    let out = bin.output();
+    assert!(
+        out.iter()
+            .any(|l| l.contains("a task the bridge needs panicked")),
+        "no essential-task line: {out:?}"
+    );
+    assert_eq!(sim.stats().logouts, 0);
+}
+
 /// §5.2: a `Quit` that a live connection consumes ends only that connection;
 /// stopping the server takes a second. The test hook runs §5.2 without step
 /// 3 (the disconnect), so the client is still connected when the first

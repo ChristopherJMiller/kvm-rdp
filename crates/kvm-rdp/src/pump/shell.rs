@@ -45,6 +45,7 @@ pub const TICK: Duration = Duration::from_millis(50);
 /// §5.2's disconnect watchdog, inside the 5 s exit (DC13).
 pub const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(2);
 /// The `Stall` test hook never blocks longer than this.
+#[cfg(feature = "test-hooks")]
 const MAX_STALL: Duration = Duration::from_secs(30);
 /// A held resize re-reads IronRDP's write counter this long after it was
 /// held, then twice as long each time, up to `RESIZE_POLL_MAX` (PC17 I4,
@@ -445,9 +446,10 @@ impl PumpShell {
                 self.exec(cmds).await;
             }
             // Test hook (L2 `/livez`): block this runtime's thread.
+            #[cfg(feature = "test-hooks")]
             RdpInput::Stall(d) => std::thread::sleep(d.min(MAX_STALL)),
-            // Test hook (PC15 review m5): a bug in the shell.
-            #[cfg(test)]
+            // Test hook: a bug in the shell (unit tests; `[test] panic_after`).
+            #[cfg(any(test, feature = "test-hooks"))]
             #[allow(clippy::panic)]
             RdpInput::InjectedPanic => panic!("injected: the pump shell panics"),
         }

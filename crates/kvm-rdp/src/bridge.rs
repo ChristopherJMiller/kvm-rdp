@@ -198,6 +198,9 @@ struct RdpParts {
     essential: Essential,
     /// The fault seam, for the RDP thread's own essential tasks.
     seam: FaultSeam,
+    /// `[test] panic_after` (DE6): when, and the channel the panic goes on.
+    #[cfg(feature = "test-hooks")]
+    panic_after: Option<(Duration, mpsc::UnboundedSender<RdpInput>)>,
 }
 
 /// The tasks the bridge cannot work without (PC15 review m5), by name.
@@ -397,6 +400,8 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
         beat: (cfg.admin.liveness_timeout / 4)
             .clamp(Duration::from_millis(10), Duration::from_secs(1)),
         seam,
+        #[cfg(feature = "test-hooks")]
+        panic_after: cfg.test.panic_after.map(|d| (d, to_pump.clone())),
     };
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Ready>();
     let rdp_thread = match std::thread::Builder::new()
@@ -470,6 +475,8 @@ fn rdp_main(p: RdpParts, ready: std::sync::mpsc::Sender<Ready>, done: watch::Sen
             beat,
             mut essential,
             seam,
+            #[cfg(feature = "test-hooks")]
+            panic_after,
         } = p;
         // The handler takes input on this thread only (PD9 fix round 1, I1).
         shell.input.bind_rdp_thread();
@@ -498,6 +505,15 @@ fn rdp_main(p: RdpParts, ready: std::sync::mpsc::Sender<Ready>, done: watch::Sen
         };
         let shell = tokio::task::spawn_local(PumpShell::new(deps).run(rdp_inputs, kvm_events));
         essential.push(("pump shell", shell));
+        // DE6: the pump shell panics on cue — §5.2's path, testable in a
+        // release build (Task 5.3) and absent from the image.
+        #[cfg(feature = "test-hooks")]
+        if let Some((after, to_pump)) = panic_after {
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(after).await;
+                let _ = to_pump.send(RdpInput::InjectedPanic);
+            });
+        }
         tokio::task::spawn_local(heartbeat(health, beat));
         let mut run =
             tokio::task::spawn_local(
@@ -804,7 +820,8 @@ impl BridgeHandle {
         why
     }
 
-    /// Test hook (L2 `/livez`): block the RDP runtime's thread for `d`.
+    /// Test hook (L2 `/livez`; DE6): block the RDP runtime's thread for `d`.
+    #[cfg(feature = "test-hooks")]
     #[doc(hidden)]
     pub fn block_rdp_runtime_for(&self, d: Duration) {
         let _ = self.ctl.to_pump.send(RdpInput::Stall(d));

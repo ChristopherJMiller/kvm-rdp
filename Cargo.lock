@@ -1955,6 +1955,7 @@ dependencies = [
  "ironrdp-tls",
  "ironrdp-tokio",
  "kvm-proto",
+ "kvm-rdp",
  "kvm-sim",
  "libc",
  "rcgen",

@@ -269,6 +269,15 @@ pub struct LogConfig {
     pub filter: String,
 }
 
+/// `[test]` (DE6): test seams, only in `test-hooks` builds — the image
+/// refuses the table as an unknown key.
+#[cfg(feature = "test-hooks")]
+#[derive(Debug, Clone, Default)]
+pub struct TestConfig {
+    /// Make the pump shell panic this long after startup (§5.2's path).
+    pub panic_after: Option<Duration>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub rdp: RdpConfig,
@@ -279,6 +288,8 @@ pub struct Config {
     pub paste: PasteConfig,
     pub security: SecurityConfig,
     pub log: LogConfig,
+    #[cfg(feature = "test-hooks")]
+    pub test: TestConfig,
 }
 
 impl Config {
@@ -436,6 +447,8 @@ struct Raw {
     paste: RawPaste,
     security: RawSecurity,
     log: RawLog,
+    #[cfg(feature = "test-hooks")]
+    test: RawTest,
 }
 
 #[derive(Deserialize, Default)]
@@ -540,6 +553,13 @@ struct RawSecurity {
 #[serde(deny_unknown_fields, default)]
 struct RawLog {
     filter: Option<String>,
+}
+
+#[cfg(feature = "test-hooks")]
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, default)]
+struct RawTest {
+    panic_after: Option<String>,
 }
 
 fn dur(v: Option<&String>, default: Duration, key: &str) -> Result<Duration, ConfigError> {
@@ -898,6 +918,15 @@ fn build(raw: Raw, base: &Path) -> Result<Config, ConfigError> {
     let log = LogConfig {
         filter: raw.log.filter.unwrap_or_else(|| "info".to_owned()),
     };
+    #[cfg(feature = "test-hooks")]
+    let test = TestConfig {
+        panic_after: raw
+            .test
+            .panic_after
+            .as_ref()
+            .map(|s| dur(Some(s), Duration::ZERO, "test.panic_after"))
+            .transpose()?,
+    };
     Ok(Config {
         rdp,
         admin,
@@ -907,6 +936,8 @@ fn build(raw: Raw, base: &Path) -> Result<Config, ConfigError> {
         paste,
         security,
         log,
+        #[cfg(feature = "test-hooks")]
+        test,
     })
 }
 
@@ -1039,6 +1070,30 @@ pub(crate) mod tests {
         assert_eq!(c.log.filter, "info");
         assert_eq!(c.kvm.password.expose(), "kvm-secret");
         assert_eq!(c.rdp.nla_password.expose(), NLA);
+    }
+
+    /// Plan E Task 1.1 (DE6): `[test] panic_after` is a `test-hooks` key —
+    /// off by default, a duration when set, its key named when it is not.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_panic_after_parses_and_is_off_by_default() {
+        let d = tempfile::tempdir().unwrap();
+        let base = minimal(d.path());
+        assert_eq!(load(d.path(), &base).unwrap().test.panic_after, None);
+        let c = load(
+            d.path(),
+            &format!("{base}[test]\npanic_after = \"750ms\"\n"),
+        )
+        .unwrap();
+        assert_eq!(c.test.panic_after, Some(Duration::from_millis(750)));
+        let e = load(d.path(), &format!("{base}[test]\npanic_after = \"soon\"\n"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("test.panic_after"), "{e}");
+        assert!(
+            !e.contains("soon"),
+            "a config error never echoes the file: {e}"
+        );
     }
 
     /// DD11: `paste.chord` is parsed at load — one or more distinct
@@ -1236,7 +1291,7 @@ pub(crate) mod tests {
             base.replace(line, &format!("{key} = {value}"))
         };
         let t = |text: String, what: &'static str| (text.into_bytes(), what);
-        vec![
+        let mut shapes = vec![
             // C1 (final review): a secret written where a file name goes —
             // every `*_file` key; a TLS key path may be a pasted PEM. The
             // TLS pair is read at startup, not by the loader (§4.4), so
@@ -1432,7 +1487,14 @@ pub(crate) mod tests {
             ),
             // Over the 1 MiB cap: refused before it is parsed.
             t(s.repeat((2 << 20) / s.len()), "a file over 1 MiB"),
-        ]
+        ];
+        // DE6: `[test] panic_after`'s rule never echoes its value either.
+        #[cfg(feature = "test-hooks")]
+        shapes.push(t(
+            format!("{base}[test]\npanic_after = \"{s}\"\n"),
+            "a secret as test.panic_after",
+        ));
+        shapes
     }
 
     /// How many of `leak_shapes` load: the TLS file shapes, whose error
