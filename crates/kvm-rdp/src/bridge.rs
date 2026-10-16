@@ -38,7 +38,9 @@ pub const FLUSH_WAIT: Duration = Duration::from_millis(500);
 pub const DISCONNECT_WAIT: Duration = Duration::from_millis(2200);
 /// Covers the KVM actor's slowest `Stop`/`Shutdown` (`session::STOP_BOUND`,
 /// 600 ms): one may still be running from the disconnect when this step's
-/// `Shutdown` is queued behind it.
+/// `Shutdown` is queued behind it. I2: a `Shutdown` also waits up to
+/// `session::SHUTDOWN_RELEASE_WAIT` for a release websocket, 950 ms in all
+/// (`session::SHUTDOWN_BOUND`).
 pub const KVM_CLOSE_WAIT: Duration = Duration::from_secs(1);
 pub const QUIT_WAIT: Duration = Duration::from_millis(500);
 /// What `run_until_signal` gives the KVM runtime's tasks after §5.2:
@@ -1850,6 +1852,8 @@ mod tests {
         assert!(at[1] - at[0] >= QUIT_WAIT, "{:?}", at[1] - at[0]);
         assert_eq!(held.lock().unwrap().len(), 2, "FlushHid and Shutdown only");
         assert!(KVM_CLOSE_WAIT > crate::kvm::session::STOP_BOUND);
+        // I2: a Shutdown also waits for a release websocket, what fits.
+        assert!(KVM_CLOSE_WAIT > crate::kvm::session::SHUTDOWN_BOUND);
         assert!(DISCONNECT_WAIT > crate::pump::shell::SHUTDOWN_WATCHDOG + crate::pump::shell::TICK);
     }
 

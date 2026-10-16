@@ -308,3 +308,180 @@ async fn a_reconnect_reasserts_the_full_state() {
     assert_eq!(env.metrics().release_all.get("websocket_reconnect"), 1);
     assert!(terminated(&c.events()).is_none());
 }
+
+// ---- I2 (Plan D final review): the release websocket, end to end.
+
+/// What the KVM holds if it keeps the last report it read (kvm-sim's model,
+/// and Leg D step 8's open question for the ES3): the last keyboard report's
+/// modifiers and keys and the last button mask kvm-sim read, on any
+/// websocket, in its order.
+fn kvm_holds(log: &[SimEvent]) -> (u8, [u8; 5], u8) {
+    let mut held = (0, [0; 5], 0);
+    for e in log {
+        if let SimEvent::Hid { bytes, .. } = e {
+            match HidFrame::decode(bytes) {
+                Ok(HidFrame::Keyboard { modifiers, keys }) => (held.0, held.1) = (modifiers, keys),
+                Ok(HidFrame::AbsMouse { buttons, .. } | HidFrame::Wheel { buttons, .. }) => {
+                    held.2 = buttons;
+                }
+                Ok(HidFrame::SetMode { .. }) => {}
+                Err(_) => panic!("kvm-sim read an undecodable frame: {bytes:02x?}"),
+            }
+        }
+    }
+    held
+}
+
+const NOTHING: (u8, [u8; 5], u8) = (0, [0; 5], 0);
+const CMD: (u8, [u8; 5], u8) = (0x08, [0; 5], 0);
+/// Set-1 `E0 5B`: the left GUI key, Cmd on the Mac.
+const LGUI: u8 = 0x5B;
+
+fn refusals(log: &[SimEvent]) -> usize {
+    log.iter()
+        .filter(|e| matches!(e, SimEvent::WsRefused { .. }))
+        .count()
+}
+
+/// A client streaming on a sized ES3 whose websocket carries Cmd held.
+async fn holding_cmd(env: &crate::harness::Env) -> crate::client::Client {
+    let c = env.client(Opts::new(2));
+    c.wait_for(T, |e| pictures(e).len() >= 3).await;
+    env.hid_ready().await;
+    c.key_extended(LGUI, true);
+    env.sim
+        .wait_for(T, |l| kvm_holds(l) == CMD)
+        .await
+        .expect("Cmd never reached the KVM");
+    c
+}
+
+/// Count of `release_websockets{outcome}` reaching `n` within `limit`.
+async fn released(env: &crate::harness::Env, outcome: &str, n: u64, limit: Duration) {
+    let m = env.metrics();
+    assert!(
+        until(limit, || m.release_websockets.get(outcome) >= n).await,
+        "release_websockets{{{outcome}}} never reached {n} (all: {})",
+        m.release_websockets.total()
+    );
+}
+
+/// I2: the session ends while the KVM is not reading — Cmd held, kvm-sim's
+/// 4 KiB control buffer and the 16 KiB send cap full of a flood, its reads
+/// paused — so the release never lands on the session's own websocket (its
+/// write blocks, and it is reset). The end opens a release websocket, which
+/// kvm-sim takes while paused; once it reads again — the abandoned
+/// websocket's stale reports included — the last state it read is released,
+/// counted `confirmed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_end_during_a_kvm_stall_is_released_once_it_reads_again() {
+    let mut sim = es3();
+    sim.control_recv_buffer = Some(4096);
+    let env = env(sim, |c| {
+        sized(c);
+        c.input.reassert_after = ms(200);
+    })
+    .await;
+    let c = holding_cmd(&env).await;
+    let ws = *ws_opens(&env.sim.events()).last().unwrap();
+    env.sim.set_policy(|p| p.pause_ws_reads = true);
+    let flood: Vec<(u8, bool)> = (0..2000)
+        .flat_map(|i| {
+            let k = [0x1E, 0x30, 0x2E][i % 3];
+            [(k, true), (k, false)]
+        })
+        .collect();
+    c.keys(&flood);
+    tokio::time::sleep(ms(300)).await;
+    c.close();
+    // kvm-sim takes the release websocket's upgrade with its reads paused.
+    env.sim
+        .wait_for(T, |l| ws_opens(l).len() == 2)
+        .await
+        .expect("no release websocket after the session end");
+    tokio::time::sleep(ms(300)).await;
+    assert_ne!(
+        kvm_holds(&env.sim.events()),
+        NOTHING,
+        "released before kvm-sim read again"
+    );
+    env.sim.set_policy(|p| p.pause_ws_reads = false);
+    released(&env, "confirmed", 1, T).await;
+    let log = env
+        .sim
+        .wait_for(T, |l| l.contains(&SimEvent::WsClose { conn: ws }))
+        .await
+        .expect("the stalled websocket never ended");
+    assert_eq!(
+        kvm_holds(&log),
+        NOTHING,
+        "the KVM still holds what it read last"
+    );
+    assert_eq!(env.metrics().release_websockets.total(), 1);
+}
+
+/// I2: the session ends while its websocket is down — kvm-sim refusing
+/// every reopen — so nothing released the Cmd the KVM read last. The
+/// release websocket the end opens delivers the release once kvm-sim takes
+/// a websocket again: one websocket at a time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_end_with_the_websocket_down_is_released_by_a_release_websocket() {
+    let env = env(es3(), sized).await;
+    let c = holding_cmd(&env).await;
+    env.sim.set_policy(|p| p.ws_status = Some(503));
+    env.sim.close_websockets();
+    env.sim
+        .wait_for(T, |l| refusals(l) >= 1)
+        .await
+        .expect("no reopen was refused");
+    let ended = env.metrics().release_all.get("session_end");
+    c.close();
+    assert!(until(T, || env.metrics().release_all.get("session_end") > ended).await);
+    tokio::time::sleep(ms(300)).await;
+    assert_eq!(kvm_holds(&env.sim.events()), CMD, "released while down");
+    env.sim.set_policy(|p| p.ws_status = None);
+    released(&env, "confirmed", 1, T).await;
+    let log = env.sim.events();
+    assert_eq!(kvm_holds(&log), NOTHING);
+    assert_eq!(ws_opens(&log).len(), 2);
+    assert_eq!(env.sim.stats().ws_max_open, 1);
+}
+
+/// I2, bounded: with kvm-sim refusing every websocket after the session
+/// end, the release websocket makes `ATTEMPTS` opens and gives up inside
+/// its 10 s budget, counted `failed`, and opens nothing after; never a
+/// logout (`Env`'s drop checks it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_release_websocket_gives_up_inside_its_budget() {
+    use kvm_rdp::hid::release::{ATTEMPTS, BUDGET, RETRY_GAP};
+    let env = env(es3(), sized).await;
+    let c = holding_cmd(&env).await;
+    env.sim.set_policy(|p| p.ws_status = Some(503));
+    env.sim.close_websockets();
+    env.sim
+        .wait_for(T, |l| refusals(l) >= 1)
+        .await
+        .expect("no reopen was refused");
+    let ended = env.metrics().release_all.get("session_end");
+    c.close();
+    assert!(until(T, || env.metrics().release_all.get("session_end") > ended).await);
+    let (t0, before) = (std::time::Instant::now(), refusals(&env.sim.events()));
+    released(&env, "failed", 1, BUDGET + ms(2000)).await;
+    let took = t0.elapsed();
+    assert!(took >= RETRY_GAP && took <= BUDGET, "{took:?}");
+    let after = refusals(&env.sim.events());
+    // The writer's last reopen may still have been in flight at the end.
+    assert!(
+        after - before <= usize::try_from(ATTEMPTS).unwrap() + 1,
+        "{} refused opens after the session end",
+        after - before
+    );
+    tokio::time::sleep(RETRY_GAP * 2).await;
+    assert_eq!(
+        refusals(&env.sim.events()),
+        after,
+        "an open after giving up"
+    );
+    assert_eq!(kvm_holds(&env.sim.events()), CMD);
+    assert_eq!(env.metrics().release_websockets.total(), 1);
+}

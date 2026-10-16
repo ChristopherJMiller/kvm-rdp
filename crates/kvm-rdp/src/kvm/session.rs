@@ -24,6 +24,7 @@
 //! into at most once per backoff, never as fast as it answers (I1).
 use crate::config::{BackoffConfig, Config, Secret};
 use crate::hid::HidControl;
+use crate::hid::release::{self, ReleaseJob};
 use crate::hid::writer::{WsCtl, WsEvent, WsTask};
 use crate::kvm::endpoint::KvmEndpoint;
 use crate::kvm::error::{FailClass, KvmError};
@@ -56,6 +57,15 @@ const ABORT_WAIT: Duration = Duration::from_millis(100);
 /// The longest a `Stop` or `Shutdown` keeps the actor (`close()`): §5.2's
 /// KVM step in `bridge` must cover it.
 pub const STOP_BOUND: Duration = CLOSE_WAIT.saturating_add(ABORT_WAIT);
+/// I2 (Plan D final review): how long a `Shutdown` waits for a release
+/// websocket still running — what §5.2's 1 s KVM step has left after a
+/// `Stop`'s `STOP_BOUND`. Past it the release runs on, detached, until the
+/// runtime's teardown drops it (counted `superseded`): it attempts what fits
+/// in the 5 s exit, and never holds it up.
+pub const SHUTDOWN_RELEASE_WAIT: Duration = Duration::from_millis(350);
+/// The longest a `Shutdown` keeps the actor, a session's close and a
+/// release websocket's wait together: §5.2's KVM step must cover it.
+pub const SHUTDOWN_BOUND: Duration = STOP_BOUND.saturating_add(SHUTDOWN_RELEASE_WAIT);
 
 pub struct SessionConfig {
     pub password: Secret,
@@ -105,6 +115,10 @@ fn ack(done: Option<oneshot::Sender<()>>) {
 
 pub async fn run_actor(mut rx: mpsc::UnboundedReceiver<KvmCommand>, deps: KvmDeps) {
     let mut next: Option<KvmCommand> = None;
+    // I2 (Plan D final review): the release websocket a session's end
+    // opened, while it runs (`hid::release`). Dropped with the actor, it
+    // runs on, detached.
+    let mut releasing: Option<JoinHandle<release::Outcome>> = None;
     loop {
         let cmd = match next.take() {
             Some(c) => c,
@@ -115,13 +129,30 @@ pub async fn run_actor(mut rx: mpsc::UnboundedReceiver<KvmCommand>, deps: KvmDep
         };
         match cmd {
             KvmCommand::Start { generation } => {
-                next = Session::new(generation, &deps).run(&mut rx).await;
+                supersede(releasing.take()).await;
+                let (after, job) = Session::new(generation, &deps).run(&mut rx).await;
+                next = after;
+                if let Some(job) = job {
+                    if matches!(next, Some(KvmCommand::Start { .. })) {
+                        // The next session's own open is the release.
+                        deps.metrics
+                            .release_websockets
+                            .inc(release::Outcome::Superseded.label());
+                    } else {
+                        releasing = Some(tokio::spawn(release::run(job)));
+                    }
+                }
             }
             KvmCommand::Stop { done, .. } => ack(done),
             KvmCommand::FlushHid { done } => {
                 let _ = done.send(());
             }
             KvmCommand::Shutdown { done } => {
+                // What fits of a release still running (§5.2); dropping
+                // the handle detaches it.
+                if let Some(r) = releasing.take() {
+                    let _ = tokio::time::timeout(SHUTDOWN_RELEASE_WAIT, r).await;
+                }
                 let _ = done.send(());
                 return;
             }
@@ -129,6 +160,20 @@ pub async fn run_actor(mut rx: mpsc::UnboundedReceiver<KvmCommand>, deps: KvmDep
             | KvmCommand::RequestIdr { .. }
             | KvmCommand::ReconnectFlv { .. } => {}
         }
+    }
+}
+
+/// A new session's `Start` ends a release websocket still running: the
+/// session's own open is the release, and the bridge holds one websocket at
+/// a time. Its drop is asynchronous, so wait for it (bounded, as `close`
+/// waits for an aborted writer); it counts itself `superseded`.
+async fn supersede(releasing: Option<JoinHandle<release::Outcome>>) {
+    let Some(r) = releasing.filter(|r| !r.is_finished()) else {
+        return;
+    };
+    r.abort();
+    if tokio::time::timeout(ABORT_WAIT, r).await.is_err() {
+        tracing::warn!("a release websocket outlived its abort wait");
     }
 }
 
@@ -166,6 +211,10 @@ struct Session<'d> {
     video: Video,
     side: Option<JoinHandle<Result<(), KvmError>>>,
     fatal: bool,
+    /// The session's fatal cause, if it had one: a release websocket never
+    /// logs in after `kvm_auth_failed`, and never opens after
+    /// `kvm_cert_mismatch` (I2).
+    cause: Option<Cause>,
 }
 
 impl<'d> Session<'d> {
@@ -219,12 +268,47 @@ impl<'d> Session<'d> {
             video,
             side: None,
             fatal: false,
+            cause: None,
         }
     }
 
     /// Serve this generation; returns a command that must be handled by
-    /// the actor next (a `Start` or `Shutdown` that ended it), if any.
-    async fn run(mut self, rx: &mut mpsc::UnboundedReceiver<KvmCommand>) -> Option<KvmCommand> {
+    /// the actor next (a `Start` or `Shutdown` that ended it), if any, and
+    /// the release websocket its end needs, if the KVM may still hold
+    /// something of ours (I2).
+    async fn run(
+        mut self,
+        rx: &mut mpsc::UnboundedReceiver<KvmCommand>,
+    ) -> (Option<KvmCommand>, Option<ReleaseJob>) {
+        let next = self.serve(rx).await;
+        (next, self.release_job())
+    }
+
+    /// I2 (Plan D final review): after `close`, the release websocket the
+    /// session's end needs — none if the KVM proved it read an all-up state
+    /// (`HidControl::kvm_may_hold`), as a normal session end does, or if
+    /// the KVM's certificate is not the pinned one.
+    fn release_job(&self) -> Option<ReleaseJob> {
+        let deps = self.deps;
+        if !deps.hid.kvm_may_hold() || self.cause == Some(Cause::KvmCertMismatch) {
+            return None;
+        }
+        let cfg = &deps.cfg;
+        Some(ReleaseJob {
+            ep: deps.ep.clone(),
+            token: self.token.borrow().as_ref().map(|(_, t)| t.clone()),
+            password: (self.cause != Some(Cause::KvmAuthFailed)).then(|| cfg.password.clone()),
+            connect_timeout: cfg.connect_timeout,
+            login_timeout: cfg.login_timeout,
+            write_timeout: cfg.hid_write_timeout,
+            settle: cfg.reassert_after,
+            budget: release::BUDGET,
+            hid: deps.hid.clone(),
+            metrics: deps.metrics.clone(),
+        })
+    }
+
+    async fn serve(&mut self, rx: &mut mpsc::UnboundedReceiver<KvmCommand>) -> Option<KvmCommand> {
         self.deadline.started(Instant::now());
         self.start_login();
         let mut tick = tokio::time::interval(TICK);
@@ -499,6 +583,7 @@ impl<'d> Session<'d> {
             return;
         }
         self.fatal = true;
+        self.cause = Some(cause);
         self.video.close();
         if let Some(side) = self.side.take() {
             side.abort();
@@ -1728,24 +1813,25 @@ mod tests {
             .collect()
     }
 
-    /// Push key presses until the HID writer is blocked — kvm-sim is not
-    /// reading — with nothing written for 200 ms (bounded: 15 s).
+    /// Push keyboard reports until the HID writer is blocked — kvm-sim is
+    /// not reading — with nothing written for 200 ms (bounded: 15 s). All
+    /// up (I2): the KVM may hold nothing of them, so no release websocket
+    /// follows a Stop and a reconnect keeps its backoff. These cases are the
+    /// reset's; a held key's are the release websocket's (below).
     async fn flood_until_blocked(r: &Rig) {
         let t0 = std::time::Instant::now();
         let sent = || r.metrics.hid_reports_sent.get();
         let (mut n, mut at) = (sent(), std::time::Instant::now());
-        let mut k = 0u8;
         loop {
             assert!(
                 t0.elapsed() < Duration::from_secs(15),
                 "the writes never blocked"
             );
             for _ in 0..64 {
-                k = k.wrapping_add(1);
                 r.hid.push(
                     HidFrame::Keyboard {
                         modifiers: 0,
-                        keys: [4 + k % 20, 0, 0, 0, 0],
+                        keys: [0; 5],
                     },
                     false,
                 );
@@ -1870,6 +1956,176 @@ mod tests {
         .expect("no write timed out");
         the_old_websocket_is_gone(&r, old, read_before, None).await;
         r.stop(1).await;
+    }
+
+    // ---- I2 (Plan D final review): the release websocket.
+
+    const CMD: HidFrame = HidFrame::Keyboard {
+        modifiers: 0x08,
+        keys: [0; 5],
+    };
+
+    /// Cmd held on the KVM: its report written on the session's websocket.
+    async fn hold_cmd(r: &Rig) {
+        r.input_ready().await;
+        let n = r.metrics.hid_reports_sent.get();
+        r.hid.push(CMD, false);
+        tokio::time::timeout(T, async {
+            while r.metrics.hid_reports_sent.get() == n {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("Cmd was never written");
+        r.sim
+            .wait_for(T, |_| r.last_kbd() == CMD.to_vec())
+            .await
+            .unwrap();
+        assert!(r.hid.kvm_may_hold());
+    }
+
+    impl Rig {
+        /// The last keyboard report kvm-sim read, on any websocket: what a
+        /// KVM that keeps the last report it read holds.
+        fn last_kbd(&self) -> Vec<u8> {
+            self.hid_bytes()
+                .into_iter()
+                .rev()
+                .find(|b| b.len() == 12)
+                .unwrap_or_default()
+        }
+
+        fn refusals(&self) -> usize {
+            self.sim
+                .events()
+                .iter()
+                .filter(|e| matches!(e, SimEvent::WsRefused { .. }))
+                .count()
+        }
+
+        /// The session's websocket closed, and its reopens refused (503).
+        async fn websocket_down(&self) {
+            let before = self.refusals();
+            self.sim.set_policy(|p| p.ws_status = Some(503));
+            self.sim.close_websockets();
+            self.sim
+                .wait_for(T, |_| self.refusals() > before)
+                .await
+                .expect("no reopen was refused");
+        }
+    }
+
+    /// A session end the KVM proved — it read the release and answered the
+    /// ping — opens no release websocket: a normal end is as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_proved_session_end_opens_no_release_websocket() {
+        let r = rig(None, |_| {}).await;
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        hold_cmd(&r).await;
+        r.hid.release_all(ReleaseTrigger::SessionEnd);
+        r.stop(1).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!r.hid.kvm_may_hold());
+        assert_eq!(ws_conns(&r.sim.events()).len(), 1);
+        assert_eq!(r.metrics.release_websockets.total(), 0);
+        assert_eq!(r.last_kbd(), KBD_ZERO.to_vec());
+    }
+
+    /// A session that ends with its websocket down — the KVM refusing every
+    /// reopen — leaves the KVM holding Cmd. The release websocket the end
+    /// opens delivers the release once the KVM takes a websocket again,
+    /// inside its budget, counted `confirmed`: one websocket at a time,
+    /// never a logout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_end_with_the_websocket_down_is_released_by_a_release_websocket() {
+        let r = rig(None, |_| {}).await;
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        hold_cmd(&r).await;
+        r.websocket_down().await;
+        r.hid.release_all(ReleaseTrigger::SessionEnd);
+        r.stop(1).await;
+        assert_eq!(r.last_kbd(), CMD.to_vec(), "the KVM was released already");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        r.sim.set_policy(|p| p.ws_status = None);
+        let m = r.metrics.clone();
+        tokio::time::timeout(release::BUDGET, async {
+            while m.release_websockets.get("confirmed") == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("no release websocket confirmed its release");
+        assert_eq!(r.last_kbd(), KBD_ZERO.to_vec());
+        assert!(!r.hid.kvm_may_hold());
+        assert_eq!(ws_conns(&r.sim.events()).len(), 2);
+        let s = r.sim.stats();
+        assert_eq!((s.ws_max_open, s.logouts), (1, 0));
+        assert_eq!(r.metrics.release_websockets.total(), 1);
+    }
+
+    /// A `Start` supersedes a release websocket still running: it is
+    /// aborted (counted `superseded`) before the new session logs in, and
+    /// the new session's own open is the release.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_start_supersedes_a_release_websocket() {
+        let r = rig(None, |_| {}).await;
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        hold_cmd(&r).await;
+        r.websocket_down().await;
+        r.hid.release_all(ReleaseTrigger::SessionEnd);
+        r.stop(1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let logins = r.sim.stats().logins_ok;
+        r.tx.send(KvmCommand::Start { generation: 2 }).unwrap();
+        let m = r.metrics.clone();
+        tokio::time::timeout(T, async {
+            while m.release_websockets.get("superseded") == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the Start did not supersede the release websocket");
+        r.sim
+            .wait_for(T, |_| r.sim.stats().logins_ok > logins)
+            .await
+            .unwrap();
+        r.sim.set_policy(|p| p.ws_status = None);
+        r.sim
+            .wait_for(T, |e| {
+                ws_conns(e).len() == 2 && hid_at(e, ws_conns(e)[1]).len() >= 2
+            })
+            .await
+            .unwrap();
+        assert_eq!(r.last_kbd(), KBD_ZERO.to_vec());
+        assert_eq!(r.metrics.release_websockets.total(), 1);
+        assert_eq!(r.sim.stats().ws_max_open, 1);
+        r.stop(2).await;
+    }
+
+    /// §5.2: a `Shutdown` waits for a release websocket still running only
+    /// what the KVM step has left (`SHUTDOWN_RELEASE_WAIT`), then the actor
+    /// ends; the release runs on, detached.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_waits_for_a_release_websocket_only_what_fits() {
+        let r = rig(None, |_| {}).await;
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        hold_cmd(&r).await;
+        r.websocket_down().await;
+        r.hid.release_all(ReleaseTrigger::SessionEnd);
+        r.stop(1).await;
+        let (done, rx) = oneshot::channel();
+        let t0 = std::time::Instant::now();
+        r.tx.send(KvmCommand::Shutdown { done }).unwrap();
+        tokio::time::timeout(T, rx).await.unwrap().unwrap();
+        let took = t0.elapsed();
+        tokio::time::timeout(T, r.actor).await.unwrap().unwrap();
+        assert!(
+            took >= SHUTDOWN_RELEASE_WAIT / 2
+                && took < SHUTDOWN_RELEASE_WAIT + Duration::from_millis(200),
+            "the Shutdown waited {took:?} for the release websocket"
+        );
+        assert_eq!(r.metrics.release_websockets.total(), 0, "it still runs");
+        assert_eq!(r.sim.stats().logouts, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

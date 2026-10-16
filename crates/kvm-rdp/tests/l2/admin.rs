@@ -730,7 +730,7 @@ const CAUSES: &[&str] = &[
 
 type Line = (&'static str, &'static str, &'static [(&'static str, Shape)]);
 
-const INPUT_LINES: [Line; 7] = [
+const INPUT_LINES: [Line; 9] = [
     (
         "kvm_rdp::rdp::input",
         "paste chord with no text on the clipboard",
@@ -769,6 +769,25 @@ const INPUT_LINES: [Line; 7] = [
         "kvm_rdp::pump::shell",
         "disconnecting the client",
         &[("cause", Shape::Word(CAUSES))],
+    ),
+    // I2 (Plan D final review): a release websocket's outcome — after a
+    // session end the KVM did not prove released (its pong is waited for
+    // 400 ms, so under load a normal end may open one).
+    (
+        "kvm_rdp::hid::release",
+        "release websocket",
+        &[
+            ("outcome", Shape::Word(&["confirmed"])),
+            ("attempts", Shape::Integer),
+        ],
+    ),
+    (
+        "kvm_rdp::hid::release",
+        "release websocket: the KVM may still hold a key",
+        &[
+            ("outcome", Shape::Word(&["unconfirmed", "failed"])),
+            ("attempts", Shape::Integer),
+        ],
     ),
 ];
 

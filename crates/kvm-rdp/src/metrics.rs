@@ -275,6 +275,10 @@ pub struct Metrics {
     /// that the backend dropped while another was in flight (`in_flight`);
     /// and requests retired with no answer (`unanswered`, I2).
     pub clipboard_discarded: Family,
+    /// I2 (Plan D final review): the release websocket a session end opens
+    /// when the KVM did not prove it released (`confirmed`, `unconfirmed`,
+    /// `failed`, `superseded`; `hid::release`).
+    pub release_websockets: Family,
 }
 
 impl Default for Metrics {
@@ -431,6 +435,11 @@ impl Default for Metrics {
                 "Clipboard answers no paste took, by reason",
                 "reason",
             ),
+            release_websockets: Family::new(
+                "kvm_rdp_release_websockets",
+                "Release websockets after a session end the KVM did not prove released",
+                "outcome",
+            ),
         }
     }
 }
@@ -475,6 +484,7 @@ impl Metrics {
             &self.disconnects,
             &self.paste_events,
             &self.clipboard_discarded,
+            &self.release_websockets,
         ] {
             f.render(&mut out);
         }
@@ -580,10 +590,11 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            43,
-            "18 counters, 12 families, 8 gauges, 5 histograms"
+            44,
+            "18 counters, 13 families, 8 gauges, 5 histograms"
         );
         assert!(t.contains("# TYPE kvm_rdp_hid_reasserts_total counter\n"));
+        assert!(t.contains("# TYPE kvm_rdp_release_websockets_total counter\n"));
         let mut sorted = names.clone();
         sorted.sort_unstable();
         sorted.dedup();
