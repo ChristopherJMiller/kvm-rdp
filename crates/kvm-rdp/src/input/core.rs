@@ -1781,6 +1781,59 @@ mod tests {
         assert!(out.is_empty(), "{}", show(&out));
     }
 
+    /// PD6 m1 (Plan D final fix wave): a timer whose deadline would
+    /// overflow `Instant` fires at once — `deadline`'s fallback, the safe
+    /// side (§7.4) — never "never": `Duration::MAX` timeouts from now, and
+    /// the default ones from the latest `Instant` there is, both release
+    /// on the next Tick. Config cannot reach it (timeouts are bounded to an
+    /// hour), but `InputCore` is a library type.
+    #[test]
+    fn a_timer_whose_deadline_overflows_fires_at_once() {
+        let now = Instant::now();
+        // The latest `Instant` there is, to the nanosecond.
+        let mut last = now;
+        let mut step = Duration::MAX;
+        while step > Duration::ZERO {
+            match last.checked_add(step) {
+                Some(t) => last = t,
+                None => step /= 2,
+            }
+        }
+        assert!(last.checked_add(Duration::from_secs(10)).is_none());
+        let max = (Duration::MAX, Duration::MAX);
+        let defaults = (Duration::from_secs(10), Duration::from_secs(30));
+        for (at, (krt, mit)) in [(now, max), (last, defaults)] {
+            for (code, trigger) in [
+                (0x1E, ReleaseTrigger::KeyRepeat),    // 'a'
+                (0x1D, ReleaseTrigger::ModifierIdle), // LCtrl
+            ] {
+                let ctx = Ctx {
+                    now: at,
+                    key_repeat_timeout: krt,
+                    modifier_idle_timeout: mit,
+                    ..Rig::new().ctx()
+                };
+                let mut core = InputCore::new();
+                let mut out = Vec::new();
+                core.step(
+                    &ctx,
+                    Event::KeyPressed {
+                        code,
+                        extended: false,
+                    },
+                    &mut out,
+                );
+                assert_eq!(core.next_deadline(), Some(at), "{code:#x}: not at once");
+                out.clear();
+                core.step(&ctx, Event::Tick, &mut out);
+                assert_eq!(releases(&out), [trigger], "{code:#x}: {}", show(&out));
+                assert_eq!(core.keys.held_modifier_bits(), 0);
+                assert_eq!(core.keys.held_nonmodifier_usages(), 0);
+                assert_eq!(core.next_deadline(), None);
+            }
+        }
+    }
+
     /// Both timers fire at their deadline, and not a nanosecond before.
     #[test]
     fn both_timers_fire_at_their_deadline_and_not_before() {
@@ -4503,7 +4556,13 @@ mod tests {
             [(0x38, false), (0x38, true)],  // Alt / Option
             [(0x2A, false), (0x36, false)], // Shift
         ];
-        let units: Vec<u16> = "AaCc1!".encode_utf16().chain([0xD800, 0x00E9]).collect();
+        // N1 (Plan D final fix wave): and the live Unicode CR, LF, BS and
+        // ESC (PD11b I5) — Return twice, Backspace, and an Esc that aborts
+        // a paste like a scancode one.
+        let units: Vec<u16> = "AaCc1!"
+            .encode_utf16()
+            .chain([0xD800, 0x00E9, 0x0D, 0x0A, 0x08, 0x1B])
+            .collect();
         let texts = [
             "",
             "x",
@@ -4543,9 +4602,15 @@ mod tests {
             fired: [0; 15],
         };
         let (mut typing_steps, mut roomless_steps) = (0usize, 0usize);
-        // 96 seeds: every outcome fires 20 times over with a margin (PD9 fix
-        // round 1 added the relative release, which moved the stream).
-        for seed in 1..=96u64 {
+        // PD6 m4: steps the shell's release raced, and the reports it dropped.
+        let (mut races, mut raced_pushes) = (0usize, 0usize);
+        // N1: pastes a fresh Unicode ESC aborted.
+        let mut unicode_esc_aborts = 0usize;
+        // 128 seeds: every outcome fires 20 times over with a margin (PD9 fix
+        // round 1 added the relative release, which moved the stream; the
+        // final fix wave's release race ends pastes early, so 96 became
+        // 128).
+        for seed in 1..=128u64 {
             let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let s = usize::try_from(seed).unwrap();
             let (krt, mit) = timeouts[s % timeouts.len()];
@@ -4737,8 +4802,9 @@ mod tests {
                             "seed {seed} step {i}: the shell's release left the device holding"
                         );
                         // A new session, more often while a paste is open (its
-                        // `session` outcome, PD9 carry 2).
-                        if rng.below(if paste.open { 2 } else { 4 }) == 0 {
+                        // `session` outcome, PD9 carry 2; two in three since
+                        // the final fix wave's release race ends pastes early).
+                        if rng.below(if paste.open { 3 } else { 8 }) < 2 {
                             generation += 1;
                             // PD9 carry 2: the paste it ends is reported.
                             let ended = core.on_generation(generation);
@@ -4799,6 +4865,18 @@ mod tests {
                     }
                     28 => answer(&mut rng),
                     29 => Event::ClipboardAvailable(rng.below(4) != 0),
+                    // Esc, as a scancode or (N1) as the Unicode unit.
+                    30 if rng.below(2) == 0 => {
+                        if sent_units.contains(&0x1B) && rng.below(2) == 0 {
+                            sent_units.retain(|d| *d != 0x1B);
+                            Event::UnicodeReleased(0x1B)
+                        } else {
+                            if !sent_units.contains(&0x1B) {
+                                sent_units.push(0x1B);
+                            }
+                            Event::UnicodePressed(0x1B)
+                        }
+                    }
                     30 => {
                         if sent_codes.contains(&ESC) && rng.below(2) == 0 {
                             release(&mut sent_codes, ESC)
@@ -4877,11 +4955,24 @@ mod tests {
                             && !is_down(0x29);
                         (chord_hit || esc_hit || pre_phase == Phase::Typing).then_some(u)
                     }
-                    Event::UnicodePressed(unit) if pre_phase == Phase::Typing => {
-                        Some(unit_usage(unit))
+                    // N1: a fresh Unicode ESC is the Esc arm, Pending or
+                    // Typing (rev 6.3, PD11b I5); typing swallows the rest.
+                    Event::UnicodePressed(unit) => {
+                        let u = unit_usage(unit);
+                        let esc_hit = pre_phase != Phase::Idle
+                            && u == Some(0x29)
+                            && !is_rbb(0x29)
+                            && !is_down(0x29);
+                        (esc_hit || pre_phase == Phase::Typing).then_some(u)
                     }
                     _ => None,
                 };
+                // N1: a fresh Unicode ESC while a paste is pending or typing
+                // ends it as `esc` (below), as a scancode Esc does.
+                let unicode_esc = matches!(event, Event::UnicodePressed(0x1B))
+                    && pre_phase != Phase::Idle
+                    && !is_rbb(0x29)
+                    && !is_down(0x29);
                 let released = match event {
                     Event::KeyReleased { code, extended } => usage_for_scancode(code, extended),
                     Event::UnicodeReleased(unit) => unit_usage(unit),
@@ -4962,6 +5053,14 @@ mod tests {
                 let pending_deadline = paste.pending_deadline;
                 paste.see(&outs, now, modifier_wait, &at);
                 let post_phase = phase(&core);
+                if unicode_esc {
+                    assert!(
+                        outs.iter()
+                            .any(|o| matches!(o, Out::Paste(PasteOutcome::Aborted("esc")))),
+                        "{at}: a fresh Unicode ESC did not abort the paste"
+                    );
+                    unicode_esc_aborts += 1;
+                }
                 assert_eq!(paste.open, post_phase != Phase::Idle, "{at}");
                 // PD7 review I1: modifier_wait ends a paste at its deadline,
                 // never before, and no paste is still Pending at or past it.
@@ -5121,11 +5220,40 @@ mod tests {
                     [kr, mi, core.paste.deadline()].into_iter().flatten().min(),
                     "{at}"
                 );
+                // PD6 m4 (Plan D final fix wave): now and then the shell's
+                // release races the step — it wins the queue lock between
+                // the step's `Ctx` and its carry (§7.3's defining race).
+                // `push_at` drops every report the step built whole (each
+                // stamped before the release), the device ends released,
+                // and the next step sees the moved epoch and releases.
+                let raced =
+                    outs.iter().any(|o| matches!(o, Out::Push { .. })) && rng.below(40) == 0;
+                if raced {
+                    hid.release_all(rng.pick(&shell_triggers));
+                    races += 1;
+                }
+                let discards = hid.metrics.hid_epoch_discards.get();
                 carry(&hid, &outs);
-                queued += outs
+                let pushed = outs
                     .iter()
                     .filter(|o| matches!(o, Out::Push { .. }))
                     .count();
+                if raced {
+                    assert_eq!(
+                        hid.metrics.hid_epoch_discards.get() - discards,
+                        u64::try_from(pushed).unwrap(),
+                        "{at}: a report built before the raced release was queued"
+                    );
+                    raced_pushes += pushed;
+                    queued = 0;
+                    drain(&hid, &mut dev);
+                    assert!(
+                        !dev.holds_a_key() && dev.buttons == 0,
+                        "{at}: the raced release left the device holding"
+                    );
+                } else {
+                    queued += pushed;
+                }
                 if !rel.is_empty() {
                     queued = 0; // a release clears the queue
                 }
@@ -5230,7 +5358,8 @@ mod tests {
         // paste outcome the core can give, too, and typing met a full queue.
         assert!(fired.iter().all(|n| *n > 500), "{fired:?}");
         eprintln!(
-            "paste outcomes {:?}, typing steps {typing_steps}, roomless {roomless_steps}",
+            "paste outcomes {:?}, typing steps {typing_steps}, roomless {roomless_steps}, \
+             races {races}, raced reports {raced_pushes}, unicode esc aborts {unicode_esc_aborts}",
             OUTCOMES.iter().zip(paste.fired).collect::<Vec<_>>()
         );
         // All but `backlog`, which needs 64 unanswered pastes inside 60 s.
@@ -5243,5 +5372,12 @@ mod tests {
             typing_steps > 1_000 && roomless_steps > 20,
             "{typing_steps} {roomless_steps}"
         );
+        // PD6 m4: the race ran often, and dropped reports when it did; N1:
+        // Unicode ESCs ended pastes.
+        assert!(
+            races > 1_500 && raced_pushes > 1_000,
+            "{races} {raced_pushes}"
+        );
+        assert!(unicode_esc_aborts >= 10, "{unicode_esc_aborts}");
     }
 }
