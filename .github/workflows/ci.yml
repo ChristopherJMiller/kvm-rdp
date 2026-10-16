@@ -179,7 +179,8 @@ jobs:
 
   lint:
     # Plan E Task 2.1: the workflows' own rules (check-workflows.sh), the
-    # scripts, the disk pass; Task 2.2 adds cargo deny.
+    # scripts, the disk pass; Task 2.2: cargo deny over the production graph
+    # (deny.toml).
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -205,5 +206,17 @@ jobs:
         run: actionlint
       - name: shellcheck
         run: shellcheck scripts/*.sh
+      - name: Rust for cargo deny (cargo metadata; rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: cargo deny — licences, bans, sources (the production graph)
+        run: cargo deny --locked check bans licenses sources
+      - name: cargo deny — advisories (blocking on main; reported on PRs, DE15)
+        # The advisory database moves daily: on a PR a new advisory is
+        # reported, not a red gate on a change that did not cause it. On
+        # main it blocks, so `publish` (which needs `lint`) never ships a
+        # known-vulnerable image. The nightly's deny-advisories job reports
+        # it every night (Task 2.3).
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
+        run: cargo deny --locked check advisories
       - name: The target-budget script (the disk pass)
         run: scripts/test-target-budget.sh
