@@ -1,0 +1,84 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "43 2 * * *"
+  workflow_dispatch:
+    inputs:
+      thresholds:
+        description: "kvm-bench thresholds — strict is §10.1's absolute targets on this runner (DE11)"
+        type: choice
+        options: [ci, strict]
+        default: ci
+
+# Read-only: the nightly writes nothing back, reads no secret, and restores
+# main's caches without saving its own.
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "4"
+
+jobs:
+  l2-under-load:
+    # Plan C final review: load-sensitive L2 cases surface here, not on the
+    # shared host — one busy loop per CPU at nice 5 (the review's measured
+    # condition), L2 at nice 19, 3 runs.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust from rust-toolchain.toml
+        run: rustup toolchain install && cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: check
+          save-if: false
+      - name: Build L2, unloaded
+        run: cargo test --workspace --all-features --test l2 --no-run
+      - name: L2 at nice 19 under a CPU stressor, three runs
+        env:
+          L2_LOAD_LOGS: ${{ runner.temp }}/l2-under-load
+        run: scripts/l2-under-load.sh 3
+      - name: Keep the logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: l2-under-load-logs
+          path: ${{ runner.temp }}/l2-under-load
+          retention-days: 14
+
+  deny-advisories:
+    # DE15 (Task 2.2): the advisory database moves daily, and a PR only
+    # reports it; the nightly reads it against main every night. Read-only,
+    # like every job here.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - name: The flake's lint tools (cargo-deny)
+        run: |
+          nix build .#lint-tools --out-link "$RUNNER_TEMP/lint-tools"
+          echo "$RUNNER_TEMP/lint-tools/bin" >> "$GITHUB_PATH"
+      - name: Drop the job token nix.conf now holds
+        # install-nix-action writes `access-tokens = github.com=$GITHUB_TOKEN`
+        # into nix.conf with no way for the caller to unset it; nothing after
+        # this step needs it (same as ci.yml's lint job).
+        run: sudo sed -i '/^access-tokens/d' /etc/nix/nix.conf
+      - name: Rust for cargo deny (cargo metadata; rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: cargo deny — advisories
+        run: cargo deny --locked check advisories
