@@ -193,6 +193,12 @@ jobs:
         run: |
           nix build .#lint-tools --out-link "$RUNNER_TEMP/lint-tools"
           echo "$RUNNER_TEMP/lint-tools/bin" >> "$GITHUB_PATH"
+      - name: Drop the job token nix.conf now holds
+        # install-nix-action writes `access-tokens = github.com=$GITHUB_TOKEN`
+        # into nix.conf with no way for the caller to unset it; nothing after
+        # this step needs it, and the repository's own scripts run next
+        # (PE5 review m1).
+        run: sudo sed -i '/^access-tokens/d' /etc/nix/nix.conf
       - name: Workflow and image-pin rules
         run: scripts/test-check-workflows.sh && scripts/check-workflows.sh
       - name: actionlint
