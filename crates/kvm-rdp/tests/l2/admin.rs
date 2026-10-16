@@ -263,6 +263,19 @@ impl Bin {
         assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
     }
 
+    /// `[test] stall_on_sigusr1`'s trigger (PE4 review m4).
+    fn sigusr1(&self) {
+        let pid = libc::pid_t::try_from(self.child.id()).unwrap();
+        // SAFETY: kill(2) on our own child's pid, which it still is (not reaped).
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
+    }
+
+    /// What the child has written so far, while it runs (the log checks
+    /// use `output`, complete only once it has exited).
+    fn lines_so_far(&self) -> Vec<String> {
+        self.out.lock().unwrap().clone()
+    }
+
     async fn wait(&mut self, limit: Duration) -> ExitStatus {
         let t0 = Instant::now();
         loop {
@@ -1030,7 +1043,9 @@ fn no_debug_shows_input() {
 /// created. The shutdown's own lines are in the log checked (P10).
 /// `/metrics`, read before the SIGTERM, holds none of it either
 /// (`assert_metrics_hold_no_input`). Nor does any `{:?}` the input path
-/// could emit show the input (`no_debug_shows_input`).
+/// could emit show the input (`no_debug_shows_input`). The m3 stale watch's
+/// line is made for real, once per filter, and goes through the same checks
+/// (`stale_watch_line`; PE4 review m4).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secrets_never_reach_the_logs() {
     // No letter of either string may pass `vocabulary` as a label part of
@@ -1059,7 +1074,9 @@ async fn secrets_never_reach_the_logs() {
         write_files(&sim, dir.path());
         let toml = dir.path().join("kvm-rdp.toml");
         let mut text = std::fs::read_to_string(&toml).unwrap();
-        text.push_str(&format!("[log]\nfilter = \"{filter}\"\n"));
+        text.push_str(&format!(
+            "[log]\nfilter = \"{filter}\"\n[test]\nstall_on_sigusr1 = \"4500ms\"\n"
+        ));
         std::fs::write(&toml, text).unwrap();
         let keylog = dir.path().join("keylog.txt");
         let mut bin = Bin::spawn(dir.path(), &[("SSLKEYLOGFILE", keylog.as_os_str())]);
@@ -1093,8 +1110,13 @@ async fn secrets_never_reach_the_logs() {
                 hid_on(&l, ws)
             )
         });
+        stale_watch_line(&bin, &c, &sim, ws, filter).await;
         // PD10 review I1(b): what a scrape would show, while it holds input.
         let metrics = http_get(bin.admin(), "/metrics").await;
+        assert!(
+            metrics.contains("kvm_rdp_release_all_total{trigger=\"rdp_stale\"} 1"),
+            "{filter}: the stale watch's release is not counted once"
+        );
         bin.sigterm();
         assert!(bin.wait(T).await.success(), "{filter}");
         let out = bin.output();
@@ -1121,7 +1143,7 @@ async fn secrets_never_reach_the_logs() {
         assert_no_fragment(filter, "the logs", &all);
         assert_no_fragment(filter, "/metrics", &metrics);
         assert_metrics_hold_no_input(filter, &metrics, &input);
-        let mut bridge_trace = false;
+        let (mut bridge_trace, mut stale_lines) = (false, 0usize);
         for line in &out {
             let v: serde_json::Value = serde_json::from_str(line)
                 .unwrap_or_else(|_| panic!("{filter}: not a JSON line: {line}"));
@@ -1135,11 +1157,14 @@ async fn secrets_never_reach_the_logs() {
             assert_target_classified(filter, target, line);
             assert_input_path_lines_allowed(filter, &v, line);
             bridge_trace |= level == "TRACE" && target.starts_with("kvm_rdp");
+            stale_lines += usize::from(v["fields"]["message"].as_str() == Some(STALE_LINE));
         }
         assert!(
             bridge_trace,
             "{filter}: no TRACE line from bridge code — the filter did not take effect"
         );
+        // PE4 review m4: the stale watch's line went through the checks above.
+        assert_eq!(stale_lines, 1, "{filter}: the stale watch's line");
         assert!(!keylog.exists(), "{filter}: SSLKEYLOGFILE was honoured");
         assert_eq!(sim.stats().logouts, 0);
     }
@@ -1229,6 +1254,57 @@ async fn a_live_connection_consumes_the_first_quit_and_a_second_stops_the_server
         TcpStream::connect(rdp).await.is_err(),
         "the RDP listener is still open"
     );
+}
+
+/// The m3 stale watch's one line (`kvm_rdp::hid::stale`, no fields).
+const STALE_LINE: &str = "the RDP runtime stopped with input held: released all";
+
+/// PE4 review m4: the stale watch's line, made for real, so the secrets
+/// case's checks classify it rather than an inspection. Once the paste is
+/// done, LShift is held, and SIGUSR1 stalls the RDP thread for 4.5 s
+/// (`[test] stall_on_sigusr1`), past `RDP_STALE_RELEASE`: the KVM-runtime
+/// watch releases the key and logs its line. The case goes on once the
+/// thread runs again (pictures flow) and LShift is let go.
+async fn stale_watch_line(bin: &Bin, c: &Client, sim: &KvmSim, ws: u64, filter: &str) {
+    const LSHIFT: u8 = 0x2A;
+    let t0 = Instant::now();
+    while !http_get(bin.admin(), "/metrics")
+        .await
+        .contains("kvm_rdp_paste_events_total{outcome=\"done\"} 1")
+    {
+        assert!(t0.elapsed() < T, "{filter}: the paste never finished");
+        tokio::time::sleep(ms(20)).await;
+    }
+    let shift = HidFrame::Keyboard {
+        modifiers: 0x02,
+        keys: [0; 5],
+    }
+    .to_vec();
+    let before = hid_on(&sim.events(), ws).len();
+    c.key(LSHIFT, true);
+    sim.wait_for(T, |l| {
+        hid_on(l, ws)
+            .get(before..)
+            .is_some_and(|f| f.contains(&shift))
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{filter}: LShift never reached kvm-sim"));
+    bin.sigusr1();
+    let t0 = Instant::now();
+    while !bin
+        .lines_so_far()
+        .iter()
+        .any(|l| message(l).as_deref() == Some(STALE_LINE))
+    {
+        assert!(
+            t0.elapsed() < T,
+            "{filter}: the stale watch's line never came"
+        );
+        tokio::time::sleep(ms(20)).await;
+    }
+    let seen = pictures(&c.events()).len();
+    c.wait_for(T, |e| pictures(e).len() >= seen + 5).await;
+    c.key(LSHIFT, false);
 }
 
 /// The latest websocket's id, once its session-start frames are on the

@@ -276,6 +276,10 @@ pub struct LogConfig {
 pub struct TestConfig {
     /// Make the pump shell panic this long after startup (§5.2's path).
     pub panic_after: Option<Duration>,
+    /// On each SIGUSR1, block the RDP runtime's thread this long (at most
+    /// 30 s): the stale watch's path through the real binary (PE4 review
+    /// m4, the secrets case).
+    pub stall_on_sigusr1: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -560,6 +564,7 @@ struct RawLog {
 #[serde(deny_unknown_fields, default)]
 struct RawTest {
     panic_after: Option<String>,
+    stall_on_sigusr1: Option<String>,
 }
 
 fn dur(v: Option<&String>, default: Duration, key: &str) -> Result<Duration, ConfigError> {
@@ -926,6 +931,12 @@ fn build(raw: Raw, base: &Path) -> Result<Config, ConfigError> {
             .as_ref()
             .map(|s| dur(Some(s), Duration::ZERO, "test.panic_after"))
             .transpose()?,
+        stall_on_sigusr1: raw
+            .test
+            .stall_on_sigusr1
+            .as_ref()
+            .map(|s| dur(Some(s), Duration::ZERO, "test.stall_on_sigusr1"))
+            .transpose()?,
     };
     Ok(Config {
         rdp,
@@ -1092,6 +1103,33 @@ pub(crate) mod tests {
         assert!(e.contains("test.panic_after"), "{e}");
         assert!(
             !e.contains("soon"),
+            "a config error never echoes the file: {e}"
+        );
+    }
+
+    /// PE4 review m4: `[test] stall_on_sigusr1` is a `test-hooks` key —
+    /// off by default, a duration when set, its key named when it is not.
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_stall_on_sigusr1_parses_and_is_off_by_default() {
+        let d = tempfile::tempdir().unwrap();
+        let base = minimal(d.path());
+        assert_eq!(load(d.path(), &base).unwrap().test.stall_on_sigusr1, None);
+        let c = load(
+            d.path(),
+            &format!("{base}[test]\nstall_on_sigusr1 = \"4500ms\"\n"),
+        )
+        .unwrap();
+        assert_eq!(c.test.stall_on_sigusr1, Some(Duration::from_millis(4500)));
+        let e = load(
+            d.path(),
+            &format!("{base}[test]\nstall_on_sigusr1 = \"long\"\n"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(e.contains("test.stall_on_sigusr1"), "{e}");
+        assert!(
+            !e.contains("long"),
             "a config error never echoes the file: {e}"
         );
     }
@@ -1493,6 +1531,12 @@ pub(crate) mod tests {
         shapes.push(t(
             format!("{base}[test]\npanic_after = \"{s}\"\n"),
             "a secret as test.panic_after",
+        ));
+        // PE4 review m4: nor does `[test] stall_on_sigusr1`'s.
+        #[cfg(feature = "test-hooks")]
+        shapes.push(t(
+            format!("{base}[test]\nstall_on_sigusr1 = \"{s}\"\n"),
+            "a secret as test.stall_on_sigusr1",
         ));
         shapes
     }

@@ -348,6 +348,25 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
         crate::hid::stale::run(health.clone(), hid.clone()),
         &seam,
     ));
+    // DE6, PE4 review m4: `[test] stall_on_sigusr1` — each SIGUSR1 blocks
+    // the RDP thread, as `block_rdp_runtime_for` does in process: the stale
+    // watch's path through the real binary. Registered here, before the
+    // ready line, so a SIGUSR1 never meets the default disposition (death).
+    #[cfg(feature = "test-hooks")]
+    if let Some(d) = cfg.test.stall_on_sigusr1 {
+        let usr1 = {
+            let _rt = kvm_rt.enter();
+            register(SignalKind::user_defined1(), "SIGUSR1")
+        };
+        if let Some(mut usr1) = usr1 {
+            let to_pump = to_pump.clone();
+            kvm_rt.spawn(async move {
+                while usr1.recv().await.is_some() {
+                    let _ = to_pump.send(RdpInput::Stall(d));
+                }
+            });
+        }
+    }
 
     let parts = RdpParts {
         server: ServerParts {
