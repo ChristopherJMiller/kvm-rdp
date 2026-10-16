@@ -86,7 +86,11 @@ impl L3 {
     /// `xvfb-run -d` lets Xvfb pick a free display itself (`-displayfd`; the
     /// deprecated `-a` scans lock files and races a concurrent run), and the
     /// display is ready when xvfb-run resumes, so `-w 0` drops its 3 s
-    /// sleep; Xvfb's own output goes to `xvfb.log` (`-e`).
+    /// sleep; Xvfb's own output goes to `xvfb.log` (`-e`). Nothing of the
+    /// group's lands outside the case (PE8 review I2): `TMPDIR` is the case's
+    /// directory (xvfb-run's Xauthority and pid files, anything FreeRDP
+    /// makes), and `-clipboard` — L3 never pastes — spares FreeRDP's
+    /// clipboard FUSE mount.
     pub fn freerdp(&mut self, args: &[&str]) {
         let log = std::fs::File::create(self.dir.path().join("freerdp.log")).unwrap();
         let home = self.dir.path().join("home");
@@ -105,13 +109,14 @@ impl L3 {
             .arg(format!("/v:{}:{}", self.rdp.ip(), self.rdp.port()))
             .arg(format!("/u:{USER}"))
             .arg(format!("/p:{NLA}"))
-            .args(["/cert:ignore", "/log-level:WARN"])
+            .args(["/cert:ignore", "/log-level:WARN", "-clipboard"])
             .args(args)
             // A session's LD_LIBRARY_PATH can carry an alsa-lib FreeRDP
             // cannot load (spikes/legb-winapp/README.md).
             .env_remove("LD_LIBRARY_PATH")
             .env("HOME", &home)
             .env("XDG_CONFIG_HOME", &home)
+            .env("TMPDIR", self.dir.path())
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log);

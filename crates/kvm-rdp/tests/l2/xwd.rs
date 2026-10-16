@@ -114,6 +114,9 @@ pub fn barcode(fb: &Framebuffer, x0: u32, y0: u32, bw: u32, bh: u32) -> Option<u
     Some(value)
 }
 
+/// How long a dropped group has after its SIGTERM before the SIGKILL.
+const GRACE: Duration = Duration::from_secs(2);
+
 /// A child in its own process group; dropping it ends the whole group.
 pub struct Group {
     child: Child,
@@ -146,16 +149,36 @@ impl Group {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+
+    /// Whether any process of the group is left: `kill(-pgid, 0)` fails
+    /// with ESRCH once none is. The leader is reaped first (a zombie still
+    /// counts); the others' parents, or the subreaper they are reparented
+    /// to, reap them.
+    fn any_left(&mut self) -> bool {
+        let _ = self.child.try_wait();
+        // SAFETY: signal 0 to our own process group probes it, sends nothing.
+        let probe = unsafe { libc::kill(-self.pgid, 0) };
+        !(probe == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH))
+    }
 }
 
 impl Drop for Group {
+    /// SIGTERM to the group, then up to `GRACE` for the whole group — not
+    /// only its leader: xvfb-run's shell dies at TERM at once, while FreeRDP
+    /// and Xvfb shut down (PE8 review I2) — and only then SIGKILL to what
+    /// is left, which a TERM-ignoring member is.
     fn drop(&mut self) {
         // SAFETY: signalling our own process group.
         unsafe { libc::kill(-self.pgid, libc::SIGTERM) };
-        let _ = self.wait_exit(Duration::from_secs(2));
-        // SAFETY: as above; whatever outlived the TERM (Xvfb under a dead
-        // xvfb-run) is still in the group.
-        unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+        let t0 = Instant::now();
+        while self.any_left() && t0.elapsed() < GRACE {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if self.any_left() {
+            // SAFETY: as above; the group still has a member, so its id
+            // is still ours.
+            unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+        }
         let _ = self.child.wait();
     }
 }
@@ -279,11 +302,13 @@ mod tests {
     }
 
     /// Review Focus 5: dropping a group kills every process in it — the
-    /// leader and what it started (Xvfb under xvfb-run, here two sleeps).
+    /// leader and what it started (Xvfb under xvfb-run, here two sleeps),
+    /// one of which ignores SIGTERM, so only the SIGKILL ends it (PE8
+    /// review m1).
     #[test]
     fn a_dropped_group_leaves_no_process_behind() {
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "sleep 60 & sleep 60"]);
+        cmd.args(["-c", "(trap '' TERM; sleep 60) & sleep 60"]);
         let g = Group::spawn(cmd).unwrap();
         let pgid = g.pgid;
         std::thread::sleep(Duration::from_millis(100));
@@ -297,5 +322,47 @@ mod tests {
             probe == -1
         });
         assert!(gone, "a process of the group outlived its drop");
+    }
+
+    /// PE8 review I2: the TERM is the group's shutdown and the KILL only its
+    /// backstop. Drop waits for the whole group, not only its leader (here,
+    /// as xvfb-run's shell, one that dies at TERM at once), so a member that
+    /// cleans up on TERM (FreeRDP, Xvfb) finishes — and drop returns once
+    /// the group is empty, not after the whole grace.
+    #[test]
+    fn a_dropped_group_lets_its_members_shut_down_before_the_kill() {
+        let dir = tempfile::tempdir().unwrap();
+        let done = dir.path().join("shut-down");
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(format!(
+            "(trap 'sleep 0.3; touch {}; exit 0' TERM; while :; do sleep 0.05; done) & sleep 60",
+            done.display()
+        ));
+        let g = Group::spawn(cmd).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let t0 = Instant::now();
+        drop(g);
+        let took = t0.elapsed();
+        assert!(
+            done.exists(),
+            "drop killed a member mid-shutdown ({took:?})"
+        );
+        assert!(took < GRACE, "drop waited out its grace: {took:?}");
+    }
+
+    /// `wait_exit` (Task 3.2's `L3::freerdp_exit`): the leader's own exit
+    /// within the limit, `None` past it.
+    #[test]
+    fn wait_exit_reports_the_leaders_exit_within_its_limit() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "exit 3"]);
+        let mut g = Group::spawn(cmd).unwrap();
+        let status = g.wait_exit(Duration::from_secs(5));
+        assert_eq!(status.and_then(|s| s.code()), Some(3));
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        let mut g = Group::spawn(cmd).unwrap();
+        assert!(g.wait_exit(Duration::from_millis(100)).is_none());
+        assert!(g.running());
     }
 }
