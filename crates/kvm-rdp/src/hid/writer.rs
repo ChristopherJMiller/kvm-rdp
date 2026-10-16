@@ -946,6 +946,89 @@ mod tests {
         assert_eq!(sim.stats().logouts, 0);
     }
 
+    /// §6.9's certificate row, rev 6.3 (PD11a review I1): a reopen that
+    /// meets a certificate other than the pinned one — kvm-sim's, swapped
+    /// mid-session — is reported once (`WsEvent::CertMismatch`), and the
+    /// writer then idles: no reconnect however long nobody stops it, and a
+    /// Close still ends it. The L2 case cannot show the idle, since there the
+    /// session's Stop ends the writer within its first backoff; here nothing
+    /// stops it for three times `backoff.max`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reopen_meeting_a_changed_certificate_idles_until_closed() {
+        use kvm_sim::{KvmSim, SimConfig, SimEvent, Source};
+        const WAIT: Duration = Duration::from_secs(3);
+        let sim = KvmSim::start(SimConfig::es3(
+            Source::fixture("360p30_es3like_poc0.h264").unwrap(),
+        ))
+        .await
+        .unwrap();
+        let p = sim.ports();
+        let ep = Arc::new(KvmEndpoint::new(
+            Scheme::Https,
+            sim.host(),
+            (p.web, p.video, p.control),
+            sim.spki_sha256(),
+        ));
+        let token = login(
+            &ep,
+            &Secret::new(sim.password()),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (mut t, ctl) = task(hid.clone(), Duration::from_secs(1));
+        // `task`'s backoff: 50 ms, doubling, at most 400 ms.
+        let idle = Duration::from_millis(400) * 3;
+        let (ev_tx, mut events) = mpsc::unbounded_channel();
+        t.events = ev_tx;
+        let (tok_tx, tok_rx) = watch::channel(Some((1, token)));
+        t.token = tok_rx;
+        t.ep = ep;
+        let run = tokio::spawn(t.run());
+        let mut next = async || {
+            tokio::time::timeout(WAIT, events.recv())
+                .await
+                .expect("no writer event")
+        };
+        assert_eq!(next().await, Some(WsEvent::Up { seq: 1 }));
+        let hid_events = |e: &[SimEvent]| {
+            e.iter()
+                .filter(|e| matches!(e, SimEvent::Hid { .. }))
+                .count()
+        };
+        sim.wait_for(WAIT, |e| hid_events(e) >= 2).await.unwrap();
+        let before = sim.stats().accepts_control;
+        sim.rotate_certificate().unwrap();
+        sim.close_websockets();
+        assert_eq!(next().await, Some(WsEvent::Down));
+        assert_eq!(next().await, Some(WsEvent::CertMismatch));
+        // Nobody stops it: the ctl channel stays open, the token stays.
+        tokio::time::sleep(idle).await;
+        assert_eq!(
+            sim.stats().accepts_control,
+            before + 1,
+            "the writer reconnected after the mismatch"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "a writer event after the mismatch"
+        );
+        assert_eq!(
+            sim.stats().ws_open,
+            0,
+            "a websocket over the new certificate"
+        );
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run did not end after Close")
+            .unwrap();
+        drop(tok_tx);
+        assert_eq!(sim.stats().logouts, 0);
+    }
+
     /// Census (§3.3, §7.3, §7.4): a key held when the websocket dies is
     /// released on the next open before any new input — the reopen's first
     /// frames are the session-start sequence — and a report made while the
