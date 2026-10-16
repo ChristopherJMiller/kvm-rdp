@@ -8,4 +8,9 @@
 !.cargo/config.toml
 !crates/
 !fixtures/slate_1080p.h264
+# .gitignore's patterns inside crates/: image-build.sh's `git status` check
+# cannot see them, so they are kept out here (PE10 review m5).
 crates/**/target
+crates/**/debug
+crates/**/mutants.out*
+crates/**/*.rs.bk

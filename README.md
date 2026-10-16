@@ -145,11 +145,14 @@ with no capabilities; it writes nothing.
   (it writes captures only under `/captures`, which the image does not have
   unless one is mounted; its `capture` and `snapshot` decodes need ffmpeg
   and bubblewrap, which the image does not have).
+  A mounted `/captures` must be owned by the run's UID: kvm-probe makes it 0700.
 - Mount the secrets as files and point the `*_file` keys at them by
   absolute path. A Kubernetes Secret volume works as mounted — no `subPath`
   — since a renewed certificate is seen through the `..data` symlink and the
   bridge exits 0 to be restarted once no client is connected (the smoke test
-  runs the image with exactly that layout at `/run/secrets/kvm-rdp`). A
+  runs the image with the deployment's layout: `config.toml` from a
+  ConfigMap at `/etc/kvm-rdp`, the passwords at `/run/secrets/kvm-rdp`, the
+  TLS pair at `/run/secrets/kvm-rdp-tls`, each `..data`-linked). A
   Secret with `defaultMode: 0400` needs `fsGroup: 65532` (or the run's UID
   as owner) for the non-root process to read it.
 - `MALLOC_ARENA_MAX=2` is set in the image: the condition its memory figures

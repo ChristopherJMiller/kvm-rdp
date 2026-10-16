@@ -5,12 +5,13 @@
 #  2. its binaries: no build-host path (PC15), kvm-probe runs;
 #  3. under the restricted Pod Security profile (read-only root, no
 #     capabilities, no-new-privileges), as 65532 and as an arbitrary UID,
-#     with its secrets mounted the way the kubelet mounts a Secret
-#     (`..<stamp>/`, a `..data` link, one link per file) at the deployment's
-#     /run/secrets/kvm-rdp: /readyz and /livez answer unauthenticated; X.224
-#     negotiation selects HYBRID for an NLA client and closes TLS-only and
-#     standard security with no protocol (§9.1, DE2); SIGTERM exits 0 within
-#     5 s (§5.2);
+#     with the deployment's ConfigMap and two Secrets mounted the way the
+#     kubelet mounts them (`..<stamp>/`, a `..data` link, one link per file)
+#     at /etc/kvm-rdp, /run/secrets/kvm-rdp and /run/secrets/kvm-rdp-tls:
+#     /readyz and /livez answer unauthenticated; X.224 negotiation selects
+#     HYBRID for an NLA client and closes TLS-only, standard security and a
+#     legacy request with no RDP_NEG_REQ without a byte (§9.1, DE2); SIGTERM
+#     exits 0 within 5 s (§5.2);
 #  4. a config with either `[test]` hook (`panic_after`, `stall_on_sigusr1`)
 #     or a security-mode key is refused, exit 2, and the error echoes no value.
 #   scripts/image-smoke.sh --paths-only FILE…   only check 2's build-path
@@ -80,49 +81,63 @@ ok "kvm-probe runs"
 
 # 3. Running. The KVM is TEST-NET-1: nothing is sent to it before an
 # authenticated client (§5.1), so the bridge must start and serve without it.
-# The secrets as the kubelet mounts a Secret volume: the files in a
-# `..<stamp>` directory, `..data` linking to it, and one link per file
-# through `..data` (deployment design §4.2) — the renewal path the bridge's
-# watcher follows (bridge::tests::a_kubernetes_secret_swap_is_a_renewal).
-sec=$work/secrets
+# The deployment's three volumes (deployment design §4.2, §4.5), each laid out
+# as the kubelet's AtomicWriter lays out a ConfigMap or Secret volume: the
+# files in a `..<stamp>` directory, `..data` linking to it, and one link per
+# file through `..data` — the renewal path the bridge's watcher follows
+# (bridge::tests::a_kubernetes_secret_swap_is_a_renewal):
+#   /etc/kvm-rdp              the ConfigMap: config.toml (and check 4's files)
+#   /run/secrets/kvm-rdp      Secret kvm-rdp-mac: kvm-password, nla-password
+#   /run/secrets/kvm-rdp-tls  Secret kvm-rdp-mac-tls (cert-manager's): tls.crt, tls.key
 stamp=..2026_10_15_00_00_00.1
-mkdir -p "$sec/$stamp" "$work/etc"
+cm=$work/configmap
+sec=$work/secret
+tls=$work/tls
+mkdir -p "$cm/$stamp" "$sec/$stamp" "$tls/$stamp"
+# A volume's links, once its files are in $1/$stamp.
+atomic_dir() {
+  local f
+  ln -s "$stamp" "$1/..data"
+  for f in "$1/$stamp"/*; do
+    ln -s "..data/${f##*/}" "$1/${f##*/}"
+  done
+  chmod 0755 "$1" "$1/$stamp"
+  chmod 0644 "$1/$stamp"/*
+}
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
-  -keyout "$sec/$stamp/tls.key" -out "$sec/$stamp/tls.crt" 2>/dev/null
-printf 'image-smoke-nla-password-0123456789\n' >"$sec/$stamp/nla.pass"
-printf 'image-smoke-kvm-password\n' >"$sec/$stamp/kvm.pass"
-ln -s "$stamp" "$sec/..data"
-for f in tls.crt tls.key nla.pass kvm.pass; do
-  ln -s "..data/$f" "$sec/$f"
-done
+  -keyout "$tls/$stamp/tls.key" -out "$tls/$stamp/tls.crt" 2>/dev/null
+printf 'image-smoke-nla-password-0123456789\n' >"$sec/$stamp/nla-password"
+printf 'image-smoke-kvm-password\n' >"$sec/$stamp/kvm-password"
 config() {
   cat <<EOF
 [rdp]
 listen = "0.0.0.0:3389"
-nla_password_file = "/run/secrets/kvm-rdp/nla.pass"
-tls_cert_file = "/run/secrets/kvm-rdp/tls.crt"
-tls_key_file = "/run/secrets/kvm-rdp/tls.key"
+username = "kvm"
+nla_password_file = "/run/secrets/kvm-rdp/nla-password"
+tls_cert_file = "/run/secrets/kvm-rdp-tls/tls.crt"
+tls_key_file = "/run/secrets/kvm-rdp-tls/tls.key"
 [admin]
 listen = "0.0.0.0:9464"
 [kvm]
 host = "192.0.2.1"
 spki_sha256 = "$(printf '0%.0s' $(seq 64))"
-password_file = "/run/secrets/kvm-rdp/kvm.pass"
+scheme = "https"
+password_file = "/run/secrets/kvm-rdp/kvm-password"
 EOF
 }
-config >"$work/etc/kvm-rdp.toml"
+config >"$cm/$stamp/config.toml"
 # The two test-hooks keys (DE6), each with a value check 4 must not see echoed.
-{ config; printf '[test]\npanic_after = "4711ms"\n'; } >"$work/etc/hooks.toml"
-{ config; printf '[test]\nstall_on_sigusr1 = "4713ms"\n'; } >"$work/etc/stall.toml"
-config | sed 's/^\[rdp\]$/[rdp]\nsecurity = "tls"/' >"$work/etc/mode.toml"
-chmod 0755 "$work" "$work/etc" "$sec" "$sec/$stamp"
-chmod 0644 "$work"/etc/* "$sec/$stamp"/*
-mounts=(-v "$work/etc:/etc/kvm-rdp:ro" -v "$sec:/run/secrets/kvm-rdp:ro")
+{ config; printf '[test]\npanic_after = "4711ms"\n'; } >"$cm/$stamp/hooks.toml"
+{ config; printf '[test]\nstall_on_sigusr1 = "4713ms"\n'; } >"$cm/$stamp/stall.toml"
+config | sed 's/^\[rdp\]$/[rdp]\nsecurity = "tls"/' >"$cm/$stamp/mode.toml"
+for d in "$cm" "$sec" "$tls"; do atomic_dir "$d"; done
+chmod 0755 "$work"
+mounts=(-v "$cm:/etc/kvm-rdp:ro" -v "$sec:/run/secrets/kvm-rdp:ro" -v "$tls:/run/secrets/kvm-rdp-tls:ro")
 
 start() { # $1 = uid:gid
   docker run -d --name "$name" --read-only --user "$1" --cap-drop ALL --security-opt no-new-privileges \
     "${mounts[@]}" -p 127.0.0.1::3389 -p 127.0.0.1::9464 \
-    "$image" --config /etc/kvm-rdp/kvm-rdp.toml >/dev/null
+    "$image" --config /etc/kvm-rdp/config.toml >/dev/null
   rdp_port=$(docker port "$name" 3389/tcp | sed -n '1s/.*://p')
   admin_port=$(docker port "$name" 9464/tcp | sed -n '1s/.*://p')
   for _ in $(seq 100); do
@@ -134,22 +149,25 @@ start() { # $1 = uid:gid
   fail "not ready within 10 s as $1"
 }
 
-# An X.224 Connection Request carrying an RDP_NEG_REQ for $1
-# (requestedProtocols, little-endian hex). Sets `reply` to what came back as
-# hex — the 19-byte Connection Confirm, or less when the bridge closes — and
-# `reply_status` to head's exit: 0 at 19 bytes or at the bridge's close, 124
-# when neither came within 5 s.
-negotiate() {
+# Sends $1 (hex) as one request on a fresh connection. Sets `reply` to what
+# came back as hex — at most the 19 bytes of a Connection Confirm with an
+# RDP_NEG_RSP — and `reply_status` to head's exit: 0 at 19 bytes or at the
+# bridge's close, 124 when neither came within 5 s.
+exchange() {
   local esc='' i
   for ((i = 0; i < ${#1}; i += 2)); do esc+="\\x${1:i:2}"; done
   exec 3<>"/dev/tcp/127.0.0.1/$rdp_port"
-  # shellcheck disable=SC2059  # the format carries the request's own escapes
-  printf "\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00$esc" >&3
+  # shellcheck disable=SC2059  # the format is the request's own escapes
+  printf "$esc" >&3
   reply_status=0
   timeout 5 head -c 19 <&3 >"$work/reply" || reply_status=$?
   exec 3<&- 3>&-
   reply=$(od -An -tx1 -v "$work/reply" | tr -d ' \n')
 }
+
+# An X.224 Connection Request carrying an RDP_NEG_REQ for $1
+# (requestedProtocols, little-endian hex).
+negotiate() { exchange "030000130ee0000000000001000800$1"; }
 
 # A full Connection Confirm (status 0, 19 bytes) whose RDP_NEG_RSP selects $2.
 selected() { # $1 = what, then the accepted protocols (hex, little-endian)
@@ -164,6 +182,21 @@ selected() { # $1 = what, then the accepted protocols (hex, little-endian)
   fail "$what: selected ${reply:30:8}, want one of $*: '$reply'"
 }
 
+# Refused as the wire shows it: closed at once with not one byte (no
+# Connection Confirm at all, so no protocol — not even a legacy one).
+refused() { # $1 = what
+  case $reply_status in
+    0) ;;
+    124) fail "$1: no answer and no close within 5 s" ;;
+    *) fail "$1: reading the reply failed (status $reply_status)" ;;
+  esac
+  [ -n "$reply" ] || return 0
+  if [ "${#reply}" -ge 38 ] && [ "${reply:22:2}" = 03 ]; then
+    fail "$1: IronRDP now answers RDP_NEG_FAILURE: update spec §9.1 ('$reply')"
+  fi
+  fail "$1: answered with $((${#reply} / 2)) bytes, want a close with none: '$reply'"
+}
+
 running_checks() { # $1 = uid:gid
   for path in /readyz /livez; do
     [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$admin_port$path")" = 200 ] ||
@@ -173,23 +206,19 @@ running_checks() { # $1 = uid:gid
   selected "TLS|HYBRID as $1" 02000000
   negotiate 0b000000 # TLS | HYBRID | HYBRID_EX: Windows App's request
   selected "TLS|HYBRID|HYBRID_EX as $1" 02000000 08000000
-  # TLS alone; standard RDP security. IronRDP at the pinned rev answers
-  # neither with an RDP_NEG_FAILURE PDU: it returns before the write and
-  # closes the connection (§9.1). A close is the refusal; a hang is not.
+  # TLS alone; standard RDP security; and the legacy request with no
+  # RDP_NEG_REQ, which asks for standard security. IronRDP at the pinned rev
+  # answers none with an RDP_NEG_FAILURE PDU: it returns before the write and
+  # closes the connection (§9.1). A close with nothing sent is the refusal; a
+  # hang, or any Connection Confirm, is not.
+  local req
   for req in 01000000 00000000; do
     negotiate "$req"
-    case $reply_status in
-      0) ;;
-      124) fail "requestedProtocols $req as $1: no answer and no close within 5 s" ;;
-      *) fail "requestedProtocols $req as $1: reading the reply failed (status $reply_status)" ;;
-    esac
-    if [ "${#reply}" -ge 38 ]; then
-      [ "${reply:22:2}" != 03 ] ||
-        fail "requestedProtocols $req: IronRDP now answers RDP_NEG_FAILURE: update spec §9.1 ('$reply')"
-      fail "requestedProtocols $req was answered with a protocol: '$reply'"
-    fi
+    refused "requestedProtocols $req as $1"
   done
-  ok "as $1: /readyz and /livez 200; HYBRID selected; TLS-only and standard security closed unselected"
+  exchange 0300000b06e00000000000
+  refused "a Connection Request with no RDP_NEG_REQ as $1"
+  ok "as $1: /readyz and /livez 200; HYBRID selected; TLS-only, standard and legacy security closed with no reply"
   local t0 t1 code logs
   t0=$(date +%s%N)
   docker stop -t 10 "$name" >/dev/null

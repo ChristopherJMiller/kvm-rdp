@@ -36,7 +36,7 @@ impl From<EndArg> for crate::l4::hid::End {
 #[derive(Parser, Debug)]
 #[command(
     name = "kvm-probe",
-    about = "Milestone-0 census tool for the ES3 KVM (spec §12). All capture output (.flv, .jsonl, .y) is written under this build's repo-root captures/ directory (gitignored), never the operator's current directory."
+    about = "Milestone-0 census tool for the ES3 KVM (spec §12). All capture output (.flv, .jsonl, .y) is written under one captures directory fixed at build time — a checkout's repo-root captures/ (gitignored), the image's /captures — never the operator's current directory."
 )]
 pub struct Cli {
     #[command(subcommand)]
