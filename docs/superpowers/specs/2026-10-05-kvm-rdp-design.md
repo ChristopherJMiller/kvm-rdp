@@ -56,6 +56,9 @@ rev 6.2's; it is added to it. One line per change:
 - §7.3, §7.4, §9.3 (Plan D final review I2): a release lands only if the KVM reads it. A session end writes a ping after its release, and the KVM's pong (or its answer to the close) proves the read; a session end without that proof, with something held written since the last proof, opens one bounded release websocket (`hid::release`: the pinned TLS, the token or one fresh login, the session start and a ping, the release again `input.reassert_after` after the pong; 3 opens in 10 s; a FIN; never a logout), superseded by the next session's `Start`; and a websocket lost while input is held reopens without its backoff. Both ship before Leg D; plan Task 1.6 step 8 gains the decision rule (harmless if the ES3 releases on websocket loss, required if it keeps a key).
 - §5.2 (I2): a `Shutdown` waits for a release websocket up to 350 ms (`SHUTDOWN_BOUND` 950 ms, inside the KVM step's 1 s); past it the release runs on, detached, until the runtime's teardown.
 - §10.4 (I2): 44 families; `release_websockets{outcome}` joins the registry.
+- §10.4 (Plan D final review m1): a paste abort counts under its reason — `paste_events{aborted}` becomes eight labels, `aborted_esc` … `aborted_session` — so "the paste typed nothing" can be told apart (`modifier_wait` from `clipboard_failed`).
+- §7.4 (m3, m5), §8 (m4): documented — a stalled RDP thread is healed only by `/livez`'s restart; a held mouse button arms no timer, by design (long drags); a queue overflow mid-paste drops characters and never holds a key. The first and last join the Plan E carries (§12).
+- §12 (m2): owner acceptance item 15, a focus change (Cmd+Tab away from Windows App and a click back in), with its rule.
 - §11.3 (I2): L2 cases for a session end during a KVM stall, one with the websocket down, and the release websocket's bound.
 
 **Rev 6.2 — Plan C (2026-10-07 to 2026-10-08).** Records what building
@@ -1469,6 +1472,11 @@ Triggers:
     formula (§12);
   - modifiers held and no keyboard event of any kind for
     `modifier_idle_timeout`.
+  - Rev 6.3 (Plan D final review m5): a held mouse button arms no timer,
+    by design — a long drag must never be cut. A button whose up never
+    comes (focus lost mid-drag) stays down until its next up (the client's
+    next click of it), a `Synchronize` or another trigger (acceptance
+    item 15).
 
 A stuck Cmd on a work Mac is the failure this exists to prevent; every trigger
 has a test (§11).
@@ -1541,6 +1549,17 @@ off up to `kvm.backoff.max` after the first), after a session end once the
 release websocket's 10 s are spent, until the next session — and a crash
 (§5.2).
 
+Rev 6.3 (Plan D final review m3): **a stalled RDP thread is healed only by
+a restart.** The input core, its driver and both timers run on the RDP
+thread (§4.3). If that thread stalls — a long synchronous IronRDP step,
+or a bug — nothing steps the timers, so what the KVM holds stays held: a
+Typist press auto-repeats on the Mac, a held Cmd stays held. Only
+`/livez` notices (the RDP heartbeat older than `admin.liveness_timeout`,
+10 s, §4.5); the supervisor's restart then runs §5.2, whose release-all
+and flush come from the KVM runtime, which the stall does not reach. A
+KVM-runtime watch that releases once the heartbeat is stale while the
+queue's newest state holds something is carried to Plan E (§12).
+
 ## 8. Clipboard: paste as typing
 
 One way only, laptop → Mac.
@@ -1607,6 +1626,17 @@ While typing:
   presses and typing went on: the Mac received the text less its first
   characters, counted `done` — a lost leading `#` or `cd x &&` changes what
   a terminal runs.
+- Rev 6.3 (Plan D final review m4): a queue overflow while typing drops
+  characters and never holds a key. DD6 keeps the Typist's own reports
+  inside the queue's room, but a writer stalled for less than
+  `hid_write_timeout` while `input.queue` − 8 reports that cannot coalesce
+  arrive (wheel notches pass through typing) overflows it: the resync
+  (§7.3) drops the Typist's queued reports and typing goes on, so
+  characters drop out of the middle of the paste, which counts `done`. No
+  key is left held: the resync re-sends the newest full state, and every
+  character's press is followed by its own release. Far-fetched at the
+  default `input.queue` of 256, easy at its floor of 9 — keep 256 in
+  deployment. Aborting the paste on a resync is carried to Plan E (§12).
 - If the client's last `Synchronize` reported Caps Lock on, the paste is
   refused (typing would invert case). (Rev 6.3, DD5: that state is toggled
   by each fresh Caps Lock press since, as the Mac's is.)
@@ -1987,7 +2017,7 @@ marked.
 | `kvm_rdp_disconnects_total` | counter | `cause`: §6.9's causes (`shutdown`, `kvm_unreachable`, `stream_corrupt`, `stream_incompatible`, `no_avc420`, `client_stalled`, `clipboard_oversize`, `kvm_auth_failed`, `kvm_cert_mismatch`) — bridge-initiated only |
 | `kvm_rdp_accept_refused_total` | counter | — |
 | `kvm_rdp_input_events_ignored_total` | counter | — (Plan C's input stub; Plan D replaces it). Rev 6.3: it keeps the name and means client input dropped — unmapped, untypeable or past a bound (DD7, DD9), taken off the RDP thread (§4.3), or arriving with no session live |
-| `kvm_rdp_paste_events_total` (rev 6.3) | counter | `outcome`: `started`, `done`, `no_text`, `caps_lock`, `multiline`, `oversize`, `backlog`, `aborted` (§8). A paste that starts counts `started`, then one of `done`, `multiline`, `oversize` and `aborted`; one refused at the chord counts only `no_text`, `caps_lock` or `backlog` |
+| `kvm_rdp_paste_events_total` (rev 6.3) | counter | `outcome`: `started`, `done`, `no_text`, `caps_lock`, `multiline`, `oversize`, `backlog`, and an abort under its reason (final review m1): `aborted_esc`, `aborted_key`, `aborted_mouse`, `aborted_release` (a release-all, §7.4), `aborted_modifier_wait` (the text or a modifier's release not in time, DD4), `aborted_clipboard_failed`, `aborted_clipboard_lost` (the answer dropped in flight), `aborted_session` (its session ended) (§8). A paste that starts counts `started`, then one of `done`, `multiline`, `oversize` and the `aborted_*`; one refused at the chord counts only `no_text`, `caps_lock` or `backlog` |
 | `kvm_rdp_paste_skipped_chars_total` (rev 6.3) | counter | — (scalars §8's text handling skipped, counted when a paste is done) |
 | `kvm_rdp_clipboard_discarded_total` (rev 6.3) | counter | `reason`: `late`, `unasked` (answers no paste took), `in_flight` (dropped by the backend while another was in flight), `unanswered` (requests retired with no answer) — §8's clipboard answers |
 | `kvm_rdp_release_websockets_total` (rev 6.3, final review I2) | counter | `outcome`: `confirmed` (the KVM's pong after the release), `unconfirmed` (written, never proved), `failed` (no open carried it), `superseded` (a new session, or the exit, ended it first) — the release websocket after a session end the KVM did not prove released (§7.4) |
@@ -2613,6 +2643,13 @@ Plan D's rulings):
   `ironrdp_server`'s "Unexpected channel received" lets an authenticated
   client cause one WARN per PDU (pre-existing; `ironrdp_cliprdr`'s are
   held at ERROR since rev 6.3, §4.5).
+- A KVM-runtime watch that calls release-all once the RDP heartbeat is
+  about 1 s old while the queue's newest state holds something (Plan D
+  final review m3): a stalled RDP thread is otherwise healed only by
+  `/livez`'s restart (§7.4).
+- Ending a paste as aborted when the queue resyncs while it types (Plan D
+  final review m4, §8), so an overflow never drops characters from the
+  middle of a paste.
 
 Not carried: bounding the admin response write and shutdown — Plan C did
 it (§4.5, rev 6.2).
@@ -2740,6 +2777,20 @@ marked *acceptance* in §4.4 are retuned from it. In priority order:
     on the Mac as a `data:` URL in Edge, and a Right Ctrl tap resets its
     counters (the probe never sends Esc). If it does not, Leg D's HID
     steps cannot be read.
+15. **Focus change** (rev 6.3, Plan D final review m2, m5). RDP gives the
+    server no focus signal (§7.4), and Cmd+Tab stays on the laptop
+    (§7.1). Hold Cmd, Cmd+Tab away from Windows App, then click back into
+    its window (and the same with Cmd+Space and Cmd+H): record what
+    reaches the bridge — key-ups when focus leaves, a `Synchronize` when
+    it returns (`release_all{synchronize}` in `/metrics`), or neither —
+    and whether the Mac then holds Cmd (the HID test page's `held` line,
+    §11.6) until `input.modifier_idle_timeout` (30 s), so that the first
+    key after the click arrives as Cmd+key (Cmd+Q, Cmd+W). Then
+    start a drag, release the button outside the window and click back
+    in: a held button arms no timer (§7.4). Rule: if neither key-ups nor
+    a `Synchronize` come, lower `input.modifier_idle_timeout`, or make a
+    click after the client's focus returns a release trigger (a code
+    change), before the bridge drives the work Mac.
 
 ## 13. Development resource budget
 
