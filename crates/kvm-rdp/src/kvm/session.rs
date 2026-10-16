@@ -2102,6 +2102,44 @@ mod tests {
         r.stop(2).await;
     }
 
+    /// r-m1 (re-review of the final fix wave): a takeover — under Preempt
+    /// the new session's `Start` sits right behind the old one's `Stop` —
+    /// aborts the release websocket the `Stop` spawned before its first
+    /// poll, and still counts it, `superseded` (§10.4: each run counts one
+    /// outcome).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_takeover_counts_the_release_websocket_it_supersedes() {
+        let r = rig(None, |_| {}).await;
+        r.tx.send(KvmCommand::Start { generation: 1 }).unwrap();
+        hold_cmd(&r).await;
+        r.websocket_down().await;
+        r.hid.release_all(ReleaseTrigger::SessionEnd);
+        let (done, stopped) = oneshot::channel();
+        r.tx.send(KvmCommand::Stop {
+            generation: 1,
+            done: Some(done),
+        })
+        .unwrap();
+        r.tx.send(KvmCommand::Start { generation: 2 }).unwrap();
+        tokio::time::timeout(T, stopped).await.unwrap().unwrap();
+        let m = r.metrics.clone();
+        let counted = tokio::time::timeout(T, async {
+            while m.release_websockets.total() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(
+            counted.is_ok(),
+            "the superseded release websocket counted nothing"
+        );
+        assert_eq!(r.metrics.release_websockets.get("superseded"), 1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(r.metrics.release_websockets.total(), 1, "counted twice");
+        r.sim.set_policy(|p| p.ws_status = None);
+        r.stop(2).await;
+    }
+
     /// §5.2: a `Shutdown` waits for a release websocket still running only
     /// what the KVM step has left (`SHUTDOWN_RELEASE_WAIT`), then the actor
     /// ends; the release runs on, detached.

@@ -587,6 +587,9 @@ async fn a_takeover_during_a_kvm_stall_ends_released() {
     let a_events = a.wait_for(T, |e| terminated(e).is_some()).await;
     assert_eq!(terminated(&a_events).unwrap(), takeover());
     assert!(terminated(&b.events()).is_none());
+    // r-m1: the takeover counted the release websocket it superseded.
+    let rw = &env.metrics().release_websockets;
+    assert_eq!((rw.get("superseded"), rw.total()), (1, 1));
 }
 
 /// R-I2: a websocket lost mid-session while kvm-sim stalls with Cmd held:

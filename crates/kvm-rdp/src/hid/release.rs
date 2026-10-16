@@ -126,27 +126,35 @@ impl Drop for Counted {
 }
 
 /// One release websocket, bounded by `job.budget`; its outcome, counted
-/// and logged (an outcome word and a count only).
-pub async fn run(job: ReleaseJob) -> Outcome {
-    let mut counted = Counted {
+/// and logged (an outcome word and a count only). The `superseded` guard
+/// exists before the future is first polled (r-m1, the re-review of the
+/// final fix wave): a run aborted before it ever ran — a takeover's
+/// `Start` sits right behind its `Stop` — still counts one.
+pub fn run(job: ReleaseJob) -> impl std::future::Future<Output = Outcome> + Send + 'static {
+    let counted = Counted {
         metrics: job.metrics.clone(),
         done: false,
     };
-    let (outcome, attempts) = release(&job).await;
-    counted.done = true;
-    job.metrics.release_websockets.inc(outcome.label());
-    match outcome {
-        Outcome::Confirmed => {
-            tracing::info!(outcome = outcome.label(), attempts, "release websocket");
+    async move {
+        // The whole guard, moved in (a field assignment alone would
+        // capture only the field, and drop the guard here and now).
+        let mut counted = counted;
+        let (outcome, attempts) = release(&job).await;
+        counted.done = true;
+        job.metrics.release_websockets.inc(outcome.label());
+        match outcome {
+            Outcome::Confirmed => {
+                tracing::info!(outcome = outcome.label(), attempts, "release websocket");
+            }
+            Outcome::Unconfirmed | Outcome::Failed => tracing::warn!(
+                outcome = outcome.label(),
+                attempts,
+                "release websocket: the KVM may still hold a key"
+            ),
+            Outcome::Superseded => {}
         }
-        Outcome::Unconfirmed | Outcome::Failed => tracing::warn!(
-            outcome = outcome.label(),
-            attempts,
-            "release websocket: the KVM may still hold a key"
-        ),
-        Outcome::Superseded => {}
+        outcome
     }
-    outcome
 }
 
 /// How one open went.
