@@ -55,6 +55,13 @@ use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 /// A close may spend this long writing the release and the close frame.
 const CLOSE_BUDGET: Duration = Duration::from_millis(400);
 
+/// I2 (Plan D final review): the payload of the ping written after a
+/// websocket's last report — at a close, and on the release websocket
+/// (`hid::release`). The KVM's pong to it proves it read everything up to
+/// it (RFC 6455 §5.5.2: an endpoint must answer a ping); a pong with any
+/// other payload (a heartbeat) proves nothing.
+pub(crate) const RELEASE_PING: &[u8] = b"kvm-rdp release";
+
 /// `input.reassert_after`'s default (DD8): 1 s past an open's session
 /// start, until L4 measures how long stale reports keep landing (Task 6.1
 /// retunes it).
@@ -366,6 +373,14 @@ impl WsTask {
                                     }
                                 }
                             }
+                            // I2 (Plan D final review): a ping after the
+                            // last report. Its pong proves the KVM read the
+                            // release (`HidControl::confirm_read`), so the
+                            // session needs no release websocket; a KVM
+                            // that answers no close frame (kvm-sim, perhaps
+                            // the ES3) still answers a ping.
+                            let pinged = written
+                                && sink.send(Message::Ping(RELEASE_PING.to_vec())).await.is_ok();
                             let closed = sink.close().await.is_ok();
                             let sent = written && closed;
                             // Wait for the KVM's side of the close, so the
@@ -374,12 +389,22 @@ impl WsTask {
                             // everything up to ours (I2, n1): an EOF or an
                             // error may be a half-close with our backlog
                             // unread. Once it has answered we are done — it
-                            // may wait for our FIN before closing (n2).
+                            // may wait for our FIN before closing (n2). Its
+                            // pong proves the read too, but not that it is
+                            // done: only the close frame ends with a FIN.
                             loop {
                                 match stream.next().await {
                                     Some(Ok(Message::Close(_))) => {
                                         answered = sent;
+                                        if sent {
+                                            let _ = self.hid.confirm_read();
+                                        }
                                         break;
+                                    }
+                                    Some(Ok(Message::Pong(p)))
+                                        if pinged && p == RELEASE_PING =>
+                                    {
+                                        let _ = self.hid.confirm_read();
                                     }
                                     Some(Ok(_)) => {}
                                     Some(Err(_)) | None => break,
@@ -1029,6 +1054,123 @@ mod tests {
             .unwrap();
         drop(tok_tx);
         assert_eq!(sim.stats().logouts, 0);
+    }
+
+    /// I2 (Plan D final review): a close that the KVM reads proves the
+    /// release landed — its pong to the ping written after the release
+    /// (kvm-sim answers pings; it never answers a close frame) — so the KVM
+    /// holds nothing of ours, and no release websocket is needed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_the_kvm_reads_proves_the_release_landed() {
+        use kvm_sim::{KvmSim, SimConfig, SimEvent, Source};
+        let sim = KvmSim::start(SimConfig::es3(
+            Source::fixture("360p30_es3like_poc0.h264").unwrap(),
+        ))
+        .await
+        .unwrap();
+        let p = sim.ports();
+        let ep = Arc::new(KvmEndpoint::new(
+            Scheme::Https,
+            sim.host(),
+            (p.web, p.video, p.control),
+            sim.spki_sha256(),
+        ));
+        let token = login(
+            &ep,
+            &Secret::new(sim.password()),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (mut t, ctl) = task(hid.clone(), Duration::from_secs(1));
+        let (tok_tx, tok_rx) = watch::channel(Some((1, token)));
+        t.token = tok_rx;
+        t.ep = ep;
+        let run = tokio::spawn(t.run());
+        let hid_events = |e: &[SimEvent]| {
+            e.iter()
+                .filter(|e| matches!(e, SimEvent::Hid { .. }))
+                .count()
+        };
+        sim.wait_for(Duration::from_secs(3), |e| hid_events(e) >= 2)
+            .await
+            .unwrap();
+        hid.push(kbd(4), false);
+        sim.wait_for(Duration::from_secs(3), |e| hid_events(e) >= 3)
+            .await
+            .unwrap();
+        assert!(hid.kvm_may_hold(), "a held key was written");
+        hid.release_all(ReleaseTrigger::SessionEnd);
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run did not end after Close")
+            .unwrap();
+        assert!(
+            !hid.kvm_may_hold(),
+            "the KVM's pong did not prove the release"
+        );
+        drop(tok_tx);
+        assert_eq!(sim.stats().logouts, 0);
+    }
+
+    /// I2: a close the KVM never reads — it is not reading — proves nothing:
+    /// the release written ahead of it may never land.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_the_kvm_never_reads_leaves_the_release_unproved() {
+        let mut p = Peer::start(false).await;
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (t, ctl) = p.task(hid.clone(), Duration::from_secs(1));
+        let run = tokio::spawn(t.run());
+        flood_until(&hid, || hid.metrics.hid_reports_sent.get() >= 3).await;
+        hid.release_all(ReleaseTrigger::SessionEnd);
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(hid.kvm_may_hold());
+        assert_eq!(p.ending().await, Ending::Reset);
+    }
+
+    /// I2: only the pong to the bridge's own ping proves the read — a pong
+    /// with any other payload (a heartbeat) is not the KVM's answer.
+    #[tokio::test]
+    async fn only_the_pong_to_the_release_ping_proves_the_read() {
+        for (payload, proved) in [(&b"heartbeat"[..], false), (RELEASE_PING, true)] {
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, ctl) = task(hid.clone(), Duration::from_secs(1));
+            let sink = GateSink::new(true);
+            let s2 = sink.clone();
+            let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Result<Message, WsError>>();
+            let inbound = futures_util::stream::poll_fn(move |cx| in_rx.poll_recv(cx));
+            let drive = tokio::spawn(async move { t.drive(s2, inbound).await });
+            wait_sent(&sink, 2).await;
+            hid.push(kbd(4), false);
+            wait_sent(&sink, 3).await;
+            hid.release_all(ReleaseTrigger::SessionEnd);
+            let (done, ack) = oneshot::channel();
+            ctl.send(WsCtl::Close { done }).unwrap();
+            // The Close arm has written the release, the ping and the close
+            // frame, and waits for the KVM's side: it answers.
+            wait_sent(&sink, 4).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            in_tx.send(Ok(Message::Pong(payload.to_vec()))).unwrap();
+            drop(in_tx);
+            tokio::time::timeout(Duration::from_secs(2), ack)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(ended(drive).await, Exit::Abandoned);
+            assert_eq!(
+                hid.kvm_may_hold(),
+                !proved,
+                "a pong of {payload:?} proved the read: {}",
+                !hid.kvm_may_hold()
+            );
+        }
     }
 
     /// Census (§3.3, §7.3, §7.4): a key held when the websocket dies is

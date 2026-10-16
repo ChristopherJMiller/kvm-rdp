@@ -170,6 +170,16 @@ impl HidQueue {
         v
     }
 
+    /// The newest keyboard or pointer state holds a key or a button (I2).
+    #[must_use]
+    pub fn state_holds(&self) -> bool {
+        let kbd = matches!(self.latest_kbd, Some(HidFrame::Keyboard { modifiers, keys })
+            if modifiers != 0 || keys != [0; 5]);
+        let buttons =
+            matches!(self.latest_mouse, Some(HidFrame::AbsMouse { buttons, .. }) if buttons != 0);
+        kbd || buttons
+    }
+
     /// Whether a frame matching `f` waits to be written (queued, or in a
     /// resync's output).
     fn waiting(&self, f: impl Fn(&HidFrame) -> bool) -> bool {
@@ -219,12 +229,32 @@ impl HidQueue {
     }
 }
 
+/// What the websockets were given, as the KVM may hold it (I2, Plan D final
+/// review): the last position sent (§3.3), whether the last keyboard and
+/// pointer reports written hold anything, and whether anything held was
+/// written since the KVM last proved it read an all-up state. A written
+/// report proves nothing — the KVM may never read it (stalled, the websocket
+/// reset with it unread) — so only that proof clears `may_hold`.
+#[derive(Default)]
+struct Sent {
+    pos: Option<(u16, u16)>,
+    kbd_held: bool,
+    buttons_held: bool,
+    may_hold: bool,
+}
+
+impl Sent {
+    fn holds(&self) -> bool {
+        self.kbd_held || self.buttons_held
+    }
+}
+
 pub struct HidControl {
     epoch: AtomicU64,
     release_pending: AtomicBool,
     notify: Notify,
     queue: Mutex<HidQueue>,
-    last_pos: Mutex<Option<(u16, u16)>>,
+    sent: Mutex<Sent>,
     pub(crate) metrics: Arc<Metrics>,
 }
 
@@ -236,13 +266,17 @@ impl HidControl {
             release_pending: AtomicBool::new(false),
             notify: Notify::new(),
             queue: Mutex::new(HidQueue::new(capacity)),
-            last_pos: Mutex::new(None),
+            sent: Mutex::new(Sent::default()),
             metrics,
         }
     }
 
     fn q(&self) -> MutexGuard<'_, HidQueue> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn sent(&self) -> MutexGuard<'_, Sent> {
+        self.sent.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     #[must_use]
@@ -395,15 +429,58 @@ impl HidControl {
 
     #[must_use]
     pub fn last_position(&self) -> Option<(u16, u16)> {
-        *self.last_pos.lock().unwrap_or_else(PoisonError::into_inner)
+        self.sent().pos
     }
 
-    /// The writer wrote `frame`.
+    /// A writer wrote `frame`: its position, and what it holds (I2).
     pub fn note_sent(&self, frame: &HidFrame) {
-        if let HidFrame::AbsMouse { x, y, .. } = *frame {
-            *self.last_pos.lock().unwrap_or_else(PoisonError::into_inner) = Some((x, y));
+        {
+            let mut s = self.sent();
+            match *frame {
+                HidFrame::Keyboard { modifiers, keys } => {
+                    s.kbd_held = modifiers != 0 || keys != [0; 5];
+                }
+                HidFrame::AbsMouse { buttons, x, y } => {
+                    s.pos = Some((x, y));
+                    s.buttons_held = buttons != 0;
+                }
+                HidFrame::Wheel { buttons, .. } => s.buttons_held = buttons != 0,
+                HidFrame::SetMode { .. } => {}
+            }
+            if s.holds() {
+                s.may_hold = true;
+            }
         }
         self.metrics.hid_reports_sent.inc();
+    }
+
+    /// I2 (Plan D final review): whether the KVM may still hold a key or a
+    /// button from what was written — something held was written, and the
+    /// KVM has not since proved it read an all-up state (`confirm_read`).
+    #[must_use]
+    pub fn kvm_may_hold(&self) -> bool {
+        self.sent().may_hold
+    }
+
+    /// I2: the KVM proved it read everything written so far on the current
+    /// websocket — its pong to a ping written after the last report, or its
+    /// answer to our close. If the last reports written hold nothing, it
+    /// holds nothing of ours: true then.
+    pub fn confirm_read(&self) -> bool {
+        let mut s = self.sent();
+        if !s.holds() {
+            s.may_hold = false;
+        }
+        !s.may_hold
+    }
+
+    /// I2: input is held — the last reports written hold a key or a button,
+    /// or the queue's newest state does (the input core holds one not yet
+    /// written). Read before a release zeroes that state.
+    #[must_use]
+    pub fn input_held(&self) -> bool {
+        let written = self.sent().holds();
+        written || self.q().state_holds()
     }
 
     /// §7.4: an all-zero keyboard report and a zero-button pointer report at
@@ -666,6 +743,52 @@ mod tests {
             c.push(kbd(k), false);
         }
         assert_eq!(drain(&c), [kbd(3), mouse(0, 9, 9)]);
+    }
+
+    /// I2 (Plan D final review): what the KVM may hold follows what was
+    /// written. A held key or button written sets it; a written release
+    /// proves nothing (the KVM may never read it); only a read the KVM
+    /// proved (`confirm_read`) with the last reports written all up clears
+    /// it. The queue's newest state is held input, not what the KVM holds.
+    #[test]
+    fn what_the_kvm_may_hold_clears_only_on_a_proved_read_of_an_all_up_state() {
+        let c = ctl(8);
+        let wheel = |buttons| HidFrame::Wheel {
+            buttons,
+            wheel: kvm_proto::hid::Wheel::Up,
+        };
+        assert!(!c.kvm_may_hold() && !c.input_held());
+        for f in c.session_start_frames() {
+            c.note_sent(&f);
+        }
+        assert!(!c.kvm_may_hold(), "the session start holds nothing");
+        c.note_sent(&kbd(4));
+        assert!(c.kvm_may_hold() && c.input_held());
+        assert!(!c.confirm_read(), "the last report written holds a key");
+        assert!(c.kvm_may_hold());
+        c.note_sent(&KBD_ZERO);
+        assert!(!c.input_held());
+        assert!(c.kvm_may_hold(), "a written release proved nothing");
+        assert!(c.confirm_read());
+        assert!(!c.kvm_may_hold());
+        // A button, in a pointer report and in a wheel report's mask.
+        c.note_sent(&mouse(1, 5, 5));
+        assert!(c.kvm_may_hold() && c.input_held());
+        c.note_sent(&mouse(0, 5, 5));
+        assert!(c.confirm_read());
+        c.note_sent(&wheel(4));
+        assert!(c.kvm_may_hold() && c.input_held());
+        assert!(!c.confirm_read());
+        c.note_sent(&wheel(0));
+        assert!(c.confirm_read() && !c.kvm_may_hold());
+        assert_eq!(c.last_position(), Some((5, 5)));
+        // Pushed, not written: held input that a reconnect must not wait on.
+        c.push(kbd(9), false);
+        assert!(c.input_held() && !c.kvm_may_hold());
+        c.release_all(ReleaseTrigger::Closing);
+        assert!(!c.input_held());
+        c.push(mouse(2, 1, 1), false);
+        assert!(c.input_held());
     }
 
     /// I1 (Plan D final review), §7.3: a websocket open that discards a
