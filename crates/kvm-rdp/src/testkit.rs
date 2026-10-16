@@ -2,6 +2,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use std::time::Duration;
 
+/// Plan E Task 1.4: the lib's tests count allocations per thread
+/// (`alloc_stats::this_thread`). The count costs one TLS add per
+/// allocation; nothing else changes.
+#[global_allocator]
+static ALLOC: crate::alloc_stats::Counting = crate::alloc_stats::Counting;
+
 /// PD5 ruling (§4.5, §9.2): no rendering of any of `values` — decimal,
 /// hex in either case, `0x`-prefixed or two-digit — appears in `s` (a
 /// `Debug` of key or pointer state). Renderings shorter than two characters

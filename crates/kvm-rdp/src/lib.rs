@@ -14,6 +14,10 @@
 )]
 
 pub mod admin;
+// §10.4's allocation counter: the lib's own tests and `alloc-stats` builds
+// only (Plan E Task 1.4) — the image's build has no such module.
+#[cfg(any(test, feature = "alloc-stats"))]
+pub mod alloc_stats;
 pub mod bridge;
 pub mod cli;
 pub mod config;

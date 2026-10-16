@@ -16,6 +16,13 @@ compile_error!("kvm-rdp: a build without debug assertions must use panic = \"abo
 
 use std::process::ExitCode;
 
+// §10.4 (Plan E Task 1.4): an `alloc-stats` build (kvm-bench's bridge)
+// counts every allocation and exports the totals on `/metrics`. Every
+// other build, the image's included, keeps the default allocator.
+#[cfg(feature = "alloc-stats")]
+#[global_allocator]
+static ALLOC: kvm_rdp::alloc_stats::Counting = kvm_rdp::alloc_stats::Counting;
+
 fn main() -> ExitCode {
     ExitCode::from(kvm_rdp::cli::main(
         std::env::args_os().skip(1),

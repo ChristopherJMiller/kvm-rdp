@@ -100,6 +100,9 @@ pub struct Video {
     /// The token a new main FLV proved by reaching its first tag, until
     /// the session takes it (`take_proven`).
     proven: Option<u64>,
+    /// Each chunk's demuxed tags, one allocation reused for every chunk
+    /// (Plan E Task 1.4); empty between chunks.
+    tags: Vec<FlvTag>,
 }
 
 /// §10.4 fps: AUs admitted over the last whole second, published once a
@@ -145,14 +148,15 @@ pub(crate) fn class_label(c: ParamClass) -> &'static str {
     }
 }
 
-fn drain(demux: &mut FlvDemuxer, bytes: &[u8]) -> (Vec<FlvTag>, Option<FlvError>) {
+/// Demux `bytes` into `tags`, the caller's reused buffer (Plan E Task 1.4:
+/// no `Vec` per chunk).
+fn drain(demux: &mut FlvDemuxer, bytes: &[u8], tags: &mut Vec<FlvTag>) -> Option<FlvError> {
     demux.push(bytes);
-    let mut tags = Vec::new();
     loop {
         match demux.next_tag() {
             Ok(Some(t)) => tags.push(t),
-            Ok(None) => return (tags, None),
-            Err(e) => return (tags, Some(e)),
+            Ok(None) => return None,
+            Err(e) => return Some(e),
         }
     }
 }
@@ -208,6 +212,7 @@ impl Video {
             last_au: None,
             fps: FpsMeter::default(),
             proven: None,
+            tags: Vec::with_capacity(8),
         }
     }
 
@@ -467,8 +472,12 @@ impl Video {
             .flv_bytes
             .add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let s = self.main.as_mut()?;
-        let (tags, err) = drain(&mut s.demux, &bytes);
-        self.admit_all(tags, err, now).await
+        let mut tags = std::mem::take(&mut self.tags);
+        tags.clear();
+        let err = drain(&mut s.demux, &bytes, &mut tags);
+        let outcome = self.admit_all(&mut tags, err, now).await;
+        self.tags = tags;
+        outcome
     }
 
     async fn pending_chunk(
@@ -486,13 +495,19 @@ impl Video {
             .flv_bytes
             .add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         let p = self.pending.as_mut()?;
-        let (tags, err) = drain(&mut p.demux, &bytes);
+        let mut tags = std::mem::take(&mut self.tags);
+        tags.clear();
+        let err = drain(&mut p.demux, &bytes, &mut tags);
         if tags.is_empty() {
-            // No first tag: a header-only chunk waits (`?`); an error means
-            // the candidate failed and the old FLV keeps flowing (§6.5).
-            // It is still the KVM's framing violation (§6.9): counted, and
+            // No first tag: a header-only chunk waits; an error means the
+            // candidate failed and the old FLV keeps flowing (§6.5). It is
+            // still the KVM's framing violation (§6.9): counted, and
             // toward the 3-in-60 s `stream_corrupt` rule.
-            let e = err?;
+            let Some(e) = err else {
+                self.tags = tags;
+                return None;
+            };
+            self.tags = tags;
             self.pending = None;
             self.metrics.upstream_reconnects.inc("commanded_failed");
             let e = AdmissionError::from(e);
@@ -506,16 +521,20 @@ impl Video {
         // Its first tag: the old FLV closes now (make-before-break, §6.5).
         self.main = self.pending.take();
         self.became_main(FlvOrigin::Commanded, now).await;
-        self.admit_all(tags, err, now).await
+        let outcome = self.admit_all(&mut tags, err, now).await;
+        self.tags = tags;
+        outcome
     }
 
+    /// Admit a chunk's `tags` in order, leaving the buffer empty (an early
+    /// return drops the rest, which belong to a dead stream).
     async fn admit_all(
         &mut self,
-        tags: Vec<FlvTag>,
+        tags: &mut Vec<FlvTag>,
         err: Option<FlvError>,
         now: Instant,
     ) -> Option<Outcome> {
-        for tag in tags {
+        for tag in tags.drain(..) {
             // A tag that lost the main FLV (end of sequence, a framing
             // refusal) ends this chunk: the rest belongs to a dead stream.
             self.main.as_ref()?;
@@ -1596,5 +1615,63 @@ mod tests {
         assert_eq!(class_label(ParamClass::Initial), "initial");
         assert_eq!(class_label(ParamClass::Resize), "resize");
         assert_eq!(class_label(ParamClass::Other), "other");
+    }
+
+    /// Plan E Task 1.4 (the per-chunk `Vec<FlvTag>`): `drain` demuxes into
+    /// the caller's buffer and never replaces it — once it holds a chunk's
+    /// tags, its allocation is reused for every later chunk — and allocates
+    /// nothing beside the demuxer's own (a twin demuxer fed the same chunks
+    /// counts those), so no temporary `Vec` hides behind the reused one.
+    #[test]
+    fn drain_reuses_the_tag_buffer() {
+        use crate::alloc_stats::this_thread;
+        use kvm_proto::flv::mux::{
+            TAG_VIDEO, avc_nalu_body, avc_sequence_header_body, write_flv_header, write_tag,
+        };
+        // `drain` only demuxes: the ES3 fixture's admitted parameter sets
+        // (the L1 rig's) make a well-formed sequence header.
+        let p = crate::pump::rig::params(crate::pump::rig::ES3);
+        let pps: Vec<&[u8]> = p.pps.iter().map(|b| b.as_ref()).collect();
+        let mut head = Vec::new();
+        write_flv_header(&mut head, false, true);
+        write_tag(
+            &mut head,
+            TAG_VIDEO,
+            0,
+            &avc_sequence_header_body(&[&p.sps], &pps, 4).unwrap(),
+        )
+        .unwrap();
+        let mut chunks = vec![head];
+        for i in 0..64u32 {
+            let mut body = Vec::new();
+            avc_nalu_body(&mut body, i == 0, 16, &[&[0x65, 0x88, 0x84, 0x21][..]], 4).unwrap();
+            let mut tag = Vec::new();
+            write_tag(&mut tag, TAG_VIDEO, (i + 1) * 33, &body).unwrap();
+            chunks.push(tag);
+        }
+        let (mut demux, mut twin) = (
+            FlvDemuxer::new(FlvLimits::default()),
+            FlvDemuxer::new(FlvLimits::default()),
+        );
+        let mut tags = Vec::with_capacity(8);
+        let (ptr, cap) = (tags.as_ptr(), tags.capacity());
+        let (mut drained, mut demuxed) = (0u64, 0u64);
+        for c in &chunks {
+            tags.clear();
+            let t0 = this_thread();
+            assert!(drain(&mut demux, c, &mut tags).is_none());
+            let t1 = this_thread();
+            twin.push(c);
+            while twin.next_tag().unwrap().is_some() {}
+            let t2 = this_thread();
+            drained += t1 - t0;
+            demuxed += t2 - t1;
+            assert_eq!(
+                (tags.as_ptr(), tags.capacity()),
+                (ptr, cap),
+                "drain replaced the buffer"
+            );
+        }
+        assert_eq!(drained, demuxed, "drain allocated beside the demuxer's own");
     }
 }

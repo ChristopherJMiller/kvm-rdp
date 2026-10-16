@@ -29,6 +29,10 @@ bench = false
 # release). Every test build turns it on through the dev-dependency on this
 # package below; `cargo build --release -p kvm-rdp` (the image) never does.
 test-hooks = []
+# §10.4's allocations per frame (Plan E Task 1.4): the binary installs
+# `alloc_stats::Counting` and /metrics exports its counters. kvm-bench's
+# bridge is built with it; the image never is.
+alloc-stats = []
 
 [dependencies]
 kvm-proto = { path = "../kvm-proto" }

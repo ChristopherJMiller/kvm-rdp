@@ -509,6 +509,22 @@ impl Metrics {
             "Third-party log lines past their callsite's limit (§4.5, rev 6.4)",
             crate::logging::suppressed(),
         );
+        #[cfg(feature = "alloc-stats")]
+        {
+            let (allocations, bytes) = crate::alloc_stats::totals();
+            render_value_counter(
+                &mut out,
+                "kvm_rdp_allocations",
+                "Heap allocations since start (alloc-stats builds, §10.4)",
+                allocations,
+            );
+            render_value_counter(
+                &mut out,
+                "kvm_rdp_allocated_bytes",
+                "Bytes requested from the allocator since start (alloc-stats builds)",
+                bytes,
+            );
+        }
         for f in [
             &self.frames,
             &self.parse_errors,
@@ -628,8 +644,8 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            45,
-            "19 counters, 13 families, 8 gauges, 5 histograms"
+            45 + if cfg!(feature = "alloc-stats") { 2 } else { 0 },
+            "19 counters, 13 families, 8 gauges, 5 histograms (+2 counters in alloc-stats builds)"
         );
         assert!(t.contains("# TYPE kvm_rdp_log_lines_suppressed_total counter\n"));
         assert!(t.contains("# TYPE kvm_rdp_hid_reasserts_total counter\n"));
@@ -646,5 +662,24 @@ mod tests {
                 "{n}"
             );
         }
+    }
+
+    /// Plan E Task 1.4 (§10.4): an alloc-stats build exports the process's
+    /// allocation counters, and they move.
+    #[cfg(feature = "alloc-stats")]
+    #[test]
+    fn alloc_stats_builds_export_the_allocation_counters() {
+        let first = Metrics::default().render();
+        let _keep: Vec<Vec<u8>> = (0..64).map(|i| vec![0u8; 64 + i]).collect();
+        let second = Metrics::default().render();
+        let value = |t: &str| -> u64 {
+            t.lines()
+                .find_map(|l| l.strip_prefix("kvm_rdp_allocations_total "))
+                .unwrap()
+                .parse()
+                .unwrap()
+        };
+        assert!(value(&second) >= value(&first) + 64, "{first}\n{second}");
+        assert!(second.contains("# TYPE kvm_rdp_allocated_bytes_total counter\n"));
     }
 }

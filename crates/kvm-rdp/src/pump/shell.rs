@@ -105,6 +105,8 @@ pub struct PumpShell {
     tick_every: Duration,
     /// The held resize's next re-read, backing off (PC17 n1).
     resize_poll: Duration,
+    /// Every step's commands, one allocation reused (PC14 n4).
+    scratch: Vec<Command>,
     /// The run loop's turns, counted only by tests.
     #[cfg(test)]
     turns: Option<Arc<AtomicU64>>,
@@ -132,6 +134,7 @@ impl PumpShell {
             shutdown_watchdog: SHUTDOWN_WATCHDOG,
             tick_every: TICK,
             resize_poll: RESIZE_POLL,
+            scratch: Vec::new(),
             #[cfg(test)]
             turns: None,
         }
@@ -214,16 +217,19 @@ impl PumpShell {
         }
     }
 
-    /// Step `inputs` in order under one GFX lock hold (§4.3).
+    /// Step `inputs` in order under one GFX lock hold (§4.3), into the
+    /// shell's reused `Vec` (PC14 n4) — `exec` hands it back.
     fn step(&mut self, inputs: impl IntoIterator<Item = Input>) -> Vec<Command> {
+        let mut out = std::mem::take(&mut self.scratch);
+        out.clear();
         let Some(gfx) = self.link.as_ref().map(|l| l.gfx.clone()) else {
+            self.scratch = out;
             return Vec::new();
         };
         let now = Instant::now();
         let mut g = lock(&gfx);
-        let mut out = Vec::new();
         for i in inputs {
-            out.extend(self.pump.step(&mut g, now, i));
+            self.pump.step_into(&mut g, now, i, &mut out);
         }
         out
     }
@@ -527,6 +533,17 @@ impl PumpShell {
 
     async fn exec(&mut self, cmds: Vec<Command>) {
         let mut queue: VecDeque<Command> = cmds.into();
+        self.exec_queue(&mut queue).await;
+        queue.clear();
+        // The capacity, for the next step; a nested step meanwhile took a
+        // fresh, empty one.
+        let back = Vec::from(queue);
+        if back.capacity() > self.scratch.capacity() {
+            self.scratch = back;
+        }
+    }
+
+    async fn exec_queue(&mut self, queue: &mut VecDeque<Command>) {
         while let Some(c) = queue.pop_front() {
             let Some(generation) = self.link.as_ref().map(|l| l.generation) else {
                 return;

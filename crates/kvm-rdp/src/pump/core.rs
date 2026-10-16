@@ -182,6 +182,21 @@ impl Pump {
         input: Input,
     ) -> Vec<Command> {
         let mut out = Vec::new();
+        self.step_into(gfx, now, input, &mut out);
+        out
+    }
+
+    /// `step`, appending to `out` (Plan E Task 1.4, PC14 n4: the shell
+    /// steps every input into one reused `Vec`). Commands already in `out`
+    /// stay where they are, before this step's.
+    pub fn step_into(
+        &mut self,
+        gfx: &mut GraphicsPipelineServer,
+        now: Instant,
+        input: Input,
+        out: &mut Vec<Command>,
+    ) {
+        let base = out.len();
         // A burst chunk (§6.5) fills across consecutive burst AUs. The shell
         // samples `Suppress`, `Backlog` and acks between AUs (DC6); those
         // must not split a chunk, so they flush it only if they change the
@@ -192,7 +207,7 @@ impl Pump {
             Input::Suppress(_) | Input::Backlog { .. } | Input::Rtt(_) | Input::FrameAck { .. }
         );
         if !sample && !matches!(&input, Input::Au(a) if a.au.burst) {
-            self.flush_batch(&mut out);
+            self.flush_batch(out);
         }
         let before = self.state;
         match input {
@@ -202,7 +217,7 @@ impl Pump {
                     self.reset();
                 }
             }
-            other if self.state != State::Idle => self.session_input(gfx, now, other, &mut out),
+            other if self.state != State::Idle => self.session_input(gfx, now, other, out),
             Input::Au(_) => self.metrics.frames_dropped.inc("not_ready"),
             _ => {}
         }
@@ -210,13 +225,19 @@ impl Pump {
             && self.state != before
             && let Some(b) = self.batch.take()
         {
-            // The chunk's frames came before the state change: send them first.
-            out.insert(0, Command::SendDvc(b));
+            // The chunk's frames came before the state change: send them
+            // first — first of this step's, after any earlier step's.
+            out.insert(base, Command::SendDvc(b));
         }
         if self.state != State::Idle {
             self.gauges(gfx, now);
         }
-        out
+    }
+
+    /// `(surface id, width, height)` of the latest Setup.
+    #[cfg(test)]
+    pub(crate) fn surface(&self) -> Option<(u16, u16, u16)> {
+        self.surface
     }
 
     fn session_input(
@@ -1869,6 +1890,134 @@ mod tests {
             panic!("{:?}", kinds(&out))
         };
         assert_eq!((b.frames, b.yield_after), (3, true));
+    }
+
+    /// Plan E Task 1.4 (PC14 n4): `step_into` appends — what an earlier
+    /// step put in the shell's reused `Vec` stays first, and the half-filled
+    /// burst chunk a state-changing sample sends goes first of this step's
+    /// commands, not of the whole `Vec`.
+    #[test]
+    fn step_into_keeps_an_earlier_steps_commands_first() {
+        let mut r = Rig::new(cfg());
+        r.live();
+        for _ in 0..3 {
+            assert!(r.step(au(false, true)).is_empty(), "the chunk fills");
+        }
+        // Suppression held for the debounce time: its second sample is the
+        // edge (Live → Paused), stepped behind an earlier step's command.
+        r.at(100);
+        assert!(r.step(Input::Suppress(true)).is_empty());
+        r.at(100 + u64::try_from(r.cfg.suppress_debounce.as_millis()).unwrap());
+        let mut out = vec![Command::ProbeRtt];
+        r.pump
+            .step_into(&mut r.gfx, r.now, Input::Suppress(true), &mut out);
+        assert_eq!(r.pump.state(), State::Paused);
+        assert_eq!(kinds(&out), ["ProbeRtt", "SendDvc", "ReleaseAll"]);
+        let Command::SendDvc(b) = &out[1] else {
+            panic!("{:?}", kinds(&out))
+        };
+        assert_eq!((b.frames, b.yield_after), (3, true));
+    }
+
+    /// §10.1 (Plan E Task 1.4, DE3 C): the pump's share of the bridge-owned
+    /// budget. Per live frame: the shell's three inputs (DC6: suppression,
+    /// backlog, the AU) and the frame's ack, stepped into one reused
+    /// `Vec` — minus what IronRDP's `send_avc420_frame` + `drain_output`
+    /// allocate for the same Annex-B on a twin `GraphicsPipelineServer` in
+    /// the same state. At most 0.5 once warm.
+    #[test]
+    #[allow(clippy::as_conversions)] // counts → f64 for the mean
+    fn the_pumps_own_allocations_per_frame_are_within_its_share() {
+        use crate::alloc_stats::this_thread;
+        use ironrdp_core::encode_vec;
+        use ironrdp_dvc::DvcProcessor as _;
+        use ironrdp_egfx::pdu::{Avc420Region, FrameAcknowledgePdu, GfxPdu, QueueDepth};
+        let (mut r, mut twin) = (Rig::new(cfg()), Rig::new(cfg()));
+        let first = r.live();
+        twin.live();
+        // The session's first IDR, acknowledged: the soft gate sees a live
+        // client, as it would once the first frame is acked.
+        let id0 = pdus(&first)
+            .iter()
+            .find_map(|p| match p {
+                GfxPdu::EndFrame(e) => Some(e.frame_id),
+                _ => None,
+            })
+            .unwrap();
+        r.ack(id0, QueueDepth::Unavailable);
+        let (sid, w, h) = twin.pump.surface().unwrap();
+        let params = params(ES3);
+        let mut out = Vec::with_capacity(16);
+        let mut annexb = Vec::with_capacity(1 << 16);
+        let ack = |id: u32| {
+            encode_vec(&GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+                queue_depth: QueueDepth::Unavailable,
+                frame_id: id,
+                total_frames_decoded: 0,
+            }))
+            .unwrap()
+        };
+        let (mut pump, mut ironrdp, mut frames) = (0u64, 0u64, 0u64);
+        for i in 1..=400u32 {
+            r.at(u64::from(i) * 33);
+            let idr = i % 60 == 0;
+            let (Input::Au(a), Input::Au(b)) = (au(idr, false), au(idr, false)) else {
+                unreachable!()
+            };
+            out.clear();
+            let t0 = this_thread();
+            r.pump
+                .step_into(&mut r.gfx, r.now, Input::Suppress(false), &mut out);
+            r.pump
+                .step_into(&mut r.gfx, r.now, Input::Backlog { written: 0 }, &mut out);
+            r.pump.step_into(&mut r.gfx, r.now, Input::Au(a), &mut out);
+            let t1 = this_thread();
+            // The frame's ack: IronRDP's part (decoding the PDU) is not
+            // the pump's, so it runs outside the count on both sides.
+            let id = pdus(&out)
+                .iter()
+                .find_map(|p| match p {
+                    GfxPdu::EndFrame(e) => Some(e.frame_id),
+                    _ => None,
+                })
+                .expect("the frame was sent");
+            r.gfx.process(CHAN, &ack(id)).unwrap();
+            let t2 = this_thread();
+            r.pump.step_into(
+                &mut r.gfx,
+                r.now,
+                Input::FrameAck {
+                    frame_id: id,
+                    queue_depth: QueueDepth::Unavailable.to_u32(),
+                },
+                &mut out,
+            );
+            let t3 = this_thread();
+            annexb.clear();
+            b.au.write_annex_b(&params, &mut annexb);
+            let region = Avc420Region::full_frame(w, h, 22);
+            let t4 = this_thread();
+            let tid = twin.gfx.send_avc420_frame(sid, &annexb, &[region], 0);
+            let msgs = twin.gfx.drain_output();
+            let t5 = this_thread();
+            drop(msgs);
+            twin.gfx
+                .process(CHAN, &ack(tid.expect("the twin sent it")))
+                .unwrap();
+            if i > 30 {
+                pump += (t1 - t0) + (t3 - t2);
+                ironrdp += t5 - t4;
+                frames += 1;
+            }
+        }
+        let net = (pump as f64 - ironrdp as f64) / frames as f64;
+        println!(
+            "pump: {net:.3} own allocations per frame ({pump} − IronRDP's {ironrdp}, {frames} frames)"
+        );
+        assert!(
+            net <= 0.5,
+            "the pump allocates {net:.3} per frame of its own (budget 0.5, DE3)"
+        );
     }
 }
 

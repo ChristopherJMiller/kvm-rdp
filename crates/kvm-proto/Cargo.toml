@@ -30,6 +30,13 @@ proptest = { workspace = true }
 name = "fixtures"
 path = "tests/fixtures.rs"
 
+# Plan E Task 1.4: kvm-proto's share of §10.1's allocation budget, under
+# this binary's own counting allocator — hence no libtest harness.
+[[test]]
+name = "alloc"
+path = "tests/alloc.rs"
+harness = false
+
 [[example]]
 name = "fuzz_seeds"
 required-features = ["fuzzing"]
