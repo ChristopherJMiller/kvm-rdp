@@ -150,9 +150,14 @@ struct GfxCallbacks {
 
 impl GraphicsPipelineHandler for GfxCallbacks {
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {
+        let sets = caps_hex(pdu);
+        // Once per negotiation, bounded by `caps_hex`; L3 reads FreeRDP's
+        // ladder from it (Plan E Task 3.1, DC8). Client-chosen bytes, as
+        // hex: never text the client typed.
+        tracing::debug!(slot = self.slot, sets = %sets.join(","), "EGFX capabilities advertised");
         let _ = self.tx.send(RdpInput::CapsAdvertised {
             slot: self.slot,
-            sets: caps_hex(pdu),
+            sets,
         });
     }
 
@@ -163,7 +168,11 @@ impl GraphicsPipelineHandler for GfxCallbacks {
         });
     }
 
-    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, _total_frames_decoded: u32) {
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, total_frames_decoded: u32) {
+        // §11.4 oracle 3: the client's own decode count (a metric only).
+        self.metrics
+            .egfx_client_frames_decoded
+            .set(i64::from(total_frames_decoded));
         let _ = self.tx.send(RdpInput::FrameAck {
             slot: self.slot,
             frame_id,
@@ -219,5 +228,67 @@ mod tests {
             assert_eq!(s.len(), 9 + 128, "{s}");
             assert!(s.starts_with(&format!("{:08x}:abab", 0x8_0000 + i)), "{s}");
         }
+    }
+
+    /// A `MakeWriter` into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Buf(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Buf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+        type Writer = Buf;
+        fn make_writer(&'a self) -> Buf {
+            self.clone()
+        }
+    }
+
+    /// Plan E Task 3.1 (§11.4 oracle 3, DE4): an ack sets the client's
+    /// decode gauge; an advertise is logged at DEBUG in census notation
+    /// (what L3 reads FreeRDP's ladder from) and still reaches the pump.
+    #[test]
+    fn an_ack_sets_the_decode_gauge_and_an_advertise_is_logged_at_debug() {
+        let metrics = Arc::new(Metrics::default());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut cb = GfxCallbacks {
+            slot: 3,
+            tx,
+            hard_cap: 60,
+            metrics: metrics.clone(),
+        };
+        cb.on_frame_ack(7, 0, 41);
+        assert_eq!(metrics.egfx_client_frames_decoded.get(), 41);
+        let buf = Buf::default();
+        let sub = crate::logging::subscriber("kvm_rdp=debug", buf.clone()).unwrap();
+        let pdu = CapabilitiesAdvertisePdu(vec![
+            RawCapabilitySet::new(CapabilityVersion::V8, vec![0x02, 0, 0, 0]),
+            RawCapabilitySet::new(CapabilityVersion::V8_1, vec![0x12, 0, 0, 0]),
+        ]);
+        tracing::subscriber::with_default(sub, || cb.capabilities_advertise(&pdu));
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("EGFX capabilities advertised"), "{text}");
+        assert!(
+            text.contains("00080004:02000000,00080105:12000000"),
+            "{text}"
+        );
+        // The ack still reaches the pump, first: it was sent first.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::FrameAck {
+                slot: 3,
+                frame_id: 7,
+                queue_depth: 0
+            })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(RdpInput::CapsAdvertised { slot: 3, .. })
+        ));
     }
 }

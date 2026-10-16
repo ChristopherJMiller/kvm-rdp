@@ -280,6 +280,9 @@ pub struct Metrics {
     pub autodetect_rtt_ms: Gauge,
     pub standing_delay_ms: Gauge,
     pub egfx_capability_version: Gauge,
+    /// §11.4 oracle 3 (Plan E Task 3.1, DE4): the client's last
+    /// `totalFramesDecoded`.
+    pub egfx_client_frames_decoded: Gauge,
     pub hid_reports_sent: Counter,
     pub hid_reports_coalesced: Counter,
     pub hid_resyncs: Counter,
@@ -413,6 +416,10 @@ impl Default for Metrics {
             egfx_capability_version: Gauge::new(
                 "kvm_rdp_egfx_capability_version",
                 "Negotiated EGFX capability version",
+            ),
+            egfx_client_frames_decoded: Gauge::new(
+                "kvm_rdp_egfx_client_frames_decoded",
+                "The client's last totalFramesDecoded, from its FrameAcknowledge (§11.4)",
             ),
             hid_reports_sent: Counter::new(
                 "kvm_rdp_hid_reports_sent",
@@ -553,6 +560,7 @@ impl Metrics {
             &self.autodetect_rtt_ms,
             &self.standing_delay_ms,
             &self.egfx_capability_version,
+            &self.egfx_client_frames_decoded,
         ] {
             g.render(&mut out);
         }
@@ -646,9 +654,10 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            45 + if cfg!(feature = "alloc-stats") { 2 } else { 0 },
-            "19 counters, 13 families, 8 gauges, 5 histograms (+2 counters in alloc-stats builds)"
+            46 + if cfg!(feature = "alloc-stats") { 2 } else { 0 },
+            "19 counters, 13 families, 9 gauges, 5 histograms (+2 counters in alloc-stats builds)"
         );
+        assert!(t.contains("# TYPE kvm_rdp_egfx_client_frames_decoded gauge\n"));
         assert!(t.contains("# TYPE kvm_rdp_log_lines_suppressed_total counter\n"));
         assert!(t.contains("# TYPE kvm_rdp_hid_reasserts_total counter\n"));
         assert!(t.contains("# TYPE kvm_rdp_release_websockets_total counter\n"));

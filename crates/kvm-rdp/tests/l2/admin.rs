@@ -170,7 +170,7 @@ async fn livez_within(addr: SocketAddr, limit: Duration) -> Option<Duration> {
 }
 
 /// The real binary on `dir`'s config; stdout and stderr captured by line.
-struct Bin {
+pub(crate) struct Bin {
     child: Child,
     out: Arc<Mutex<Vec<String>>>,
     /// The two pipe readers (P10): `output` joins them.
@@ -200,7 +200,7 @@ impl Bin {
     /// The environment is cleared, then given `RUST_LOG=off` (P48: a binary
     /// that took its filter from `RUST_LOG` would log nothing, not even the
     /// ready line) and `envs`.
-    fn spawn(dir: &Path, envs: &[(&str, &OsStr)]) -> Bin {
+    pub(crate) fn spawn(dir: &Path, envs: &[(&str, &OsStr)]) -> Bin {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_kvm-rdp"));
         cmd.arg("--config")
             .arg(dir.join("kvm-rdp.toml"))
@@ -242,7 +242,7 @@ impl Bin {
 
     /// The RDP address from the `kvm-rdp ready` line (its admin address is
     /// kept: `admin`).
-    async fn ready(&mut self) -> SocketAddr {
+    pub(crate) async fn ready(&mut self) -> SocketAddr {
         let rx = self.ready.take().unwrap();
         let (rdp, admin) = tokio::task::spawn_blocking(move || rx.recv_timeout(T))
             .await
@@ -253,7 +253,7 @@ impl Bin {
     }
 
     /// The admin listener's address, from the ready line.
-    fn admin(&self) -> SocketAddr {
+    pub(crate) fn admin(&self) -> SocketAddr {
         self.admin.expect("`ready` first")
     }
 
@@ -270,13 +270,13 @@ impl Bin {
         assert_eq!(unsafe { libc::kill(pid, libc::SIGUSR1) }, 0);
     }
 
-    /// What the child has written so far, while it runs (the log checks
-    /// use `output`, complete only once it has exited).
-    fn lines_so_far(&self) -> Vec<String> {
+    /// What the child has written so far (a live snapshot; `output` is the
+    /// complete log once it has exited).
+    pub(crate) fn lines(&self) -> Vec<String> {
         self.out.lock().unwrap().clone()
     }
 
-    async fn wait(&mut self, limit: Duration) -> ExitStatus {
+    pub(crate) async fn wait(&mut self, limit: Duration) -> ExitStatus {
         let t0 = Instant::now();
         loop {
             if let Some(s) = self.child.try_wait().unwrap() {
@@ -295,7 +295,7 @@ impl Bin {
     /// them is the log complete (P10: the shutdown's last lines, where a
     /// regression would leak, are the ones a reader may still be copying
     /// when `wait` returns).
-    fn output(&mut self) -> Vec<String> {
+    pub(crate) fn output(&mut self) -> Vec<String> {
         for r in self.readers.drain(..) {
             let _ = r.join();
         }
@@ -846,7 +846,7 @@ fn assert_input_path_lines_allowed(what: &str, v: &serde_json::Value, line: &str
 }
 
 /// `GET path` on `addr`: the body.
-async fn http_get(addr: SocketAddr, path: &str) -> String {
+pub(crate) async fn http_get(addr: SocketAddr, path: &str) -> String {
     let mut s = admin_connect(addr).await;
     s.write_all(format!("GET {path} HTTP/1.1\r\nHost: l2\r\nConnection: close\r\n\r\n").as_bytes())
         .await
@@ -1292,7 +1292,7 @@ async fn stale_watch_line(bin: &Bin, c: &Client, sim: &KvmSim, ws: u64, filter: 
     bin.sigusr1();
     let t0 = Instant::now();
     while !bin
-        .lines_so_far()
+        .lines()
         .iter()
         .any(|l| message(l).as_deref() == Some(STALE_LINE))
     {
