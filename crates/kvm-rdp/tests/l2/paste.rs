@@ -152,6 +152,32 @@ async fn a_paste_types_the_exact_report_list() {
     );
 }
 
+/// Plan E Task 1.3 (PD8 m3, Review Focus 4): IronRDP builds a client's
+/// whole format list — here CF_UNICODETEXT and 20 000 registered formats
+/// with long names, about 1 MiB on the wire — before the bridge sees it.
+/// The session survives it, keeps streaming, and the paste still types
+/// exactly what `a_paste_types_the_exact_report_list` would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_twenty_thousand_format_list_still_pastes() {
+    let env = env(es3(), |c| {
+        sized(c);
+        c.paste.pace = ms(0);
+        c.paste.modifier_wait = ms(300);
+    })
+    .await;
+    let c = env.client(Opts::new(2).clipboard("abc").extra_formats(20_000));
+    ready(&c).await;
+    let ws = env.hid_ready().await;
+    paste_chord(&c, true);
+    counted(&env, "done", 1).await;
+    let mut want = chord_frames(true);
+    want.extend(typed("abc"));
+    assert_eq!(settled(until_mark(&env, &c, ws).await), want);
+    let before = pictures(&c.events()).len();
+    c.wait_for(T, |e| pictures(e).len() >= before + 5).await;
+    assert_eq!(env.sim.stats().logouts, 0);
+}
+
 /// §8 `multiline = "refuse"`: an inner break refuses the paste (nothing
 /// typed); a trailing one is dropped, so a second client's `"a\n"` (a new
 /// session) types `a`.

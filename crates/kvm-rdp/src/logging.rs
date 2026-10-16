@@ -3,12 +3,18 @@
 //! independent `Targets` filter holds the libraries that log credentials or
 //! payloads at INFO (and those whose WARNs carry client-chosen data at
 //! ERROR), combined with `FilterExt::and`, so nothing in config can raise
-//! them. Bridge code logs no keystrokes, HID frames, pasted text,
+//! them. Third-party lines are also limited per callsite (rev 6.4, DE5).
+//! Bridge code logs no keystrokes, HID frames, pasted text,
 //! tokens or passwords, and no per-frame event above `trace`.
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+use tracing::callsite::Identifier;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::{EnvFilter, FilterExt as _, LevelFilter, Targets};
 use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::layer::{Context, Filter, SubscriberExt as _};
 
 /// Targets held at INFO whatever `log.filter` says: sspi and the acceptor
 /// log NTLM tokens at debug, `ironrdp_server` traces every event, and the
@@ -47,6 +53,82 @@ pub const CAPPED_TARGETS: &[&str] = &[
 /// `CAPPED_TARGETS`' `ironrdp` prefix.
 pub const ERROR_CAPPED_TARGETS: &[&str] = &["ironrdp_cliprdr"];
 
+/// Rev 6.4 (PD8 m4, DE5): a third-party callsite logs its first event, then
+/// at most one per this interval; the rest are counted in
+/// `kvm_rdp_log_lines_suppressed_total`. IronRDP warns once per PDU where
+/// an authenticated client chooses the PDUs ("Unexpected channel
+/// received"), so a level cap alone still lets a client flood the log.
+pub const THIRD_PARTY_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Lines the per-callsite limit dropped, process-wide (`/metrics`).
+static SUPPRESSED: AtomicU64 = AtomicU64::new(0);
+
+/// Third-party lines dropped so far by the per-callsite limit.
+#[must_use]
+pub fn suppressed() -> u64 {
+    SUPPRESSED.load(Ordering::Relaxed)
+}
+
+/// Bridge code is never limited: where a peer drives its lines they are
+/// already bounded (DC15's refusal line, §4.5).
+fn third_party(target: &str) -> bool {
+    !(target == "kvm_rdp" || target.starts_with("kvm_rdp::"))
+}
+
+/// The limit: one `Instant` per third-party callsite that has logged — a
+/// map bounded by the binary's callsites, not by what a peer sends.
+struct PerCallsite {
+    interval: Duration,
+    last: Mutex<HashMap<Identifier, Instant>>,
+    dropped: &'static AtomicU64,
+}
+
+/// `callsite_enabled` keeps its default, `sometimes`, on purpose: a filter
+/// whose `event_enabled` can refuse needs `enabled` to run before every
+/// event. With `always`, tracing-subscriber 0.3.23 skips `enabled`, so the
+/// per-layer state a refusal leaves behind is never re-armed and the
+/// thread's next event at an `always` callsite would be dropped unseen
+/// (a debug assertion in `FilterState::event_enabled` catches it).
+impl<S> Filter<S> for PerCallsite {
+    /// Every callsite stays eligible; the level filters it is `and`ed
+    /// after decide what reaches `event_enabled`.
+    fn enabled(&self, _: &tracing::Metadata<'_>, _: &Context<'_, S>) -> bool {
+        true
+    }
+
+    /// No level opinion of its own: `And` takes the minimum of the hints,
+    /// in which `None` wins, so `None` here would raise
+    /// `LevelFilter::current()` to TRACE and make every skipped `trace!`
+    /// pay an interest check.
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(LevelFilter::TRACE)
+    }
+
+    /// Called for an event the level filters let through, just before it
+    /// is written: the per-callsite decision, and the count.
+    fn event_enabled(&self, event: &tracing::Event<'_>, _: &Context<'_, S>) -> bool {
+        let meta = event.metadata();
+        if !third_party(meta.target()) {
+            return true;
+        }
+        let now = Instant::now();
+        let mut last = self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match last.get(&meta.callsite()) {
+            Some(t) if now.saturating_duration_since(*t) < self.interval => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            _ => {
+                last.insert(meta.callsite(), now);
+                true
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct LogError(pub String);
 
@@ -62,6 +144,21 @@ impl std::error::Error for LogError {}
 pub fn subscriber<W>(
     filter: &str,
     writer: W,
+) -> Result<impl tracing::Subscriber + Send + Sync + 'static, LogError>
+where
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    subscriber_limited(filter, writer, THIRD_PARTY_INTERVAL, &SUPPRESSED)
+}
+
+/// `subscriber` with the per-callsite limit's `interval` and the counter
+/// its dropped lines go to (a test's own, so tests in one process never
+/// see each other's counts).
+fn subscriber_limited<W>(
+    filter: &str,
+    writer: W,
+    interval: Duration,
+    dropped: &'static AtomicU64,
 ) -> Result<impl tracing::Subscriber + Send + Sync + 'static, LogError>
 where
     W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
@@ -84,7 +181,11 @@ where
     let layer = tracing_subscriber::fmt::layer()
         .json()
         .with_writer(writer)
-        .with_filter(user.and(cap));
+        .with_filter(user.and(cap).and(PerCallsite {
+            interval,
+            last: Mutex::default(),
+            dropped,
+        }));
     Ok(tracing_subscriber::registry().with(layer))
 }
 
@@ -111,7 +212,9 @@ mod tests {
         clippy::indexing_slicing
     )]
     use super::*;
+    use std::sync::atomic::AtomicU64;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// A `MakeWriter` into a shared buffer.
     #[derive(Clone, Default)]
@@ -209,6 +312,100 @@ mod tests {
                 assert!(out.contains(shown), "{filter}: {shown} missing: {out}");
             }
         }
+    }
+
+    /// One third-party callsite (each macro call is its own).
+    fn unexpected_channel() {
+        tracing::warn!(target: "ironrdp_server::server", "unexpected-channel");
+    }
+
+    /// DE5 (PD8 m4): a third-party callsite logs its first event, then at
+    /// most one per interval, and every dropped line is counted. Events the
+    /// level filters already drop are never counted (they never reach the
+    /// limit), other callsites keep their own allowance, and bridge lines
+    /// are never limited.
+    #[test]
+    fn a_third_party_callsite_logs_once_per_interval_and_counts_the_rest() {
+        let buf = Buf::default();
+        let dropped: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
+        let sub =
+            subscriber_limited("trace", buf.clone(), Duration::from_millis(300), dropped).unwrap();
+        tracing::subscriber::with_default(sub, || {
+            for _ in 0..1000 {
+                unexpected_channel();
+            }
+            for _ in 0..1000 {
+                tracing::debug!(target: "ironrdp_server::server", "capped-debug");
+            }
+            tracing::warn!(target: "ironrdp_server::other", "another-callsite");
+            // Per callsite, not per target: the flooding callsite's target.
+            tracing::warn!(target: "ironrdp_server::server", "same-target-callsite");
+            for _ in 0..50 {
+                tracing::info!(target: "kvm_rdp::bridge", "bridge-line");
+            }
+            std::thread::sleep(Duration::from_millis(400));
+            unexpected_channel();
+        });
+        let out = buf.text();
+        // Timing-robust (§13's loaded host): a deschedule past the 300 ms
+        // interval inside the first loop lets one more line through, and
+        // every line is either logged or counted.
+        let logged = u64::try_from(out.matches("unexpected-channel").count()).unwrap();
+        let dropped = dropped.load(std::sync::atomic::Ordering::Relaxed);
+        assert!((2..=4).contains(&logged), "{logged} logged: {out}");
+        assert_eq!(logged + dropped, 1001, "{logged} logged, {dropped} dropped");
+        assert_eq!(out.matches("another-callsite").count(), 1, "{out}");
+        assert_eq!(out.matches("same-target-callsite").count(), 1, "{out}");
+        assert_eq!(out.matches("bridge-line").count(), 50, "{out}");
+        assert_eq!(out.matches("capped-debug").count(), 0, "{out}");
+    }
+
+    /// The limit has no level opinion: the subscriber's hint stays the
+    /// level filters' (`None` from the limit would win `And`'s minimum and
+    /// raise `LevelFilter::current()` to TRACE).
+    #[test]
+    fn the_limit_keeps_the_level_hint() {
+        for (filter, hint) in [("info", LevelFilter::INFO), ("warn", LevelFilter::WARN)] {
+            let sub = subscriber(filter, Buf::default()).unwrap();
+            assert_eq!(
+                tracing::Subscriber::max_level_hint(&sub),
+                Some(hint),
+                "{filter}"
+            );
+        }
+    }
+
+    /// The production subscriber uses the 10 s interval and the
+    /// process-wide counter `/metrics` reads.
+    #[test]
+    fn the_interval_is_ten_seconds() {
+        assert_eq!(THIRD_PARTY_INTERVAL, Duration::from_secs(10));
+        // `subscriber` itself: a callsite's second line inside the interval
+        // is dropped into `suppressed()`, and `/metrics` renders that count.
+        // Other tests in this process can only raise it, so the bounds hold.
+        let buf = Buf::default();
+        let sub = subscriber("trace", buf.clone()).unwrap();
+        let before = suppressed();
+        tracing::subscriber::with_default(sub, || {
+            for _ in 0..2 {
+                tracing::warn!(target: "ironrdp_server::server", "production-limit");
+            }
+        });
+        let lo = suppressed();
+        assert_eq!(buf.text().matches("production-limit").count(), 1);
+        assert!(lo > before, "the dropped line was not counted");
+        let shown = crate::metrics::Metrics::default().render();
+        let hi = suppressed();
+        let rendered: u64 = shown
+            .lines()
+            .find_map(|l| l.strip_prefix("kvm_rdp_log_lines_suppressed_total "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (lo..=hi).contains(&rendered),
+            "{rendered} not in {lo}..={hi}"
+        );
     }
 
     #[test]

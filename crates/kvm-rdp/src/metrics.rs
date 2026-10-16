@@ -42,6 +42,15 @@ impl Counter {
     }
 }
 
+/// One counter whose value lives outside `Metrics` (a process-wide static):
+/// rendered like `Counter`.
+pub(crate) fn render_value_counter(out: &mut String, name: &str, help: &str, value: u64) {
+    let _ = write!(
+        out,
+        "# HELP {name}_total {help}\n# TYPE {name}_total counter\n{name}_total {value}\n"
+    );
+}
+
 pub struct Gauge {
     name: &'static str,
     help: &'static str,
@@ -494,6 +503,12 @@ impl Metrics {
         ] {
             c.render(&mut out);
         }
+        render_value_counter(
+            &mut out,
+            "kvm_rdp_log_lines_suppressed",
+            "Third-party log lines past their callsite's limit (§4.5, rev 6.4)",
+            crate::logging::suppressed(),
+        );
         for f in [
             &self.frames,
             &self.parse_errors,
@@ -613,9 +628,10 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            44,
-            "18 counters, 13 families, 8 gauges, 5 histograms"
+            45,
+            "19 counters, 13 families, 8 gauges, 5 histograms"
         );
+        assert!(t.contains("# TYPE kvm_rdp_log_lines_suppressed_total counter\n"));
         assert!(t.contains("# TYPE kvm_rdp_hid_reasserts_total counter\n"));
         assert!(t.contains("# TYPE kvm_rdp_release_websockets_total counter\n"));
         let mut sorted = names.clone();

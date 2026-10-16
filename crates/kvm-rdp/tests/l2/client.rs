@@ -14,8 +14,8 @@ use ironrdp_async::FramedWrite as _;
 use ironrdp_cliprdr::CliprdrClient;
 use ironrdp_cliprdr::backend::{ClipboardMessage, ClipboardMessageProxy, CliprdrBackend};
 use ironrdp_cliprdr::pdu::{
-    ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
-    FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
+    ClipboardFormat, ClipboardFormatId, ClipboardFormatName, ClipboardGeneralCapabilityFlags,
+    FileContentsRequest, FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
     OwnedFormatDataResponse,
 };
 use ironrdp_connector::connection_activation::{
@@ -109,6 +109,8 @@ pub struct Opts {
     /// The client's clipboard text: with it, a CLIPRDR channel that offers
     /// CF_UNICODETEXT and answers the server's requests for it.
     clipboard: Option<String>,
+    /// Registered formats the clipboard also offers (`extra_formats`).
+    extra_formats: usize,
 }
 
 impl Opts {
@@ -124,11 +126,18 @@ impl Opts {
             ack: Ack::Normal,
             recv_buffer: None,
             clipboard: None,
+            extra_formats: 0,
         }
     }
     /// Hold `text` on the client's clipboard (CF_UNICODETEXT, §8).
     pub fn clipboard(mut self, text: &str) -> Opts {
         self.clipboard = Some(text.to_owned());
+        self
+    }
+    /// Offer `n` more registered formats (ids 0xC000.., long names) beside
+    /// CF_UNICODETEXT: a format list about 52 bytes a format on the wire.
+    pub fn extra_formats(mut self, n: usize) -> Opts {
+        self.extra_formats = n;
         self
     }
     pub fn user(mut self, u: &str) -> Opts {
@@ -524,6 +533,7 @@ async fn connect(
     if let Some(text) = &opts.clipboard {
         let backend = ClientClip {
             text: text.clone(),
+            extra_formats: opts.extra_formats,
             proxy: ClipProxy(clip),
             log: log.clone(),
         };
@@ -839,6 +849,8 @@ impl ClipboardMessageProxy for ClipProxy {
 /// NUL-terminated as Windows, Windows App and FreeRDP send it (D4).
 struct ClientClip {
     text: String,
+    /// `Opts::extra_formats`.
+    extra_formats: usize,
     proxy: ClipProxy,
     log: Log,
 }
@@ -866,11 +878,17 @@ impl CliprdrBackend for ClientClip {
         push(&self.log, Ev::ClipReady);
     }
     fn on_request_format_list(&mut self) {
-        // Monitor Ready: announce that the client holds Unicode text (D9b).
+        // Monitor Ready: announce that the client holds Unicode text (D9b),
+        // and with `extra_formats` that many registered formats besides.
+        let mut formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+        formats.extend((0..self.extra_formats).map(|i| {
+            let id = 0xC000 + u32::try_from(i % 0x3FFF).unwrap();
+            ClipboardFormat::new(ClipboardFormatId::new(id)).with_name(ClipboardFormatName::new(
+                format!("kvm-rdp-l2-format-{i:05}"),
+            ))
+        }));
         self.proxy
-            .send_clipboard_message(ClipboardMessage::SendInitiateCopy(vec![
-                ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT),
-            ]));
+            .send_clipboard_message(ClipboardMessage::SendInitiateCopy(formats));
     }
     fn on_process_negotiated_capabilities(&mut self, _: ClipboardGeneralCapabilityFlags) {}
     fn on_remote_copy(&mut self, _: &[ClipboardFormat]) {}
