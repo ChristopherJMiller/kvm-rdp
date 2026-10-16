@@ -2768,4 +2768,77 @@ mod tests {
             })
             .await;
     }
+
+    /// Plan E Task 1.4 (PC14 n4): `exec` hands the step's buffer back, and
+    /// the next step reuses it — the shell's per-frame steps allocate no
+    /// `Vec` of their own.
+    #[tokio::test(flavor = "current_thread")]
+    async fn exec_hands_the_steps_buffer_back() {
+        let cfg = rig::cfg();
+        let metrics = Arc::new(Metrics::default());
+        let (etx, _events) = mpsc::unbounded_channel();
+        let (ktx, _cmds) = mpsc::unbounded_channel();
+        let gens = Arc::new(Generations::default());
+        let display = DisplayShared::new((640, 360));
+        let hid = Arc::new(HidControl::new(16, metrics.clone()));
+        let input = Arc::new(InputShared::new(InputDeps {
+            hid: hid.clone(),
+            display: display.clone(),
+            events: ServerEvents::default(),
+            gens: gens.clone(),
+            metrics: metrics.clone(),
+            cfg: InputRuntimeConfig::test(),
+        }));
+        let deps = ShellDeps {
+            cfg: cfg.clone(),
+            metrics: metrics.clone(),
+            gens: gens.clone(),
+            hid,
+            display: display.clone(),
+            events: etx,
+            suppressed: Arc::new(AtomicBool::new(false)),
+            rtt: Arc::new(AtomicU32::new(u32::MAX)),
+            to_kvm: ktx,
+            input,
+        };
+        let mut s = PumpShell::with_pump(deps, Pump::with_slate(cfg, metrics, None));
+        let gfx: GfxServerHandle =
+            Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(Null))));
+        gfx.lock().unwrap().start(CHAN).unwrap();
+        let generation = gens.begin();
+        s.rdp_input(RdpInput::SessionStart {
+            generation,
+            slot: 1,
+            gfx: gfx.clone(),
+            counter: Arc::new(AtomicU64::new(0)),
+            abort: info().abort_handle(),
+            clip_slot: Some(1),
+        })
+        .await;
+        let adv = encode_vec(&GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(
+            rig::census_caps(),
+        )))
+        .unwrap();
+        gfx.lock().unwrap().process(CHAN, &adv).unwrap();
+        s.rdp_input(RdpInput::OnReady {
+            slot: 1,
+            version: 0x8_0105,
+        })
+        .await;
+        let cmds = s.step([Input::Tick]);
+        let (p, c) = (cmds.as_ptr(), cmds.capacity());
+        assert!(c > 0, "the setup's commands left a buffer");
+        s.exec(cmds).await;
+        assert_eq!(
+            (s.scratch.as_ptr(), s.scratch.capacity()),
+            (p, c),
+            "exec kept the buffer"
+        );
+        s.kvm_event(KvmEvent::FlvOpened {
+            generation,
+            origin: FlvOrigin::First,
+        })
+        .await;
+        assert_eq!(s.scratch.as_ptr(), p, "the next step reused it");
+    }
 }
