@@ -530,6 +530,12 @@ pub fn index_of(map: &HashMap<Vec<u8>, usize>, annex_b: &[u8]) -> usize {
     map[&first_slice(split_annex_b(annex_b))]
 }
 
+/// A received picture's barcode index, or `None` for a picture that is no
+/// fixture frame (one kvm-sim altered, PC17 m1).
+pub fn try_index_of(map: &HashMap<Vec<u8>, usize>, annex_b: &[u8]) -> Option<usize> {
+    map.get(&first_slice(split_annex_b(annex_b))).copied()
+}
+
 /// The `source_index` of every AU kvm-sim sent on FLV `conn`, in order.
 pub fn sent_on(log: &[SimEvent], conn: u64) -> Vec<usize> {
     log.iter()

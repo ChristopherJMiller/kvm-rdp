@@ -328,3 +328,62 @@ async fn a_wrong_kvm_certificate_sends_no_login() {
     let s = env.sim.stats();
     assert_eq!(s.logins_ok + s.logins_failed, 0);
 }
+
+/// PC7 W10 (ledger carry): the KVM's certificate changes mid-session, and
+/// the websocket's next reconnect meets it. The bridge pins the SPKI
+/// (§3.2), so the new certificate fails the pin: fatal at once,
+/// `kvm_cert_mismatch` (0x9, shared with `kvm_auth_failed`, so the label is
+/// checked too), with no re-login and no logout, and its writer idling
+/// rather than reconnecting (rev 6.3). The mismatch is the websocket's: one
+/// more control connection, which never upgraded, and no FLV reopened (the
+/// open one keeps the certificate it was served).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_certificate_change_mid_session_is_fatal_at_once() {
+    let (env, c) = streaming(|_| {}).await;
+    env.hid_ready().await;
+    let before = env.sim.stats();
+    env.sim.rotate_certificate().unwrap();
+    // Force a websocket reconnect: its reopen now hits the new certificate.
+    env.sim.close_websockets();
+    let evs = c.wait_for(T, |e| terminated(e).is_some()).await;
+    assert_eq!(
+        terminated(&evs).unwrap(),
+        description(Cause::KvmCertMismatch)
+    );
+    assert_eq!(env.metrics().disconnects.get("kvm_cert_mismatch"), 1);
+    assert_eq!(env.metrics().disconnects.total(), 1);
+    // The writer idles: no control connection after the one that met the
+    // new certificate, however long the backoff (`kvm.backoff.max` 400 ms).
+    let again = env
+        .sim
+        .wait_for(ms(1000), |_| {
+            env.sim.stats().accepts_control > before.accepts_control + 1
+        })
+        .await;
+    assert!(
+        again.is_err(),
+        "the websocket reconnected after the mismatch"
+    );
+    let s = env.sim.stats();
+    assert_eq!(
+        s.accepts_control,
+        before.accepts_control + 1,
+        "the reopen never reached the KVM"
+    );
+    assert_eq!(
+        ws_opens(&env.sim.events()).len(),
+        1,
+        "a websocket upgraded over the new certificate"
+    );
+    assert_eq!(
+        (s.accepts_video, flv_opens(&env.sim.events()).len()),
+        (before.accepts_video, 1),
+        "an FLV reopened: the mismatch was not the websocket's"
+    );
+    assert_eq!(
+        (s.logins_ok, s.logins_failed),
+        (before.logins_ok, before.logins_failed),
+        "a re-login after the mismatch"
+    );
+    assert_eq!(s.logouts, 0, "§3.2: the bridge never logs out");
+}

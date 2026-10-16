@@ -1,5 +1,7 @@
 //! One self-signed certificate on all three ports, as on the ES3 (§3.2), and
-//! the SHA-256 of its SPKI that a test config pins.
+//! the SHA-256 of its SPKI that a test config pins. Every [`identity`] call
+//! makes a fresh key pair, so another SPKI: `KvmSim::rotate_certificate`
+//! (PC7 W10) relies on it.
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio_rustls::TlsAcceptor;

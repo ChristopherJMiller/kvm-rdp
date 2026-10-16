@@ -112,6 +112,14 @@ pub struct Policy {
     /// while the other viewers get it: a KVM that drops a frame for one
     /// viewer (PC17 N2).
     pub skip_flv_frame: Option<u64>,
+    /// The next FLV opened while another is open — a `ReconnectFlv`
+    /// candidate — changes one byte inside the first slice of its Nth
+    /// frame, counting from 1 at its first IDR, while the other viewers get
+    /// the frame as encoded: a replay that diverges in content (PC17 m1),
+    /// which matches nothing the old FLV delivered. That open spends it
+    /// (back to `None`), so one connection diverges; an FLV opened alone
+    /// leaves it set.
+    pub alter_candidate_frame: Option<u64>,
 }
 
 /// A command for every open websocket.
@@ -240,6 +248,19 @@ impl Shared {
             true
         } else {
             false
+        }
+    }
+
+    /// `Policy::alter_candidate_frame` for an `av.flv` open that has
+    /// subscribed and not yet logged its `FlvOpen`: taken (spent) only when
+    /// another FLV is open, tested and taken under one lock acquisition, as
+    /// `take_flv_refusal` does.
+    pub(crate) fn take_alter_candidate_frame(&self) -> Option<u64> {
+        let mut g = self.lock();
+        if g.stats.flv_open > 0 {
+            g.policy.alter_candidate_frame.take()
+        } else {
+            None
         }
     }
 

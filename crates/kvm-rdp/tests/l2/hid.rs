@@ -5,10 +5,12 @@
 //! shows up (it waits on the latest websocket).
 use crate::client::{Opts, pictures, terminated};
 use crate::harness::{
-    KBD_ZERO, SET_MODE, T, env, es3, hid_on, ms, sized, streaming, until, ws_opens,
+    KBD_ZERO, SET_MODE, T, abs, env, es3, hid_on, hid_stamped, ms, sized, streaming, until,
+    until_mark, within, ws_opens,
 };
 use kvm_proto::hid::HidFrame;
 use kvm_sim::SimEvent;
+use std::time::Duration;
 
 /// Reports reach kvm-sim byte-exact, in order, after the session-start
 /// sequence; a websocket reopen's session-start carries the pointer at the
@@ -206,4 +208,103 @@ async fn the_websocket_survives_another_sessions_logout() {
         .unwrap();
     assert!(!log.contains(&SimEvent::WsClose { conn: ws }));
     assert_eq!(ws_opens(&log).len(), 1);
+}
+
+/// PC9 fix 2 / DD8 (Task 4.2): after a websocket reconnect, the fresh
+/// websocket's session start is followed, `reassert_after` later (§11.1's
+/// one-sided bound), by the current full state once more — so a stale
+/// press the KVM read from its own receive buffer is overwritten.
+///
+/// PD10 m4: a key is held across the reconnect. The reconnect's epoch
+/// released it, so the state re-asserted holds nothing — the re-assert
+/// carries `KBD_ZERO` — and the pointer stays where the client left it.
+/// The key stays released by the bridge: its client release sends nothing,
+/// and the core's first step since the reconnect pushes only its released
+/// state (the epoch zero, `input.rs`'s module doc) — never the key again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_reasserts_the_full_state() {
+    /// Set-1 make code of the key held across the reconnect (usage 0x04).
+    const A: u8 = 0x1E;
+    /// The zero report the core's first step after a release pushes.
+    const EPOCH_ZERO: [u8; 12] = KBD_ZERO;
+    let after = ms(300);
+    // `sized()` sets a 600 s re-assert so the exact-frame cases never see
+    // one (Task 4.2, D10a); this case scales it back down (`streaming`'s
+    // edit runs after `sized`). The key-repeat timer is moved out of the
+    // way, so only the reconnect releases the held key.
+    let (env, c) = streaming(move |c| {
+        c.input.reassert_after = after;
+        c.input.key_repeat_timeout = Duration::from_secs(60);
+    })
+    .await;
+    let ws = env.hid_ready().await;
+    // The first websocket's own re-assert, of a state nothing has set yet,
+    // writes nothing; it is done before the case sends.
+    assert!(
+        until(T, || env.metrics().hid_reasserts.get() == 1).await,
+        "the first websocket never re-asserted"
+    );
+    let pointer = abs(0, 320, 180); // the centre of the 640×360 surface
+    c.key(A, true); // held across the reconnect
+    c.mouse_move(320, 180);
+    let log = env
+        .sim
+        .wait_for(T, |l| hid_on(l, ws).len() >= 5)
+        .await
+        .unwrap();
+    assert_eq!(
+        hid_on(&log, ws),
+        [
+            SET_MODE.to_vec(),
+            KBD_ZERO.to_vec(),
+            EPOCH_ZERO.to_vec(),
+            HidFrame::Keyboard {
+                modifiers: 0,
+                keys: [0x04, 0, 0, 0, 0]
+            }
+            .to_vec(),
+            pointer.clone()
+        ]
+    );
+    env.sim.close_websockets();
+    let ws2 = env.hid_ready_after(1).await;
+    assert!(
+        until(T, || env.metrics().hid_reasserts.get() == 2).await,
+        "the reopen never re-asserted"
+    );
+    let log = env
+        .sim
+        .wait_for(T, |l| hid_on(l, ws2).len() >= 5)
+        .await
+        .unwrap();
+    // The reopen's session start (SET_MODE, KBD_ZERO, the pointer at its
+    // last position), then the re-assert: no key held, the same pointer.
+    assert_eq!(
+        hid_on(&log, ws2),
+        [
+            SET_MODE.to_vec(),
+            KBD_ZERO.to_vec(),
+            pointer.clone(),
+            KBD_ZERO.to_vec(),
+            pointer.clone()
+        ],
+        "the re-assert after the reconnect"
+    );
+    let stamped = hid_stamped(&env.sim, ws2);
+    within(stamped[3].0.duration_since(stamped[2].0), after);
+    // The client releases the key the bridge already released, then marks.
+    c.key(A, false);
+    assert_eq!(
+        until_mark(&env, &c, ws2).await,
+        [
+            pointer.clone(),
+            KBD_ZERO.to_vec(),
+            pointer,
+            EPOCH_ZERO.to_vec()
+        ],
+        "the held key was pressed again after the reconnect"
+    );
+    assert_eq!(env.metrics().hid_reasserts.get(), 2, "once per websocket");
+    assert_eq!(env.metrics().release_all.get("websocket_reconnect"), 1);
+    assert!(terminated(&c.events()).is_none());
 }

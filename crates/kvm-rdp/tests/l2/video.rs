@@ -16,7 +16,7 @@
 use crate::client::{Client, Ev, Opts, Picture, confirmed, nal_types, pictures, terminated};
 use crate::harness::{
     ES3_FIXTURE, Env, LONGGOP, T, assert_run, barcodes, env, es3, flv_opens, index_of, ms, sent_on,
-    sized, source, until, within,
+    sized, source, try_index_of, until, within,
 };
 use kvm_proto::h264::{parse_sps, split_annex_b};
 use kvm_rdp::config::IdrPolicy;
@@ -229,6 +229,118 @@ async fn a_candidate_skipping_a_frame_mid_replay_keeps_the_sequence() {
         env.metrics().frames_dropped.get("repeat") >= 3,
         "no replay to drop: the candidate did not lag ({got:?})"
     );
+}
+
+/// PC17 m1 (final review carry): a lagging candidate whose replayed P frame
+/// diverges in content from the one the old main already gave the client —
+/// kvm-sim changes one byte inside its third frame's slice — matches no ring
+/// entry at its place or later. The pump drops it (`replay_diverged`, once:
+/// the knob is spent by one connection) and enters NeedIdr, and the picture
+/// recovers at the next IDR. From the re-advertise's confirm to ten pictures
+/// past that IDR the client never gets the altered picture (it is no
+/// fixture frame), never an AU twice, and never a P frame out of sequence
+/// (the ES3 has one reference frame). The skip case above resyncs instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_divergent_replay_frame_ends_the_replay_at_an_idr() {
+    let env = env(es3(), |c| {
+        sized(c);
+        c.video.idr_policy = IdrPolicy::Reconnect;
+    })
+    .await;
+    let c = env.client(Opts::new(2));
+    c.wait_for(T, |e| pictures(e).len() >= 45).await;
+    env.sim.set_policy(|p| {
+        p.delay_flv_header = Some(ms(200));
+        p.alter_candidate_frame = Some(3);
+    });
+    let n = c.with_log(<[Ev]>::len);
+    c.readvertise();
+    let idrs = |p: &[Picture]| -> Vec<usize> {
+        p.iter()
+            .enumerate()
+            .filter(|(_, p)| nal_types(&p.annex_b).contains(&5))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    // The first IDR after the confirm is the one the candidate's open
+    // forced; the second ends the NeedIdr the divergence entered.
+    let evs = c
+        .wait_for(T, |e| {
+            confirmed(e, n).is_some_and(|k| {
+                let p = pictures(&e[k..]);
+                idrs(&p).get(1).is_some_and(|i| p.len() > i + 10)
+            })
+        })
+        .await;
+    let pics = pictures(&evs[confirmed(&evs, n).unwrap()..]);
+    let recovery = idrs(&pics)[1];
+    let window = &pics[..=recovery + 10];
+    // The fixture's 120 frames are distinct: within fewer, a repeat is real.
+    assert!(
+        window.len() < 120,
+        "recovered only after {recovery} pictures"
+    );
+    let map = barcodes(ES3_FIXTURE);
+    let got: Vec<(Option<usize>, bool)> = window
+        .iter()
+        .map(|p| (try_index_of(&map, &p.annex_b), nal_types(&p.annex_b) == [1]))
+        .collect();
+    assert!(
+        got.iter().all(|g| g.0.is_some()),
+        "a picture that is no fixture frame (the altered one) reached the client: {got:?}"
+    );
+    let got: Vec<(usize, bool)> = got.into_iter().map(|(i, p)| (i.unwrap(), p)).collect();
+    let mut seen = std::collections::HashSet::new();
+    let twice: Vec<usize> = got
+        .iter()
+        .map(|g| g.0)
+        .filter(|i| !seen.insert(*i))
+        .collect();
+    assert!(
+        twice.is_empty(),
+        "AUs the client got twice: {twice:?} in {got:?}"
+    );
+    for w in got.windows(2) {
+        let ((prev, _), (cur, p)) = (w[0], w[1]);
+        assert!(!p || cur == prev + 1, "P frame {cur} after {prev}: {got:?}");
+    }
+    assert_eq!(
+        env.metrics().frames_dropped.get("replay_diverged"),
+        1,
+        "the altered frame was not a divergence ({got:?})"
+    );
+    // kvm-sim's side: the candidate's third AU is the old main's frame of
+    // the same seq with other bytes (another frame id); its first two are
+    // the same bytes — the replay the pump matched before it diverged.
+    let log = env.sim.events();
+    let opens = flv_opens(&log);
+    assert!(opens.len() >= 2, "no ReconnectFlv candidate");
+    let aus = |conn: u64| -> Vec<(u64, u64)> {
+        log.iter()
+            .filter_map(|e| match e {
+                SimEvent::FlvAu {
+                    conn: on,
+                    seq,
+                    frame_id,
+                    ..
+                } if *on == conn => Some((*seq, *frame_id)),
+                _ => None,
+            })
+            .collect()
+    };
+    let (main, candidate) = (aus(opens[0]), aus(opens[1]));
+    assert!(
+        candidate.len() >= 3,
+        "the candidate sent {} AUs",
+        candidate.len()
+    );
+    let on_main = |seq: u64| main.iter().find(|a| a.0 == seq).map(|a| a.1);
+    for (k, (seq, id)) in candidate.iter().take(3).enumerate() {
+        let theirs = on_main(*seq).unwrap_or_else(|| panic!("the old main never sent seq {seq}"));
+        assert_eq!(theirs != *id, k == 2, "candidate AU {k} (seq {seq})");
+    }
+    assert!(terminated(&c.events()).is_none());
+    assert_eq!(env.metrics().disconnects.total(), 0);
 }
 
 /// The long-GOP fixture at the ES3's pacing, sized, `idr_side_timeout` set,

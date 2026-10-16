@@ -44,6 +44,8 @@ struct Writer<W> {
     seen_idr: bool,
     /// `Policy::skip_flv_frame` at open, and the frames seen since the first IDR.
     skip: Option<u64>,
+    /// `Policy::alter_candidate_frame`, if this open took it.
+    alter: Option<u64>,
     frames_seen: u64,
     /// `Fault::Silence`: stop writing, keep the connection open.
     silenced: bool,
@@ -142,6 +144,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         if self.skip == Some(self.frames_seen) {
             return Ok(());
         }
+        let alter = self.alter == Some(self.frames_seen);
         if matches!(self.pending, Some(Fault::TwoPictures)) && self.held.is_none() {
             self.held = Some(f);
             return Ok(());
@@ -158,7 +161,11 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
             nals.push(sps);
             nals.push(pps);
         }
+        let own = nals.len();
         nals.extend(f.nals.iter().cloned());
+        if alter && let Some(own) = nals.get_mut(own..) {
+            corrupt_first_vcl(own, |v| alter_one_byte(v));
+        }
         if fault.is_none() {
             fault = self.pending.take();
         }
@@ -235,6 +242,22 @@ fn corrupt_first_vcl(nals: &mut [Bytes], f: impl FnOnce(&mut Vec<u8>)) {
         *n = Bytes::from(v);
     }
 }
+
+/// `Policy::alter_candidate_frame` (PC17 m1): the middle byte of a slice
+/// NAL becomes 0x55 (0xAA if it was 0x55). It lies inside the slice data,
+/// past the NAL header and the slice header's first fields, and is never a
+/// value (0x00–0x03) that could form a start code or an emulation-prevention
+/// sequence: the AU keeps its length and shape, and its bytes differ from
+/// what every other viewer got.
+fn alter_one_byte(v: &mut [u8]) {
+    let mid = v.len() / 2;
+    if mid > 0
+        && let Some(b) = v.get_mut(mid)
+    {
+        *b = if *b == 0x55 { 0xAA } else { 0x55 };
+    }
+}
+
 pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     mut io: S,
     req: Request,
@@ -279,6 +302,9 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     let Some(mut sub) = enc.subscribe().await else {
         return;
     };
+    // Before this open's own `FlvOpen` counts it: only another open FLV
+    // makes it a candidate (PC17 m1).
+    let alter = shared.take_alter_candidate_frame();
     shared.record(SimEvent::FlvOpen { conn });
     if let Some(d) = policy.delay_flv_header {
         tokio::time::sleep(d).await;
@@ -294,6 +320,7 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
         frames_written: 0,
         seen_idr: false,
         skip: policy.skip_flv_frame,
+        alter,
         frames_seen: 0,
         silenced: false,
         pending: None,

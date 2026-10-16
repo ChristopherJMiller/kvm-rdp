@@ -1,10 +1,11 @@
 //! `kvm-sim`: a fake Angeet/Yeeso ES3 for tests and benches (spec §11.5,
 //! Milestone 2). It serves the ES3's three TLS ports on loopback with one
-//! self-signed certificate — `login.lua` with global logout, `av.flv` from
-//! one shared encoder in the ES3's measured stream shape, and the control
-//! websocket recording every HID frame — and records everything it sees so
-//! the bridge's L2/L3 tests and kvm-bench can assert on it. It replays
-//! committed fixtures only, never KVM captures.
+//! self-signed certificate (swappable mid-run, `rotate_certificate`) —
+//! `login.lua` with global logout, `av.flv` from one shared encoder in the
+//! ES3's measured stream shape, and the control websocket recording every
+//! HID frame — and records everything it sees so the bridge's L2/L3 tests
+//! and kvm-bench can assert on it. It replays committed fixtures only, never
+//! KVM captures.
 
 mod encoder;
 mod flv;
@@ -21,8 +22,8 @@ pub use state::{Policy, PortKind, SimEvent, SimStats};
 use encoder::EncoderHandle;
 use state::{Shared, WsCmd};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -201,6 +202,9 @@ pub struct KvmSim {
     shared: Arc<Shared>,
     enc: EncoderHandle,
     tasks: Arc<std::sync::Mutex<Vec<AbortHandle>>>,
+    /// What every connection task shares: [`KvmSim::rotate_certificate`]
+    /// swaps its acceptor.
+    ctx: Arc<ConnCtx>,
 }
 
 async fn bind(recv_buffer: Option<u32>, send_buffer: Option<u32>) -> std::io::Result<TcpListener> {
@@ -222,7 +226,11 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// What every connection task shares.
 struct ConnCtx {
     shared: Arc<Shared>,
-    acceptor: TlsAcceptor,
+    /// The certificate new connections are served (PC7 W10): each
+    /// connection clones the acceptor current when its handshake starts,
+    /// under this lock and never across the handshake, so a swap reaches
+    /// only the handshakes that start after it.
+    acceptor: std::sync::Mutex<TlsAcceptor>,
     password: String,
     enc: EncoderHandle,
     profile: Profile,
@@ -231,7 +239,12 @@ struct ConnCtx {
 
 /// One accepted connection: TLS, then its port's service.
 async fn serve_connection(kind: PortKind, tcp: TcpStream, conn: u64, ctx: Arc<ConnCtx>) {
-    let Ok(Ok(mut tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, ctx.acceptor.accept(tcp)).await
+    let acceptor = ctx
+        .acceptor
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let Ok(Ok(mut tls)) = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await
     else {
         return;
     };
@@ -277,7 +290,7 @@ impl KvmSim {
         };
         let ctx = Arc::new(ConnCtx {
             shared: shared.clone(),
-            acceptor: id.acceptor,
+            acceptor: std::sync::Mutex::new(id.acceptor),
             password: cfg.password.clone(),
             enc: enc.clone(),
             profile: cfg.profile,
@@ -317,6 +330,7 @@ impl KvmSim {
             shared,
             enc,
             tasks,
+            ctx,
         })
     }
 
@@ -329,7 +343,8 @@ impl KvmSim {
     pub fn ports(&self) -> SimPorts {
         self.ports
     }
-    /// The pin for the bridge's `kvm.spki_sha256` (one cert, all ports).
+    /// The pin for the bridge's `kvm.spki_sha256` (one cert, all ports): the
+    /// first certificate's, even after [`KvmSim::rotate_certificate`].
     #[must_use]
     pub fn spki_sha256(&self) -> &str {
         &self.spki_sha256
@@ -390,6 +405,21 @@ impl KvmSim {
     }
     pub fn close_websockets(&self) {
         self.shared.ws_broadcast(WsCmd::Close);
+    }
+    /// PC7 W10: the KVM's certificate changes. Every TLS handshake that
+    /// starts after this, on all three ports, is served a fresh
+    /// self-signed certificate — another key pair, so another SPKI on each
+    /// call — and fails a client's pin on [`KvmSim::spki_sha256`], which
+    /// stays the first certificate's. Connections already open keep theirs.
+    /// On an error the current certificate stays.
+    pub fn rotate_certificate(&self) -> std::io::Result<()> {
+        let id = tls::identity()?;
+        *self
+            .ctx
+            .acceptor
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = id.acceptor;
+        Ok(())
     }
     /// Send every open websocket a frame header declaring `declared_len`
     /// bytes (§3.2: the bridge closes at 4 KiB without buffering).
