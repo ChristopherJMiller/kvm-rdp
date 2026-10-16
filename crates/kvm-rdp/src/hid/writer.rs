@@ -1250,6 +1250,10 @@ mod tests {
         sent(3).await;
         for (held, want_fast) in [(true, true), (false, false)] {
             assert_eq!(hid.input_held(), held);
+            // R-I3 (re-review of the final fix wave): counted before the
+            // close. Read after `Up`, the reopen may already have written
+            // its session start, and a target past it is never reached.
+            let base = hid.metrics.hid_reports_sent.get();
             sim.close_websockets();
             assert_eq!(next().await, WsEvent::Down);
             let t0 = Instant::now();
@@ -1261,7 +1265,7 @@ mod tests {
                 assert!(took >= BACKOFF * 3 / 4, "nothing held: it took {took:?}");
             }
             // The reopen's session start: nothing held from here on.
-            sent(hid.metrics.hid_reports_sent.get() + 2).await;
+            sent(base + 2).await;
         }
         close(&ctl).await;
         tokio::time::timeout(Duration::from_secs(5), run)
