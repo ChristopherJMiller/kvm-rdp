@@ -38,7 +38,11 @@ existing() { # $1 = OWNER/REPO: its pin in a workflow already, if any
     sed -E 's/^uses:[[:space:]]*//; s/[[:space:]]+#[[:space:]]*/ # /' | sort -u | sed -n 1p
 }
 verify() { # every uses: anywhere in the file (the set check-workflows rule 1 reads)
-  local f=$1 bad=0 ref comment action sha tag repo want
+  local f=$1 bad=0 ref comment action sha tag repo want rows
+  if ! rows=$(yq -r '.. | select(tag == "!!map") | select(has("uses")) | .uses | select(tag == "!!str") | [., line_comment] | @tsv' "$f"); then
+    echo "pin-action: $f: yq cannot read this file" >&2
+    return 1
+  fi
   while IFS=$'\t' read -r ref comment; do
     [ -n "$ref" ] || continue
     comment=${comment#"${comment%%[!#[:space:]]*}"}
@@ -60,7 +64,7 @@ verify() { # every uses: anywhere in the file (the set check-workflows rule 1 re
     else
       echo "pin-action: $f: $action $tag = $sha"
     fi
-  done < <(yq -r '.. | select(tag == "!!map") | select(has("uses")) | .uses | select(tag == "!!str") | [., line_comment] | @tsv' "$f")
+  done <<<"$rows"
   return "$bad"
 }
 case "${1:-}" in

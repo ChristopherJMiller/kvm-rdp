@@ -11,7 +11,7 @@ fails=0
 expect() { # $1 = pass|fail, $2 = what, then env assignments for the check
   local want=$1 what=$2
   shift 2
-  if env "$@" "$check" >"$work/out" 2>&1; then got=pass; else got=fail; fi
+  if timeout 10 env "$@" "$check" >"$work/out" 2>&1; then got=pass; else [ $? -eq 124 ] && got=timeout || got=fail; fi
   if [ "$got" != "$want" ]; then
     echo "test-check-workflows: $what: expected $want, got $got" >&2
     cat "$work/out" >&2
@@ -221,5 +221,37 @@ else
   echo "test-check-workflows: m4: --rewrite tried the network for a pinned action" >&2; fails=$((fails + 1))
 fi
 expect fail "an unpinned BuildKit image" WORKFLOWS_DIR="$d" DOCKERFILE="$d/Dockerfile" IMAGE_BUILD="$d/build.sh"
+
+# --- Fix round 2 (PE5 re-review N1, N2, ARG cycles, --verify on bad YAML) ---
+# N1: Task 4.1's own image-build.sh line must not trip the literal-image check
+df n1task41 'FROM scratch' pass "BUILDKIT_IMAGE=moby/buildkit:v0.20.0${pinned}
+docker buildx create --driver-opt \"image=\$BUILDKIT_IMAGE\"
+docker buildx inspect | grep -qF \"image=\\\"\$BUILDKIT_IMAGE\\\"\""
+df n1unpinned 'FROM scratch' fail "BUILDKIT_IMAGE=moby/buildkit:v0.20.0${pinned}
+docker buildx create --driver-opt 'image=moby/buildkit:latest'"
+df n1unpinnedeq 'FROM scratch' fail "BUILDKIT_IMAGE=moby/buildkit:v0.20.0${pinned}
+docker buildx create --driver-opt=image=moby/buildkit:latest"
+# N2: a parser directive names an image too
+df n2unpinned '# syntax=docker/dockerfile:1.7
+FROM scratch' fail
+df n2pinned "# syntax=docker/dockerfile:1.7${pinned}
+FROM scratch" pass
+df n2spaced "#  Syntax = docker/dockerfile:1.7
+FROM scratch" fail
+df n2late 'FROM scratch
+# syntax=docker/dockerfile:1.7' pass
+# ARG cycles must end (expect() bounds each case at 10 s and counts a timeout as a failure)
+# shellcheck disable=SC2016  # the Dockerfile's literal ${…}
+{
+df cycleself 'ARG B=${B}
+FROM ${B}' fail
+df cycletwo 'ARG A=${C}
+ARG C=${A}
+FROM ${A}' fail
+}
+# --verify on YAML yq cannot parse must not read as "no pins"
+d=$(case_dir verifybadyaml); printf 'jobs: [unclosed\n  a: {\n' >"$d/w.yml"
+if $pa --verify "$d/w.yml" >/dev/null 2>&1; then
+  echo "test-check-workflows: --verify passed YAML yq cannot parse" >&2; fails=$((fails + 1)); fi
 [ "$fails" -eq 0 ] || { echo "test-check-workflows: $fails failed" >&2; exit 1; }
 echo "test-check-workflows: all cases pass"

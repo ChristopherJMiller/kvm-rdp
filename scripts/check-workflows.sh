@@ -19,7 +19,7 @@
 #  5. Every image the Dockerfile names (FROM, an ARG default that is an image,
 #     COPY --from=, RUN --mount=...from=) carries a digest, stages excepted.
 #  6. scripts/image-build.sh assigns BUILDKIT_IMAGE by digest, at least once,
-#     and names no literal `image=` driver option.
+#     and names no literal `--driver-opt image=` (it must use $BUILDKIT_IMAGE).
 #  7. Every job has `timeout-minutes`.
 #  8. Every Swatinem/rust-cache step saves only on main: its `save-if` is
 #     `${{ github.ref == 'refs/heads/main' }}` or `false`.
@@ -121,9 +121,14 @@ twice=$(printf '%s' "$pins" | LC_ALL=C sort -u | cut -d@ -f1 | uniq -d)
 declare -A argdef=()
 declare -A stage=()
 image_ok() { # $1 = a reference, $2 = the instruction for the message
-  local img=$1 sub name val
+  local img=$1 sub name val rounds=0
   # Substitute $VAR and ${VAR} from the ARG defaults.
   while [[ $img =~ \$\{?([A-Za-z_][A-Za-z0-9_]*)\}? ]]; do
+    rounds=$((rounds + 1))
+    if [ "$rounds" -gt 32 ]; then
+      err "$dockerfile: ARG substitution does not settle after 32 rounds (a self-referencing or cyclic ARG): $2"
+      return 0
+    fi
     name=${BASH_REMATCH[1]}
     if [ -z "${argdef[$name]+x}" ] || [ -z "${argdef[$name]}" ]; then
       err "$dockerfile: ARG $name has no default but names an image: $2"
@@ -140,6 +145,17 @@ image_ok() { # $1 = a reference, $2 = the instruction for the message
   grep -qE "$digest" <<<"$img" || err "$dockerfile: image not pinned by digest: $2"
 }
 if [ -f "$dockerfile" ]; then
+  # A parser directive (`# syntax=image`) on the leading comment lines names a
+  # frontend image BuildKit pulls: it needs a digest too.
+  while IFS= read -r line; do
+    case $line in
+      [[:space:]]*'#'*|'#'*) ;;
+      *) break ;;
+    esac
+    if grep -qiE '^[[:space:]]*#[[:space:]]*syntax[[:space:]]*=' <<<"$line" && ! grep -qE "$digest" <<<"$line"; then
+      err "$dockerfile: the syntax= frontend is not pinned by digest: $line"
+    fi
+  done <"$dockerfile"
   norm=$(awk '
     { sub(/^[ \t]+/, ""); if ($0 ~ /^#/) next
       buf = cont ? buf " " $0 : $0
@@ -199,7 +215,7 @@ if [ -f "$image_build" ]; then
     [ -n "$line" ] || continue
     grep -qE "$digest" <<<"$line" || err "$image_build: BuildKit image not pinned by digest: $line"
   done <<<"$assigns"
-  if grep -qE 'image=[^$[:space:]"'"'"']' "$image_build"; then
+  if grep -qE 'driver-opt[= [:space:]]+["'"'"']?image=[^$"'"'"'[:space:]]' "$image_build"; then
     err "$image_build: a literal image= driver option (use \$BUILDKIT_IMAGE)"
   fi
 fi
