@@ -235,7 +235,7 @@ df n1quoted 'FROM scratch' fail "BUILDKIT_IMAGE=moby/buildkit:v0.20.0${pinned}
 docker buildx create --driver-opt image=\"moby/buildkit:latest\""
 df n1comma 'FROM scratch' fail "BUILDKIT_IMAGE=moby/buildkit:v0.20.0${pinned}
 docker buildx create --driver-opt cpu-shares=205,image=moby/buildkit:latest"
-df n1literalpinned 'FROM scratch' pass "BUILDKIT_IMAGE=moby/buildkit:v0.20.0${pinned}
+df n1literalpinned 'FROM scratch' fail "BUILDKIT_IMAGE=moby/buildkit:v0.20.0${pinned}
 docker buildx create --driver-opt image=moby/buildkit:v0.20.0${pinned}"
 # N2: a parser directive names an image too
 df n2unpinned '# syntax=docker/dockerfile:1.7

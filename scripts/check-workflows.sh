@@ -19,7 +19,7 @@
 #  5. Every image the Dockerfile names (FROM, an ARG default that is an image,
 #     COPY --from=, RUN --mount=...from=) carries a digest, stages excepted.
 #  6. scripts/image-build.sh assigns BUILDKIT_IMAGE by digest, at least once,
-#     and names no literal `--driver-opt image=` without a digest.
+#     and names no literal `--driver-opt image=` (it must use $BUILDKIT_IMAGE).
 #  7. Every job has `timeout-minutes`.
 #  8. Every Swatinem/rust-cache step saves only on main: its `save-if` is
 #     `${{ github.ref == 'refs/heads/main' }}` or `false`.
@@ -215,11 +215,11 @@ if [ -f "$image_build" ]; then
     [ -n "$line" ] || continue
     grep -qE "$digest" <<<"$line" || err "$image_build: BuildKit image not pinned by digest: $line"
   done <<<"$assigns"
-  # A literal image= driver option must itself carry a digest; $VAR forms are
-  # checked at their assignment above.
-  while IFS= read -r line; do
-    grep -qE "$digest" <<<"$line" || err "$image_build: a literal image= driver option without a digest (use \$BUILDKIT_IMAGE): $line"
-  done < <(grep -E 'driver-opt[= [:space:]]+["'"'"']?([^[:space:]"'"'"']*,)?image=["'"'"']?[^$"'"'"'[:space:]]' "$image_build" || true)
+  # A literal image= driver option is refused, pinned or not: the image must
+  # come from $BUILDKIT_IMAGE, whose assignment is checked above.
+  if grep -qE 'driver-opt[= [:space:]]+["'"'"']?([^[:space:]"'"'"']*,)?image=["'"'"']?[^$"'"'"'[:space:]]' "$image_build"; then
+    err "$image_build: a literal image= driver option (use \$BUILDKIT_IMAGE)"
+  fi
 fi
 [ "$fail" -eq 0 ] && echo "check-workflows: every rule holds"
 exit "$fail"
