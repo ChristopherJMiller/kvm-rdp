@@ -225,6 +225,19 @@ impl Histogram {
     }
 }
 
+/// §10.4 (Plan D final review m1): `paste_events`' abort labels, one per
+/// reason the input core gives (`rdp::input::abort_label`).
+pub const PASTE_ABORTS: [&str; 8] = [
+    "aborted_esc",
+    "aborted_key",
+    "aborted_mouse",
+    "aborted_release",
+    "aborted_modifier_wait",
+    "aborted_clipboard_failed",
+    "aborted_clipboard_lost",
+    "aborted_session",
+];
+
 pub struct Metrics {
     pub flv_bytes: Counter,
     pub flv_tags: Counter,
@@ -268,7 +281,8 @@ pub struct Metrics {
     pub accept_refused: Counter,
     pub input_events_ignored: Counter,
     /// §8: every paste's outcome (`started`, `done`, `no_text`,
-    /// `caps_lock`, `multiline`, `oversize`, `backlog`, `aborted`).
+    /// `caps_lock`, `multiline`, `oversize`, `backlog`, and an abort under
+    /// its reason, `PASTE_ABORTS`; final review m1).
     pub paste_events: Family,
     pub paste_skipped_chars: Counter,
     /// PD9 carry 3: clipboard answers no paste took (`late`, `unasked`), or
@@ -445,6 +459,15 @@ impl Default for Metrics {
 }
 
 impl Metrics {
+    /// Every paste abort counted, whatever its reason (`PASTE_ABORTS`).
+    #[must_use]
+    pub fn paste_aborts(&self) -> u64 {
+        PASTE_ABORTS
+            .iter()
+            .chain(&["aborted"])
+            .fold(0, |n, l| n.saturating_add(self.paste_events.get(l)))
+    }
+
     /// The Prometheus text exposition (version 0.0.4).
     #[must_use]
     pub fn render(&self) -> String {

@@ -4399,6 +4399,15 @@ mod tests {
                 if let PasteOutcome::Done { typed, .. } = p {
                     assert!(*typed <= self.max_chars, "{at}: past max_chars");
                 }
+                // §10.4 (final review m1): every abort reason the core
+                // gives has its own `paste_events` label.
+                if let PasteOutcome::Aborted(why) = p {
+                    assert_ne!(
+                        crate::rdp::input::abort_label(why),
+                        "aborted",
+                        "{at}: an abort reason with no label"
+                    );
+                }
                 match p {
                     PasteOutcome::Started => {
                         assert!(!self.open, "{at}: a second Started");

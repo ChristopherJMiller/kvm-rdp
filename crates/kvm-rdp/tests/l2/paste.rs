@@ -194,7 +194,7 @@ async fn esc_aborts_and_usage_0x29_is_never_sent() {
     typing(&env, ws).await;
     c.key(ESC, true);
     c.key(ESC, false);
-    counted(&env, "aborted", 1).await;
+    counted(&env, "aborted_esc", 1).await;
     let got = settled(until_mark(&env, &c, ws).await);
     let chord = chord_frames(true);
     assert_eq!(got[..chord.len()], chord);
@@ -224,7 +224,7 @@ async fn a_mouse_click_aborts() {
     typing(&env, ws).await;
     c.mouse_button(FpButton::Left, true, 10, 10);
     c.mouse_button(FpButton::Left, false, 10, 10);
-    counted(&env, "aborted", 1).await;
+    counted(&env, "aborted_mouse", 1).await;
     let got = settled(until_mark(&env, &c, ws).await);
     let chord = chord_frames(true);
     assert_eq!(got[..chord.len()], chord);
@@ -289,7 +289,7 @@ async fn an_8_mib_payload_is_clipboard_oversize_and_types_nothing() {
     // At the scaled 300 ms `modifier_wait` the transfer may outlast the
     // pending paste (DD4 bounds the answer's wait too): it ended once,
     // refused for the oversize or timed out first.
-    assert_eq!(pasted(&env, "oversize") + pasted(&env, "aborted"), 1);
+    assert_eq!(pasted(&env, "oversize") + env.metrics().paste_aborts(), 1);
     assert!(
         !carries(&every_frame(&env.sim.events()), 0x1B),
         "an x reached the KVM"
@@ -304,7 +304,7 @@ async fn modifiers_held_past_the_wait_cancel() {
     let (env, c, ws) = pasting("abc", |c| c.paste.modifier_wait = wait).await;
     let t0 = Instant::now();
     paste_chord(&c, false);
-    counted(&env, "aborted", 1).await;
+    counted(&env, "aborted_modifier_wait", 1).await;
     within(t0.elapsed(), wait);
     for m in CHORD_MODS {
         c.key(m, false);
@@ -386,7 +386,9 @@ async fn a_paste_during_a_websocket_outage_types_nothing_partial() {
     env.sim.set_policy(|p| p.ws_status = None);
     let ws = env.hid_ready_after(opens).await;
     assert!(
-        until(T, || pasted(&env, "done") + pasted(&env, "aborted") > 0).await,
+        until(T, || pasted(&env, "done") + env.metrics().paste_aborts()
+            > 0)
+        .await,
         "the paste never ended"
     );
     let got = until_mark(&env, &c, ws).await;
@@ -395,7 +397,10 @@ async fn a_paste_during_a_websocket_outage_types_nothing_partial() {
         !letters.iter().any(|u| carries(&got, *u)),
         "a partial paste reached the KVM: {got:02x?}"
     );
-    assert_eq!((pasted(&env, "done"), pasted(&env, "aborted")), (0, 1));
+    assert_eq!(
+        (pasted(&env, "done"), pasted(&env, "aborted_release")),
+        (0, 1)
+    );
     assert!(
         env.metrics().release_all.get("websocket_reconnect") > reconnects,
         "the reopen's discard was not counted as a release"
@@ -430,7 +435,7 @@ async fn an_oversize_response_drops_the_session() {
         "disconnects{{clipboard_oversize}} is {}",
         env.metrics().disconnects.get("clipboard_oversize")
     );
-    assert_eq!(pasted(&env, "oversize") + pasted(&env, "aborted"), 1);
+    assert_eq!(pasted(&env, "oversize") + env.metrics().paste_aborts(), 1);
     assert!(
         !carries(&every_frame(&env.sim.events()), 0x04),
         "an oversize paste typed"

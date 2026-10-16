@@ -301,7 +301,7 @@ impl InputShared {
             PasteOutcome::Refused(PasteRefusal::Multiline) => "multiline",
             PasteOutcome::Refused(PasteRefusal::Oversize) => "oversize",
             PasteOutcome::Refused(PasteRefusal::Backlog) => "backlog",
-            PasteOutcome::Aborted(_) => "aborted",
+            PasteOutcome::Aborted(why) => abort_label(why),
         };
         self.metrics.paste_events.inc(label);
     }
@@ -499,6 +499,24 @@ impl RdpServerInputHandler for InputHandler {
     }
 }
 
+/// §10.4 (Plan D final review m1): a paste abort's `paste_events` label
+/// names its reason — the core's (`PasteOutcome::Aborted`), each one of
+/// `metrics::PASTE_ABORTS`. A reason the core does not give counts plain
+/// `aborted` (the core's property test pins that it gives none).
+pub(crate) fn abort_label(reason: &str) -> &'static str {
+    match reason {
+        "esc" => "aborted_esc",
+        "key" => "aborted_key",
+        "mouse" => "aborted_mouse",
+        "release" => "aborted_release",
+        "modifier_wait" => "aborted_modifier_wait",
+        "clipboard_failed" => "aborted_clipboard_failed",
+        "clipboard_lost" => "aborted_clipboard_lost",
+        "session" => "aborted_session",
+        _ => "aborted",
+    }
+}
+
 #[cfg(test)]
 impl InputRuntimeConfig {
     pub fn test() -> Self {
@@ -558,6 +576,30 @@ mod tests {
     use kvm_proto::hid::HidFrame;
     use std::sync::atomic::AtomicBool;
     use tokio::sync::mpsc;
+
+    /// §10.4 (Plan D final review m1): each abort reason the core gives
+    /// counts under its own `paste_events` label — `modifier_wait` (the
+    /// client holding the modifiers back) told apart from
+    /// `clipboard_failed` — and the eight are `PASTE_ABORTS`.
+    #[test]
+    fn a_paste_abort_is_counted_under_its_reason() {
+        let reasons = [
+            "esc",
+            "key",
+            "mouse",
+            "release",
+            "modifier_wait",
+            "clipboard_failed",
+            "clipboard_lost",
+            "session",
+        ];
+        let labels: Vec<&str> = reasons.iter().map(|r| abort_label(r)).collect();
+        assert_eq!(labels, crate::metrics::PASTE_ABORTS);
+        for (r, l) in reasons.iter().zip(&labels) {
+            assert_eq!(*l, format!("aborted_{r}"));
+        }
+        assert_eq!(abort_label("not a reason the core gives"), "aborted");
+    }
     use tokio::task::LocalSet;
 
     fn shared() -> Arc<InputShared> {
@@ -840,7 +882,7 @@ mod tests {
         /// draining the queue as the writer would; the usages typed. Real
         /// time, or the paused clock auto-advancing.
         async fn type_out(&mut self) -> Vec<u8> {
-            let ended = |m: &Metrics| m.paste_events.get("done") + m.paste_events.get("aborted");
+            let ended = |m: &Metrics| m.paste_events.get("done") + m.paste_aborts();
             let before = ended(&self.metrics);
             let mut typed = Vec::new();
             for _ in 0..64 {
@@ -1003,7 +1045,7 @@ mod tests {
         assert_eq!(r.metrics.paste_events.get("started"), 1);
         r.end();
         r.s.set_generation(0); // the shell's SessionStop
-        assert_eq!(r.metrics.paste_events.get("aborted"), 1);
+        assert_eq!(r.metrics.paste_events.get("aborted_session"), 1);
         assert_eq!(r.metrics.paste_events.total(), 2);
         // Typing, too.
         r.start();
@@ -1018,7 +1060,7 @@ mod tests {
         let g = r.gens.begin(); // Preempt: the winner's on_connection_info
         r.hid.release_all(ReleaseTrigger::SessionStart);
         r.s.set_generation(g);
-        assert_eq!(r.metrics.paste_events.get("aborted"), 2);
+        assert_eq!(r.metrics.paste_aborts(), 2);
     }
 
     /// PD9 carry 2 (PD6 m3): `on_generation` drops the core's state with
@@ -1139,7 +1181,7 @@ mod tests {
         r.chord();
         tokio::time::advance(Duration::from_secs(5)).await; // modifier_wait
         r.unchord(); // the due Tick first: the paste ends unanswered
-        assert_eq!(r.metrics.paste_events.get("aborted"), 1);
+        assert_eq!(r.metrics.paste_events.get("aborted_modifier_wait"), 1);
         r.chord();
         assert_eq!(r.requests(), 2);
         r.s.clipboard_text(utf16("old"));
@@ -1173,7 +1215,7 @@ mod tests {
         r.s.clipboard_available(true);
         r.chord();
         r.s.clipboard_failed();
-        assert_eq!(r.metrics.paste_events.get("aborted"), 1);
+        assert_eq!(r.metrics.paste_events.get("aborted_clipboard_failed"), 1);
         r.s.clipboard_text(utf16("x"));
         r.s.clipboard_failed();
         assert_eq!(r.metrics.clipboard_discarded.get("unasked"), 2);
@@ -1216,7 +1258,13 @@ mod tests {
         r.s.clipboard_lost(1);
         assert_eq!(r.metrics.clipboard_discarded.get("late"), 1);
         assert_eq!(r.metrics.clipboard_discarded.get("in_flight"), 1);
-        assert_eq!(r.metrics.paste_events.get("aborted"), 2);
+        assert_eq!(
+            (
+                r.metrics.paste_events.get("aborted_modifier_wait"),
+                r.metrics.paste_events.get("aborted_clipboard_lost")
+            ),
+            (1, 1)
+        );
         r.unchord();
         r.chord();
         r.s.clipboard_lost(0);
@@ -1400,8 +1448,7 @@ mod tests {
                 button: MouseButton::Left,
                 pressed: false,
             });
-            let ended_paste =
-                || r.metrics.paste_events.get("aborted") + r.metrics.paste_events.get("done") > 0;
+            let ended_paste = || r.metrics.paste_aborts() + r.metrics.paste_events.get("done") > 0;
             while !ended_paste() && t0.elapsed() < Duration::from_secs(10) {
                 std::thread::yield_now();
             }

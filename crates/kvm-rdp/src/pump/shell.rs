@@ -2193,7 +2193,10 @@ mod tests {
                         answer: Answer::detached(),
                     })
                     .unwrap();
-                until("the paste's abort", || m.paste_events.get("aborted") == 1).await;
+                until("the paste's abort", || {
+                    m.paste_events.get("aborted_clipboard_failed") == 1
+                })
+                .await;
                 chord(&t.input, false);
                 // An answer types; a stale slot's answer is dropped first.
                 chord(&t.input, true);
@@ -2403,7 +2406,11 @@ mod tests {
                     assert_eq!(m.paste_events.get("started"), 1, "failed: {failed}");
                     tokio::time::sleep(WIRED_WAIT + Duration::from_millis(50)).await;
                     keys(false); // paste 1 ends unanswered
-                    assert_eq!(m.paste_events.get("aborted"), 1, "failed: {failed}");
+                    assert_eq!(
+                        m.paste_events.get("aborted_modifier_wait"),
+                        1,
+                        "failed: {failed}"
+                    );
                     keys(true); // paste 2 asks
                     // Before the shell runs: paste 1's late answer, then 2's.
                     ours.on_format_data_response(if failed {
@@ -2417,7 +2424,7 @@ mod tests {
                     })
                     .await;
                     assert_eq!(m.clipboard_discarded.get("late"), 1, "failed: {failed}");
-                    assert_eq!(m.paste_events.get("aborted"), 2, "failed: {failed}");
+                    assert_eq!(m.paste_aborts(), 2, "failed: {failed}");
                     keys(false);
                     let mut typed = Vec::new();
                     loop {
