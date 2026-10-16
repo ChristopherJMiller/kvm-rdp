@@ -5,8 +5,10 @@ on:
     - cron: "17 3 * * *"
   workflow_dispatch:
 
-# Read-only token: the job writes nothing back and uses no secret.
-# dtolnay/rust-toolchain@master is that action's documented usage.
+# Read-only token: the job writes nothing back and uses no secret. Every
+# action is pinned to a commit SHA with its tag beside it
+# (scripts/check-workflows.sh; bump with scripts/pin-action.sh). Rust comes
+# from rustup on the runner image, reading rust-toolchain.toml.
 permissions:
   contents: read
 
@@ -17,18 +19,22 @@ env:
 
 jobs:
   fuzz:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Nine targets × 300 s (45 min) plus the ASan build and the seeds.
     timeout-minutes: 75
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: nightly-2026-10-01
-      - uses: dtolnay/rust-toolchain@master
+          persist-credentials: false
+      - name: Rust (stable from rust-toolchain.toml; the fuzz nightly)
+        run: |
+          rustup toolchain install
+          rustup toolchain install nightly-2026-10-01 --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          toolchain: 1.94.1
-      - uses: Swatinem/rust-cache@v2
+          # Reads main's cache, never writes it.
+          shared-key: fuzz
+          save-if: false
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
       - name: Seeds, on stable (rust-toolchain.toml)
@@ -39,7 +45,7 @@ jobs:
         run: scripts/fuzz.sh run 300
       - name: Keep any crash
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts

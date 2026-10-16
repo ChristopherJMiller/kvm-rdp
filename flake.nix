@@ -45,8 +45,27 @@
           export CARGO_TARGET_DIR="$(dirname "$common")/target"
         fi
       '';
+
+      # CI's tools at flake.lock's versions (Plan E Task 2.1, DE13): a CI job
+      # runs `nix build .#<name>` and puts result/bin on PATH. Rust stays
+      # rustup's in CI (rust-toolchain.toml), the same 1.94.1 as below.
+      ciTools = name: paths: pkgs.buildEnv {
+        name = "kvm-rdp-${name}";
+        inherit paths;
+      };
     in
     {
+      packages.${system} = {
+        lint-tools = ciTools "lint-tools" [ pkgs.cargo-deny pkgs.actionlint pkgs.shellcheck pkgs.yq-go ];
+        # §11.4: FreeRDP 3 built with OpenH264 (nixpkgs 3.32.1), under Xvfb.
+        l3-tools = ciTools "l3-tools" [ pkgs.freerdp pkgs.xvfb-run ];
+        # §10.2's bench streams (scripts/gen-fixtures.sh bench).
+        # ffmpeg-headless (305 MiB) has ffmpeg-full's libx264, freetype and
+        # fontconfig at a fifth of its closure; the devshell keeps
+        # ffmpeg-full for the committed fixtures.
+        bench-tools = ciTools "bench-tools" [ pkgs.ffmpeg-headless pkgs.jq ];
+      };
+
       devShells.${system} = {
         default = pkgs.mkShell {
           # cargoWrapper first so its `cargo` shadows the toolchain's on PATH.
@@ -59,6 +78,12 @@
             pkgs.jq
             pkgs.bubblewrap
             pkgs.openssl # census step 2: `openssl s_client -brief` per TLS port
+            pkgs.freerdp
+            pkgs.xvfb-run
+            pkgs.cargo-deny
+            pkgs.actionlint
+            pkgs.shellcheck
+            pkgs.yq-go
           ];
 
           KVM_RDP_FONT = "${pkgs.dejavu_fonts}/share/fonts/truetype/DejaVuSans.ttf";

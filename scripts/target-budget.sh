@@ -15,11 +15,26 @@ if [ ! -d "$dir" ]; then
   echo "target-budget: $dir does not exist (nothing built yet)"
   exit 0
 fi
+# The disk pass (Plan E Task 2.1; Plan C ledger, minor 4): `[build]
+# incremental = false` since Plan C leaves every `incremental/` directory
+# stale, so deleting them is always safe.
+if [ "${1:-}" = "--prune" ]; then
+  pruned_kib=0
+  for inc in "$dir"/*/incremental "$dir"/*/*/incremental; do
+    [ -d "$inc" ] || continue
+    kib=$(du -sk "$inc" | cut -f1)
+    rm -rf -- "$inc"
+    pruned_kib=$((pruned_kib + kib))
+    echo "target-budget: pruned $inc (${kib} KiB)"
+  done
+  echo "target-budget: pruned $(awk -v k="$pruned_kib" 'BEGIN { printf "%.2f", k / 1048576 }') GiB of stale incremental caches"
+fi
 used_kib=$(du -sk "$dir" | cut -f1)
 budget_kib=$(( budget_gib * 1024 * 1024 ))
 used_gib=$(awk -v k="$used_kib" 'BEGIN { printf "%.2f", k / 1048576 }')
 if [ "$used_kib" -gt "$budget_kib" ]; then
   echo "target-budget: $dir is ${used_gib} GiB, over the ${budget_gib} GiB budget." >&2
+  echo "target-budget: run 'scripts/target-budget.sh --prune' first; if still over," >&2
   echo "target-budget: run 'cargo clean', then the per-task gate again. If it is over" >&2
   echo "target-budget: budget again straight after that, stop and report the size;" >&2
   echo "target-budget: never raise KVM_RDP_TARGET_BUDGET_GIB to get past this gate." >&2

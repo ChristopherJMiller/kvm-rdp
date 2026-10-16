@@ -5,9 +5,12 @@ on:
     branches: [main]
   pull_request:
 
-# Read-only token: no job writes to the repo or uses a secret. Actions stay on
-# their major tags; dtolnay/rust-toolchain@master (with an explicit
-# `toolchain:`) is that action's documented usage and predates these gates.
+# Read-only for every job but `publish` (Plan E Task 4.2), which asks for its
+# own permissions and runs only on a push to main; no job reads a secret on a
+# pull request, so a fork's PR runs every gate safely. Every action is pinned
+# to a commit SHA with its tag beside it (scripts/check-workflows.sh; bump
+# with scripts/pin-action.sh). Rust comes from rustup on the runner image,
+# reading rust-toolchain.toml; every other tool from the flake (DE13).
 permissions:
   contents: read
 
@@ -20,27 +23,28 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  # ubuntu-latest has 4 vCPUs; .cargo/config.toml's RUST_TEST_THREADS = 4
+  # ubuntu-24.04 has 4 vCPUs; .cargo/config.toml's RUST_TEST_THREADS = 4
   # matches it, and L2's one-sided timing asserts are sized for that.
   CARGO_BUILD_JOBS: "4"
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # IronRDP's graph plus L2 (§13): a hung L2 case must not hold a runner.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: 1.94.1
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+          # No job pushes git: the token is not left on disk while the
+          # repository's own code runs (check-workflows.sh rule 10).
+          persist-credentials: false
+      - name: Rust from rust-toolchain.toml (1.94.1 with clippy and rustfmt)
+        run: rustup toolchain install && cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # One dependency cache (~/.cargo and target/, workspace crates
-          # cleaned out), written by main only: pull requests restore it and
-          # never save their own, so the IronRDP-sized target is cached once
-          # rather than once per branch.
+          # One dependency cache, written by main only: pull requests
+          # restore it and never save their own (the nightly reads it too).
+          shared-key: check
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The cheap gates first: none of them compiles anything.
       - name: Format
@@ -128,6 +132,11 @@ jobs:
           fi
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Clippy — the image's feature set
+        # The build that ships has neither test-hooks nor alloc-stats: an
+        # item gated on them must leave no unused import behind (Docker
+        # does not deny warnings).
+        run: cargo clippy -p kvm-rdp --lib --bins -- -D warnings
       - name: Test
         # Unit, L1 and L2 (the bridge, kvm-sim and an IronRDP client on
         # private loopback addresses in 127.128.0.0/10 — Linux routes all of
@@ -138,20 +147,20 @@ jobs:
 
   fuzz:
     # Bounded fuzzing of kvm-proto (spec §11.2, §13 — CI only): every target
-    # for 5 s, RSS-capped by scripts/fuzz.sh. Longer runs are the nightly
-    # workflow's.
-    runs-on: ubuntu-latest
+    # for 5 s, RSS-capped by scripts/fuzz.sh. Longer runs are the nightly's.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: nightly-2026-10-01
-      - uses: dtolnay/rust-toolchain@master
+          persist-credentials: false
+      - name: Rust (stable from rust-toolchain.toml; the fuzz nightly)
+        run: |
+          rustup toolchain install
+          rustup toolchain install nightly-2026-10-01 --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          toolchain: 1.94.1
-      - uses: Swatinem/rust-cache@v2
-        with:
+          shared-key: fuzz
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version 0.13.2
@@ -163,7 +172,32 @@ jobs:
         run: scripts/fuzz.sh run 5
       - name: Keep any crash
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts
+
+  lint:
+    # Plan E Task 2.1: the workflows' own rules (check-workflows.sh), the
+    # scripts, the disk pass; Task 2.2 adds cargo deny.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - name: The flake's lint tools (cargo-deny, actionlint, shellcheck, yq)
+        run: |
+          nix build .#lint-tools --out-link "$RUNNER_TEMP/lint-tools"
+          echo "$RUNNER_TEMP/lint-tools/bin" >> "$GITHUB_PATH"
+      - name: Workflow and image-pin rules
+        run: scripts/test-check-workflows.sh && scripts/check-workflows.sh
+      - name: actionlint
+        run: actionlint
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: The target-budget script (the disk pass)
+        run: scripts/test-target-budget.sh
