@@ -20,8 +20,11 @@
 //!
 //! A websocket ends with a FIN only after a close the KVM answered with its
 //! own close frame — it read everything up to ours (a bare EOF proves
-//! nothing: it may be a half-close with our backlog unread). Every other
-//! end (a failed or blocked
+//! nothing: it may be a half-close with our backlog unread). That the KVM
+//! read the release is proved only by its pong to the close's ping or a
+//! close frame echoing ours (`CLOSE_REASON`): a close it began may cross
+//! ours before it read the release (r-m2, the re-review of the final fix
+//! wave), and still ends with a FIN. Every other end (a failed or blocked
 //! write, a lost read side, a close it never answered, the task aborted)
 //! resets the connection (`SO_LINGER` 0), so a backlog of HID reports it had
 //! not read is discarded with the connection rather than delivered after
@@ -63,6 +66,8 @@ use kvm_proto::hid::HidFrame;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
 
 /// A close may spend this long writing the release and the close frame.
@@ -80,6 +85,20 @@ pub(crate) const RELEASE_PING: &[u8] = b"kvm-rdp release";
 /// websocket again; the open re-asserts `reassert_after` past it. Never
 /// `RELEASE_PING`: a late pong to it would pass for the close's proof.
 pub(crate) const OPEN_PING: &[u8] = b"kvm-rdp open";
+
+/// r-m2 (re-review of the final fix wave): the reason our close frame
+/// carries, so the KVM's answer to it — a close frame echoing ours (RFC
+/// 6455 §5.5.1) — can be told from a close the KVM began. Only the answer
+/// proves the KVM read everything up to our close.
+const CLOSE_REASON: &str = "kvm-rdp release";
+
+/// Our close frame: a normal closure with `CLOSE_REASON`.
+fn our_close() -> CloseFrame<'static> {
+    CloseFrame {
+        code: CloseCode::Normal,
+        reason: CLOSE_REASON.into(),
+    }
+}
 
 /// `input.reassert_after`'s default (DD8): 1 s past an open's session
 /// start, until L4 measures how long stale reports keep landing (Task 6.1
@@ -461,22 +480,27 @@ impl WsTask {
                             // the ES3) still answers a ping.
                             let pinged = written
                                 && sink.send(Message::Ping(RELEASE_PING.to_vec())).await.is_ok();
-                            let closed = sink.close().await.is_ok();
+                            // r-m2: our close carries `CLOSE_REASON`, so the
+                            // KVM's answer can be told from a close it began.
+                            let closed = sink.send(Message::Close(Some(our_close()))).await.is_ok()
+                                && sink.close().await.is_ok();
                             let sent = written && closed;
                             // Wait for the KVM's side of the close, so the
                             // next session's websocket never overlaps this
-                            // one. Only its close frame proves it read
-                            // everything up to ours (I2, n1): an EOF or an
-                            // error may be a half-close with our backlog
-                            // unread. Once it has answered we are done — it
-                            // may wait for our FIN before closing (n2). Its
-                            // pong proves the read too, but not that it is
-                            // done: only the close frame ends with a FIN.
+                            // one. Only its close frame ends it with a FIN
+                            // (I2, n1): an EOF or an error may be a
+                            // half-close with our backlog unread. Once it
+                            // has closed we are done — it may wait for our
+                            // FIN before closing (n2). What proves it read
+                            // the release is its pong, or its answer to our
+                            // close — a close frame echoing ours (r-m2): a
+                            // close it began may have crossed ours before it
+                            // read the release.
                             loop {
                                 match stream.next().await {
-                                    Some(Ok(Message::Close(_))) => {
+                                    Some(Ok(Message::Close(frame))) => {
                                         answered = sent;
-                                        if sent {
+                                        if sent && frame == Some(our_close()) {
                                             let _ = self.hid.confirm_read();
                                         }
                                         break;
@@ -618,11 +642,13 @@ mod tests {
         sent: Vec<Vec<u8>>,
         /// Every ping's payload (R-I2).
         pings: Vec<Vec<u8>>,
+        /// Every close frame sent as a message (r-m2).
+        closes: Vec<Option<CloseFrame<'static>>>,
         waker: Option<Waker>,
     }
 
     /// A sink a test can block and unblock; records every binary message,
-    /// and every ping apart.
+    /// and every ping and close frame apart.
     #[derive(Clone, Default)]
     struct GateSink(Arc<Mutex<Gate>>);
 
@@ -644,6 +670,9 @@ mod tests {
         }
         fn pings(&self) -> Vec<Vec<u8>> {
             self.0.lock().unwrap().pings.clone()
+        }
+        fn closes(&self) -> Vec<Option<CloseFrame<'static>>> {
+            self.0.lock().unwrap().closes.clone()
         }
         fn fail(&self) {
             self.0.lock().unwrap().fail = true;
@@ -667,6 +696,7 @@ mod tests {
             match item {
                 Message::Binary(b) => self.0.lock().unwrap().sent.push(b),
                 Message::Ping(p) => self.0.lock().unwrap().pings.push(p),
+                Message::Close(c) => self.0.lock().unwrap().closes.push(c),
                 _ => {}
             }
             Ok(())
@@ -1280,6 +1310,60 @@ mod tests {
                 hid.kvm_may_hold(),
                 !proved,
                 "a pong of {payload:?} proved the read: {}",
+                !hid.kvm_may_hold()
+            );
+        }
+    }
+
+    /// r-m2 (re-review of the final fix wave): a close frame read after
+    /// ours proves the KVM read the release only when it answers ours — it
+    /// echoes our close (RFC 6455 §5.5.1). A close the KVM began, crossing
+    /// ours — perhaps before it read the release — proves nothing: its own
+    /// payload, none, or our code alone. Any close frame still decides the
+    /// FIN: the KVM is closing, and whatever it reads next ends with ours.
+    #[tokio::test]
+    async fn only_an_answer_to_our_close_proves_the_read() {
+        let own = |code, reason: &str| {
+            Some(CloseFrame {
+                code,
+                reason: reason.to_owned().into(),
+            })
+        };
+        for (frame, proved) in [
+            (None, false),
+            (own(CloseCode::Normal, ""), false),
+            (own(CloseCode::Away, CLOSE_REASON), false),
+            (own(CloseCode::Normal, "bye"), false),
+            (Some(our_close()), true),
+        ] {
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, ctl) = task(hid.clone(), Duration::from_secs(1));
+            let sink = GateSink::new(true);
+            let s2 = sink.clone();
+            let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Result<Message, WsError>>();
+            let inbound = futures_util::stream::poll_fn(move |cx| in_rx.poll_recv(cx));
+            let drive = tokio::spawn(async move { t.drive(s2, inbound).await });
+            wait_sent(&sink, 2).await;
+            hid.push(kbd(4), false);
+            wait_sent(&sink, 3).await;
+            hid.release_all(ReleaseTrigger::SessionEnd);
+            let (done, ack) = oneshot::channel();
+            ctl.send(WsCtl::Close { done }).unwrap();
+            // The Close arm has written the release, the ping and our close
+            // frame, and waits for the KVM's side: a close frame.
+            wait_sent(&sink, 4).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(sink.closes(), [Some(our_close())], "our close frame");
+            in_tx.send(Ok(Message::Close(frame.clone()))).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), ack)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(ended(drive).await, Exit::Closed, "{frame:?}: no FIN");
+            assert_eq!(
+                hid.kvm_may_hold(),
+                !proved,
+                "a close of {frame:?} proved the read: {}",
                 !hid.kvm_may_hold()
             );
         }
