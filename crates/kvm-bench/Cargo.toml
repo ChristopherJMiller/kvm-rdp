@@ -1,0 +1,63 @@
+[package]
+name = "kvm-bench"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+autotests = false
+autobins = false
+autoexamples = false
+
+# The pure half — statistics, the /metrics parser, thresholds, the matchers
+# — with its unit tests; it uses no IronRDP, so its test binary links none
+# (§13, design decision 12).
+[lib]
+name = "kvm_bench"
+path = "src/lib.rs"
+doctest = false
+
+# The IO half: kvm-sim, the client, the bridge subprocess, the null bridge.
+# No unit tests: it would be a third IronRDP-linked test executable (§13).
+[[bin]]
+name = "kvm-bench"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+kvm-proto = { path = "../kvm-proto" }
+kvm-sim = { path = "../kvm-sim" }
+# The client crates L2 already compiles, at the workspace pin (§4.2), and
+# ironrdp-server for the null bridge (Task 5.4) — egfx only.
+ironrdp-async = { workspace = true }
+ironrdp-cliprdr = { workspace = true }
+ironrdp-connector = { workspace = true }
+ironrdp-core = { workspace = true }
+ironrdp-dvc = { workspace = true }
+ironrdp-egfx = { workspace = true }
+ironrdp-graphics = { workspace = true }
+ironrdp-pdu = { workspace = true }
+ironrdp-server = { workspace = true }
+ironrdp-session = { workspace = true }
+ironrdp-svc = { workspace = true }
+ironrdp-tls = { workspace = true, features = ["rustls"] }
+ironrdp-tokio = { workspace = true, features = ["reqwest"] }
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+# default features would pull in ring (§4.2)
+rcgen = { version = "0.13", default-features = false, features = ["aws_lc_rs", "pem"] }
+# `logging` and tokio's `signal` as the bridge (`-p kvm-rdp`) resolves them,
+# so tokio, rustls and aws-lc-sys build once for both release binaries
+# (§13's 8 GiB); kvm-bench's client crates still turn on `bitflags/std`,
+# `ironrdp-tls/rustls` and the like, so about 50 units — most `ironrdp-*`
+# crates — build twice (measured at drafting).
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12", "logging"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "macros", "time", "sync", "signal"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+x509-parser = "0.16"

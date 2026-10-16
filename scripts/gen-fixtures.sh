@@ -5,6 +5,8 @@
 #   scripts/gen-fixtures.sh            fixtures/*.h264|.flv + *.manifest.json (committed)
 #   scripts/gen-fixtures.sh es3like    only fixtures/360p30_es3like_poc0.h264 (+ manifest)
 #   scripts/gen-fixtures.sh large      fixtures/large/*.h264 (gitignored; spikes, benches)
+#   scripts/gen-fixtures.sh bench      ${CARGO_TARGET_DIR:-target}/bench-streams/*.h264 (kvm-bench's
+#                                      §10.2 streams; -threads 4, not deterministic, never committed)
 #   scripts/gen-fixtures.sh clean      rm -rf fixtures/large
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -221,10 +223,41 @@ large() {
     -bsf:v h264_metadata=video_full_range_flag=1 -f h264 $d/1080p30_main_limited_flagfull.h264
 }
 
+# §10.2's bench streams (Plan E Task 5.1, DE10): testsrc2 under full-frame
+# noise at 8 Mbit/s capped (no filler), the barcode drawn over the noise,
+# an IDR every second, 20 s each — loops of at least 10 s — into the shared
+# target dir. -threads 4 (§13), so not deterministic: nothing pins their
+# bytes, and kvm-bench checks what it needs (unique FrameIds, the bitrate).
+# sliced-threads=0, as every other fixture: -tune zerolatency with -threads 4
+# would cut each AU into four slices, which no ES3 stream does; and
+# -filter_threads 4, or the lavfi graph takes one thread per CPU (§13).
+bench_enc() { # OUT SIZE FPS BLOCK_W BLOCK_H SOURCE NOISE — SOURCE ends in = or : (its options follow)
+  "${FF[@]}" -filter_threads 4 -f lavfi -i "${6}size=$2:rate=$3" \
+    -vf "$7,$(barcode "$4" "$5"),scale=out_color_matrix=bt709:out_range=pc,format=yuv420p" \
+    -t 20 -an -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -level:v 4.2 \
+    -bf 0 -threads 4 \
+    -x264-params "sliced-threads=0:keyint=$3:min-keyint=$3:scenecut=0:aud=1:repeat-headers=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=pc" \
+    -b:v 8M -maxrate 8M -bufsize 8M -f h264 "$1"
+}
+bench() {
+  local d=${CARGO_TARGET_DIR:-target}/bench-streams
+  mkdir -p "$d"
+  # 30 and 60 fps at two resolutions (§10.2; 720p for resize churn).
+  bench_enc "$d/bench_1080p30.h264" 1920x1080 30 120 64 "testsrc2=" "noise=alls=60:allf=t"
+  bench_enc "$d/bench_1080p60.h264" 1920x1080 60 120 64 "testsrc2=" "noise=alls=60:allf=t"
+  bench_enc "$d/bench_720p30.h264" 1280x720 30 80 48 "testsrc2=" "noise=alls=60:allf=t"
+  bench_enc "$d/bench_720p60.h264" 1280x720 60 80 48 "testsrc2=" "noise=alls=60:allf=t"
+  # Idle → motion (§10.2): 10 s of a still grey screen (only the barcode
+  # changes), then 10 s of noise.
+  bench_enc "$d/idle_motion_1080p30.h264" 1920x1080 30 120 64 "color=c=0x404040:" \
+    "noise=alls=60:allf=t:enable='gte(t,10)'"
+}
+
 case "$MODE" in
   committed) committed ;;
   es3like) es3like ;;
   large) large ;;
+  bench) bench ;;
   clean) rm -rf fixtures/large ;;
-  *) echo "usage: $0 [committed|es3like|large|clean]" >&2; exit 2 ;;
+  *) echo "usage: $0 [committed|es3like|large|bench|clean]" >&2; exit 2 ;;
 esac

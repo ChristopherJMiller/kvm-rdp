@@ -1,0 +1,116 @@
+//! §10.2's matchers: received frames to kvm-sim's sends by FrameId, and
+//! client key presses to the HID reports kvm-sim read.
+use std::collections::HashMap;
+use std::time::Instant;
+
+/// End-to-end latencies in ms: each received `(frame_id, arrival)` minus
+/// the latest send of that id at or before the arrival (a looped source
+/// sends each id once per loop); and how many arrivals matched no send.
+#[must_use]
+pub fn latencies(sent: &[(u64, Instant)], received: &[(u64, Instant)]) -> (Vec<f64>, usize) {
+    let mut by_id: HashMap<u64, Vec<Instant>> = HashMap::new();
+    for (id, at) in sent {
+        by_id.entry(*id).or_default().push(*at);
+    }
+    for v in by_id.values_mut() {
+        v.sort();
+    }
+    let (mut out, mut unmatched) = (Vec::with_capacity(received.len()), 0);
+    for (id, at) in received {
+        let tx = by_id.get(id).and_then(|v| {
+            let i = v.partition_point(|t| t <= at);
+            i.checked_sub(1).and_then(|j| v.get(j))
+        });
+        match tx {
+            Some(tx) => out.push(at.duration_since(*tx).as_secs_f64() * 1000.0),
+            None => unmatched += 1,
+        }
+    }
+    (out, unmatched)
+}
+
+/// §10.2's load check: FrameIds unique within one loop, the loop at least
+/// `min_secs` long at `fps`.
+pub fn unique_loop(ids: &[u64], fps: u32, min_secs: f64) -> Result<(), String> {
+    let secs = ids.len() as f64 / f64::from(fps);
+    if secs < min_secs {
+        return Err(format!("the loop is {secs:.2} s, under {min_secs} s"));
+    }
+    let mut seen = std::collections::HashSet::with_capacity(ids.len());
+    match ids.iter().position(|id| !seen.insert(*id)) {
+        Some(i) => Err(format!("frame {i}'s FrameId repeats within the loop")),
+        None => Ok(()),
+    }
+}
+
+/// Input latencies in ms (§10.1): each press `(usage, written)` against the
+/// first keyboard report (§3.3: `AA AA 08 …`, first key slot at byte 7) at
+/// or after it carrying that usage, each report used once, in order; and
+/// how many presses met none.
+#[must_use]
+pub fn input_latencies(
+    presses: &[(u8, Instant)],
+    reports: &[(Instant, Vec<u8>)],
+) -> (Vec<f64>, usize) {
+    let (mut out, mut missed, mut cursor) = (Vec::new(), 0, 0);
+    for (usage, sent) in presses {
+        let hit = reports[cursor..]
+            .iter()
+            .position(|(at, b)| at >= sent && b.len() >= 8 && b[2] == 0x08 && b[7] == *usage);
+        match hit {
+            Some(i) => {
+                out.push(reports[cursor + i].0.duration_since(*sent).as_secs_f64() * 1000.0);
+                cursor += i + 1;
+            }
+            None => missed += 1,
+        }
+    }
+    (out, missed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_frame_matches_the_latest_send_of_its_id_before_it_arrived() {
+        let t = Instant::now();
+        let ms = |n: u64| t + Duration::from_millis(n);
+        // A two-frame loop sent twice; the client got the second loop's.
+        let sent = [(1, ms(0)), (2, ms(33)), (1, ms(66)), (2, ms(99))];
+        let received = [(1, ms(70)), (2, ms(104)), (9, ms(110))];
+        let (lat, unmatched) = latencies(&sent, &received);
+        assert_eq!(lat, [4.0, 5.0]);
+        assert_eq!(unmatched, 1);
+    }
+
+    #[test]
+    fn a_loop_needs_unique_ids_and_ten_seconds() {
+        let ids: Vec<u64> = (0..300).collect();
+        assert!(unique_loop(&ids, 30, 10.0).is_ok());
+        assert!(unique_loop(&ids[..299], 30, 10.0).is_err(), "9.97 s");
+        let mut dup = ids.clone();
+        dup[150] = 3;
+        assert!(unique_loop(&dup, 30, 10.0).is_err());
+    }
+
+    #[test]
+    fn each_press_meets_the_first_report_of_its_key_after_it() {
+        let t = Instant::now();
+        let ms = |n: u64| t + Duration::from_millis(n);
+        let kbd = |usage: u8| vec![0xAA, 0xAA, 0x08, 0, 0, 0, 0, usage, 0, 0, 0, 0];
+        let zero = kbd(0);
+        let presses = [(0x04, ms(10)), (0x05, ms(60)), (0x06, ms(110))];
+        let reports = vec![
+            (ms(5), kbd(0x04)), // before its press: not it
+            (ms(12), kbd(0x04)),
+            (ms(13), zero.clone()),
+            (ms(63), kbd(0x05)),
+            (ms(64), zero),
+        ];
+        let (lat, missed) = input_latencies(&presses, &reports);
+        assert_eq!(lat, [2.0, 3.0]);
+        assert_eq!(missed, 1);
+    }
+}
