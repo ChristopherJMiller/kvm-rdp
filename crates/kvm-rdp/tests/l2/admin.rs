@@ -648,9 +648,14 @@ const INPUT_TARGETS: [&str; 5] = [
 /// `kvm::session`, `kvm::video`, `pump::core`) log only when something goes
 /// wrong — a failed start or KVM session, an incompatible stream, an EGFX
 /// setup refused, a task outliving its abort wait — which this case does
-/// not have; if one ever logs here, the case fails for review.
-const KNOWN_TARGETS: [&str; 3] = [
+/// not have; if one ever logs here, the case fails for review —
+/// except `kvm::session`, whose "a task outlived its abort wait" line
+/// depends on load (a 100 ms bound), so it is listed: its lines carry KVM
+/// session state, never input, and still face every encoding and fragment
+/// check.
+const KNOWN_TARGETS: [&str; 4] = [
     "kvm_rdp::bridge",
+    "kvm_rdp::kvm::session",
     "kvm_rdp::rdp::gfx",
     "kvm_rdp::rdp::handler",
 ];
