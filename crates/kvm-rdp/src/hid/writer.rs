@@ -188,11 +188,21 @@ impl WsTask {
                     }
                     // P21: `drive` counted the loss under its one reason
                     // (`websocket` for the read side, `websocket_write`).
+                    // I2 (Plan D final review): read before the release
+                    // zeroes the queue's state.
+                    let held = self.hid.input_held();
                     self.hid.release_all(ReleaseTrigger::WebsocketReconnect);
                     let _ = self.events.send(WsEvent::Down);
-                    let d = self.backoff.next_delay();
-                    if !self.sleep(d).await {
-                        return;
+                    // I2: while input is held, the reopen skips the backoff
+                    // — a KVM that keeps a key held across the loss repeats
+                    // it until the session start lands. Once per loss with
+                    // something held: a failed reopen backs off as ever,
+                    // and the reopen's session start holds nothing.
+                    if !held {
+                        let d = self.backoff.next_delay();
+                        if !self.sleep(d).await {
+                            return;
+                        }
                     }
                 }
                 Err(e) => match e.class() {
@@ -1173,6 +1183,95 @@ mod tests {
         }
     }
 
+    /// I2 (Plan D final review): while input is held — a key written when
+    /// the websocket dies — the reopen skips the backoff: a KVM that keeps
+    /// the key held across the loss auto-repeats it until the session-start
+    /// sequence lands. With nothing held, the reopen backs off as ever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn while_input_is_held_a_reconnect_skips_the_backoff() {
+        use kvm_sim::{KvmSim, SimConfig, Source};
+        const BACKOFF: Duration = Duration::from_secs(2);
+        let sim = KvmSim::start(SimConfig::es3(
+            Source::fixture("360p30_es3like_poc0.h264").unwrap(),
+        ))
+        .await
+        .unwrap();
+        let p = sim.ports();
+        let ep = Arc::new(KvmEndpoint::new(
+            Scheme::Https,
+            sim.host(),
+            (p.web, p.video, p.control),
+            sim.spki_sha256(),
+        ));
+        let token = login(
+            &ep,
+            &Secret::new(sim.password()),
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+        let (mut t, ctl) = task(hid.clone(), Duration::from_secs(1));
+        let (tok_tx, tok_rx) = watch::channel(Some((1, token)));
+        let (ev_tx, mut ev) = mpsc::unbounded_channel();
+        t.token = tok_rx;
+        t.ep = ep;
+        t.events = ev_tx;
+        let slow = BackoffConfig {
+            initial: BACKOFF,
+            factor: 2,
+            max: BACKOFF,
+            jitter_percent: 0,
+        };
+        t.backoff = Backoff::new(slow, Jitter::new(1));
+        let run = tokio::spawn(t.run());
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(5), ev.recv())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(next().await, WsEvent::Up { seq: 1 });
+        let sent = |n: u64| {
+            let m = hid.metrics.clone();
+            async move {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while m.hid_reports_sent.get() < n {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        };
+        sent(2).await;
+        hid.push(kbd(4), false); // held, and written
+        sent(3).await;
+        for (held, want_fast) in [(true, true), (false, false)] {
+            assert_eq!(hid.input_held(), held);
+            sim.close_websockets();
+            assert_eq!(next().await, WsEvent::Down);
+            let t0 = Instant::now();
+            assert_eq!(next().await, WsEvent::Up { seq: 1 });
+            let took = t0.elapsed();
+            if want_fast {
+                assert!(took < BACKOFF / 2, "held: the reopen backed off {took:?}");
+            } else {
+                assert!(took >= BACKOFF * 3 / 4, "nothing held: it took {took:?}");
+            }
+            // The reopen's session start: nothing held from here on.
+            sent(hid.metrics.hid_reports_sent.get() + 2).await;
+        }
+        close(&ctl).await;
+        tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("run did not end after Close")
+            .unwrap();
+        drop(tok_tx);
+        assert_eq!(sim.stats().logouts, 0);
+    }
+
     /// Census (§3.3, §7.3, §7.4): a key held when the websocket dies is
     /// released on the next open before any new input — the reopen's first
     /// frames are the session-start sequence — and a report made while the
@@ -1242,10 +1341,23 @@ mod tests {
         sim.wait_for(Duration::from_secs(3), |e| frames(e).len() >= 3)
             .await
             .unwrap();
+        // I2: with key 4 held the reopen skips the backoff, so kvm-sim
+        // refuses it — then the writer backs off, and the report below is
+        // made while the websocket is down.
+        let refused = |e: &[SimEvent]| {
+            e.iter()
+                .filter(|e| matches!(e, SimEvent::WsRefused { .. }))
+                .count()
+        };
+        sim.set_policy(|p| p.ws_status = Some(503));
         sim.close_websockets();
         // The writer saw the loss, released, and is backing off.
         assert_eq!(next(&mut ev).await, WsEvent::Down);
+        sim.wait_for(Duration::from_secs(3), |e| refused(e) >= 1)
+            .await
+            .unwrap();
         hid.push(kbd(5), false); // made while the websocket is down
+        sim.set_policy(|p| p.ws_status = None);
         assert_eq!(next(&mut ev).await, WsEvent::Up { seq: 1 });
         sim.wait_for(Duration::from_secs(3), |e| frames(e).len() >= 5)
             .await
