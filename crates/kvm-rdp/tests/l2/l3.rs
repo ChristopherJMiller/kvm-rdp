@@ -145,13 +145,16 @@ impl L3 {
     /// Xvfb's logs for diagnosis. A reading of 0 is skipped: black is
     /// Xvfb's root, FreeRDP's empty window and frame 0 alike (`xwd.rs`'s
     /// barcode test), and frame 0 recurs every 4 s, so skipping it costs at
-    /// most one frame.
+    /// most one frame. The `Instant` is taken just after the read, so any
+    /// frame the picture shows was sent before it, however long the test
+    /// thread waited between the two (PE8 review I1).
     pub async fn barcode_within(&self, limit: Duration) -> (u16, Instant) {
         let path = self.fb.path().join("Xvfb_screen0");
         let t0 = Instant::now();
         loop {
+            let fb = Framebuffer::read(&path);
             let at = Instant::now();
-            if let Some(b) = Framebuffer::read(&path)
+            if let Some(b) = fb
                 .and_then(|f| barcode(&f, 0, 0, BLOCK.0, BLOCK.1))
                 .filter(|b| *b != 0)
             {
