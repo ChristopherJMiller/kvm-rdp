@@ -285,6 +285,17 @@ async fn a_divergent_replay_frame_ends_the_replay_at_an_idr() {
         .iter()
         .map(|p| (try_index_of(&map, &p.annex_b), nal_types(&p.annex_b) == [1]))
         .collect();
+    // First (PD11a review m3): the altered frame is a divergence only inside
+    // the ring — only if the old main handed the client at least 3 AUs
+    // during the candidate's lag. Past the ring it rightly goes out, and the
+    // fixture-frame check below would read that as a bridge bug.
+    assert_eq!(
+        env.metrics().frames_dropped.get("replay_diverged"),
+        1,
+        "the altered frame was no divergence (inside the ring only if the old \
+         main handed at least 3 AUs during the lag; the recovery IDR is \
+         picture {recovery}): {got:?}"
+    );
     assert!(
         got.iter().all(|g| g.0.is_some()),
         "a picture that is no fixture frame (the altered one) reached the client: {got:?}"
@@ -304,11 +315,6 @@ async fn a_divergent_replay_frame_ends_the_replay_at_an_idr() {
         let ((prev, _), (cur, p)) = (w[0], w[1]);
         assert!(!p || cur == prev + 1, "P frame {cur} after {prev}: {got:?}");
     }
-    assert_eq!(
-        env.metrics().frames_dropped.get("replay_diverged"),
-        1,
-        "the altered frame was not a divergence ({got:?})"
-    );
     // kvm-sim's side: the candidate's third AU is the old main's frame of
     // the same seq with other bytes (another frame id); its first two are
     // the same bytes — the replay the pump matched before it diverged.
