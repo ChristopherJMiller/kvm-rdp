@@ -341,6 +341,13 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
         ),
         &seam,
     ));
+    // Plan E Task 1.5 (§7.4, m3): on the KVM runtime, which a stalled RDP
+    // thread does not reach.
+    let stale_task = kvm_rt.spawn(fault_point(
+        "stale watch",
+        crate::hid::stale::run(health.clone(), hid.clone()),
+        &seam,
+    ));
 
     let parts = RdpParts {
         server: ServerParts {
@@ -396,9 +403,11 @@ fn spawn_with_grace(cfg: Config, handshake_grace: Duration) -> Result<BridgeHand
             ("KVM actor", actor_task),
             ("admin listener", admin_task),
             ("certificate watcher", watcher_task),
+            ("stale watch", stale_task),
         ],
+        // §4.5's cap, named: the stale watch's bound is three of it (DE16).
         beat: (cfg.admin.liveness_timeout / 4)
-            .clamp(Duration::from_millis(10), Duration::from_secs(1)),
+            .clamp(Duration::from_millis(10), crate::hid::stale::HEARTBEAT_MAX),
         seam,
         #[cfg(feature = "test-hooks")]
         panic_after: cfg.test.panic_after.map(|d| (d, to_pump.clone())),
@@ -1938,6 +1947,16 @@ mod tests {
     async fn a_panicked_certificate_watcher_stops_the_bridge() {
         dies_and_stops_the_bridge("certificate watcher", |h| {
             h.faults.send_replace(Some("certificate watcher"));
+        })
+        .await;
+    }
+
+    /// Plan E Task 1.5: the stale watch is an essential KVM-runtime task —
+    /// without it a stalled RDP thread keeps a key held until `/livez`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_stale_watch_stops_the_bridge() {
+        dies_and_stops_the_bridge("stale watch", |h| {
+            h.faults.send_replace(Some("stale watch"));
         })
         .await;
     }

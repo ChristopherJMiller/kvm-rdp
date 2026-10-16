@@ -235,8 +235,9 @@ impl Histogram {
 }
 
 /// §10.4 (Plan D final review m1): `paste_events`' abort labels, one per
-/// reason the input core gives (`rdp::input::abort_label`).
-pub const PASTE_ABORTS: [&str; 8] = [
+/// reason the input core gives (`rdp::input::abort_label`); Plan E Task 1.5
+/// (m4) adds `aborted_resync`, a queue resync while the Typist typed.
+pub const PASTE_ABORTS: [&str; 9] = [
     "aborted_esc",
     "aborted_key",
     "aborted_mouse",
@@ -245,6 +246,7 @@ pub const PASTE_ABORTS: [&str; 8] = [
     "aborted_clipboard_failed",
     "aborted_clipboard_lost",
     "aborted_session",
+    "aborted_resync",
 ];
 
 pub struct Metrics {

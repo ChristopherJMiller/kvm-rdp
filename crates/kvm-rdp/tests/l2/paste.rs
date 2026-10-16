@@ -20,7 +20,7 @@ use kvm_proto::hid::HidFrame;
 use kvm_rdp::config::{Config, Multiline};
 use kvm_rdp::msg::Cause;
 use kvm_sim::SimEvent;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// A second session's mark: its session start already puts the pointer at
 /// the first session's `MARK`.
@@ -431,6 +431,81 @@ async fn a_paste_during_a_websocket_outage_types_nothing_partial() {
         env.metrics().release_all.get("websocket_reconnect") > reconnects,
         "the reopen's discard was not counted as a release"
     );
+}
+
+/// Plan E Task 1.5 (Plan D final review m4, §8): a queue resync while the
+/// Typist types ends the paste as `aborted_resync` and releases all, so an
+/// overflow never drops characters from the middle of a paste. kvm-sim
+/// stops reading with a small receive buffer, so the writer blocks and the
+/// Typist fills its room (8 of the least queue, 9); a pointer move takes
+/// the ninth slot and a wheel notch finds the queue full. What kvm-sim then
+/// receives is a prefix of the text — never a text with a hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queue_resync_while_typing_aborts_the_paste_with_no_hole() {
+    // Long enough to outlast kvm-sim's 4 KiB receive buffer and the bridge's
+    // 16 KiB send cap (about 18 bytes a report on the wire, two a character).
+    let text = "abcdefghij".repeat(300);
+    let mut sim = es3();
+    sim.control_recv_buffer = Some(4096);
+    let env = env(sim, |c| {
+        sized(c);
+        c.paste.pace = ms(0);
+        c.paste.modifier_wait = ms(300);
+        c.input.queue = 9;
+        c.input.hid_write_timeout = Duration::from_secs(30);
+    })
+    .await;
+    let c = env.client(Opts::new(2).clipboard(&text));
+    ready(&c).await;
+    let ws = env.hid_ready().await;
+    let hid = env.bridge().hid().clone();
+    env.sim.set_policy(|p| p.pause_ws_reads = true);
+    paste_chord(&c, true);
+    counted(&env, "started", 1).await;
+    // Blocked: nothing written for 300 ms with the Typist at its room.
+    let written = || env.metrics().hid_reports_sent.get();
+    let t0 = Instant::now();
+    loop {
+        let w = written();
+        if !until(ms(300), || written() != w).await && hid.queued() >= 8 {
+            break;
+        }
+        assert!(
+            t0.elapsed() < T,
+            "the writer never blocked within {T:?}: {} written",
+            written()
+        );
+    }
+    c.mouse_move(5, 5);
+    // One notch: IronRDP passes the rotation units through, and the core
+    // makes a notch of every 120 (§7.2).
+    c.wheel(-120);
+    counted(&env, "aborted_resync", 1).await;
+    assert_eq!(env.metrics().release_all.get("paste_resync"), 1);
+    assert_eq!(pasted(&env, "done"), 0);
+    env.sim.set_policy(|p| p.pause_ws_reads = false);
+    // The keyboard reports kvm-sim received, less the release's zeros at
+    // the end: the chord, then a prefix of the typed text.
+    let mut kbd: Vec<Vec<u8>> = settled(until_mark(&env, &c, ws).await)
+        .into_iter()
+        .filter(|f| f.len() == 12 && f[2] == 0x08)
+        .collect();
+    while kbd.last() == Some(&KBD_ZERO.to_vec()) {
+        kbd.pop();
+    }
+    let mut want = chord_frames(true);
+    want.extend(typed(&text));
+    assert!(kbd.len() > chord_frames(true).len(), "nothing was typed");
+    assert!(
+        kbd.len() < want.len(),
+        "the whole text was typed: the resync never landed mid-paste"
+    );
+    assert!(
+        want.starts_with(&kbd),
+        "a hole in the paste: {} reports typed, not a prefix of the text",
+        kbd.len()
+    );
+    assert_eq!(env.sim.stats().logouts, 0);
 }
 
 /// §8 `paste.max_bytes`: an answer one UTF-16 unit over 64 KiB (with its

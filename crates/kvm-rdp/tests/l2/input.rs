@@ -16,6 +16,7 @@ use crate::harness::{
 };
 use kvm_proto::hid::{HidFrame, Wheel};
 use kvm_rdp::hid::HidControl;
+use kvm_rdp::hid::stale::RDP_STALE_RELEASE;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -611,4 +612,66 @@ async fn a_held_modifier_releases_after_modifier_idle_timeout() {
         ]
     );
     assert_eq!(env.metrics().release_all.get("modifier_idle"), 1);
+}
+
+/// Plan E Task 1.5 (spec §7.4, Plan D final review m3): the RDP runtime
+/// stalls with a key held. Nothing on that thread runs — no timer, no core
+/// step — so only the KVM-runtime watch can release it: kvm-sim sees the
+/// all-zero report within 5× `RDP_STALE_RELEASE` (3 s) of the stall and
+/// not before 0.5× (§11.1), during the stall, counted
+/// `release_all{rdp_stale}` once, and the key is not pressed again once
+/// the thread runs again. (`key_repeat_timeout` is raised to 60 s, past
+/// the 5× bound: only the watch can pass this case.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_rdp_runtime_with_a_key_held_is_released_by_the_kvm_runtime() {
+    // Longer than the bound plus a heartbeat period, so the release comes
+    // inside the stall.
+    const STALL: Duration = Duration::from_secs(6);
+    let (env, c) = streaming(|c| c.input.key_repeat_timeout = Duration::from_secs(60)).await;
+    let ws = env.hid_ready().await;
+    c.key(A, true);
+    let press = kbd(0, 0x04);
+    env.sim
+        .wait_for(T, |l| hid_on(l, ws).contains(&press))
+        .await
+        .unwrap_or_else(|l| panic!("the press never reached kvm-sim: {:02x?}", hid_on(&l, ws)));
+    let t0 = Instant::now();
+    env.bridge().block_rdp_runtime_for(STALL);
+    // The first all-zero keyboard report after the press: its stamp.
+    let released = || {
+        let s = hid_stamped(&env.sim, ws);
+        let p = s.iter().position(|(_, f)| *f == press)?;
+        s[p..].iter().find(|(_, f)| *f == zero()).map(|(t, _)| *t)
+    };
+    assert!(
+        until(RDP_STALE_RELEASE * 5, || released().is_some()).await,
+        "no all-zero report within 5× RDP_STALE_RELEASE of the stall"
+    );
+    let at = released().unwrap().duration_since(t0);
+    eprintln!("m3: the stale watch released {at:?} into a {STALL:?} stall");
+    assert!(
+        at >= RDP_STALE_RELEASE / 2,
+        "released {at:?} into the stall, before 0.5× the bound"
+    );
+    assert!(
+        at < STALL,
+        "released {at:?} in, after the stall: not the watch"
+    );
+    assert_eq!(env.metrics().release_all.get("rdp_stale"), 1);
+    // After the stall: the core's next step sees the moved epoch and
+    // releases its own state (the key is released by the bridge), so the
+    // key never goes down again on its own.
+    let frames = until_mark(&env, &c, ws).await;
+    let p = frames.iter().position(|f| *f == press).unwrap();
+    let z = p + frames[p..].iter().position(|f| *f == zero()).unwrap();
+    assert!(
+        !frames[z..].contains(&press),
+        "pressed again after the release: {frames:02x?}"
+    );
+    c.key(A, false);
+    assert_eq!(
+        env.metrics().release_all.get("rdp_stale"),
+        1,
+        "one release per stall"
+    );
 }

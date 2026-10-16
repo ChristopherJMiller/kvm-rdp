@@ -39,7 +39,8 @@ impl Health {
             liveness_timeout,
         }
     }
-    /// The RDP runtime's heartbeat (a `LocalSet` task, every second).
+    /// The RDP runtime's heartbeat (a `LocalSet` task, every quarter of
+    /// `admin.liveness_timeout`, at most `hid::stale::HEARTBEAT_MAX`, 1 s).
     pub fn beat(&self) {
         let ms = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_beat_ms.store(ms, Ordering::Relaxed);
@@ -50,10 +51,16 @@ impl Health {
     pub fn set_rdp_bound(&self) {
         self.rdp_bound.store(true, Ordering::Relaxed);
     }
+    /// How long since the RDP runtime's last heartbeat: `/livez` and the
+    /// stale watch (`hid::stale`) both read it.
+    #[must_use]
+    pub fn rdp_age(&self) -> Duration {
+        let last = Duration::from_millis(self.last_beat_ms.load(Ordering::Relaxed));
+        self.epoch.elapsed().saturating_sub(last)
+    }
     #[must_use]
     pub fn live(&self) -> bool {
-        let last = Duration::from_millis(self.last_beat_ms.load(Ordering::Relaxed));
-        self.epoch.elapsed().saturating_sub(last) <= self.liveness_timeout
+        self.rdp_age() <= self.liveness_timeout
     }
     #[must_use]
     pub fn ready(&self) -> bool {
@@ -232,6 +239,23 @@ mod tests {
         assert!(get(addr, "/livez").await.starts_with("HTTP/1.1 503"));
         health.beat();
         assert!(get(addr, "/livez").await.starts_with("HTTP/1.1 200"));
+    }
+
+    /// Plan E Task 1.5: the heartbeat's age, which `/livez` and the stale
+    /// watch both read. Generous bounds (§13's loaded host).
+    #[test]
+    fn the_rdp_age_is_the_time_since_the_last_beat() {
+        let h = Health::new(Duration::from_secs(10));
+        h.beat();
+        assert!(h.rdp_age() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(300));
+        let age = h.rdp_age();
+        assert!(
+            age >= Duration::from_millis(299) && age < Duration::from_secs(5),
+            "{age:?}"
+        );
+        h.beat();
+        assert!(h.rdp_age() < Duration::from_secs(1));
     }
 
     #[tokio::test]

@@ -1,8 +1,10 @@
 //! §7.3's queue: the input handler pushes full-state reports stamped with
 //! the current release epoch; a motion-only report replaces a motion-only
-//! tail; a full queue is cleared and resynced to the final state;
-//! release-all bumps the epoch, clears the queue and raises a flag the
-//! writer services before anything else (§7.4). O(1) per push.
+//! tail; a full queue is cleared and resynced to the final state — while a
+//! paste types, cleared with nothing to resync, for the abort's release
+//! (`push_typing_at`, m4); release-all bumps the epoch, clears the queue
+//! and raises a flag the writer services before anything else (§7.4).
+//! O(1) per push.
 use crate::metrics::Metrics;
 use kvm_proto::hid::HidFrame;
 use std::collections::VecDeque;
@@ -31,6 +33,12 @@ pub enum ReleaseTrigger {
     KeyRepeat,
     /// `modifier_idle_timeout` (§7.4), raised by the input core's timer.
     ModifierIdle,
+    /// The KVM-runtime stale watch: the RDP heartbeat stopped with input
+    /// held (§7.4; Plan E Task 1.5, m3).
+    RdpStale,
+    /// A queue resync while the Typist typed ended the paste (§8; Plan E
+    /// Task 1.5, m4).
+    PasteResync,
 }
 
 impl ReleaseTrigger {
@@ -47,6 +55,8 @@ impl ReleaseTrigger {
             ReleaseTrigger::Synchronize => "synchronize",
             ReleaseTrigger::KeyRepeat => "key_repeat",
             ReleaseTrigger::ModifierIdle => "modifier_idle",
+            ReleaseTrigger::RdpStale => "rdp_stale",
+            ReleaseTrigger::PasteResync => "paste_resync",
         }
     }
 }
@@ -297,14 +307,34 @@ impl HidControl {
     /// back in a later resync (§7.3; §7.4 "never a down-up-down glitch";
     /// PC7 fix round 1, I1).
     pub(crate) fn push_at(&self, stamp: u64, frame: HidFrame, motion_only: bool) -> Push {
+        self.push_inner(stamp, frame, motion_only, false)
+    }
+
+    /// m4: a resync while the Typist types — the input core ends the paste
+    /// and releases all, so the resync's state is dropped under the same
+    /// queue lock, as `discard_queued` does (Plan D I1): nothing is left
+    /// for the resync to send, and the newest state is zeroed (the position
+    /// kept), so neither the writer, woken below, nor a re-assert ever
+    /// writes the Typist's newest character before the release's zeros
+    /// (Plan E Task 1.5). The epoch is not moved: the abort's release-all
+    /// does that, under the core lock the caller holds.
+    pub(crate) fn push_typing_at(&self, stamp: u64, frame: HidFrame, motion_only: bool) -> Push {
+        self.push_inner(stamp, frame, motion_only, true)
+    }
+
+    fn push_inner(&self, stamp: u64, frame: HidFrame, motion_only: bool, typing: bool) -> Push {
         let r = {
             let mut q = self.q();
             if self.epoch() == stamp {
-                q.push(Report {
+                let r = q.push(Report {
                     epoch: stamp,
                     frame,
                     motion_only,
-                })
+                });
+                if typing && r == Push::Resync {
+                    q.release();
+                }
+                r
             } else {
                 Push::Discarded
             }
@@ -483,6 +513,13 @@ impl HidControl {
         written || self.q().state_holds()
     }
 
+    /// m3 (Plan E Task 1.5): the queue's newest keyboard or pointer state
+    /// holds a key or a button — what the input core last asked for.
+    #[must_use]
+    pub fn newest_holds(&self) -> bool {
+        self.q().state_holds()
+    }
+
     /// §7.4: an all-zero keyboard report and a zero-button pointer report at
     /// the last position sent — none if no position was ever sent.
     #[must_use]
@@ -586,6 +623,129 @@ mod tests {
             assert_eq!(c.epoch(), before + 1);
             assert_eq!(c.metrics.release_all.get(label), 1);
         }
+    }
+
+    /// Plan E Task 1.5: the stale watch's trigger (m3) and the resync
+    /// abort's (m4), each under its own `release_all{trigger}` label.
+    #[test]
+    fn the_stale_watch_and_the_resync_abort_are_counted_under_their_labels() {
+        let c = ctl(4);
+        for (t, label) in [
+            (ReleaseTrigger::RdpStale, "rdp_stale"),
+            (ReleaseTrigger::PasteResync, "paste_resync"),
+        ] {
+            assert_eq!(t.label(), label);
+            c.release_all(t);
+            assert_eq!(c.metrics.release_all.get(label), 1);
+        }
+    }
+
+    /// m3's condition: the queue's newest state holds a key or a button.
+    #[test]
+    fn newest_holds_follows_the_newest_state() {
+        let c = ctl(4);
+        assert!(!c.newest_holds());
+        c.push(kbd(4), false);
+        assert!(c.newest_holds(), "a key down");
+        c.push(kbd(0), false);
+        assert!(!c.newest_holds(), "all up");
+        c.push(mouse(1, 5, 5), false);
+        assert!(c.newest_holds(), "a button down");
+        c.release_all(ReleaseTrigger::RdpStale);
+        assert!(!c.newest_holds(), "a release zeroes it");
+    }
+
+    /// Plan E Task 1.5 (m4; pre-flight R1): while the Typist types, a push
+    /// that finds the queue full drops the resync's state under the queue
+    /// lock, as `discard_queued` does (Plan D I1): the writer — which the
+    /// push wakes — has nothing to write, never the Typist's newest
+    /// character, until the release's zeros. `push_at` keeps it (§7.3).
+    #[test]
+    fn a_resync_while_typing_leaves_nothing_to_write_before_the_release() {
+        let c = ctl(4);
+        let e = c.epoch();
+        for k in 4..8 {
+            assert_eq!(c.push_typing_at(e, kbd(k), false), Push::Queued);
+        }
+        assert_eq!(c.push_typing_at(e, kbd(8), false), Push::Resync);
+        assert_eq!(
+            c.next_frame(),
+            None,
+            "the resync's state is dropped under the lock"
+        );
+        // Nor can a re-assert write it (it writes the newest state), and
+        // the newest state holds nothing: zeroed, as `discard_queued` does.
+        assert_eq!(c.reassert_frames(), Some(vec![KBD_ZERO]));
+        assert!(!c.newest_holds());
+        assert_eq!(
+            c.epoch(),
+            e,
+            "the abort's release-all moves the epoch, not this"
+        );
+        c.release_all(ReleaseTrigger::PasteResync);
+        assert!(c.take_release());
+        assert_eq!(c.release_frames(), [KBD_ZERO]);
+        assert_eq!(c.next_frame(), None);
+        // Not typing, a resync still sends the final state (§7.3).
+        let d = ctl(4);
+        let e = d.epoch();
+        for k in 4..8 {
+            assert_eq!(d.push_at(e, kbd(k), false), Push::Queued);
+        }
+        assert_eq!(d.push_at(e, kbd(8), false), Push::Resync);
+        assert_eq!(d.next_frame(), Some(kbd(8)));
+    }
+
+    /// m4 (R1): the drop is made inside the push's own hold of the queue
+    /// lock. A writer polling `next_frame` on another thread — as the real
+    /// one does, on the KVM runtime — never takes a typing resync's state
+    /// between the push and the drop. Each pushed frame is distinct, so a
+    /// frame the writer took is one it was given.
+    #[test]
+    fn a_concurrent_writer_never_takes_a_typing_resyncs_state() {
+        use std::collections::HashSet;
+        use std::sync::atomic::AtomicBool;
+        let c = Arc::new(ctl(1));
+        let done = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut took = Vec::new();
+                while !done.load(Ordering::SeqCst) {
+                    took.extend(c.next_frame());
+                }
+                took
+            })
+        };
+        let e = c.epoch();
+        let mut dropped = HashSet::new();
+        let t0 = std::time::Instant::now();
+        for n in 0u32..2_000_000 {
+            if t0.elapsed() > Duration::from_millis(300) {
+                break;
+            }
+            let [a, b, x, y] = n.to_le_bytes();
+            let f = HidFrame::Keyboard {
+                modifiers: 0,
+                keys: [a, b, x, y, 1],
+            };
+            if c.push_typing_at(e, f, false) == Push::Resync {
+                dropped.insert(f.to_vec());
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+        let took = writer.join().unwrap();
+        assert!(dropped.len() > 100, "{} resyncs", dropped.len());
+        let leaked = took
+            .iter()
+            .filter(|f| dropped.contains(&f.to_vec()))
+            .count();
+        assert_eq!(
+            leaked,
+            0,
+            "the writer took {leaked} typing resyncs' states of {}",
+            dropped.len()
+        );
     }
 
     /// §7.3: release-all bumps the epoch; nothing queued before it is sent

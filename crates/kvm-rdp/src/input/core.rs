@@ -136,6 +136,10 @@ pub enum Event {
     /// A format list said Unicode text is (or is not) on the clipboard: the
     /// core's only availability signal (D9c).
     ClipboardAvailable(bool),
+    /// The shell's word that a push it carried out found the HID queue full
+    /// and resynced it (§7.3) — while the Typist types, typed reports were
+    /// cleared (Plan E Task 1.5, m4).
+    QueueResynced,
     Tick,
 }
 
@@ -180,6 +184,7 @@ impl std::fmt::Debug for Event {
             Event::ClipboardOversize => "ClipboardOversize",
             Event::ClipboardLost(_) => "ClipboardLost",
             Event::ClipboardAvailable(_) => "ClipboardAvailable",
+            Event::QueueResynced => "QueueResynced",
             Event::Tick => "Tick",
         };
         f.debug_struct("Event")
@@ -329,6 +334,13 @@ impl InputCore {
             || self.keys.held_nonmodifier_usages() > 0
             || self.pointer.held_buttons() != 0
             || matches!(self.paste, State::Typing { .. })
+    }
+
+    /// Whether a paste is typing (§8): a queue resync now would have
+    /// cleared typed reports (Plan E Task 1.5, m4).
+    #[must_use]
+    pub fn typing(&self) -> bool {
+        matches!(self.paste, State::Typing { .. })
     }
 
     /// A new session: reset everything, the paste, the clipboard's
@@ -606,6 +618,8 @@ impl InputCore {
                     }
                 }
             }
+            // `paste_filter` never passes it on (m4).
+            Event::QueueResynced => {}
             Event::Tick => self.timers(ctx, out),
         }
     }
@@ -746,6 +760,21 @@ impl InputCore {
                 self.last_kbd_event = Some(ctx.now);
                 self.swallow_press(Some(USAGE_ESC), out);
                 self.end_paste(ctx, PasteOutcome::Aborted("esc"), out);
+                None
+            }
+            // Plan E Task 1.5 (m4, §8): the queue resynced while typing —
+            // the reports it cleared were typed characters, so typing on
+            // would leave a hole. The paste ends as aborted, and everything
+            // is released: the resync's state goes with the queue, so no
+            // character after the hole is typed either. The outcome comes
+            // first, so `release_marked` adds none of its own.
+            Event::QueueResynced => {
+                if typing {
+                    self.paste = State::Idle;
+                    out.push(Out::Paste(PasteOutcome::Aborted("resync")));
+                    let _ = self.release_marked(out);
+                    out.push(Out::Release(ReleaseTrigger::PasteResync));
+                }
                 None
             }
             // Typing: every client press is swallowed and released by the
@@ -1026,6 +1055,9 @@ mod tests {
     )]
     use super::*;
     use crate::hid::HidControl;
+    use crate::hid::stale::{
+        HEARTBEAT_MAX, RDP_STALE_RELEASE, StaleWatch, WATCH_EVERY, next_check,
+    };
     use crate::input::paste::{PasteOutcome, PasteRefusal};
     use crate::metrics::Metrics;
     use kvm_proto::hid::HidFrame;
@@ -1155,6 +1187,7 @@ mod tests {
             Event::ClipboardOversize => "ClipboardOversize".to_owned(),
             Event::ClipboardLost(n) => format!("ClipboardLost({n})"),
             Event::ClipboardAvailable(a) => format!("ClipboardAvailable({a})"),
+            Event::QueueResynced => "QueueResynced".to_owned(),
             Event::Tick => "Tick".to_owned(),
         }
     }
@@ -3663,7 +3696,7 @@ mod tests {
     #[test]
     fn every_paste_outcome_leaves_nothing_held() {
         type Drive = fn(&mut Wired) -> Vec<u8>;
-        let cases: [(&str, PasteOutcome, Drive); 15] = [
+        let cases: [(&str, PasteOutcome, Drive); 16] = [
             (
                 "no text",
                 PasteOutcome::Refused(PasteRefusal::NoText),
@@ -3794,6 +3827,11 @@ mod tests {
                     vec![0x1E, 0x10]
                 },
             ),
+            ("resync typing", PasteOutcome::Aborted("resync"), |w| {
+                w.typing("abcdef");
+                w.step(Event::QueueResynced);
+                vec![]
+            }),
         ];
         for (what, want, drive) in cases {
             let mut w = Wired::new();
@@ -3808,6 +3846,52 @@ mod tests {
             w.device_follows_the_core(what);
             w.settle(&held, what);
         }
+    }
+
+    /// Plan E Task 1.5 (m4, §8): a queue resync while the Typist types ends
+    /// the paste as aborted ("resync") and releases all — the resync cleared
+    /// typed reports, so typing on would leave a hole — and nothing more is
+    /// typed. Idle or Pending, a resync changes nothing (the shell steps it
+    /// only while typing, but the core does not rely on that).
+    #[test]
+    fn a_queue_resync_while_typing_aborts_the_paste_and_releases_all() {
+        let mut w = Wired::new();
+        w.typing("abcdef");
+        assert!(w.core.typing());
+        let out = w.step(Event::QueueResynced);
+        assert_eq!(outcomes(&out), [&PasteOutcome::Aborted("resync")]);
+        assert_eq!(releases(&out), [ReleaseTrigger::PasteResync]);
+        assert!(!w.core.typing() && !w.core.paste.is_active());
+        for _ in 0..16 {
+            w.now += w.pace;
+            let out = w.step(Event::Tick);
+            assert!(
+                !pushes(&out)
+                    .iter()
+                    .any(|(f, _)| matches!(f, HidFrame::Keyboard { keys, .. } if keys[0] != 0)),
+                "typed after the abort: {}",
+                show(&out)
+            );
+        }
+        let mut idle = Wired::new();
+        let out = idle.step(Event::QueueResynced);
+        assert!(
+            outcomes(&out).is_empty() && releases(&out).is_empty(),
+            "{}",
+            show(&out)
+        );
+        let mut pending = Wired::new();
+        pending.chord();
+        let out = pending.step(Event::QueueResynced);
+        assert!(
+            outcomes(&out).is_empty() && releases(&out).is_empty(),
+            "{}",
+            show(&out)
+        );
+        assert!(
+            pending.core.paste.is_active(),
+            "a Pending paste is not typing"
+        );
     }
 
     // ---- The PD9 carries: clipboard answers, the session boundary, room.
@@ -4525,6 +4609,10 @@ mod tests {
     /// - whenever the core holds a key or modifier a deadline is armed, and
     ///   the device never holds what the core does not — while typing, only
     ///   the Typist's one key (with at most Shift) or keys already marked;
+    /// - the RDP thread stalls (Plan E Task 1.5, m3): with the KVM
+    ///   runtime's stale watch (`hid::stale`) reading the heartbeat's age,
+    ///   nothing is held past `RDP_STALE_RELEASE` plus one watch period of
+    ///   it, and nothing is released before;
     /// - at the end the client goes silent: Ticks at each deadline end any
     ///   paste and leave no key held, and once the client lets go the
     ///   device holds nothing.
@@ -4606,6 +4694,9 @@ mod tests {
         let (mut races, mut raced_pushes) = (0usize, 0usize);
         // N1: pastes a fresh Unicode ESC aborted.
         let mut unicode_esc_aborts = 0usize;
+        // Plan E Task 1.5 (m3): RDP-thread stalls, those the stale watch
+        // released input in, and those it found a paste typing in.
+        let (mut stalls, mut stale_releases, mut stale_typing) = (0usize, 0usize, 0usize);
         // 128 seeds: every outcome fires 20 times over with a margin (PD9 fix
         // round 1 added the relative release, which moved the stream; the
         // final fix wave's release race ends pastes early, so 96 became
@@ -4627,6 +4718,8 @@ mod tests {
             let mut generation = 1;
             let (mut remap, mut surface) = (false, (1920, 1080));
             let mut stalled = false;
+            // m3: the KVM runtime's stale watch (`hid::stale`).
+            let mut watch = StaleWatch::default();
             // What sits in the HID queue since the writer last drained it:
             // the shell's room is 8 less that (DD6).
             let mut queued = 0usize;
@@ -4704,6 +4797,9 @@ mod tests {
                 // pending or typing, and sought now and then when idle;
                 // otherwise any event.
                 let branch = match phase(&core) {
+                    // m3: now and then the RDP thread stalls mid-paste, a
+                    // Typist press perhaps on the KVM (§7.4's example).
+                    Phase::Typing if rng.below(40) == 0 => 24,
                     Phase::Pending if rng.below(4) != 0 => 31,
                     Phase::Typing if rng.below(8) != 0 => 31,
                     Phase::Idle if rng.below(6) == 0 => 26,
@@ -4913,6 +5009,66 @@ mod tests {
                     33 => {
                         now += Duration::from_millis(rng.pick(&[0u64, 1, 2, 15]));
                         Event::Tick
+                    }
+                    // Plan E Task 1.5 (m3): the RDP thread stalls — no event,
+                    // no Tick, no heartbeat — for `stall`, its last beat up
+                    // to one heartbeat period before. The KVM runtime's stale
+                    // watch reads the heartbeat's age on its own schedule
+                    // (`next_check`) and the writer keeps draining (unless
+                    // the KVM is stalled too): never a release at or before
+                    // RDP_STALE_RELEASE,
+                    // at most one per stall, and once the age is past it by
+                    // a watch period nothing is held — in the queue's newest
+                    // state, nor on the device. The next step sees the moved
+                    // epoch, as after any release of the shell's.
+                    24 if rng.below(3) == 0 => {
+                        let age0 = Duration::from_millis(rng.pick(&[0u64, 1, 250, 999, 1_000]));
+                        assert!(age0 <= HEARTBEAT_MAX);
+                        let stall = Duration::from_millis(
+                            rng.pick(&[500u64, 1_999, 2_999, 3_001, 3_101, 6_000, 30_000]),
+                        );
+                        stalls += 1;
+                        if phase(&core) == Phase::Typing {
+                            stale_typing += 1;
+                        }
+                        let mut t = Duration::ZERO;
+                        let mut released = false;
+                        loop {
+                            let age = age0 + t;
+                            let at = format!(
+                                "seed {seed} step {i}: a {stall:?} stall, {age:?} since the last beat"
+                            );
+                            if watch.step(age, || hid.newest_holds()) {
+                                assert!(age > RDP_STALE_RELEASE, "{at}: released early");
+                                assert!(age <= RDP_STALE_RELEASE + WATCH_EVERY, "{at}: late");
+                                assert!(!released, "{at}: released twice in one stall");
+                                hid.release_all(ReleaseTrigger::RdpStale);
+                                released = true;
+                                stale_releases += 1;
+                                queued = 0; // a release clears the queue
+                            }
+                            if !stalled {
+                                drain(&hid, &mut dev);
+                                queued = 0;
+                            }
+                            if age > RDP_STALE_RELEASE + WATCH_EVERY {
+                                assert!(!hid.newest_holds(), "{at}: input still held");
+                                assert!(
+                                    stalled || (!dev.holds_a_key() && dev.buttons == 0),
+                                    "{at}: the device still holds"
+                                );
+                            }
+                            // The watch's own schedule: its next look.
+                            t += next_check(age);
+                            if t > stall {
+                                break;
+                            }
+                        }
+                        now += stall;
+                        // The thread runs again: its next beat is fresh, and
+                        // the watch is re-armed.
+                        assert!(!watch.step(Duration::ZERO, || true));
+                        continue;
                     }
                     _ => {
                         now += Duration::from_millis(rng.pick(&advances));
@@ -5359,7 +5515,8 @@ mod tests {
         assert!(fired.iter().all(|n| *n > 500), "{fired:?}");
         eprintln!(
             "paste outcomes {:?}, typing steps {typing_steps}, roomless {roomless_steps}, \
-             races {races}, raced reports {raced_pushes}, unicode esc aborts {unicode_esc_aborts}",
+             races {races}, raced reports {raced_pushes}, unicode esc aborts {unicode_esc_aborts}, \
+             rdp stalls {stalls} (stale releases {stale_releases}, while typing {stale_typing})",
             OUTCOMES.iter().zip(paste.fired).collect::<Vec<_>>()
         );
         // All but `backlog`, which needs 64 unanswered pastes inside 60 s.
@@ -5379,5 +5536,11 @@ mod tests {
             "{races} {raced_pushes}"
         );
         assert!(unicode_esc_aborts >= 10, "{unicode_esc_aborts}");
+        // m3: the RDP thread stalled often, the watch released held input in
+        // many of those stalls, and in some a paste was typing.
+        assert!(
+            stalls > 500 && stale_releases > 100 && stale_typing > 20,
+            "{stalls} {stale_releases} {stale_typing}"
+        );
     }
 }

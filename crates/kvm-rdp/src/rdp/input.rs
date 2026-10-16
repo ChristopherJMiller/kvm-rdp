@@ -2,7 +2,8 @@
 //! `InputCore` under a mutex beside `HidControl`, the display, the server's
 //! event sender and the config; `InputHandler` is IronRDP's callback, and
 //! `run_driver` ticks the core at its next deadline. Every step reads the
-//! release epoch into its `Ctx` and pushes with `push_at`, so a report
+//! release epoch into its `Ctx` and pushes with `push_at` (`push_typing_at`
+//! while a paste types: a resync then ends the paste, m4), so a report
 //! built before a release never lands after its zeros (§7.3; design
 //! decision 6). The mutex is never held across an await (§4.3), and
 //! nothing is called into IronRDP under it: a `ServerEvent` is a channel
@@ -32,7 +33,7 @@
 //! of clipboard text; paste activity is metrics, and the one log line (a
 //! chord with no text offered, §8) names no content.
 use crate::config::{Config, Multiline};
-use crate::hid::{HidControl, ReleaseTrigger};
+use crate::hid::{HidControl, Push, ReleaseTrigger};
 use crate::input::core::{Ctx, Event, InputCore, Out};
 use crate::input::paste::{PasteOutcome, PasteRefusal, TYPIST_ROOM};
 use crate::input::pointer::Button;
@@ -208,7 +209,7 @@ impl InputShared {
     fn sync_generation(&self, core: &mut InputCore) -> Gen {
         let mut outs = Vec::new();
         let generation = self.follow(core, &mut outs);
-        self.carry_out(generation, outs);
+        self.carry_out(generation, outs, false);
         generation
     }
 
@@ -225,7 +226,16 @@ impl InputShared {
         } else {
             core.step(&self.ctx(now, generation), event, &mut outs);
         }
-        self.carry_out(generation, outs);
+        // m4 (§8): a push that resynced the queue while the Typist types
+        // cleared typed reports, and `push_typing_at` dropped the resync's
+        // state. The core ends the paste — under the same core lock (I1),
+        // before any other event can step it.
+        let typing = core.typing();
+        if self.carry_out(generation, outs, typing) && typing {
+            let mut outs = Vec::new();
+            core.step(&self.ctx(now, generation), Event::QueueResynced, &mut outs);
+            self.carry_out(generation, outs, false);
+        }
     }
 
     /// Step the core with `event`, carry out its `Out`s, and re-arm the
@@ -249,7 +259,14 @@ impl InputShared {
         self.rearm(&core);
     }
 
-    fn carry_out(&self, generation: Gen, outs: Vec<Out>) {
+    /// Carry out the core's `Out`s; whether a push found the queue full and
+    /// resynced it (§7.3; Plan E Task 1.5, m4). `typing`: the core is
+    /// typing a paste after this step — pushes then use `push_typing_at`,
+    /// and after a resync no further report is pushed before the abort: its
+    /// release-all would discard them anyway, and queued meanwhile the
+    /// writer could send them first.
+    fn carry_out(&self, generation: Gen, outs: Vec<Out>, typing: bool) -> bool {
+        let mut resynced = false;
         for out in outs {
             match out {
                 Out::Push {
@@ -257,7 +274,15 @@ impl InputShared {
                     motion_only,
                     stamp,
                 } => {
-                    let _ = self.hid.push_at(stamp, frame, motion_only);
+                    if typing && resynced {
+                        continue;
+                    }
+                    let push = if typing {
+                        self.hid.push_typing_at(stamp, frame, motion_only)
+                    } else {
+                        self.hid.push_at(stamp, frame, motion_only)
+                    };
+                    resynced |= push == Push::Resync;
                 }
                 Out::Release(trigger) => self.hid.release_all(trigger),
                 Out::Ignored => self.metrics.input_events_ignored.inc(), // DD7, DD9 (D8f)
@@ -266,6 +291,7 @@ impl InputShared {
                 Out::ClipboardDiscarded(why) => self.metrics.clipboard_discarded.inc(why),
             }
         }
+        resynced
     }
 
     /// §8 step 3: ask the client for its CF_UNICODETEXT — a `ServerEvent`,
@@ -513,6 +539,7 @@ pub(crate) fn abort_label(reason: &str) -> &'static str {
         "clipboard_failed" => "aborted_clipboard_failed",
         "clipboard_lost" => "aborted_clipboard_lost",
         "session" => "aborted_session",
+        "resync" => "aborted_resync",
         _ => "aborted",
     }
 }
@@ -580,7 +607,7 @@ mod tests {
     /// §10.4 (Plan D final review m1): each abort reason the core gives
     /// counts under its own `paste_events` label — `modifier_wait` (the
     /// client holding the modifiers back) told apart from
-    /// `clipboard_failed` — and the eight are `PASTE_ABORTS`.
+    /// `clipboard_failed` — and the nine are `PASTE_ABORTS`.
     #[test]
     fn a_paste_abort_is_counted_under_its_reason() {
         let reasons = [
@@ -592,6 +619,7 @@ mod tests {
             "clipboard_failed",
             "clipboard_lost",
             "session",
+            "resync",
         ];
         let labels: Vec<&str> = reasons.iter().map(|r| abort_label(r)).collect();
         assert_eq!(labels, crate::metrics::PASTE_ABORTS);
@@ -1032,6 +1060,79 @@ mod tests {
                 })
                 .await;
         });
+    }
+
+    /// Plan E Task 1.5 (m4, §8): through the shell. The writer stands still
+    /// (no `write`), so the Typist fills its room; wheel notches — pointer
+    /// reports share the queue — then find it full: a resync. The paste
+    /// ends `aborted_resync` with `release_all{paste_resync}`, and after the
+    /// release's zeros nothing is typed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queue_resync_while_typing_ends_the_paste() {
+        let mut r = rig_with_queue(TYPIST_ROOM + 1);
+        r.start();
+        let _ = r.write();
+        r.s.clipboard_available(true);
+        r.chord();
+        r.s.clipboard_text(utf16("abcdefghijklmnopqrstuvwxyz"));
+        r.unchord();
+        let resyncs = r.metrics.hid_resyncs.get();
+        for _ in 0..=TYPIST_ROOM + 1 {
+            if r.metrics.hid_resyncs.get() > resyncs {
+                break;
+            }
+            r.s.mouse(MouseEvent::VerticalScroll { value: -120 });
+        }
+        assert_eq!(
+            r.metrics.hid_resyncs.get(),
+            resyncs + 1,
+            "the wheel never filled the queue"
+        );
+        assert_eq!(r.metrics.paste_events.get("aborted_resync"), 1);
+        assert_eq!(r.metrics.release_all.get("paste_resync"), 1);
+        assert_eq!(r.metrics.paste_events.get("done"), 0);
+        r.s.feed(Event::Tick);
+        let after = r.write();
+        assert!(
+            !after
+                .iter()
+                .any(|f| matches!(f, HidFrame::Keyboard { keys, .. } if keys[0] != 0)),
+            "typed after the resync: {after:?}"
+        );
+        assert!(r.holds_nothing());
+    }
+
+    /// Plan E Task 1.5 (m4; pre-flight R1): once a push of a typing step
+    /// finds the queue full, `carry_out` makes none of the step's later
+    /// pushes — queued before the abort's release, the writer could send
+    /// the Typist's next character first — and `push_typing_at` dropped the
+    /// resync's own state: nothing is left to write. Not typing, both go out
+    /// as §7.3 has it: the later reports, then the final state.
+    #[tokio::test(flavor = "current_thread")]
+    async fn after_a_typing_resync_the_steps_later_pushes_are_not_made() {
+        for typing in [true, false] {
+            let mut r = rig_with_queue(TYPIST_ROOM + 1);
+            let g = r.start();
+            let _ = r.write();
+            for k in 0..=TYPIST_ROOM {
+                let usage = u8::try_from(0x10 + k).unwrap();
+                assert_eq!(r.hid.push(kbd(0, usage), false), Push::Queued);
+            }
+            let stamp = r.hid.epoch();
+            let push = |frame| Out::Push {
+                frame,
+                motion_only: false,
+                stamp,
+            };
+            let outs = vec![push(kbd(0, 0x04)), push(KBD_ZERO), push(kbd(0, 0x05))];
+            assert!(r.s.carry_out(g, outs, typing), "typing {typing}: no resync");
+            let left: Vec<HidFrame> = std::iter::from_fn(|| r.hid.next_frame()).collect();
+            if typing {
+                assert_eq!(left, [], "a report was left to write before the abort");
+            } else {
+                assert_eq!(left, [KBD_ZERO, kbd(0, 0x05), kbd(0, 0x05)]);
+            }
+        }
     }
 
     /// PD9 carry 2 (PD7): a session change ends an active paste, and its

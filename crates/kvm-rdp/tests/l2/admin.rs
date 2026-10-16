@@ -730,7 +730,7 @@ const CAUSES: &[&str] = &[
 
 type Line = (&'static str, &'static str, &'static [(&'static str, Shape)]);
 
-const INPUT_LINES: [Line; 9] = [
+const INPUT_LINES: [Line; 10] = [
     (
         "kvm_rdp::rdp::input",
         "paste chord with no text on the clipboard",
@@ -788,6 +788,13 @@ const INPUT_LINES: [Line; 9] = [
             ("outcome", Shape::Word(&["unconfirmed", "failed"])),
             ("attempts", Shape::Integer),
         ],
+    ),
+    // Plan E Task 1.5 (m3): the KVM-runtime watch released held input
+    // because the RDP runtime stopped; once per stall, no fields.
+    (
+        "kvm_rdp::hid::stale",
+        "the RDP runtime stopped with input held: released all",
+        &[],
     ),
 ];
 
