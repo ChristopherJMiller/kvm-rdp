@@ -22,7 +22,7 @@ use crate::flv::mux::{
     write_tag,
 };
 use crate::flv::{FlvDemuxer, FlvLimits, TagBody, VideoBody};
-use crate::h264::rewrite::{RewriteConfig, RewriteError, RewriteFields, rewrite_sps};
+use crate::h264::rewrite::{RewriteConfig, RewriteError, RewriteFields, level_rank, rewrite_sps};
 use crate::h264::sanitize::{NalVerdict, check_nal};
 use crate::h264::sps_syntax::{BitstreamRestriction, ColourDescription, SpsSyntax};
 use crate::h264::{SpsPins, avcc_to_annex_b, split_annex_b};
@@ -246,15 +246,16 @@ pub fn sps_rewrite(data: &[u8]) {
     // RB3 amendment: a level raise on a 66/77/88 SPS clears
     // constraint_set3_flag unconditionally (the bit is reserved once
     // level_idc != 11), not only when the input itself was level 1b.
-    // Preflight I1/m5: key this off an independently observed raise
-    // (input vs output `level_idc`) rather than trusting the rewriter's
-    // own `r.changed.level` report — a rewriter that mis-reports
-    // `changed.level` while clearing cs3 without an actual raise must not
-    // be excused by believing its own flag (M18b2). This numeric
-    // comparison does not special-case a level-1b -> 1.1 raise that keeps
-    // `level_idc`'s number at 11 (none of this target's seeds reach that
-    // case); see the fix-round report for the known limitation.
-    let level_raised = out.level_idc != input.level_idc;
+    // Preflight I1/m5: key this off an independently observed raise (input
+    // vs output) rather than trusting the rewriter's own `r.changed.level`
+    // report — a rewriter that mis-reports `changed.level` while clearing
+    // cs3 without an actual raise must not be excused by believing its own
+    // flag (M18b2). Plan E Task 2.4 (pre-flight E7): observed by rank, not
+    // by number — level 1b -> 1.1 keeps `level_idc` 11 and is a raise
+    // (`level_rank` places 1b between 1 and 1.1). An unranked level was
+    // refused above as `UnknownLevel`.
+    let rank = |s: &SpsSyntax| level_rank(s.profile_idc, s.level_idc, s.constraint_flags);
+    let level_raised = rank(&out) > rank(&input);
     if matches!(input.profile_idc, 66 | 77 | 88) && level_raised {
         expect.constraint_flags &= !0x10;
     }
@@ -463,6 +464,35 @@ fn p_slice_with_lists(c: &Ctx, mods: usize, mmcos: usize) -> Vec<u8> {
     w.write_u8(0xA5); // stand-in slice data
     w.write_trailing_bits();
     let mut nal = vec![0x41]; // nal_ref_idc 2, non-IDR slice
+    escape_rbsp_into(&w.into_rbsp(), &mut nal);
+    nal
+}
+
+/// A Baseline level-1b SPS (`level_idc` 11, `constraint_set3_flag` set) at
+/// 10×9 macroblocks: 2,700 MB/s at 30 fps is past 1b's MaxMBPS of 1,485, so
+/// the rewriter raises it to 1.1 — `level_idc`'s number unchanged, cs3
+/// cleared (`rewrite.rs`'s `level_1b_is_ranked_between_level_1_and_level_1_1`,
+/// case 1). POC type 2, no VUI. Plan E Task 2.4: the `sps_rewrite` seed
+/// that keeps the oracle's raise-by-rank honest.
+fn level_1b_needing_1_1() -> Vec<u8> {
+    use crate::bits::{BitWriter, escape_rbsp_into};
+    let mut w = BitWriter::new();
+    w.write_u8(66); // profile_idc: Baseline
+    w.write_u8(0x10); // constraint_set3_flag: with level_idc 11, level 1b
+    w.write_u8(11); // level_idc
+    w.write_ue(0); // seq_parameter_set_id
+    w.write_ue(0); // log2_max_frame_num_minus4
+    w.write_ue(2); // pic_order_cnt_type
+    w.write_ue(1); // max_num_ref_frames
+    w.write_flag(false); // gaps_in_frame_num_value_allowed_flag
+    w.write_ue(9); // pic_width_in_mbs_minus1: 10 MBs
+    w.write_ue(8); // pic_height_in_map_units_minus1: 9 MBs
+    w.write_flag(true); // frame_mbs_only_flag
+    w.write_flag(true); // direct_8x8_inference_flag
+    w.write_flag(false); // frame_cropping_flag
+    w.write_flag(false); // vui_parameters_present_flag
+    w.write_trailing_bits();
+    let mut nal = vec![0x67];
     escape_rbsp_into(&w.into_rbsp(), &mut nal);
     nal
 }
@@ -740,6 +770,7 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
         ("es3_census", ES3_SPS.to_vec()),
         ("es3like", ES3_LIKE_PARAMS.0.to_vec()),
         ("main", MAIN_360P_PARAMS.0.to_vec()),
+        ("level_1b_needs_1_1", level_1b_needing_1_1()),
     ] {
         out.push(("sps_rewrite", name.to_owned(), sps));
     }
@@ -840,6 +871,31 @@ mod tests {
                 run(target, &bytes[..cut.min(bytes.len())]);
             }
         }
+    }
+
+    /// Plan E Task 2.4 (pre-flight E7; Plan B PB12's recorded limitation):
+    /// a Baseline level-1b SPS (level_idc 11 with constraint_set3_flag) at
+    /// a size that needs 1.1 is raised with cs3 cleared while level_idc's
+    /// number stays 11. The oracle must read that as a raise — by rank —
+    /// and pass; read by number it saw no raise, expected cs3 kept, and
+    /// failed (the fuzz nightly's constraint_flags 75 vs 91 at level_idc 11,
+    /// profile 66). The case is also a seed, so the fuzzer starts from it.
+    #[test]
+    fn the_oracle_reads_a_level_1b_to_1_1_raise_by_rank() {
+        let sps = level_1b_needing_1_1();
+        let r = rewrite_sps(&sps, &RewriteConfig::ES3).unwrap();
+        assert_eq!(
+            (r.syntax.level_idc, r.syntax.constraint_flags & 0x10),
+            (11, 0),
+            "1b -> 1.1: level_idc's number unchanged, cs3 cleared"
+        );
+        sps_rewrite(&sps);
+        assert!(
+            seeds()
+                .iter()
+                .any(|(t, n, s)| *t == "sps_rewrite" && n == "level_1b_needs_1_1" && *s == sps),
+            "the case is an sps_rewrite seed"
+        );
     }
 
     #[test]

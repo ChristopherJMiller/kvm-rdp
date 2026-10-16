@@ -132,7 +132,7 @@ pub fn required_level_idc(width_mbs: u32, height_mbs: u32, fps: u32) -> Option<u
 /// the Baseline, Main and Extended profiles (66, 77, 88); `level_idc` 9, for
 /// every other profile (fix round 1, I1).
 #[must_use]
-fn is_level_1b(profile_idc: u8, level_idc: u8, constraint_flags: u8) -> bool {
+pub(crate) fn is_level_1b(profile_idc: u8, level_idc: u8, constraint_flags: u8) -> bool {
     match profile_idc {
         66 | 77 | 88 => level_idc == 11 && constraint_flags & 0x10 != 0,
         _ => level_idc == 9,
@@ -147,7 +147,7 @@ fn is_level_1b(profile_idc: u8, level_idc: u8, constraint_flags: u8) -> bool {
 /// 6.1 and 6.2 are real entries this rewriter does not rank, since §6.1
 /// refuses above 5.1 regardless, fix round 2).
 #[must_use]
-fn level_rank(profile_idc: u8, level_idc: u8, constraint_flags: u8) -> Option<u16> {
+pub(crate) fn level_rank(profile_idc: u8, level_idc: u8, constraint_flags: u8) -> Option<u16> {
     if is_level_1b(profile_idc, level_idc, constraint_flags) {
         return Some(21);
     }
