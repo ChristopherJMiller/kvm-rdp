@@ -70,7 +70,8 @@ The design, and every decision behind it, is
   its warnings quote client-chosen names). A full-stack test runs the
   real binary at trace level, types a sentinel and pastes a canary
   through it, and checks that neither reaches its logs or `/metrics` in
-  any encoding.
+  any of the encodings it checks (text, characters, bytes, hex, decimal,
+  base64, HID frames, 6-character fragments).
 - **A config error never echoes the file.** It names the path and either a
   line and column with a fixed category such as `unknown key` or `wrong value
   type`, or — for a value that parses but breaks a rule — the key and the
@@ -130,8 +131,9 @@ most 64 KiB) and are never logged.
 ## Input and paste
 
 - **Keyboard and mouse.** RDP scancodes become USB-HID usages, and Unicode
-  key events are typed through the US layout; the target machine applies
-  its own layout. Five keys are reported at once, as on the device. The
+  key events are typed through the US layout (Return, Backspace and Esc
+  sent as Unicode units included); the target machine applies its own
+  layout. Five keys are reported at once, as on the device. The
   mouse is absolute (left, right and middle buttons, vertical wheel);
   relative motion, the X1/X2 buttons and horizontal scroll are dropped and
   counted. `input.mac_remap`, which would undo Windows App's Cmd → Ctrl
