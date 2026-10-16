@@ -82,3 +82,56 @@ jobs:
         run: rustup toolchain install
       - name: cargo deny — advisories
         run: cargo deny --locked check advisories
+
+  image-build:
+    # Two clean builds of the same commit on two runners (DE1): the digests
+    # must match, or the image is not reproducible.
+    strategy:
+      matrix:
+        run: [first, second]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: A clean build
+        run: |
+          scripts/image-build.sh "$RUNNER_TEMP/i.oci.tar" --no-cache | tee "$RUNNER_TEMP/build.txt"
+          mkdir -p "$RUNNER_TEMP/digests"
+          manifest=$(tar -xOf "$RUNNER_TEMP/i.oci.tar" index.json | jq -r '.manifests[0].digest')
+          echo "$manifest" > "$RUNNER_TEMP/digests/manifest"
+          # The config digest from the archive, not the loaded image's .Id
+          # (which is the manifest's under the containerd image store).
+          tar -xOf "$RUNNER_TEMP/i.oci.tar" "blobs/sha256/${manifest#sha256:}" | jq -r '.config.digest' > "$RUNNER_TEMP/digests/config"
+          docker image inspect -f '{{json .RootFS.Layers}}' kvm-rdp:ci > "$RUNNER_TEMP/digests/layers"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digests-${{ matrix.run }}
+          path: ${{ runner.temp }}/digests
+          retention-days: 14
+      - name: Keep the archive and the build log (a mismatch needs both to diff)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-${{ matrix.run }}
+          path: |
+            ${{ runner.temp }}/i.oci.tar
+            ${{ runner.temp }}/build.txt
+          retention-days: 3
+
+  reproducible:
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digests-*
+          path: ${{ runner.temp }}/d
+      - name: The two builds are one image
+        run: |
+          cd "$RUNNER_TEMP/d"
+          for f in config manifest layers; do
+            echo "$f: $(cat digests-first/$f) / $(cat digests-second/$f)"
+            diff digests-first/$f digests-second/$f
+          done
