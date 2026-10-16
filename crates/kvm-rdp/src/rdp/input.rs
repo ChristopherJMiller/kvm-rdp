@@ -1476,6 +1476,7 @@ mod tests {
         let buf = Buf::default();
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()
+            .without_time() // a timestamp can hold a needle ("777")
             .with_max_level(tracing::Level::TRACE)
             .with_writer(move || writer.clone())
             .finish();
@@ -1555,11 +1556,16 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut kbd = None;
                     loop {
+                        // `stop` is read before the queue is: every push happened before
+                        // it was set (the driver is joined first), so a look that finds
+                        // nothing after reading it set has written everything. Read after
+                        // the look, a push made between the two would be lost.
+                        let stopping = stop.load(Ordering::SeqCst);
                         let f = if hid.take_release() {
                             hid.release_frames()
                         } else if let Some(f) = hid.next_frame() {
                             vec![f]
-                        } else if stop.load(Ordering::SeqCst) {
+                        } else if stopping {
                             break;
                         } else {
                             std::thread::yield_now();
@@ -1609,6 +1615,10 @@ mod tests {
             driver.join().unwrap();
             stop.store(true, Ordering::SeqCst);
             let kbd = writer.join().unwrap();
+            assert!(
+                !r.hid.take_release() && r.hid.next_frame().is_none(),
+                "run {run}: the test's writer stopped with reports unwritten"
+            );
             if kbd.is_some_and(|k| k != KBD_ZERO) {
                 held += 1;
             }
