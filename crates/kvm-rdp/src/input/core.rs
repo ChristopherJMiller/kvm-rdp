@@ -656,8 +656,12 @@ impl InputCore {
     ///   retired, pairs with a newer one and can be typed. CLIPRDR's format
     ///   data responses carry no request id to tell them apart, and with
     ///   delayed rendering a merely slow answer carries the clipboard as of
-    ///   answering; stale content needs a transport stall over 60 s, which
-    ///   `video.stall_timeout` (10 s) ends as `client_stalled` first.
+    ///   answering; stale content needs a transport stall over 60 s. While
+    ///   video flows to the client, that stall closes the EGFX gates and
+    ///   `video.stall_timeout` (10 s) ends it as `client_stalled` first; not
+    ///   while the client has suppressed its display (`Paused`) or is
+    ///   reactivating, when the stall timer is frozen, nor while it suspends
+    ///   acks, when the timer is off (PD11b review I3; spec §8).
     fn retire(&mut self, ctx: &Ctx, out: &mut Vec<Out>) {
         let after = request_retire(ctx.modifier_wait);
         while let Some(at) = self.requests.front().copied() {

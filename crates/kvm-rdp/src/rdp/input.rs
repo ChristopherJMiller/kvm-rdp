@@ -14,10 +14,12 @@
 //! reports, so a Typist press built by one step never lands after another
 //! step's abort zero. Every lock taken under it is a leaf (the HID queue,
 //! the display, the metrics). And the handler takes input only on the RDP
-//! thread (`bind_rdp_thread`): IronRDP's ainput DVC calls it from
-//! `spawn_blocking`, one task per PDU in no order — a Devolutions extension
-//! Windows App does not use — and those calls are dropped and counted
-//! (`input_events_ignored`, as DD7 drops relative motion).
+//! thread (`bind_rdp_thread`): IronRDP's ainput DVC — FreeRDP's Advanced
+//! Input extension (`FreeRDP::Advanced::Input`), mouse events only, not a
+//! Microsoft RDP channel, so Windows App is not expected to open it —
+//! calls it from `spawn_blocking`, one task per PDU in no order, and those
+//! calls are dropped and counted (`input_events_ignored`, as DD7 drops
+//! relative motion).
 //!
 //! The core follows the live generation (`Generations`), whatever word the
 //! pump shell last passed on: the handler moves it — and releases all —
