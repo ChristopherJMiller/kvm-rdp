@@ -255,6 +255,20 @@ df cycletwo 'ARG A=${C}
 ARG C=${A}
 FROM ${A}' fail
 }
+# Rule 12: a write job evaluates no repository code and takes only this run's artifact
+d=$(case_dir w12checkout)
+yq -i '.jobs.publish.steps = [{"uses": "actions/checkout@0123456789abcdef0123456789abcdef01234567", "with": {"persist-credentials": false}}, {"run": "scripts/anything.sh"}]' "$d/w.yml" && yq -i '.jobs.publish.steps[] |= (select(has("uses")) | .uses line_comment = "v9.9.9")' "$d/w.yml"
+wf fail "a checkout (and a repo script) in a write job" "$d"
+d=$(case_dir w12dlok)
+yq -i '.jobs.publish.steps = [{"uses": "actions/download-artifact@0123456789abcdef0123456789abcdef01234567", "with": {"name": "x"}}]' "$d/w.yml" && yq -i '.jobs.publish.steps[] |= (select(has("uses")) | .uses line_comment = "v9.9.9")' "$d/w.yml"
+wf pass "a same-run download-artifact in a write job" "$d"
+for key in run-id github-token repository; do
+  d=$(case_dir "w12dl$key")
+  yq -i ".jobs.publish.steps = [{\"uses\": \"actions/download-artifact@0123456789abcdef0123456789abcdef01234567\", \"with\": {\"name\": \"x\", \"$key\": \"1\"}}]" "$d/w.yml" && yq -i '.jobs.publish.steps[] |= (select(has("uses")) | .uses line_comment = "v9.9.9")' "$d/w.yml"
+  wf fail "a cross-run download-artifact ($key) in a write job" "$d"
+done
+d=$(case_dir w12checkoutread); yq -i '.jobs.a.steps[0].with."persist-credentials" = false' "$d/w.yml"
+wf pass "a checkout in a read-only job" "$d"
 # --verify on YAML yq cannot parse must not read as "no pins"
 d=$(case_dir verifybadyaml); printf 'jobs: [unclosed\n  a: {\n' >"$d/w.yml"
 if $pa --verify "$d/w.yml" >/dev/null 2>&1; then

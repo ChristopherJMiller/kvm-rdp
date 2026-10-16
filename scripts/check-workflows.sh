@@ -29,6 +29,10 @@
 # (yq's `//` treats `false` as absent, so rules 8 and 10 read the bare value:
 # an absent key prints `null`.)
 # 11. One repository, one SHA, across every workflow.
+# 12. A job with any write permission has no actions/checkout, no `uses: ./`
+#     and no download-artifact with run-id, github-token or repository (a
+#     `run:` of a repo script needs a checkout first, so the checkout ban
+#     covers it).
 # Action names are matched lower-cased: GitHub resolves owner/repo without case.
 set -euo pipefail
 wf=${WORKFLOWS_DIR:-.github/workflows}
@@ -98,6 +102,24 @@ for f in "$wf"/*.yml "$wf"/*.yaml; do
     perms=$(yq -o=json -I=0 ".jobs.\"$job\".permissions // {}" "$f")
     if grep -qE '"write(-all)?"' <<<"$perms" && ! guarded "$f" "$job"; then
       err "$f: job $job asks for write permissions but its if: is not exactly: $guard"
+    fi
+    # Rule 12: a job with a write permission runs no repository code and
+    # takes only this run's artifact. A `run:` of a repo script needs a
+    # checkout first, so banning the checkout (and `uses: ./`) covers it
+    # without parsing `run:`; a download from another run, repository or
+    # token could substitute the archive that `image` tested.
+    if grep -qE '"write(-all)?"' <<<"$perms"; then
+      while IFS= read -r u; do
+        [ -n "$u" ] || continue
+        case $u in
+          actions/checkout@*) err "$f: job $job has write permissions and checks out the repository (it must run no repository code)" ;;
+          ./*) err "$f: job $job has write permissions and uses a local action: $u" ;;
+        esac
+      done < <(yq -r ".jobs.\"$job\".steps[]? | (.uses // \"\") | downcase" "$f")
+      while IFS= read -r k; do
+        [ -n "$k" ] || continue
+        err "$f: job $job has write permissions and a download-artifact with $k (only this run's artifact)"
+      done < <(yq -r ".jobs.\"$job\".steps[]? | select((.uses // \"\") | downcase | test(\"^actions/download-artifact@\")) | .with // {} | keys | .[] | select(. == \"run-id\" or . == \"github-token\" or . == \"repository\")" "$f")
     fi
     timeout=$(yq ".jobs.\"$job\".\"timeout-minutes\" // \"\"" "$f")
     [ -n "$timeout" ] || err "$f: job $job has no timeout-minutes"

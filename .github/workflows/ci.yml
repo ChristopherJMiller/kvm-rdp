@@ -242,6 +242,9 @@ jobs:
         run: scripts/test-target-budget.sh
 
   image:
+    outputs:
+      # The archive's manifest digest, for `publish` to compare with the push.
+      digest: ${{ steps.digest.outputs.digest }}
     # Plan E Task 4.2: this commit's image, built reproducibly and smoke-tested
     # (scripts/image-build.sh, scripts/image-smoke.sh). On main its OCI
     # archive is what `publish` pushes — the tested bytes, never a rebuild.
@@ -253,6 +256,12 @@ jobs:
           persist-credentials: false
       - name: Build (an OCI archive, and the same image loaded as kvm-rdp:ci)
         run: scripts/image-build.sh "$RUNNER_TEMP/kvm-rdp.oci.tar"
+      - name: The tested archive's manifest digest
+        id: digest
+        run: |
+          digest=$(tar -xOf "$RUNNER_TEMP/kvm-rdp.oci.tar" index.json | jq -r '.manifests[0].digest')
+          case $digest in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "::error::no manifest digest in the archive: $digest"; exit 1 ;; esac
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - name: Smoke test
         run: scripts/image-smoke.sh kvm-rdp:ci
       - name: Keep the tested archive for publish
@@ -267,8 +276,9 @@ jobs:
   publish:
     # The one job with write permissions (design decision 10): a push to main,
     # after every gate. It runs no repository code — no checkout, no flake
-    # (DE13's exception): only pinned actions, and the runner image's skopeo
-    # and docker, on the archive the `image` job tested.
+    # (DE13's exception; check-workflows rule 12): only pinned actions, and
+    # the runner image's skopeo, docker and gh, on the archive the `image`
+    # job tested.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: [check, fuzz, lint, image]
     runs-on: ubuntu-24.04
@@ -280,15 +290,28 @@ jobs:
       attestations: write
     env:
       IMAGE: ghcr.io/christopherjmiller/kvm-rdp
+      # What a verifier must see in the signing certificate (the README's
+      # literal values): this workflow, on main.
+      IDENTITY: https://github.com/ChristopherJMiller/kvm-rdp/.github/workflows/ci.yml@refs/heads/main
+      ISSUER: https://token.actions.githubusercontent.com
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: kvm-rdp-image
           path: ${{ runner.temp }}
+      # Before the push: a failed install must not leave an unsigned tag.
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          # Explicit: v3 signs in the new bundle format, which a v2 verifier
+          # cannot find (the README says "cosign v3 or later").
+          cosign-release: v3.0.6
       - name: Push the tested archive as sha-<short>, digests preserved
         id: push
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The manifest digest the `image` job read from the archive it
+          # smoke-tested, passed on as a job output.
+          TESTED: ${{ needs.image.outputs.digest }}
         run: |
           set -euo pipefail
           archive="$RUNNER_TEMP/kvm-rdp.oci.tar"
@@ -299,9 +322,8 @@ jobs:
           skopeo copy --preserve-digests --format oci --digestfile "$RUNNER_TEMP/digest" \
             "oci-archive:$archive" "docker://$tag"
           pushed=$(cat "$RUNNER_TEMP/digest")
-          tested=$(tar -xOf "$archive" index.json | jq -r '.manifests[0].digest')
-          if [ "$pushed" != "$tested" ]; then
-            echo "::error::pushed $pushed, but the image job tested $tested"
+          if [ -z "$TESTED" ] || [ "$pushed" != "$TESTED" ]; then
+            echo "::error::pushed $pushed, but the image job tested ${TESTED:-nothing}"
             exit 1
           fi
           echo "digest=$pushed" >> "$GITHUB_OUTPUT"
@@ -310,11 +332,6 @@ jobs:
             echo
             echo "\`$tag@$pushed\`"
           } >> "$GITHUB_STEP_SUMMARY"
-      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
-        with:
-          # Explicit: v3 signs in the new bundle format, which a v2 verifier
-          # cannot find (the README says "cosign v3 or later").
-          cosign-release: v3.0.6
       # Quoted: a plain YAML scalar cannot hold ": " (the colon after keyless).
       - name: "Sign the digest (keyless: this workflow's identity on main)"
         env:
@@ -323,9 +340,24 @@ jobs:
         run: cosign sign --yes "$IMAGE@$DIGEST"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-name: ghcr.io/christopherjmiller/kvm-rdp
+          subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
           # A user-owned repository: no artifact-metadata storage record
           # (which would need a fifth permission).
           create-storage-record: false
+      - name: Verify what was just published, as the README tells a consumer to
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cosign verify "$IMAGE@$DIGEST" \
+            --certificate-identity "$IDENTITY" \
+            --certificate-oidc-issuer "$ISSUER" >/dev/null
+          gh attestation verify "oci://$IMAGE@$DIGEST" \
+            --repo ChristopherJMiller/kvm-rdp \
+            --cert-identity "$IDENTITY" \
+            --cert-oidc-issuer "$ISSUER" \
+            --deny-self-hosted-runners >/dev/null
+          echo "signature and provenance verify against $IDENTITY"

@@ -97,7 +97,7 @@ jobs:
           persist-credentials: false
       - name: A clean build
         run: |
-          scripts/image-build.sh "$RUNNER_TEMP/i.oci.tar" --no-cache | tee "$RUNNER_TEMP/build.txt"
+          scripts/image-build.sh "$RUNNER_TEMP/i.oci.tar" --no-cache 2>&1 | tee "$RUNNER_TEMP/build.txt"
           mkdir -p "$RUNNER_TEMP/digests"
           manifest=$(tar -xOf "$RUNNER_TEMP/i.oci.tar" index.json | jq -r '.manifests[0].digest')
           echo "$manifest" > "$RUNNER_TEMP/digests/manifest"
@@ -131,7 +131,9 @@ jobs:
       - name: The two builds are one image
         run: |
           cd "$RUNNER_TEMP/d"
+          bad=0
           for f in config manifest layers; do
-            echo "$f: $(cat digests-first/$f) / $(cat digests-second/$f)"
-            diff digests-first/$f digests-second/$f
+            echo "$f: $(cat "digests-first/$f") / $(cat "digests-second/$f")"
+            diff "digests-first/$f" "digests-second/$f" || bad=1
           done
+          exit "$bad"

@@ -164,10 +164,12 @@ a build-provenance attestation (verify with cosign v3 or later; the signature
 is in the new bundle format):
 
     cosign verify ghcr.io/christopherjmiller/kvm-rdp@sha256:<digest> \
-      --certificate-identity-regexp '^https://github.com/ChristopherJMiller/kvm-rdp/\.github/workflows/ci\.yml@refs/heads/main$' \
+      --certificate-identity 'https://github.com/ChristopherJMiller/kvm-rdp/.github/workflows/ci.yml@refs/heads/main' \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com
     gh attestation verify oci://ghcr.io/christopherjmiller/kvm-rdp@sha256:<digest> \
-      --repo ChristopherJMiller/kvm-rdp
+      --repo ChristopherJMiller/kvm-rdp \
+      --cert-identity 'https://github.com/ChristopherJMiller/kvm-rdp/.github/workflows/ci.yml@refs/heads/main' \
+      --deny-self-hosted-runners
 
 A commit whose CI run was superseded while queued (GitHub keeps one pending
 run per concurrency group) has no image; pin a published one.
