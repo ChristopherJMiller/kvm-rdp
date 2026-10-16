@@ -24,19 +24,24 @@ impl Framebuffer {
 
     /// XWDFileHeader: 25 big-endian CARD32s (X11's XWDFile.h), then the
     /// window name (to `header_size`), `ncolors` 12-byte XWDColors, then
-    /// `height` lines of `bytes_per_line`.
+    /// `height` lines of `bytes_per_line`. The sizes are the file's, so
+    /// their arithmetic is checked: one that overflows is no image.
     pub fn parse(data: Vec<u8>) -> Option<Framebuffer> {
         let word = |i: usize| -> Option<u32> {
             let b = data.get(i * 4..i * 4 + 4)?;
             Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
         };
+        let size = |i: usize| -> Option<usize> { usize::try_from(word(i)?).ok() };
         if word(1)? != 7 || word(11)? != 32 {
             return None; // XWD_FILE_VERSION 7; 32 bits per pixel only
         }
         let (width, height) = (word(4)?, word(5)?);
-        let bytes_per_line = usize::try_from(word(12)?).ok()?;
-        let start = usize::try_from(word(0)?).ok()? + usize::try_from(word(19)?).ok()? * 12;
-        if data.len() < start + bytes_per_line * usize::try_from(height).ok()? {
+        let bytes_per_line = size(12)?;
+        let start = size(0)?.checked_add(size(19)?.checked_mul(12)?)?;
+        let end = bytes_per_line
+            .checked_mul(usize::try_from(height).ok()?)?
+            .checked_add(start)?;
+        if data.len() < end {
             return None;
         }
         Some(Framebuffer {
@@ -54,22 +59,25 @@ impl Framebuffer {
         if x >= self.width || y >= self.height {
             return None;
         }
-        let off = self.start
-            + usize::try_from(y).ok()? * self.bytes_per_line
-            + usize::try_from(x).ok()? * 4;
-        let b = self.data.get(off..off + 4)?;
+        let off = usize::try_from(y)
+            .ok()?
+            .checked_mul(self.bytes_per_line)?
+            .checked_add(usize::try_from(x).ok()?.checked_mul(4)?)?
+            .checked_add(self.start)?;
+        let b = self.data.get(off..off.checked_add(4)?)?;
         let px = if self.lsb_first {
             u32::from_le_bytes([b[0], b[1], b[2], b[3]])
         } else {
             u32::from_be_bytes([b[0], b[1], b[2], b[3]])
         };
+        // In u64: a mask as wide as 32 bits times 255 does not fit a u32.
         let channel = |mask: u32| -> u8 {
             if mask == 0 {
                 return 0;
             }
             let shift = mask.trailing_zeros();
-            let max = mask >> shift;
-            u8::try_from(((px & mask) >> shift) * 255 / max).unwrap_or(255)
+            let max = u64::from(mask >> shift);
+            u8::try_from(u64::from((px & mask) >> shift) * 255 / max).unwrap_or(255)
         };
         Some([
             channel(self.masks[0]),
@@ -210,6 +218,42 @@ mod tests {
         assert_eq!(fb.rgb(3, 2), Some([30, 40, 7]));
         assert_eq!(fb.rgb(8, 0), None, "outside the image");
         assert!(Framebuffer::parse(vec![0; 50]).is_none(), "a short file");
+    }
+
+    /// Header word `i` (a big-endian CARD32) set to `v`.
+    fn set_word(data: &mut [u8], i: usize, v: u32) {
+        data[i * 4..i * 4 + 4].copy_from_slice(&v.to_be_bytes());
+    }
+
+    /// PE8 review m2: the file's header values are checked, never trusted —
+    /// sizes that overflow are no image (not a panic), a mask wider than
+    /// 24 bits still reads, and a file one byte short of its last pixel is
+    /// no image.
+    #[test]
+    fn an_overflowing_or_truncated_file_is_no_framebuffer() {
+        let good = xwd(8, 4, |_, _| [235, 235, 235]);
+        assert!(Framebuffer::parse(good.clone()).is_some());
+        // bytes_per_line, height, ncolors, header_size: alone and together.
+        for words in [&[12][..], &[5], &[19], &[0], &[12, 5, 19], &[0, 12, 5, 19]] {
+            let mut bad = good.clone();
+            for &w in words {
+                set_word(&mut bad, w, u32::MAX);
+            }
+            assert!(
+                Framebuffer::parse(bad).is_none(),
+                "words {words:?} = u32::MAX"
+            );
+        }
+        // A 32-bit red mask over a pixel whose pad byte is set: 0xFFEBEBEB
+        // times 255 overflows a u32.
+        let mut wide = good.clone();
+        set_word(&mut wide, 14, u32::MAX);
+        wide[3232 + 3] = 0xFF;
+        let fb = Framebuffer::parse(wide).unwrap();
+        assert_eq!(fb.rgb(0, 0), Some([254, 235, 235]), "a 32-bit red mask");
+        let mut short = good;
+        short.truncate(short.len() - 1);
+        assert!(Framebuffer::parse(short).is_none(), "one byte short");
     }
 
     /// §11.5's barcode: block k white when bit k of the frame index is set.
