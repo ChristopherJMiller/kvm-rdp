@@ -41,6 +41,16 @@
 //! ahead of a queued report would type a key early and again, or break a
 //! drag. The queue's pointer reports each carry the current buttons, so
 //! the stale press this guards against is the keyboard's.
+//!
+//! A timed re-assert can fire while the KVM is not reading — a reconnect or
+//! a takeover during a stall opens at once, the KVM still stalled — and
+//! then waits in the new websocket's buffer with the session start, read
+//! in no set order against the abandoned websocket's leftovers. So every
+//! open writes a ping after its session start (`OPEN_PING`), and its pong —
+//! the KVM reading this websocket again — re-arms the re-assert
+//! `reassert_after` past it, once (R-I2, the re-review of the final fix
+//! wave; the release websocket's pong-gated rule, DD8). The timed one stays
+//! for a KVM that never answers a ping.
 use crate::hid::{HidControl, ReleaseTrigger};
 use crate::kvm::endpoint::{KvmEndpoint, SocketHandle};
 use crate::kvm::error::FailClass;
@@ -64,6 +74,12 @@ const CLOSE_BUDGET: Duration = Duration::from_millis(400);
 /// it (RFC 6455 §5.5.2: an endpoint must answer a ping); a pong with any
 /// other payload (a heartbeat) proves nothing.
 pub(crate) const RELEASE_PING: &[u8] = b"kvm-rdp release";
+
+/// R-I2 (re-review of the final fix wave): the payload of the ping every
+/// open writes after its session start. Its pong shows the KVM reads this
+/// websocket again; the open re-asserts `reassert_after` past it. Never
+/// `RELEASE_PING`: a late pong to it would pass for the close's proof.
+pub(crate) const OPEN_PING: &[u8] = b"kvm-rdp open";
 
 /// `input.reassert_after`'s default (DD8): 1 s past an open's session
 /// start, until L4 measures how long stale reports keep landing (Task 6.1
@@ -340,8 +356,22 @@ impl WsTask {
         S: Sink<Message, Error = WsError> + Unpin,
         St: Stream<Item = Result<Message, WsError>> + Unpin,
     {
+        // R-I2 (re-review of the final fix wave): a ping after the session
+        // start. A KVM stalled while this websocket opened — a reconnect or
+        // a takeover during the stall — reads the timed re-assert below
+        // with the session start once it reads again, in no set order
+        // against what the abandoned websocket left in its buffer; its pong
+        // to this ping shows it reads again, and the re-assert goes once
+        // more `reassert_after` past that (DD8's rule, pong-gated, as the
+        // release websocket's is). Its own payload: a late pong to
+        // `RELEASE_PING` would pass for the close's proof.
+        if !self.ping(&mut sink).await {
+            return Exit::Failed;
+        }
+        let mut pong_awaited = true;
         // PC9 fix 2: once, `reassert_after` past the session start (`None`
-        // once done; bounded config, so the add never overflows).
+        // once done; bounded config, so the add never overflows) — the
+        // re-assert for a KVM that never answers a ping.
         let mut reassert_at = tokio::time::Instant::now().checked_add(self.reassert_after);
         // m1 (PD9 review): the latest it may wait for the queue to empty.
         let mut reassert_by = reassert_at.and_then(|at| at.checked_add(self.reassert_after));
@@ -476,6 +506,16 @@ impl WsTask {
                         self.metrics.upstream_reconnects.inc("websocket");
                         return Exit::Failed;
                     }
+                    // R-I2: the KVM reads this websocket again — the state
+                    // once more, `reassert_after` past this pong. Once: a
+                    // KVM repeating it cannot hold the re-assert off. It
+                    // proves nothing about a release (`confirm_read`): it
+                    // answers a ping written before the reports after it.
+                    Some(Ok(Message::Pong(p))) if pong_awaited && p == OPEN_PING => {
+                        pong_awaited = false;
+                        reassert_at = tokio::time::Instant::now().checked_add(self.reassert_after);
+                        reassert_by = reassert_at.and_then(|at| at.checked_add(self.reassert_after));
+                    }
                     Some(Ok(_)) => {}
                 },
                 () = async move {
@@ -505,6 +545,20 @@ impl WsTask {
         }
         self.metrics.hid_reasserts.inc();
         Some(true)
+    }
+
+    /// R-I2: the open's ping (`OPEN_PING`), bounded by `hid_write_timeout`;
+    /// a failure is a write's (`write`).
+    async fn ping<S: Sink<Message, Error = WsError> + Unpin>(&self, sink: &mut S) -> bool {
+        let ping = sink.send(Message::Ping(OPEN_PING.to_vec()));
+        let ok = matches!(
+            tokio::time::timeout(self.write_timeout, ping).await,
+            Ok(Ok(()))
+        );
+        if !ok {
+            self.metrics.upstream_reconnects.inc("websocket_write");
+        }
+        ok
     }
 
     /// One write on a websocket that stays in service: a failure ends it
@@ -562,10 +616,13 @@ mod tests {
         /// Every write fails at once (a dead socket).
         fail: bool,
         sent: Vec<Vec<u8>>,
+        /// Every ping's payload (R-I2).
+        pings: Vec<Vec<u8>>,
         waker: Option<Waker>,
     }
 
-    /// A sink a test can block and unblock; records every binary message.
+    /// A sink a test can block and unblock; records every binary message,
+    /// and every ping apart.
     #[derive(Clone, Default)]
     struct GateSink(Arc<Mutex<Gate>>);
 
@@ -584,6 +641,9 @@ mod tests {
         }
         fn sent(&self) -> Vec<Vec<u8>> {
             self.0.lock().unwrap().sent.clone()
+        }
+        fn pings(&self) -> Vec<Vec<u8>> {
+            self.0.lock().unwrap().pings.clone()
         }
         fn fail(&self) {
             self.0.lock().unwrap().fail = true;
@@ -604,8 +664,10 @@ mod tests {
             }
         }
         fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), WsError> {
-            if let Message::Binary(b) = item {
-                self.0.lock().unwrap().sent.push(b);
+            match item {
+                Message::Binary(b) => self.0.lock().unwrap().sent.push(b),
+                Message::Ping(p) => self.0.lock().unwrap().pings.push(p),
+                _ => {}
             }
             Ok(())
         }
@@ -1941,6 +2003,72 @@ mod tests {
             wait_sent(&sink, 3).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
             assert_eq!(hid.metrics.hid_reasserts.get(), 1);
+            drive.abort();
+        });
+    }
+
+    /// R-I2 (re-review of the final fix wave): every open writes a ping
+    /// after its session start — its own payload, never the close's — and
+    /// re-asserts `reassert_after` past the KVM's pong to it. A KVM stalled
+    /// past the timed re-assert reads that one with the open's other
+    /// frames, in no set order against what an abandoned websocket left in
+    /// its buffer; the one after the pong lands once it reads again. The
+    /// timed one stays, for a KVM that never answers a ping. Only the first
+    /// pong to the open's ping counts, and it proves nothing about a
+    /// release: it answers a ping written before the reports after it.
+    #[test]
+    fn every_open_reasserts_past_the_kvms_pong_to_its_ping() {
+        crate::testkit::paused_within(crate::testkit::PAUSED_WATCHDOG, || async {
+            const AFTER: Duration = Duration::from_millis(500);
+            const MARGIN: Duration = Duration::from_millis(100);
+            let hid = Arc::new(HidControl::new(16, Arc::new(Metrics::default())));
+            let (mut t, _ctl) = task(hid.clone(), Duration::from_secs(5));
+            t.reassert_after = AFTER;
+            let sink = GateSink::new(true);
+            let s2 = sink.clone();
+            let (in_tx, mut in_rx) = mpsc::unbounded_channel::<Result<Message, WsError>>();
+            let inbound = futures_util::stream::poll_fn(move |cx| in_rx.poll_recv(cx));
+            let drive = tokio::spawn(async move { t.drive(s2, inbound).await });
+            wait_sent(&sink, 2).await;
+            assert_eq!(
+                sink.pings(),
+                [OPEN_PING.to_vec()],
+                "no ping of its own after the session start"
+            );
+            // A key pressed and released: the KVM may hold it until it
+            // proves it read the release.
+            hid.push(kbd(0x04), false);
+            hid.push(kbd(0), false);
+            wait_sent(&sink, 4).await;
+            let reasserts = || hid.metrics.hid_reasserts.get();
+            // The KVM stalls: the timed re-assert still goes out.
+            tokio::time::sleep(AFTER + MARGIN).await;
+            assert_eq!(reasserts(), 1, "no timed re-assert");
+            // A pong of another payload — a heartbeat's, or the close's —
+            // re-arms nothing.
+            for p in [&b"heartbeat"[..], RELEASE_PING] {
+                in_tx.send(Ok(Message::Pong(p.to_vec()))).unwrap();
+            }
+            tokio::time::sleep(AFTER * 2).await;
+            assert_eq!(reasserts(), 1, "another payload's pong re-armed it");
+            // The KVM reads again: the state once more, `reassert_after`
+            // past its pong.
+            in_tx.send(Ok(Message::Pong(OPEN_PING.to_vec()))).unwrap();
+            tokio::time::sleep(AFTER - MARGIN).await;
+            assert_eq!(
+                reasserts(),
+                1,
+                "re-asserted before reassert_after past the pong"
+            );
+            tokio::time::sleep(MARGIN * 2).await;
+            assert_eq!(reasserts(), 2, "no re-assert past the pong");
+            assert_eq!(sink.sent().last().unwrap(), &KBD_ZERO.to_vec());
+            // Once: a second pong re-arms nothing.
+            in_tx.send(Ok(Message::Pong(OPEN_PING.to_vec()))).unwrap();
+            tokio::time::sleep(AFTER * 2).await;
+            assert_eq!(reasserts(), 2, "a second pong re-armed it");
+            assert!(hid.kvm_may_hold(), "the open's pong proved the release");
+            assert_eq!(sink.pings(), [OPEN_PING.to_vec()]);
             drive.abort();
         });
     }

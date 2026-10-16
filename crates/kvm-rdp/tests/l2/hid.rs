@@ -3,12 +3,13 @@
 //! `discard_queued()` once the session-start pair is on the wire (P47) —
 //! and a case that pushes after a reopen calls it only once the reopen
 //! shows up (it waits on the latest websocket).
-use crate::client::{Opts, pictures, terminated};
+use crate::client::{Opts, pictures, takeover, terminated};
 use crate::harness::{
     KBD_ZERO, SET_MODE, T, abs, env, es3, hid_on, hid_stamped, ms, sized, streaming, until,
     until_mark, within, ws_opens,
 };
 use kvm_proto::hid::HidFrame;
+use kvm_rdp::hid::writer::REASSERT_AFTER;
 use kvm_sim::SimEvent;
 use std::time::Duration;
 
@@ -484,4 +485,131 @@ async fn a_release_websocket_gives_up_inside_its_budget() {
     );
     assert_eq!(kvm_holds(&env.sim.events()), CMD);
     assert_eq!(env.metrics().release_websockets.total(), 1);
+}
+
+// ---- R-I2 (re-review of the final fix wave): an open during a KVM stall.
+
+/// How long kvm-sim stays stalled past the new websocket's open: three
+/// times the production `input.reassert_after`, so the open's timed
+/// re-assert fires inside the stall.
+const STALL_PAST_OPEN: Duration = Duration::from_secs(3);
+
+/// A sized ES3 with kvm-sim's control buffer at 4 KiB and the production
+/// `input.reassert_after` (1 s).
+async fn stall_env() -> crate::harness::Env {
+    let mut sim = es3();
+    sim.control_recv_buffer = Some(4096);
+    env(sim, |c| {
+        sized(c);
+        c.input.reassert_after = REASSERT_AFTER;
+    })
+    .await
+}
+
+/// `pairs` distinct press-release pairs (a, b, c).
+fn flood(pairs: usize) -> Vec<(u8, bool)> {
+    (0..pairs)
+        .flat_map(|i| {
+            let k = [0x1E, 0x30, 0x2E][i % 3];
+            [(k, true), (k, false)]
+        })
+        .collect()
+}
+
+/// A websocket opened after the first `opens` while kvm-sim stalls with
+/// stale Cmd reports in the older websockets' buffers. kvm-sim reads again
+/// `STALL_PAST_OPEN` after that open, and reads the older websockets'
+/// leftovers and the new one's frames in no set order. The newest
+/// websocket re-asserts once more after kvm-sim reads again — `reassert_after`
+/// past the pong to its open's ping — so what it reads last is the state:
+/// nothing held.
+async fn read_again_and_settle(env: &crate::harness::Env, opens: usize) {
+    env.sim
+        .wait_for(T, |l| ws_opens(l).len() > opens)
+        .await
+        .expect("no websocket opened during the stall");
+    let opened = std::time::Instant::now();
+    tokio::time::sleep_until((opened + STALL_PAST_OPEN).into()).await;
+    let all = ws_opens(&env.sim.events());
+    let older = all[..all.len() - 1].to_vec();
+    assert_ne!(
+        kvm_holds(&env.sim.events()),
+        NOTHING,
+        "released before kvm-sim read again"
+    );
+    let reasserts = env.metrics().hid_reasserts.get();
+    env.sim.set_policy(|p| p.pause_ws_reads = false);
+    // Once every older websocket has ended, all it will ever deliver is in
+    // the log.
+    env.sim
+        .wait_for(T, |l| {
+            older
+                .iter()
+                .all(|w| l.contains(&SimEvent::WsClose { conn: *w }))
+        })
+        .await
+        .expect("a stalled websocket never ended");
+    assert!(
+        until(T, || env.metrics().hid_reasserts.get() > reasserts).await,
+        "no re-assert once kvm-sim read again: the open's re-assert fired \
+         inside the stall, behind the stale reports"
+    );
+    assert!(
+        until(T, || kvm_holds(&env.sim.events()) == NOTHING).await,
+        "the KVM still holds {:02x?}: a stale report landed last",
+        kvm_holds(&env.sim.events())
+    );
+    tokio::time::sleep(REASSERT_AFTER).await;
+    assert_eq!(
+        kvm_holds(&env.sim.events()),
+        NOTHING,
+        "a stale report landed late"
+    );
+}
+
+/// R-I2: a takeover while kvm-sim stalls with Cmd held. The old session's
+/// release never lands — its writes block, and its websocket is reset —
+/// and the takeover's `Start` supersedes the release websocket its end
+/// would open, so the new session's open is the release. That open's
+/// session start and timed re-assert wait in kvm-sim's buffer while the
+/// stall lasts; once it reads again the KVM ends holding nothing, the old
+/// websocket's stale Cmd reports included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_during_a_kvm_stall_ends_released() {
+    let env = stall_env().await;
+    let a = holding_cmd(&env).await;
+    env.sim.set_policy(|p| p.pause_ws_reads = true);
+    a.keys(&flood(2000));
+    tokio::time::sleep(ms(300)).await;
+    let opens = ws_opens(&env.sim.events()).len();
+    let b = env.client(Opts::new(3)); // the takeover
+    read_again_and_settle(&env, opens).await;
+    let a_events = a.wait_for(T, |e| terminated(e).is_some()).await;
+    assert_eq!(terminated(&a_events).unwrap(), takeover());
+    assert!(terminated(&b.events()).is_none());
+}
+
+/// R-I2: a websocket lost mid-session while kvm-sim stalls with Cmd held:
+/// a write blocks past `hid_write_timeout`, and with input held the reopen
+/// skips the backoff, so it opens inside the stall. The reconnect released
+/// Cmd — the client still holds it, released by the bridge — so once
+/// kvm-sim reads again the KVM must hold nothing, the old websocket's
+/// stale Cmd reports included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_during_a_kvm_stall_ends_released() {
+    let env = stall_env().await;
+    let c = holding_cmd(&env).await;
+    let opens = ws_opens(&env.sim.events()).len();
+    env.sim.set_policy(|p| p.pause_ws_reads = true);
+    // Distinct presses, Cmd held, until a write blocks and the websocket
+    // reopens.
+    let t0 = std::time::Instant::now();
+    while ws_opens(&env.sim.events()).len() <= opens {
+        assert!(t0.elapsed() < T, "no write blocked");
+        c.keys(&flood(400));
+        tokio::time::sleep(ms(50)).await;
+    }
+    assert!(env.metrics().upstream_reconnects.get("websocket_write") >= 1);
+    read_again_and_settle(&env, opens).await;
+    assert!(terminated(&c.events()).is_none());
 }
