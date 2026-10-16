@@ -2,11 +2,54 @@
 
 | | |
 |---|---|
-| Status | Draft rev 6.2 — Plan C's deviations recorded (2026-10-08); rev 6.1: Plan B's (2026-10-06); rev 6: census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
+| Status | Draft rev 6.3 — Plan D's deviations recorded (2026-10-15); rev 6.2: Plan C's (2026-10-08); rev 6.1: Plan B's (2026-10-06); rev 6: census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
 | Repo | `github.com/ChristopherJMiller/kvm-rdp` (public, MIT OR Apache-2.0) |
 | First target | Angeet/Yeeso ES3 "ONE KVM" wired to a Mac Studio |
 | Client | Microsoft Windows App on macOS, through an rdpgw RD Gateway on 443 |
 | Companion spec | Deployment, gateway, edge gating and KVM isolation live in `luma-homeops` (separate spec, written after Milestone 0). §9.4 lists what this spec requires of it |
+
+**Rev 6.3 — Plan D (2026-10-14 to 2026-10-15).** Records what building
+Milestones 3b and 4 settled, against the code as built. DD*n* are Plan D's
+recorded deviations (`docs/superpowers/plans/2026-10-14-kvm-rdp-plan-d.md`);
+every amended passage below is marked "rev 6.3". Plan D's hardware run
+(Task 1.6, Leg D in `census.md`) has not happened yet — it waits for the
+owner — so every value it would retune keeps its written default and every
+L4 question stays open (§11.6, §15). The change log supersedes nothing in
+rev 6.2's; it is added to it. One line per change:
+
+- DD1 (§11.6, §15): the L4 runbook never logs out. kvm-probe has no `--logout`; the refusal forms are measured for a never-issued token, no token and a token that lapsed on its own; the forms after a global logout, and whether the control websocket survives another session's logout, are measured only if the owner logs out in the vendor web UI during Task 1.6's optional step (`logout-watch` only watches), and are otherwise "not measured".
+- DD2 (§4.1, §11.2): `kvm-proto` holds the tables (`keymap`), `hid::scale_abs`, and §8's text handling, UTF-16 decoding and Typist (`paste`); the input state machine — the released-by-bridge rule, both §7.4 timers, the paste states — is `kvm-rdp`'s `input::` modules, beside `hid::queue`, tested with an injected clock.
+- DD3 (§4.4, §7.1): `input.mac_remap` switches a fixed table: on, a report holding Ctrl and one of C, V, X, A, Z, F, W carries GUI in that Ctrl's place (left for left, right for right). There is no configurable table until the key-matrix fixture exists; off by default.
+- DD4 (§8): the pending paste — from the chord until typing starts, `paste.modifier_wait` bounds both the wait for the clipboard text and the wait for every modifier's release; a fresh Esc (swallowed), a fresh non-modifier press or a mouse button (both passed through), or any release cancels it; a second chord is swallowed; modifier presses and releases pass through; an answer no paste waits for types nothing.
+- DD5 (§8): Caps Lock is the last `Synchronize`'s state, toggled by each fresh Caps Lock press since.
+- DD6 (§8): the Typist waits for HID-queue room as well as `paste.pace`: a step pushes at most 8 − queued reports, each `paste.pace` after the last (no catch-up burst), and looks again 2 ms later when there is no room, so `paste.pace = 0` never overflows `input.queue`.
+- DD7 (§7.1, §7.2, §10.4): relative motion and presses, the X1/X2 buttons (and any later one), horizontal and ainput scroll, unmapped scancodes and untypeable or surrogate Unicode units are dropped and counted in `input_events_ignored`, which keeps that meaning; a relative button release is honoured (PD9 I4); the Keyboard Power usage is never sent.
+- DD8 (§3.2, §4.4, §7.3): "once a reconnect settles" is every websocket open re-asserting the full HID state once, `input.reassert_after` (1 s) past its session-start sequence; L4's retune rule and its receive-window assumption are in §4.4.
+- DD9 (§7.1, §7.4): at most 16 non-modifier keys are tracked (5 reported) and 32 released-by-bridge keys and modifiers remembered; a press past the first bound, or a held key the second has no room for, is dropped and counted.
+- DD10 (§4.4, §8): `paste.pace` is twice the smallest pace at which the ES3 typed L4's 200-character pattern losslessly three runs out of three, every slower pace lossless too; not measured yet, so 15 ms stands.
+- DD11 (§4.4, §8): `paste.chord` is parsed at load — one or more distinct modifiers, then one letter or digit; anything else is refused.
+- §4.2: `ironrdp-cliprdr` joins at the same pin; it was already compiled in `ironrdp-server`'s graph.
+- §4.3: the input core is a sans-IO core (`input::core::InputCore`), stepped by IronRDP's input handler and by a driver on the RDP `LocalSet`, under one mutex held from a feed's first step to its last output carried out (PD9 I1); it follows the live generation, so the pump shell's word is advisory (PD9 m5); handler calls off the RDP thread (IronRDP's ainput DVC, from `spawn_blocking`) are dropped and counted (PD9 I1).
+- §4.4: `input.queue` is at least 9 (DD6); `input.reassert_after` with L4's rule (DD8, D29); `paste.chord` is a parsed chord (DD11); `paste.pace`'s source (DD10); `CONTROL_SNDBUF` is sized from L4's page-measured HID rate, is not a config key, and stays 16 KiB until Leg D; every new or changed key has its `leak_shapes` shape.
+- §4.5 (PD8 m4): `ironrdp_cliprdr` is held at ERROR (`logging::ERROR_CAPPED_TARGETS`), not INFO: its WARNs carry client-chosen file names and fire once per hostile PDU.
+- §5.2: the input core's driver joins the essential tasks; the key-held-on-death check is built (`kvm-probe hid-hold`) and waits for Leg D.
+- §6.9, §8 (PD8): `clipboard_oversize` reaches the pump as `RdpInput::Fatal` from the session's own CLIPRDR backend, and counts only for the current generation; a failed clipboard response is no cause.
+- §7.1, §7.2: the mapping as built — Unicode presses type through the US layout with their own Shift; a button event carries its own position, so a click with no prior move lands where it was made; coordinates clamp to the surface, or to the advertised size before the first Setup.
+- §7.3: the input handler is built, replacing DC7's counting stub: a step takes each report's state and its epoch stamp together and pushes with `push_at`; the re-assert (DD8) waits for a drained queue, and from `reassert_after` past its deadline goes after the next frame written only while no keyboard report waits, without its pointer part while pointer reports wait (PD9 m1, PD9 R-I1) — so it never overtakes a queued report.
+- §7.4: `ReleaseTrigger` gains `Synchronize`, `KeyRepeat` and `ModifierIdle`, raised by the input core, whose timers fire only on a step; after a `Synchronize` the core forgets every released-by-bridge mark, so a held key's next key-down presses it again (PD5 m6), while every other release, a websocket reconnect included, keeps the marks; typing's start releases what the client still holds.
+- §8 step 1 (PD8 m5): the server advertises no clipboard capability beyond IronRDP's own `USE_LONG_FORMAT_NAMES`.
+- §8 text handling (D4, PD7 m1, m1-r): the text ends at CF_UNICODETEXT's U+0000; skipped scalars are dropped before step 1, so a trailing break followed only by skipped units is still removed, and a skipped unit between a CR and its LF never splits that CRLF into a typed Return and a removed LF.
+- §8 (PD9 carry 3, I2): clipboard requests are counted per generation and each answer belongs to the oldest outstanding; only the pending paste whose own request that is takes it, and every other answer is discarded and counted; a failed answer ends its paste at once; a request no answer has come for is retired after `max(60 s, 2 × paste.modifier_wait)`; a file-list answer counts as one.
+- §8 (PD9 m-R1, m-R2): two accepted residuals — a never-answering client's drift heals only after a 60 s pause in paste attempts, and an answer more than 60 s late can be typed by a newer paste; a paste past 64 outstanding requests is refused locally (`backlog`).
+- §8 (PD8 I2): a format list whose first `FileGroupDescriptorW`-named format has CF_UNICODETEXT's id offers no text: IronRDP would parse the answer as a file list, past `paste.max_bytes`.
+- §8 (controller ruling 2): Milestone 4's comparison with the KVM's `hid.lua?type=text` is deferred to Plan E's perf pass; ours stays the default.
+- §9.2 (PD5 ruling): every type that holds input has a redacted `Debug`; DC9's L2 case is the proof.
+- §9.3: what the Mac does when the websocket dies with a key held waits for Leg D.
+- §10.4 (PD9 ruling 4): the registry as built has 43 families; `hid_reasserts`, `paste_events{outcome}`, `paste_skipped_chars` and `clipboard_discarded{reason}` join it, and `release_all{trigger}` gains `synchronize`, `key_repeat` and `modifier_idle`.
+- §11.2 (DD2): the input core's injected-clock tests are `kvm-rdp` unit tests, not `kvm-proto` L0.
+- §11.3: the input, stuck-key and paste cases run through a real IronRDP client (Tasks 5.1, 5.2); W10, the divergent replay and the re-assert are exercised (Task 5.3); the secrets case types the keystroke sentinel and pastes the canary (DC9), with two accepted residuals.
+- §11.6, §15: every L4 check is a `kvm-probe` subcommand proven against kvm-sim; Leg D, the run on the ES3, is pending (owner), so they all stay open.
+- §12: planning unit D's status; owner acceptance items 12–14 and a note on item 4; one list of what is carried to Plan E.
 
 **Rev 6.2 — Plan C (2026-10-07 to 2026-10-08).** Records what building
 Milestone 3a settled, against the code as built. DC*n* are Plan C's recorded
@@ -236,8 +279,9 @@ item the census did not measure is marked *open*.
   task aborted — resets the connection (`SO_LINGER` 0), so HID reports the
   KVM had not yet read are discarded with it, never delivered after the next
   websocket's session-start sequence. What already sits in the KVM's own
-  receive buffer it may still read: Plan D re-asserts the full HID state
-  once a reconnect settles (§7.4, §9.3).
+  receive buffer it may still read: so (rev 6.3, DD8) every websocket open
+  re-asserts the full HID state once, `input.reassert_after` past its
+  session-start sequence (§7.3, §7.4, §9.3).
 - **The bridge never calls logout.** Because logout is global, it would end
   the operator's break-glass web-UI session (and any `kvm-probe` run).
   Teardown closes the websocket and the FLV and lets the token lapse (§5.1).
@@ -297,13 +341,23 @@ Every hostile-input parser lives in `kvm-proto`, so fuzzing and most tests
 never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
 `kvm-probe`.
 
+Rev 6.3 (DD2): of the input path, `kvm-proto` holds the tables (`keymap`:
+set-1 scancode → usage, the US layout, `paste.chord`'s `Chord`),
+`hid::scale_abs` (§7.2) and `paste` (§8's text handling, UTF-16 decoding
+and the Typist). The input state machine — keyboard and pointer state,
+the released-by-bridge rule, both §7.4 timers and the paste states — is
+`kvm-rdp`'s `input::{keys, pointer, paste, core}`, beside `hid::queue`
+whose release epoch and `ReleaseTrigger` it uses, as Plan C put its other
+sans-IO cores (pump, upstream, HID queue) in `kvm-rdp`.
+
 ### 4.2 Dependencies
 
 - **IronRDP is git-pinned**: one rev, at or after `38b074e` (2026-10-01; for
   Plan C, a rev on the fork branch below), for every `ironrdp-*` crate used
   (including `ironrdp-pdu`, for ErrorInfo codes),
   as direct git dependencies in `[workspace.dependencies]` — no
-  `[patch.crates-io]`. crates.io `ironrdp-server 0.13.0` / `ironrdp-egfx 0.3.0`
+  `[patch.crates-io]` (rev 6.3: Plan D adds `ironrdp-cliprdr`, §8, at the
+  same rev; it was already compiled in `ironrdp-server`'s graph). crates.io `ironrdp-server 0.13.0` / `ironrdp-egfx 0.3.0`
   lack `ConnectionPolicy::Preempt`, `on_connection_info`, the full EGFX
   capability ladder, re-advertise recovery, the ack-suspend fix and the pre-TLS
   DoS fix (#1515), and their `Avc420Region` bounds are inclusive where HEAD's
@@ -439,6 +493,7 @@ never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
   otherwise drained at line rate; the KVM never sees back-pressure.
 - **Input path** (§7.3) and the **HID writer** never block the RDP runtime.
 - **Rev 6.2 (Plan C).** `SessionStart`/`SessionStop` come from the RDP side with the GFX handle (DC4): every `KvmEvent` carries its generation, and the shell's `biased` select takes the RDP side first, then the 50 ms tick, then the KVM stream — so no KVM event overtakes its session's start, and a KVM stream that never empties cannot stop the tick-driven watchdog, stall, IDR and probe timers. The tick runs only while a session (or a closing pump) needs it. The shell samples suppression and the write counter per tick and per AU and feeds every RTT read; the core alone treats a generation's first read as its reference (DC6). A dropped AU marks the next one `after_drop` (DC12); the KVM → pump channel holds the hard cap + 8 (DC14).
+- **Rev 6.3 (Plan D): the input core.** `input::core::InputCore` is the input path's sans-IO core: `step(ctx, event, &mut outs)`, where the context carries `now`, the release epoch, the live generation, the surface size, the `input.*`/`paste.*` values and the HID queue's room, and `next_deadline()` says when a timer, the pending paste or the Typist next needs a `Tick`. Its outputs are pushes stamped with the epoch they were built at, releases, a clipboard request, paste outcomes and counts. `rdp::input::InputShared` holds it under one `std::sync::Mutex`, fed from IronRDP's input handler, from a driver on the RDP `LocalSet` that sleeps until the core's next deadline (an essential task, §5.2), and from the pump shell's clipboard words. A feed holds the lock from its first step until its last output is carried out, so two feeds never interleave their reports (PD9 I1); the lock is never held across an await, every lock taken under it is a leaf, and nothing under it calls into IronRDP — a clipboard request is a `ServerEvent` channel send, for the current generation only. The core follows the live generation (`Generations`), which the connection handler (`rdp::handler`) moves, with its release, inside `on_connection_info` and `on_disconnected`; the pump shell's `set_generation` word is advisory, so a `SessionStop` read after the next session's keys began (Preempt) never resets them (PD9 m5). The handler takes input only on the RDP thread: IronRDP's ainput DVC calls it from `spawn_blocking`, one task per PDU in no order — a Devolutions extension Windows App does not use — and those calls are dropped and counted (`input_events_ignored`, PD9 I1).
 
 ### 4.4 Configuration
 
@@ -501,13 +556,14 @@ Windows App run retunes (§12):
 | `video.suppress_debounce` | 1 s | §6.6 |
 | `video.disconnect_watchdog` | 5 s | §6.9 |
 | `video.region_qp` | 22 | Constant; client hint only |
-| `input.queue` | 256 reports | §7.3 |
+| `input.queue` | 256 reports | §7.3. Rev 6.3: 9 to 4096 — at least `TYPIST_ROOM` + 1, so the Typist's up to 8 reports a step, and typing's start one more, never overflow it into a resync (DD6) |
 | `input.hid_write_timeout` | 1 s | |
 | `input.key_repeat_timeout` | 10 s (*acceptance*) | Repeats are not yet confirmed: the typematic capture needs Windows App (`census.md`, Leg B — deferred). Then: measured max initial delay + 2 × repeat interval + 250 ms, floor 1 s (§7.4, §12) |
 | `input.modifier_idle_timeout` | 30 s | Confirmed; nothing in the census bears on it (§7.4) |
-| `input.mac_remap` | off (*acceptance*) | Until the key-matrix capture shows Windows App's Cmd rewrite can be told apart from a real Ctrl+key (§7.1, §12) |
-| `paste.chord` | Ctrl+Option+Shift+V (raw scancodes) | §8 |
-| `paste.pace` | 15 ms between HID reports | §8 |
+| `input.mac_remap` | off (*acceptance*) | Until the key-matrix capture shows Windows App's Cmd rewrite can be told apart from a real Ctrl+key (§7.1, §12). Rev 6.3: the switch for DD3's fixed table (§7.1) |
+| `input.reassert_after` (rev 6.3) | 1 s | §3.2, §7.3, §7.4 (DD8): how long past each websocket open's session-start sequence the full HID state is re-asserted, once; more than 0, at most 1 h. L4's rule (D29): if Leg D sees stale reports land after a fresh session start (`hid-stale`), the default becomes `max(1 s, ceil(1800 / hid_rate))` s, capped at 1 h, where `hid_rate` is the HID test page's measured reports/s (`hid-type`) — the time the KVM takes to read out a whole receive window of stale reports, taken as 64 KiB (Linux's default receive buffer) ÷ ~37 B per report (§7.3) ≈ 1 800; if not, or with no rate measured, 1 s stands (a backstop). Not measured yet: 1 s |
+| `paste.chord` | Ctrl+Option+Shift+V (raw scancodes) | §8. Rev 6.3 (DD11): written `"ctrl+option+shift+v"` and parsed at load into a `Chord` — one or more distinct modifiers (`ctrl` or `control`, `shift`, `alt` or `option`, `cmd` or `win`; case and spaces around `+` ignored; either side's key matches), then one letter or digit, held with exactly those modifiers; anything else is refused at load |
+| `paste.pace` | 15 ms between HID reports | §8. Rev 6.3 (DD10): set from L4 as twice the smallest pace at which the ES3 typed the 200-character pattern losslessly three runs out of three, every slower pace lossless too (`hid-type`); not measured yet, so 15 ms stands. 0 is allowed (L2) |
 | `paste.max_chars` / `max_bytes` / `modifier_wait` | 4096 / 64 KiB / 5 s | |
 | `paste.multiline` | `enter` | or `refuse` |
 | `security.accept_rate` | 30 admitted connection attempts per sliding `security.accept_window`, global; refusals do not count (rev 6.2) | §9.1 |
@@ -515,6 +571,16 @@ Windows App run retunes (§12):
 | `rdp.cert_poll_interval` | 60 s (rev 6.2) | A changed certificate or key runs §5.2 and exits 0, once no client is connected |
 | `admin.liveness_timeout` | 10 s (rev 6.2) | §4.5's heartbeat age, configurable for L2 |
 | `log.filter` | `info` | EnvFilter syntax; capped (§4.5) |
+
+Rev 6.3: the control websocket's `SO_SNDBUF` cap (`kvm::endpoint::CONTROL_SNDBUF`,
+16 KiB, §7.3) is not a config key. L4 sizes it from the HID report rate the
+test page measures (D28 — the probe's own write rate is only a diagnostic):
+adjusted, with kvm-probe's matching `hid::SNDBUF`, only if a full buffer
+would take more than about 1 s of input to drain, or hold fewer than a few
+reports. Not measured yet, so it stays 16 KiB. Every key Plan D added or
+changed — `input.queue`'s bound, `input.reassert_after`, `paste.chord` —
+has its `leak_shapes` shape, and its error never echoes the value (the C1
+rule).
 
 ### 4.5 Admin endpoints and logging
 
@@ -540,7 +606,11 @@ Windows App run retunes (§12):
   else at TRACE) and is combined with it via `FilterExt::and`, so nothing in
   config can raise them. (sspi and the acceptor log NTLM tokens at debug;
   `ironrdp_server` traces every dispatched event; tungstenite traces HID
-  payloads.)
+  payloads.) Rev 6.3 (PD8 m4): `ironrdp_cliprdr` is held at ERROR instead
+  (`logging::ERROR_CAPPED_TARGETS`; the more specific target wins over the
+  `ironrdp` prefix): its WARNs carry client-chosen data — the file-list
+  sanitiser logs the client's file names — and fire once per hostile PDU,
+  so a client could otherwise flood the log.
 - Bridge code never logs keystrokes, HID frames, pasted text, the KVM token or
   passwords. HID and paste activity is logged as counts. URLs are logged as
   `scheme://host:port/path`, query removed. No per-frame events above `trace`.
@@ -595,7 +665,9 @@ stopping the server takes a second `Quit` after that connection has
 drained (rev 6.1). The shutdown's disconnect watchdog is 2 s, not `video.disconnect_watchdog`, to fit the 5 s (rev 6.2). Release builds use
 `panic = "abort"`. A crash cannot release keys: what the Mac does when the
 websocket TCP connection dies with a key held moved from Leg A to Plan D's L4 (rev 6.2; Plan C has no HID input path)
-hardware checks (§12), and the answer goes in §9.3.
+hardware checks (§12), and the answer goes in §9.3. Rev 6.3: Plan D built
+the check (`kvm-probe hid-hold`, ending the websocket with a close, a FIN
+or a reset while a key is held); it waits for Leg D (§11.6).
 
 Rev 6.2 (Plan C), as built (DC13): the steps are bounded at 500 ms (flush),
 2.2 s (the 2 s watchdog plus a tick), 1 s (the KVM actor's `Stop`/`Shutdown`,
@@ -609,8 +681,8 @@ restarted one can. A changed certificate runs the same sequence (§4.4). The
 binary logs `kvm-rdp ready` only after its SIGTERM and SIGINT handlers are
 registered, so a signal sent the moment the line appears still runs this
 sequence. A panic in a task the bridge cannot run without (the pump shell,
-the KVM actor, the admin listener, the certificate watcher) stops the RDP
-server in every build, not only under `panic = "abort"`. Exit codes: 0
+the KVM actor, the admin listener, the certificate watcher; rev 6.3: and
+the input core's driver, §4.3) stops the RDP server in every build, not only under `panic = "abort"`. Exit codes: 0
 after a signal or a certificate change, 1 if startup failed or the RDP
 server stopped on its own, 2 on a config or logging error.
 
@@ -1204,6 +1276,16 @@ If it is lost, the remedy is a lingering close in IronRDP's teardown
 bounded by its `DISCONNECT_STEP_GRACE`) — a candidate fourth fork patch
 (§4.2); Plan C changes nothing here.
 
+**`clipboard_oversize`** (rev 6.3, Plan D, as built): the session's own
+CLIPRDR backend — one per connection, bound to its generation as the GFX
+handle is (§8) — sends `RdpInput::Fatal` for a response over
+`paste.max_bytes`, and nothing more after it. The pump shell steps it as
+`UpstreamFatal` only when it comes from the current link's backend and that
+generation is still current: a Preempt candidate's or an evicted session's
+is dropped, and so is one read after `on_disconnected`, so no disconnect
+is counted that never happens. A failed clipboard response (`CB_RESPONSE_FAIL`) is not a
+cause; it ends the paste waiting for it (§8).
+
 | Cause | ErrorInfo |
 |---|---|
 | `shutdown` | `ERRINFO_RPC_INITIATED_DISCONNECT` (0x1) |
@@ -1231,6 +1313,19 @@ bounded by its `DISCONNECT_STEP_GRACE`) — a candidate fourth fork patch
   §12).
 - Known limits: no horizontal scroll (the server does not advertise
   `TS_MOUSE_HWHEEL`); Pause arrives as LCtrl+NumLock (`EXTENDED1` is dropped).
+- Rev 6.3 (as built; DD3, DD5, DD7, DD9): the remap table is DD3's fixed
+  one — with `input.mac_remap` on, a report holding Ctrl and one of C, V,
+  X, A, Z, F, W carries GUI in that Ctrl's place, applied only when a
+  report is built, so the held state and the paste chord (§8) stay raw.
+  Unicode key events type through the US layout, with Shift from the
+  latest Unicode press alone, and release by code unit; that Shift is
+  reported while a Unicode-pressed key is down and never longer, and a
+  later scancode press of a non-modifier ends it. Caps Lock is the last `Synchronize`'s state, toggled by each
+  fresh Caps Lock press (DD5). At most 16 non-modifier keys are tracked;
+  a press past that, an unmapped scancode (counted on its press only) or
+  an untypeable or surrogate Unicode unit is dropped and counted in
+  `input_events_ignored` (DD7, DD9). The Keyboard Power usage (`E0 5E`) is
+  never sent.
 
 ### 7.2 Mouse
 
@@ -1240,14 +1335,25 @@ bounded by its `DISCONNECT_STEP_GRACE`) — a candidate fourth fork patch
 - Buttons left/right/middle = HID bits 0/1/2.
 - Wheel: RDP's ±120-per-notch rotation is accumulated; each whole notch emits
   one wheel frame (§3.3) with the current button mask.
+- Rev 6.3 (as built): a button event carries the client's position
+  (IronRDP's do), so a click with no move before it lands where it was
+  made, never (0, 0); before the first Setup, coordinates scale against
+  the advertised size.
+  A relative button release (`ButtonRel`) is honoured where the pointer
+  is (PD9 I4: a release is always safe); relative motion and presses, the
+  X1/X2 buttons, horizontal and ainput scroll are dropped and counted
+  (DD7).
 
 ### 7.3 HID output path
 
-Rev 6.2 (DC7): Plan C ships no input handler yet — a counting stub drops every
-client input event into `kvm_rdp_input_events_ignored_total` — so
-`HidControl::push` is the queue's only production entry point, and Plan D's
-mapping is its first caller; everything below the handler (queue, epoch,
-writer) is built.
+Rev 6.3 (Plan D): the input handler is built, replacing rev 6.2's
+counting stub (DC7). Its state is the input core's (§4.3,
+`input::core::InputCore`); each step reads the release epoch into its
+context first, builds its reports from the state that epoch left, and
+pushes each with `HidControl::push_at(stamp)` — the state and its stamp
+taken together — so a report built before a release is dropped whole
+rather than landing after the zeros. Every feed carries its reports out
+under the core lock, and only input taken on the RDP thread is fed (§4.3).
 
 - The input handler owns the authoritative HID state (pressed keys, button
   mask, last absolute position) and is synchronous and O(1).
@@ -1283,7 +1389,21 @@ writer) is built.
   auto-repeated the key held down (§7.4), and the queue's coalescing never
   engages while the writer is never behind. Capped, a HID report being
   ~37 bytes on the wire, under a thousand fit before a write blocks. Plan
-  D's L4 sizes the cap from the ES3's measured HID report rate.
+  D's L4 sizes the cap from the ES3's measured HID report rate (rev 6.3:
+  the test page's, D28; not measured yet, so 16 KiB stands, §4.4).
+- Rev 6.3 (DD8, PC9 fix 2): every websocket open re-asserts the full HID
+  state once, `input.reassert_after` past its session-start sequence —
+  the queue's resync state, the last keyboard and pointer reports pushed
+  (zeros after a release, so it never brings a released key back),
+  counted in `hid_reasserts` — and only once the queue is drained and no
+  release is pending, so it overtakes neither and repeats what the KVM
+  should hold anyway. A queue that never drains (motion under
+  backpressure) does not hold it for ever: from `reassert_after` past its
+  deadline it goes after the next frame written instead of waiting for a
+  lull, but only while no keyboard report waits, and without its pointer
+  part while pointer reports wait (PD9 m1, re-review R-I1) — the newest
+  state written ahead of a queued report would type a key early and then
+  again, or break a drag. So it never overtakes a queued report.
 - `on_disconnected` sets release-all and then closes over the same ordered
   path, so the release is flushed before the socket closes.
 
@@ -1318,20 +1438,56 @@ Triggers:
 A stuck Cmd on a work Mac is the failure this exists to prevent; every trigger
 has a test (§11).
 
+Rev 6.3 (Plan D, as built): `Synchronize` and both timers are raised by the
+input core (`ReleaseTrigger::Synchronize`, `KeyRepeat`, `ModifierIdle`;
+`release_all{trigger}` `synchronize`, `key_repeat`, `modifier_idle`);
+every other trigger reaches the core only as a moved release epoch, which
+releases its state before the event it comes with. The timers are sans-IO
+(`input::core`): each is armed only while something it watches is held,
+and fires only on a step — the driver ticks the core at its next deadline,
+and an event that arrives after a deadline the driver has not ticked yet
+is stepped after a `Tick` whose release is carried out first. A `Pressed`
+resets the key-repeat timer only when its key is a non-modifier still held
+after it (a new press or a repeat). Released-by-bridge covers keys,
+modifiers and buttons (bounded, DD9), every key a paste swallows, and
+every non-modifier key the client still holds when a paste starts typing
+(§8). One exception (PD5 review m6): after a `Synchronize` the core
+forgets every mark. MS-RDPBCGR's Synchronize resets the server's key state
+to all keys up, and the client then sends key-downs for what it still
+holds; so a key held across it is pressed again by its next key-down, and
+a stale mark (a `Released` lost after an earlier release) can never
+swallow a fresh press — Cmd held across a focus change, then C, reaches
+the Mac as Cmd+C, not a typed c. Every other release keeps the marks, a
+websocket reconnect included, so a reconnect still never re-presses
+anything.
+
 ## 8. Clipboard: paste as typing
 
 One way only, laptop → Mac.
 
 1. The user copies on the laptop; Windows App announces its formats over
    CLIPRDR. The bridge records only that text is available. The server
-   advertises no clipboard capabilities of its own.
+   advertises no clipboard capabilities of its own (rev 6.3, PD8 m5: none
+   beyond IronRDP's own `USE_LONG_FORMAT_NAMES` format-list encoding).
+   Rev 6.3: "text" is CF_UNICODETEXT in the latest format list — a list
+   offering only ANSI text has none — and a list whose first format named
+   `FileGroupDescriptorW` has CF_UNICODETEXT's id offers none either
+   (PD8 I2): IronRDP takes that first name as the client's file list
+   whatever its id, and would parse the answer as a file list, past
+   `paste.max_bytes`; a benign client never names a standard format.
 2. The user presses the **chord** (default Ctrl+Option+Shift+V), matched on raw
    client scancodes before any remap. Cmd+V can't be used: Windows App rewrites
    it to Ctrl+V. The chord's key is swallowed. A chord with no text announced is
-   swallowed and logged.
+   swallowed and logged. (Rev 6.3: the chord is parsed at load, DD11, §4.4,
+   and fires only on a fresh press of its key, never a repeat; a client
+   that sends its keys as Unicode units never fires it — acceptance item 13.)
 3. The bridge requests `CF_UNICODETEXT` and waits until every physical modifier
    is released; if they are not released within `paste.modifier_wait`, the paste
-   is cancelled.
+   is cancelled. (Rev 6.3, DD4: the same bound covers the wait for the text;
+   until typing starts, a fresh Esc — swallowed — a fresh non-modifier press
+   or a mouse button — both passed through — or any release cancels the
+   paste, a second chord is swallowed, and modifier presses and releases
+   pass through, since the chord's own modifier presses reached the KVM.)
 4. The Typist types the text.
 
 **Report sequence.** Each character is one press report and one all-zero
@@ -1340,7 +1496,15 @@ modifier byte. `paste.pace` separates every report (so ~30 ms per character).
 `paste.pace` is provisional: in Leg A an 842-character URL sent at one report
 per 20 ms took ~60–90 s to land in Edge's address bar (the omnibox's
 per-keystroke work is mixed in), so Plan D (rev 6.2; was Plan C) measures the KVM's own HID report
-rate (L4) before the pace is fixed (`census.md`, Derived decisions).
+rate (L4) before the pace is fixed (`census.md`, Derived decisions). Rev 6.3
+(DD10): `paste.pace` is then twice the smallest pace at which the ES3 typed
+L4's 200-character pattern losslessly three runs out of three (§4.4); Leg D
+has not run, so 15 ms stands. And (DD6) the Typist also waits for room in
+the HID queue: a step pushes at most 8 − queued reports, each `paste.pace`
+after the last, with no catch-up burst, and looks again 2 ms later when
+the queue is full — so `paste.pace = 0` (L2) never overflows
+`input.queue` into a resync that would lose characters, and the driver
+never spins.
 
 While typing:
 
@@ -1348,8 +1512,14 @@ While typing:
   swallowed except Esc, which aborts (and is itself swallowed). Mouse motion
   passes through; any mouse button, `Synchronize` or §7.4 trigger aborts.
   Abort and completion both end with an all-zero keyboard report.
+  (Rev 6.3: the mouse button itself passes through. Every press swallowed
+  while typing is released by the bridge, so its repeats after the
+  paste are not fresh presses; and when typing starts, every non-modifier
+  key the client still holds is released by the bridge and zeroed at
+  once, even if the Typist then has nothing to send.)
 - If the client's last `Synchronize` reported Caps Lock on, the paste is
-  refused (typing would invert case).
+  refused (typing would invert case). (Rev 6.3, DD5: that state is toggled
+  by each fresh Caps Lock press since, as the Mac's is.)
 
 Text handling, in order:
 
@@ -1361,6 +1531,16 @@ Text handling, in order:
    scalar.
 4. At most `paste.max_chars` characters are typed, counted after steps 1–3.
 
+Rev 6.3 (as built; D4, PD7 m1 and m1-r): the text ends at CF_UNICODETEXT's
+U+0000 terminator — nothing after it is text, or counted — and each
+ill-formed UTF-16 unit is one U+FFFD, skipped and counted at step 3. The
+scalars step 3 skips are dropped before step 1 (CR excepted: it is a line
+break), so no skipped unit changes which break is the trailing one: a
+trailing break followed only by skipped units is still removed, and a
+skipped unit between a CR and its LF never splits that CRLF into a typed
+Return and a removed LF. Skips are counted only while `max_chars` has
+room.
+
 Limits and hygiene:
 
 - IronRDP reassembles the whole client-declared SVC/DVC payload (up to 4 GiB)
@@ -1369,19 +1549,69 @@ Limits and hygiene:
   session dropped (cause `clipboard_oversize`). Memory during reassembly is
   bounded only by the memory limit (container or systemd); OOM-kill on an
   abusive NLA-authenticated client is the accepted failure mode. An upstream
-  reassembly cap for SVC and DVC is tracked in the pin review.
+  reassembly cap for SVC and DVC is tracked in the pin review. (Rev 6.3:
+  the CLIPRDR backend checks a response's length before it copies a byte;
+  over the cap it ends the session through `RdpInput::Fatal`, §6.9, says
+  nothing more, and the paste that asked counts `oversize`.)
 - Contents are never logged; `FormatDataResponse` is never `Debug`-formatted.
 - Deployment must enable the channel or CLIPRDR never opens: rdpgw needs
   **`Caps.EnableClipboard: true`**. Without it rdpgw sends
   `HTTP_TUNNEL_REDIR_DISABLE_CLIPBOARD` and FreeRDP leaves `cliprdr` out of
   its channel list; with it, `cliprdr` is requested and given an MCS channel
-  (`census.md`, Leg C; clipboard data itself is Plan D's to test, rev 6.2).
+  (`census.md`, Leg C; clipboard data itself is Plan D's to test, rev 6.2;
+  rev 6.3: L2 tests it over real CLIPRDR, §11.3).
   `redirectclipboard:i:1` is rdpgw's own default, so rdpgw leaves it out of
   the `.rdp` (it writes no field equal to its default) and the client's
   default applies. Whether Windows App obeys rdpgw's redirect flags is an
   acceptance item (§12).
 - Milestone 4 compares our typing with the KVM's own `hid.lua?type=text`
   endpoint; ours stays the default unless the device's paces better.
+  Rev 6.3: that comparison is deferred to Plan E's perf pass (controller
+  ruling, 2026-10-14); ours stays the default.
+
+**Clipboard answers** (rev 6.3, as built; PD9 carry 3, review I2,
+re-review m-R1 and m-R2). CLIPRDR answers data requests in order, and
+IronRDP forwards every answer, asked for or not, so the input core counts
+the requests it has made this generation and not seen answered, and an
+answer — text, a failure, the fatal oversize, or one the backend dropped
+in flight — belongs to the oldest of them. Only the pending paste whose
+own request that is takes it; any other answer is discarded and counted
+(`clipboard_discarded{late}`, or `{unasked}` with none outstanding), so a
+paste never types the answer to an earlier one that timed out. A failed
+answer (`CB_RESPONSE_FAIL`, the client's or IronRDP's own) ends the paste
+waiting for it at once, not at `paste.modifier_wait`. An answer IronRDP
+parsed as a file list — a client that renamed a format between the chord
+and the request — reaches the core as an answer with no text, like a
+failure, so the count stays true; one that does not parse as a list comes
+through raw,
+under `paste.max_bytes` like any other. The backend keeps at most one
+availability word and one answer in flight to the pump shell per
+connection; an answer that comes meanwhile is dropped before a byte is
+copied and counted (`{in_flight}`), and still answers its request. A
+request no answer has come for would shift every later answer onto the
+request before it for the rest of the session, so each keeps its instant
+and is retired, counted `{unanswered}`, once `max(60 s, 2 ×
+paste.modifier_wait)` old — never while its own paste still waits —
+when the next paste starts or the next answer comes. Two residuals are
+accepted:
+
+- Retirement goes by age, so with a client that leaves a request
+  unanswered, a paste made before that request is retired takes the
+  phantom's place with its own prompt answer (discarded, `late`), and its
+  own request becomes the phantom, with a fresh age: retrying within 60 s
+  moves the drift forward, and only a 60 s pause in paste attempts heals
+  it. Ending the chain would let a paste take an answer while an older
+  request may still be answered.
+- An answer more than 60 s late, once its request is retired, pairs with
+  a newer one and can be typed. CLIPRDR's format data responses carry no
+  request id, and with delayed rendering a merely slow answer carries the
+  clipboard as of answering; stale content needs a transport stall over
+  60 s, which `video.stall_timeout` ends as `client_stalled` first.
+
+At most 64 requests are outstanding (ironrdp-cliprdr's own cap): a paste
+past that is refused locally and asks nothing (`paste_events{backlog}`) —
+IronRDP would fail the request itself, and that failure would be taken
+for the oldest request's answer.
 
 ## 9. Security
 
@@ -1439,6 +1669,14 @@ pasted text are never logged (§4.5). Secrets come only from files (§4.4).
 Rev 6.2 (final review C1): nor is any `*_file` key's value, in an error, a
 log line or a `Debug` — an operator may write the secret, or paste the PEM,
 where the file name goes; a file that cannot be read is named by its key.
+Rev 6.3 (PD5 ruling; Plan D): keystrokes and pasted text are as sensitive
+as a password, so no type that holds them derives `Debug` — HID frames
+and queued reports, the keyboard, pointer and paste state, US-layout
+strokes, prepared text and the Typist, the input core's events and
+outputs, and the clipboard's words to the pump: each shows its kind and
+counts only. The input path logs paste activity as metrics and one line
+(a chord with no text offered, which names no content). DC9's secrets
+case is the proof (§11.3).
 
 ### 9.3 Threat model
 
@@ -1453,7 +1691,7 @@ where the file name goes; a file that cannot be read is named by its key.
 | A gateway token is replayed (a leaked `.rdp`) | Tokens are bound to the bridge's host; **`VerifyClientIp: true`** with `Server.TrustedProxies` = the edge and the edge stamping `X-Forwarded-For`, so a token works only from the address that fetched it — Leg C: a token minted for another address is refused (`E_PROXY_RAP_ACCESSDENIED`); NLA still applies (§9.4) | A token is reusable — Leg C opened two tunnels with one — until `exp` + 60 s (about 6 min) from the pinned address. Pinning refuses legitimate connections if `/connect` and the tunnel reach rdpgw from different addresses (split routing, NAT) |
 | rdpgw's session cookie bypasses its trusted-proxy check | **The edge strips `Set-Cookie: RDPGWSESSION`** from `/connect` responses, and `/connect` is reachable only through the auth proxy (§9.4). Leg C: the cookie from a proxied `/connect`, sent directly from an untrusted address with no identity header, got 200 and a fresh token, because rdpgw accepts an authenticated session before it checks `TrustedProxies`; IP pinning does not help, since that token carries the caller's own address | If a cookie escapes anyway, it mints tokens for its 120 s lifetime (`Max-Age=120`) |
 | A client that stops reading pins the session | `Closing` + disconnect watchdog + hard abort (§6.9) | — |
-| Bridge crash with a key held | `panic = "abort"`; release on every orderly path | Depends on the KVM's behaviour on websocket loss (Plan D's L4, §12; rev 6.2) |
+| Bridge crash with a key held | `panic = "abort"`; release on every orderly path | Depends on the KVM's behaviour on websocket loss (Plan D's L4, §12; rev 6.2). Rev 6.3: `kvm-probe hid-hold` measures it for a close, a FIN and a reset; Leg D has not run, so it is still unknown |
 | Census capture leaks or attacks the dev host | Sandbox (§12) | — |
 
 ### 9.4 Requirements on the companion spec
@@ -1616,7 +1854,10 @@ frame (`alloc-stats` builds).
 **The registry as built** (rev 6.2, Plan C's `kvm_rdp::metrics`). Counters
 and labelled families are exposed with `_total`; label values are fixed
 strings from bridge code, never device or client text. Paste events and
-skipped characters are Plan D's, allocations per frame Plan E's.
+skipped characters are Plan D's, allocations per frame Plan E's. Rev 6.3
+(Plan D's `kvm_rdp::metrics`, as built): 43 families — 18 counters, 12
+labelled families, 8 gauges and 5 histograms, a count `metrics`'s own test
+pins; Plan D's rows are marked.
 
 | Metric | Kind | Labels (values) |
 |---|---|---|
@@ -1641,11 +1882,15 @@ skipped characters are Plan D's, allocations per frame Plan E's.
 | `kvm_rdp_egfx_qoe_decode_seconds` | histogram | — (QoE, V10+ clients) |
 | `kvm_rdp_egfx_in_flight`, `kvm_rdp_egfx_backlog_bytes`, `kvm_rdp_egfx_ack_suspended`, `kvm_rdp_egfx_oldest_unacked_ms`, `kvm_rdp_autodetect_rtt_ms`, `kvm_rdp_standing_delay_ms`, `kvm_rdp_egfx_capability_version` | gauge | — |
 | `kvm_rdp_hid_reports_sent_total`, `kvm_rdp_hid_reports_coalesced_total`, `kvm_rdp_hid_resyncs_total`, `kvm_rdp_hid_epoch_discards_total` | counter | — |
-| `kvm_rdp_release_all_total` | counter | `trigger`: `session_start`, `session_end`, `closing`, `watchdog`, `shutdown`, `websocket_reconnect`, `suppression` (Plan D adds `Synchronize` and the timers) |
+| `kvm_rdp_hid_reasserts_total` (rev 6.3) | counter | — (full-state re-asserts after a websocket open, DD8, §7.3) |
+| `kvm_rdp_release_all_total` | counter | `trigger`: `session_start`, `session_end`, `closing`, `watchdog`, `shutdown`, `websocket_reconnect`, `suppression`; rev 6.3: `synchronize`, `key_repeat`, `modifier_idle` (the input core's, §7.4) |
 | `kvm_rdp_sessions_total` | counter | — |
 | `kvm_rdp_disconnects_total` | counter | `cause`: §6.9's causes (`shutdown`, `kvm_unreachable`, `stream_corrupt`, `stream_incompatible`, `no_avc420`, `client_stalled`, `clipboard_oversize`, `kvm_auth_failed`, `kvm_cert_mismatch`) — bridge-initiated only |
 | `kvm_rdp_accept_refused_total` | counter | — |
-| `kvm_rdp_input_events_ignored_total` | counter | — (Plan C's input stub; Plan D replaces it) |
+| `kvm_rdp_input_events_ignored_total` | counter | — (Plan C's input stub; Plan D replaces it). Rev 6.3: it keeps the name and means client input dropped — unmapped, untypeable or past a bound (DD7, DD9), taken off the RDP thread (§4.3), or arriving with no session live |
+| `kvm_rdp_paste_events_total` (rev 6.3) | counter | `outcome`: `started`, `done`, `no_text`, `caps_lock`, `multiline`, `oversize`, `backlog`, `aborted` (§8). A paste that starts counts `started`, then one of `done`, `multiline`, `oversize` and `aborted`; one refused at the chord counts only `no_text`, `caps_lock` or `backlog` |
+| `kvm_rdp_paste_skipped_chars_total` (rev 6.3) | counter | — (scalars §8's text handling skipped, counted when a paste is done) |
+| `kvm_rdp_clipboard_discarded_total` (rev 6.3) | counter | `reason`: `late`, `unasked` (answers no paste took), `in_flight` (dropped by the backend while another was in flight), `unanswered` (requests retired with no answer) — §8's clipboard answers |
 
 `frames_dropped` counts frames, not gate events (rev 6.2): a frame a gate
 drops counts that gate's reason — in Live, `burst_truncated` for a burst AU
@@ -1685,6 +1930,13 @@ and `replay_diverged` are §6.5's replay rule after a `ReconnectFlv` swap.
 | L3 interop | CI, `#[ignore]` test | FreeRDP 3 from the flake (§11.4) |
 | L4 hardware | opt-in | `kvm-probe` and `--features hil` tests against the real ES3 (§11.6) |
 | L5 manual | checklist | Windows App direct and through rdpgw (§11.6) |
+
+Rev 6.3 (DD2): the L0 row's input cores — the release epoch and the
+released-by-bridge rule, both key timers, paste pacing — are the input
+core's, so they are `kvm-rdp` unit tests with an injected clock (beside
+`hid::queue`'s), not `kvm-proto` L0; `kvm-proto`'s L0 keeps the scancode
+table (against Microsoft's, §11.1), the US layout, `scale_abs` and §8's
+text handling and Typist.
 
 L1 cases:
 
@@ -1783,7 +2035,11 @@ time is budgeted for the harness itself. The video cases run once per
   the second session sees no frame, timer or `Disconnect` from the first.
 - **Video oracle**: from the first KVM IDR on, the client's FrameId sequence
   equals kvm-sim's, and each received AU matches §6.3's composition; the first
-  KVM AU is an IDR carrying SPS/PPS.
+  KVM AU is an IDR carrying SPS/PPS. Rev 6.3 (PC17 m1, Task 5.3): a
+  `ReconnectFlv` candidate whose replayed P frame differs from the one the
+  client already has is dropped (`frames_dropped{replay_diverged}`, §6.5)
+  and the picture recovers at the next IDR; the client never gets the
+  altered frame, an AU twice, or a P frame out of sequence.
 - **Lifecycle**: with `default_size` 1920×1080 and a 360p fixture: the slate on
   the default surface, then DeactivateAll and a 640×360 surface before any KVM
   frame, login count 1 throughout; a reconnect sends no Resize; after
@@ -1826,7 +2082,11 @@ time is budgeted for the harness itself. The video cases run once per
   request; `kvm_cert_mismatch`). Rev 6.2: a certificate that changes
   mid-session, after a good login, on the websocket — fatal at once, its
   writer idling rather than reconnecting — is not exercised until kvm-sim
-  can swap its certificate; Plan D's (PC7 W10).
+  can swap its certificate; Plan D's (PC7 W10). Rev 6.3: exercised (Task
+  5.3) — kvm-sim swaps its certificate mid-session and drops the
+  websocket; the reopen fails the pin: `kvm_cert_mismatch` at once, no
+  re-login, no logout, no websocket upgraded and no further control
+  connection.
 - **Stalled client** (asserted on `/metrics`, not timing): withheld acks →
   after the bridge's first soft-gate drop (`frames_dropped{reason="soft_gate"}`
   > 0) its sent-frame counter does not advance again before Closing,
@@ -1851,8 +2111,15 @@ time is budgeted for the harness itself. The video cases run once per
   where a FIN delivers its whole send buffer), a reopen restores the
   pointer, the websocket survives another session's logout — and the
   input-event cases (RDP input → HID frames) are Plan D's, with its handler.
+  Rev 6.3: built (Task 5.1) — the cases above run through the real handler
+  from an in-process IronRDP client, a click with no prior move lands
+  where it was made, and (Task 5.3) a reconnect's re-assert carries the
+  current state once more, `reassert_after` later — zeros for a key held
+  across it, which stays released by the bridge.
 - **Stuck keys**: every §7.4 trigger releases all; a key held across a release
-  is not re-pressed by later repeats until its `Released`; typematic repeats at
+  is not re-pressed by later repeats until its `Released` (rev 6.3: a
+  `Synchronize` excepted — it forgets the marks, §7.4 — so the case holds
+  the key across a websocket reconnect); typematic repeats at
   0.2× the timeout for 2× the timeout → no release; no repeats → release; two
   keys held with repeats of the second only → no release; mouse motion never
   resets the timers.
@@ -1863,7 +2130,9 @@ time is budgeted for the harness itself. The video cases run once per
   mouse click aborts; modifiers held past the (scaled) wait cancel; Caps Lock
   on refuses; the chord key never reaches kvm-sim; 64 KiB + 2 bytes → session
   dropped, nothing typed; 64 KiB − 2 bytes → typed up to `max_chars`; an 8 MiB
-  payload, fully sent → `clipboard_oversize`, nothing typed.
+  payload, fully sent → `clipboard_oversize`, nothing typed. Rev 6.3: built
+  (Task 5.2), over real CLIPRDR from the in-process client, which answers
+  only the CF_UNICODETEXT it holds, terminator included.
 - **Admin**: `/livez` goes stale when the `LocalSet` is blocked; `/readyz`
   succeeds without a KVM. Rev 6.2 adds: a flood past the 32-connection cap —
   each connection past it is dropped unanswered although it sends a full
@@ -1886,7 +2155,22 @@ time is budgeted for the harness itself. The video cases run once per
   environment cleared and then given `SSLKEYLOGFILE` and `RUST_LOG=off` — a
   bridge that read `RUST_LOG` would log nothing and never report ready; the
   log is checked only once both pipe readers have drained, and must hold the
-  shutdown's own last lines.
+  shutdown's own last lines. Rev 6.3 (DC9, Plan D): the case now types the
+  keystroke sentinel and pastes the canary, and is the proof §9.2 rests
+  on. In stdout, stderr and `/metrics` (read before the SIGTERM) it
+  forbids every encoding of either string — the text, its characters,
+  bytes and code units, each keystroke's frame, key slots and codes, in
+  hex, decimal and base64 — and every 6-character fragment of either. A
+  line from the input path must be one of a reviewed list, each field in
+  its value's shape (an integer, a boolean or a word from a fixed list), so
+  no reviewed line can carry free text; a bridge log target outside the
+  reviewed lists fails the case; every `/metrics` name and label is the
+  bridge's own vocabulary; and no `Debug` the input path could emit shows
+  what was typed or pasted. Two residuals are accepted: a lone number
+  equal to one key code or code unit — a `/metrics` sample value, or an
+  integer field of a reviewed line — and a line logged under a reviewed
+  target outside the input path, which faces the encoding and fragment
+  checks but not the value shapes.
 
 ### 11.4 L3 interop
 
@@ -2002,6 +2286,33 @@ questions belong to L5.
   EOF (the bridge treats only a close frame as an answered close, §3.2);
   and the lag between the old FLV's forced IDR and a `ReconnectFlv`
   candidate's first tag (§6.5's replay ring holds 64 AUs, about 2 s).
+- Rev 6.3 (Plan D; DD1): each of these checks but the preset change is a
+  new `kvm-probe` subcommand, proven against kvm-sim in kvm-sim's own test
+  binary — `hid-hold` (the websocket ended by a close, a FIN or a reset
+  while a key is held),
+  `concurrent-flv` (side request → forced main-FLV IDR over 20 trials,
+  same-token refusal and its form, the forced-IDR → candidate lag and how
+  many AUs a swap would replay), `token-life` and `session-cap` (the
+  abandoned token's life and a session cap; each runs only with the
+  owner's consent, since its logins could evict the owner's web-UI
+  session), the HID test page with `hid-type` (the KVM's HID report rate,
+  read off the page — it sizes `CONTROL_SNDBUF` and enters
+  `input.reassert_after`'s rule — and the smallest pace typed losslessly,
+  which sets `paste.pace`), `refusal-forms` (a never-issued token,
+  and none), `ws-close` (the close form) — and one new check,
+  `hid-stale`: whether stale reports land after a fresh session start,
+  which decides `input.reassert_after` (§4.4). A preset change uses
+  Plan A's `capture` and `summarize` while the owner changes it. The forms
+  after a global logout, and the control websocket's survival of another
+  session's logout, come only from `logout-watch`, which watches while the
+  owner logs out in the vendor web UI and never sends a logout (DD1). The
+  probe sees the Mac only through the KVM's own video — a committed HID
+  test page the owner opens, and `snapshot`, which decodes one fresh IDR
+  in the sandbox to a PNG under `captures/` — types only a generated
+  pattern into that page, and ends every HID command released (Ctrl-C,
+  SIGTERM, SIGHUP and SIGQUIT included; `hid-release` from a fresh process
+  after a kill). The run on the ES3 (Task 1.6; Leg D in `census.md`) is
+  pending (owner): until it runs, every question above stays open (§15).
 - L5 checklist (pass/fail, recorded): key matrix; Mac remap profile; paste
   (including newline handling); reconnect and a takeover of a stale session;
   resize; display sleep/wake; each fatal cause's dialog (no auto-reconnect);
@@ -2150,8 +2461,36 @@ before `census.md` is committed):
 | A | Milestone 0 (with the `kvm-proto` subset, fixtures, `kvm-probe`, spikes, the IronRDP fork patches) → `census.md` + spec revision |
 | B | M1 + M2, including the SPS rewriter — required: level patch, VUI re-serialisation and `bitstream_restriction` (§6.8), with the POC-type-0 fixture (§11.5) — and kvm-sim's ES3 profile. No AU assembler and no GOP cache: Leg A needs neither (§6.2, §6.5) |
 | C | M3a: config, logging, admin endpoints, metrics, shutdown, lifecycle, NLA, EGFX pump and state machine, the websocket, the HID writer skeleton and release epoch, L1 and video/lifecycle L2. Requires the three IronRDP patches of `kvm-rdp-egfx-patches-v2` @ `c99eece2`, git-pinned (§4.2; rev 6.2: the patch-1 fallback is not built) |
-| D | M3b + M4: first §11.6's L4 hardware checks (rev 6.2, moved from C); keyboard and mouse mapping, stuck-key timers and the released-by-bridge rule, the Typist, and their L2 cases |
-| E | M5 + M6: L3, CI, image, perf pass (rev 6.2: CI's job timeout, tracked-secrets gate and target-budget step landed with Plan C, DC19) |
+| D | M3b + M4: first §11.6's L4 hardware checks (rev 6.2, moved from C); keyboard and mouse mapping, stuck-key timers and the released-by-bridge rule, the Typist, and their L2 cases (rev 6.3: built, with CLIPRDR paste, the re-assert and Plan C's L2 carries; the L4 checks are tooling proven on kvm-sim, and their run on the ES3, Task 1.6, is pending (owner) — DC18's items are built, not yet measured) |
+| E | M5 + M6: L3, CI, image, perf pass (rev 6.2: CI's job timeout, tracked-secrets gate and target-budget step landed with Plan C, DC19; rev 6.3: also the carries below) |
+
+**Carried to Plan E** (rev 6.3: one list, from Plan C's final review and
+Plan D's rulings):
+
+- `--remap-path-prefix` (or `trim-paths` once stable) in the image build,
+  so no build-host source path reaches an error message (PC15).
+- Actions pinned by SHA, and `cargo deny` (licences and advisories) over
+  the production graph.
+- §10.1's allocation budget, including PC14 n4 (one extra `Vec` copy per
+  AU in the pump's `step`) and the per-chunk `Vec<FlvTag>`.
+- A minimum frame size in admission: a hostile SPS can resize the client
+  to a tiny desktop (16×16) — e.g. refused below MS-RDPBCGR's 200 px as
+  `stream_incompatible`.
+- Gating the `RdpInput::Stall` test hook (a `std::thread::sleep` on the RDP
+  runtime, reachable only through a hidden test handle) behind a
+  non-default feature.
+- IronRDP's format-list amplification (PD8 m3): `get_formats` builds the
+  client's whole format list, about 5–10× its wire size, before the
+  backend runs, and `paste.max_bytes` caps only responses — the
+  reassembly class §8 accepts; a format-count cap joins the pin review's
+  upstream-cap note.
+- Milestone 4's comparison of our typing with the KVM's
+  `hid.lua?type=text` (§8), in the perf pass.
+- A nightly L2 run under a CPU stressor at the wrapper's nice 19, so
+  load-sensitive cases surface in CI rather than on the shared host.
+
+Not carried: bounding the admin response write and shutdown — Plan C did
+it (§4.5, rev 6.2).
 
 The companion `luma-homeops` spec is written once Milestone 0 passes. It has
 passed (verdict below), so the companion spec can be written now; it takes
@@ -2216,7 +2555,11 @@ marked *acceptance* in §4.4 are retuned from it. In priority order:
    default macOS settings. Sets `input.key_repeat_timeout` (max initial delay
    + 2 × repeat interval + 250 ms, floor 1 s, §7.4) and decides
    `input.mac_remap` (on only if the Cmd rewrite can be told apart from a
-   real Ctrl+key, §7.1); committed as the remap-table fixture.
+   real Ctrl+key, §7.1); committed as the remap-table fixture. Rev 6.3:
+   `mac_remap` switches DD3's fixed table (Ctrl + C, V, X, A, Z, F, W →
+   GUI), so the capture must also show that table is exactly Windows
+   App's rewrite before it ships on; `key_repeat_timeout` stays 10 s until
+   this capture retunes it.
 5. **ErrorInfo dialogs and auto-reconnect** for 0x1, 0x5, 0x7 and 0x9 (no
    auto-reconnect loop), and whether `0x19` SERVER_SHUTDOWN suits `shutdown`
    better (§6.9).
@@ -2254,6 +2597,22 @@ marked *acceptance* in §4.4 are retuned from it. In priority order:
     ErrorInfo and closes at once, so a real client may lose it to a reset
     (§6.9). Lost: carry the lingering-close patch to the fork (a candidate
     patch 4, §4.2, §6.9) and re-check.
+12. **Return, Backspace and Esc as Unicode units** (rev 6.3, Plan D: PD5
+    m7, PD7 m5). Does Windows App — in its Unicode keyboard mode, or
+    through an IME — ever send Return, Backspace or Esc as Unicode units
+    (U+000D, U+0008, U+001B) rather than scancodes? The US layout has no
+    stroke for them, so the bridge drops and counts them
+    (`input_events_ignored`, DD7), and a Unicode Esc never aborts a paste
+    (§8). If it does, they need a mapping.
+13. **The paste chord in Unicode mode** (rev 6.3, PD7). The chord is
+    matched on raw scancodes only (§8), so a client that sends its keys as
+    Unicode units never fires it. Check that Windows App sends
+    Ctrl+Option+Shift+V as scancodes, direct and through rdpgw.
+14. **The HID test page in Edge** (rev 6.3; L4's, not Windows App's — the
+    owner checks it at the start of Task 1.6). The committed page opens
+    on the Mac as a `data:` URL in Edge, and a Right Ctrl tap resets its
+    counters (the probe never sends Esc). If it does not, Leg D's HID
+    steps cannot be read.
 
 ## 13. Development resource budget
 
@@ -2345,6 +2704,18 @@ before `paste.pace` is fixed (§8); and the four checks Plan C added (§11.6,
 rev 6.2): the refusal forms after a global logout, same-token FLV refusal,
 the websocket close form, and the forced-IDR → candidate lag. Still to be recorded in `census.md`: the
 firmware version (from the UI's about page).
+
+Rev 6.3: still open, for Leg D. Plan D built every one of these checks as
+a `kvm-probe` subcommand proven against kvm-sim (§11.6), and added one:
+whether stale reports land after a fresh session start (`hid-stale`),
+which decides `input.reassert_after` (§4.4). The run on the ES3 (Task 1.6,
+`census.md` Leg D) is pending (owner), so nothing here is settled yet, and
+`paste.pace` (15 ms), `CONTROL_SNDBUF` (16 KiB) and `input.reassert_after`
+(1 s) keep their written defaults. Even after Leg D, the refusal forms
+after a global logout and the control websocket's survival of another
+session's logout stay "not measured" (DD1) unless the owner runs Task
+1.6's optional logout step; the never-issued-token, no-token and
+lapsed-token forms Leg D measures stand in for them.
 
 Watched: the IronRDP fork branch `kvm-rdp-egfx-patches-v2` and, once the owner
 opens it, its upstream PR (§4.2); IronRDP API churn and an upstream SVC/DVC

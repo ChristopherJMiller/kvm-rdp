@@ -3,22 +3,24 @@
 An RDP server for a commodity IP-KVM, being built to log in to the KVM,
 pass the KVM's H.264 video through to the RDP client untouched (EGFX
 AVC420, via [IronRDP](https://github.com/Devolutions/IronRDP)), and turn
-the client's keyboard and mouse into the KVM's USB-HID frames — so that an
-RDP client, Windows App on macOS the first, can drive whatever machine the
-KVM is plugged into, with no browser and no re-encode. Not all of that is
-built yet: see the status below.
+the client's keyboard, mouse and clipboard paste into the KVM's USB-HID
+frames — so that an RDP client, Windows App on macOS the first, can drive
+whatever machine the KVM is plugged into, with no browser and no
+re-encode. That is built, but not yet run against the real device or
+Windows App: see the status below.
 
 The first target is the Angeet/Yeeso ES3 ("ONE KVM").
 
-**Status:** in development (Milestone 3a). The bridge runs: NLA-only RDP
-with EGFX AVC420 passthrough of the KVM's H.264, one session at a time (a
-new authenticated client takes over), the KVM's control websocket and HID
-writer, admin endpoints and a graceful shutdown — tested against `kvm-sim`
-with an in-process IronRDP client. Client input is not mapped yet: keyboard
-and mouse events are counted and dropped. Keyboard and mouse mapping, paste
-and clipboard come next (Milestone 3b), after the hardware checks they
-depend on. The bridge has not yet driven the real device, and Windows App
-has not yet been run against it (the owner's acceptance checks).
+**Status:** in development (Milestones 3b and 4). The bridge runs: NLA-only
+RDP with EGFX AVC420 passthrough of the KVM's H.264, one session at a time
+(a new authenticated client takes over), the client's keyboard and mouse
+mapped to the KVM's HID frames with the stuck-key safety below, clipboard
+paste as typing, admin endpoints and a graceful shutdown — tested against
+`kvm-sim` with an in-process IronRDP client. `kvm-probe` has the hardware
+checks a few settings depend on (the paste pace among them), proven against
+`kvm-sim` but not yet run on the real device, so those settings keep their
+safe defaults. The bridge has not yet driven the real device, and Windows
+App has not yet been run against it (the owner's acceptance checks).
 
 The design, and every decision behind it, is
 [the spec](docs/superpowers/specs/2026-10-05-kvm-rdp-design.md).
@@ -58,12 +60,17 @@ The design, and every decision behind it, is
 - **The bridge never logs out of the KVM.** The ES3's logout is global: one
   session's logout invalidates every token, including the vendor web UI's
   break-glass session. The bridge closes its websocket and video streams
-  and lets its token lapse instead.
+  and lets its token lapse instead. `kvm-probe` has no logout either.
 - **Secrets come only from files** named in the config, and are never
-  logged; nor are tokens, keystrokes or HID frames. The bridge reads no
+  logged; nor are tokens, keystrokes, HID frames or pasted text — paste
+  and HID activity shows up as counts in `/metrics`. The bridge reads no
   environment variable but `KVM_RDP_CONFIG` — not even `RUST_LOG`; the
   libraries that log credentials or payloads at debug level are capped at
-  INFO whatever `log.filter` says.
+  INFO whatever `log.filter` says (the clipboard library at ERROR, since
+  its warnings quote client-chosen names). A full-stack test runs the
+  real binary at trace level, types a sentinel and pastes a canary
+  through it, and checks that neither reaches its logs or `/metrics` in
+  any encoding.
 - **A config error never echoes the file.** It names the path and either a
   line and column with a fixed category such as `unknown key` or `wrong value
   type`, or — for a value that parses but breaks a rule — the key and the
@@ -119,6 +126,37 @@ most 64 KiB) and are never logged.
   the supervisor restarts the bridge on the new pair.
 - Exit codes: 0 after a signal or a certificate change, 1 if startup failed
   or the RDP server stopped on its own, 2 on a config or logging error.
+
+## Input and paste
+
+- **Keyboard and mouse.** RDP scancodes become USB-HID usages, and Unicode
+  key events are typed through the US layout; the target machine applies
+  its own layout. Five keys are reported at once, as on the device. The
+  mouse is absolute (left, right and middle buttons, vertical wheel);
+  relative motion, the X1/X2 buttons and horizontal scroll are dropped and
+  counted. `input.mac_remap`, which would undo Windows App's Cmd → Ctrl
+  rewrite, ships off until the acceptance checks have looked at it.
+- **Stuck keys.** RDP never tells the server that the client lost focus,
+  so the bridge releases every key and button itself: when a session
+  starts or ends, on the client's keyboard `Synchronize`, when the KVM's
+  websocket reconnects, when the client suppresses its display (minimised,
+  after a 1 s debounce), at shutdown, and on two timers — a held key with
+  no typematic repeat for `input.key_repeat_timeout` (10 s), or a held
+  modifier with no keyboard event at all for
+  `input.modifier_idle_timeout` (30 s). A key released by a timer or a
+  reconnect is not pressed again by its repeats, only by a fresh press.
+- **Paste is one way, laptop to target, as typing.** Copy on the laptop,
+  press the chord (`paste.chord`, default Ctrl+Option+Shift+V), and let go
+  of the modifiers within `paste.modifier_wait` (5 s): the bridge asks the
+  client for its text and types it at `paste.pace`. Esc or a mouse click
+  stops it, and keys pressed while it types never reach the target. A
+  trailing line break is not typed, characters the US layout cannot type
+  are skipped and counted, and with Caps Lock on the paste is refused
+  (`paste.multiline = "refuse"` refuses multi-line text too). An answer
+  over `paste.max_bytes` (64 KiB) ends the session. Nothing reads the
+  target's clipboard, and a compromised KVM sees what is pasted: don't
+  paste secrets. Through rdpgw, the clipboard channel needs
+  `Caps.EnableClipboard: true`.
 
 ## Development
 
