@@ -149,6 +149,11 @@ pub struct SpsLimits {
     pub max_level_idc: u8,
     pub max_width: u32,
     pub max_height: u32,
+    /// Plan E (DE8): RDP's 200-pixel minimum desktop (MS-RDPEDISP
+    /// 2.2.2.2.1; IronRDP's displaycontrol enforces 200..=8192) — a hostile
+    /// SPS must not shrink the client to a postage stamp.
+    pub min_width: u32,
+    pub min_height: u32,
     pub max_num_ref_frames: u32,
     pub require_no_scaling_matrix: bool,
     pub require_no_hrd: bool,
@@ -161,6 +166,8 @@ impl Default for SpsLimits {
             max_level_idc: 51, // level 5.1
             max_width: 4096,
             max_height: 2304,
+            min_width: 200,
+            min_height: 200,
             max_num_ref_frames: 1,
             require_no_scaling_matrix: true,
             require_no_hrd: true,
@@ -184,6 +191,8 @@ pub enum SpsLimitViolation {
     Level(u8),
     WidthTooLarge(u32),
     HeightTooLarge(u32),
+    WidthTooSmall(u32),
+    HeightTooSmall(u32),
     WidthNotEven(u32),
     HeightNotEven(u32),
     TooManyRefFrames(u32),
@@ -220,6 +229,12 @@ pub fn check_sps_limits(s: &SpsSummary, limits: &SpsLimits) -> Result<(), SpsLim
     }
     if s.height > limits.max_height {
         return Err(SpsLimitViolation::HeightTooLarge(s.height));
+    }
+    if s.width < limits.min_width {
+        return Err(SpsLimitViolation::WidthTooSmall(s.width));
+    }
+    if s.height < limits.min_height {
+        return Err(SpsLimitViolation::HeightTooSmall(s.height));
     }
     // Bitwise `& 1` avoids clippy::arithmetic_side_effects on `%`.
     if s.width & 1 == 1 {
@@ -520,6 +535,29 @@ mod tests {
         assert_eq!(
             check_sps_limits(&s, &lim),
             Err(SpsLimitViolation::HeightTooLarge(2306))
+        );
+
+        // Plan E Task 1.2 (DE8): RDP's 200-pixel minimum desktop.
+        let mut s = ok_summary();
+        s.width = 198;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::WidthTooSmall(198))
+        );
+
+        let mut s = ok_summary();
+        s.height = 198;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::HeightTooSmall(198))
+        );
+
+        let mut s = ok_summary();
+        (s.width, s.height) = (200, 200);
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Ok(()),
+            "200×200 is the floor, admitted"
         );
 
         let mut s = ok_summary();

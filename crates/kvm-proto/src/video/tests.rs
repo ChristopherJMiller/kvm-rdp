@@ -14,7 +14,7 @@ use crate::flv::{FlvDemuxer, FlvError, FlvLimits, FrameType};
 use crate::h264::picture::{AudRefusal, HeaderLimit, SliceRefusal};
 use crate::h264::sanitize::NalRefusal;
 use crate::h264::test_support::{PpsCfg, SliceCfg, SpsCfg};
-use crate::h264::{NalHeader, PinnedField, SpsIncompatibleReason};
+use crate::h264::{NalHeader, PinnedField, SpsIncompatibleReason, SpsLimitViolation};
 
 /// A Baseline 1080p SPS (POC type 2, `log2_max_frame_num` 4) at level 40.
 fn sps() -> Vec<u8> {
@@ -616,6 +616,34 @@ fn an_flv_reconnect_restarts_ct_poc_and_bursts_but_keeps_the_pins() {
     fresh.flv_opened();
     let first = fresh.admit(seq_tag(SpsCfg::main_1080p().build()), now);
     assert_eq!(first.unwrap().params.unwrap().class, ParamClass::Initial);
+}
+
+/// Plan E Task 1.2 (DE8): a sequence header whose SPS codes a picture
+/// under 200 pixels either way is stream_incompatible before it can resize
+/// anything; one at 208×208 (13 macroblocks) is admitted.
+#[test]
+fn a_tiny_frame_is_stream_incompatible() {
+    let tiny = |mbs_minus1: u32| {
+        let mut c = SpsCfg::main_1080p();
+        c.profile_idc = 66;
+        c.level_idc = 40;
+        c.pic_width_in_mbs_minus1 = mbs_minus1;
+        c.pic_height_in_map_units_minus1 = mbs_minus1;
+        c.crop = None;
+        c.build()
+    };
+    let mut a = VideoAdmission::new(AdmissionConfig::default());
+    a.flv_opened();
+    assert_eq!(
+        a.admit(seq_tag(tiny(0)), Instant::now()),
+        Err(incompatible(Incompatible::Sps(
+            SpsIncompatibleReason::OutsideLimits(SpsLimitViolation::WidthTooSmall(16))
+        )))
+    );
+    let mut a = VideoAdmission::new(AdmissionConfig::default());
+    a.flv_opened();
+    let ok = a.admit(seq_tag(tiny(12)), Instant::now()).unwrap();
+    assert_eq!(ok.params.map(|p| p.class), Some(ParamClass::Initial));
 }
 
 #[test]
