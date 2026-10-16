@@ -1324,8 +1324,10 @@ mod tests {
     }
 
     /// m1: nor is a candidate excluded from §6.9's certificate class — an
-    /// SPKI mismatch on it is fatal at once. kvm-sim cannot change its
-    /// certificate mid-session, so the failure is fed in directly.
+    /// SPKI mismatch on it is fatal at once. The classification alone, with
+    /// the failure fed in; over real TLS, after kvm-sim's mid-session
+    /// `rotate_certificate`, it is L2's
+    /// `faults::a_reconnect_candidate_meeting_a_changed_certificate_is_fatal`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_candidate_with_a_cert_mismatch_is_fatal() {
         let mut r = rig(64, |_| {}, |_| {}).await;

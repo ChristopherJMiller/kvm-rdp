@@ -1,13 +1,14 @@
 //! §11.3 Faults, each against its §6.9 class and ErrorInfo. Every fatal
 //! case also checks the cause's label: ErrorInfo 0x7 is shared by six
 //! causes and 0x9 by two (P45).
-use crate::client::{Opts, description, pictures, terminated};
+use crate::client::{Client, Opts, description, pictures, terminated};
 use crate::harness::{
-    KBD_ZERO, SET_MODE, T, env, es3, flv_opens, hid_on, ms, sized, streaming, until, within,
+    Env, KBD_ZERO, SET_MODE, T, env, es3, flv_opens, hid_on, ms, sized, streaming, until, within,
     ws_opens,
 };
+use kvm_rdp::config::IdrPolicy;
 use kvm_rdp::msg::Cause;
-use kvm_sim::{Fault, SimEvent};
+use kvm_sim::{Fault, SimEvent, SimStats};
 use std::time::Instant;
 
 /// Framing violations (§6.2): each one is transient — a reconnect, the
@@ -329,14 +330,45 @@ async fn a_wrong_kvm_certificate_sends_no_login() {
     assert_eq!(s.logins_ok + s.logins_failed, 0);
 }
 
+/// What every mid-session certificate case asserts once the client has
+/// terminated: fatal with `kvm_cert_mismatch` — its description and its
+/// label, since 0x9 is shared with `kvm_auth_failed` — and no other cause;
+/// no re-login, and no logout. After a swap a re-login fails at the web
+/// port's TLS, before `login.lua`, so the login counters cannot see an
+/// attempt and the web port's accepts are the check (PD11a review m1).
+/// Returns kvm-sim's counters then, for the case's own checks.
+async fn assert_cert_fatal(env: &Env, c: &Client, before: &SimStats) -> SimStats {
+    let evs = c.wait_for(T, |e| terminated(e).is_some()).await;
+    assert_eq!(
+        terminated(&evs).unwrap(),
+        description(Cause::KvmCertMismatch)
+    );
+    assert_eq!(env.metrics().disconnects.get("kvm_cert_mismatch"), 1);
+    assert_eq!(env.metrics().disconnects.total(), 1);
+    let s = env.sim.stats();
+    assert_eq!(
+        s.accepts_web, before.accepts_web,
+        "a re-login was attempted after the mismatch"
+    );
+    assert_eq!(
+        (s.logins_ok, s.logins_failed),
+        (before.logins_ok, before.logins_failed),
+        "a re-login after the mismatch"
+    );
+    assert_eq!(s.logouts, 0, "§3.2: the bridge never logs out");
+    s
+}
+
 /// PC7 W10 (ledger carry): the KVM's certificate changes mid-session, and
 /// the websocket's next reconnect meets it. The bridge pins the SPKI
 /// (§3.2), so the new certificate fails the pin: fatal at once,
-/// `kvm_cert_mismatch` (0x9, shared with `kvm_auth_failed`, so the label is
-/// checked too), with no re-login and no logout, and its writer idling
-/// rather than reconnecting (rev 6.3). The mismatch is the websocket's: one
-/// more control connection, which never upgraded, and no FLV reopened (the
-/// open one keeps the certificate it was served).
+/// `kvm_cert_mismatch`, with no re-login and no logout. The mismatch is the
+/// websocket's: one more control connection, which never upgraded, and no
+/// FLV reopened (the open one keeps the certificate it was served). That
+/// the writer then idles rather than reconnecting (rev 6.3) is the
+/// writer's own case (`hid::writer`
+/// `a_reopen_meeting_a_changed_certificate_idles_until_closed`): here the
+/// session's teardown stops the writer within its first backoff.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_certificate_change_mid_session_is_fatal_at_once() {
     let (env, c) = streaming(|_| {}).await;
@@ -345,26 +377,7 @@ async fn a_certificate_change_mid_session_is_fatal_at_once() {
     env.sim.rotate_certificate().unwrap();
     // Force a websocket reconnect: its reopen now hits the new certificate.
     env.sim.close_websockets();
-    let evs = c.wait_for(T, |e| terminated(e).is_some()).await;
-    assert_eq!(
-        terminated(&evs).unwrap(),
-        description(Cause::KvmCertMismatch)
-    );
-    assert_eq!(env.metrics().disconnects.get("kvm_cert_mismatch"), 1);
-    assert_eq!(env.metrics().disconnects.total(), 1);
-    // The writer idles: no control connection after the one that met the
-    // new certificate, however long the backoff (`kvm.backoff.max` 400 ms).
-    let again = env
-        .sim
-        .wait_for(ms(1000), |_| {
-            env.sim.stats().accepts_control > before.accepts_control + 1
-        })
-        .await;
-    assert!(
-        again.is_err(),
-        "the websocket reconnected after the mismatch"
-    );
-    let s = env.sim.stats();
+    let s = assert_cert_fatal(&env, &c, &before).await;
     assert_eq!(
         s.accepts_control,
         before.accepts_control + 1,
@@ -380,10 +393,108 @@ async fn a_certificate_change_mid_session_is_fatal_at_once() {
         (before.accepts_video, 1),
         "an FLV reopened: the mismatch was not the websocket's"
     );
-    assert_eq!(
-        (s.logins_ok, s.logins_failed),
-        (before.logins_ok, before.logins_failed),
-        "a re-login after the mismatch"
+    // The teardown leaves no control connection after the one that met the
+    // new certificate (`kvm.backoff.max` is 400 ms).
+    let again = env
+        .sim
+        .wait_for(ms(1000), |_| {
+            env.sim.stats().accepts_control > before.accepts_control + 1
+        })
+        .await;
+    assert!(
+        again.is_err(),
+        "a control connection after the session's teardown"
     );
-    assert_eq!(s.logouts, 0, "§3.2: the bridge never logs out");
+}
+
+/// §6.9's certificate row holds on any connection (PD11a review I2). The
+/// main FLV: after a mid-session swap its reconnect — kvm-sim closed it —
+/// meets the new certificate, and that is fatal at once with
+/// `kvm_cert_mismatch`, not a transient retry that would end
+/// `kvm_unreachable` at the deadline. One more video connection, no FLV
+/// opened over the new certificate, no side FLV, the websocket untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_main_flv_reconnect_meeting_a_changed_certificate_is_fatal() {
+    let (env, c) = streaming(|_| {}).await;
+    let before = env.sim.stats();
+    env.sim.rotate_certificate().unwrap();
+    env.sim.inject(Fault::Close);
+    let s = assert_cert_fatal(&env, &c, &before).await;
+    let log = env.sim.events();
+    assert_eq!(
+        (s.accepts_video, flv_opens(&log).len()),
+        (before.accepts_video + 1, 1),
+        "not one main reopen, refused at TLS"
+    );
+    assert_eq!(
+        env.metrics().idr_side_failures.total(),
+        0,
+        "a side FLV met it, not the main's reopen"
+    );
+    assert_eq!(ws_opens(&log).len(), 1);
+}
+
+/// §6.9, I2: a side FLV (`idr_policy = side`, a re-advertise past the
+/// main FLV's setup window) meets the swapped certificate: fatal at once
+/// through the session's side path (`idr_side_failures{cert}`), never the
+/// fallback `ReconnectFlv` a side failure of any other kind leads to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_side_flv_meeting_a_changed_certificate_is_fatal() {
+    let env = env(es3(), |c| {
+        sized(c);
+        c.video.idr_policy = IdrPolicy::Side;
+    })
+    .await;
+    let c = env.client(Opts::new(2));
+    // 1.5 s after the FLV's first IDR: the re-advertise's request goes at once.
+    c.wait_for(T, |e| pictures(e).len() >= 45).await;
+    let before = env.sim.stats();
+    env.sim.rotate_certificate().unwrap();
+    c.readvertise();
+    let s = assert_cert_fatal(&env, &c, &before).await;
+    assert_eq!(env.metrics().idr_requests.get("side"), 1);
+    assert_eq!(env.metrics().idr_side_failures.get("cert"), 1);
+    assert_eq!(
+        env.metrics().idr_side_fallbacks.get(),
+        0,
+        "the side FLV's mismatch fell back to a ReconnectFlv"
+    );
+    assert_eq!(
+        (s.accepts_video, flv_opens(&env.sim.events()).len()),
+        (before.accepts_video + 1, 1),
+        "not one side FLV, refused at TLS"
+    );
+}
+
+/// §6.9, I2: a make-before-break `ReconnectFlv` candidate
+/// (`idr_policy = reconnect`, a re-advertise past the setup window) meets
+/// the swapped certificate: fatal at once, not a failed candidate that the
+/// IDR core asks again for while the old FLV flows on
+/// (`upstream_reconnects{commanded_failed}`). The end-to-end form of the
+/// lib's `kvm::video` `a_candidate_with_a_cert_mismatch_is_fatal`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnect_candidate_meeting_a_changed_certificate_is_fatal() {
+    let env = env(es3(), |c| {
+        sized(c);
+        c.video.idr_policy = IdrPolicy::Reconnect;
+    })
+    .await;
+    let c = env.client(Opts::new(2));
+    c.wait_for(T, |e| pictures(e).len() >= 45).await;
+    let before = env.sim.stats();
+    env.sim.rotate_certificate().unwrap();
+    c.readvertise();
+    let s = assert_cert_fatal(&env, &c, &before).await;
+    assert_eq!(env.metrics().idr_requests.get("reconnect"), 1);
+    assert_eq!(
+        env.metrics().upstream_reconnects.get("commanded_failed"),
+        0,
+        "the candidate's mismatch was retried"
+    );
+    assert_eq!(env.metrics().idr_side_failures.total(), 0);
+    assert_eq!(
+        (s.accepts_video, flv_opens(&env.sim.events()).len()),
+        (before.accepts_video + 1, 1),
+        "not one candidate, refused at TLS"
+    );
 }
