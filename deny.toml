@@ -16,7 +16,12 @@ yanked = "deny"
 # RUSTSEC-2023-0071 — PENDING OWNER SIGN-OFF (before the first push; Plan E
 # owner items). rsa: the Marvin attack — rsa's private-key operations are
 # not constant-time (PKCS#1 v1.5 decryption padding; no default blinding,
-# which signing shares); no fixed release exists.
+# which signing shares). The fix is rsa 0.10.0 (the advisory's patched
+# range is >= 0.10.0; rc.18 is unpatched), which IronRDP cannot reach:
+# every Devolutions release pins rsa = "=0.10.0-rc.18" (picky, sspi,
+# winscard) and IronRDP pins picky exactly. The owner declined forking
+# three crypto crates, because the bridge performs no rsa private-key
+# operation (below).
 # Where it is: rsa 0.10.0-rc.18, reached only through IronRDP — picky
 #   7.0.0-rc.25 (via ironrdp-connector, which ironrdp-acceptor and
 #   ironrdp-server use), sspi 0.21.3 and winscard 0.3.3 (`cargo tree -i rsa
@@ -47,10 +52,11 @@ yanked = "deny"
 # Mitigation: none needed — at c99eece2 ironrdp-server has no Kerberos (or
 #   PKU2U) option at all (accept_credssp(…, None) is a literal), and kvm-rdp
 #   calls only with_hybrid. Re-read at every IronRDP pin bump (Task 6.1's
-#   pin-review checklist), and drop this entry when rsa ships a fixed
-#   release.
+#   pin-review checklist), and at each one run `cargo update -p rsa
+#   --dry-run --verbose`: once the chain reaches rsa >= 0.10.0, drop this
+#   entry.
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin) via IronRDP's picky/sspi/winscard: the bridge's NTLM-only CredSSP and its rustls/aws-lc TLS key perform no rsa private-key operation — PENDING OWNER SIGN-OFF" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin) via IronRDP's picky/sspi/winscard: the bridge's NTLM-only CredSSP and its rustls/aws-lc TLS key perform no rsa private-key operation — PENDING OWNER SIGN-OFF; fixed in rsa 0.10.0, unreachable through IronRDP's exact picky/sspi/winscard pins" },
 ]
 
 [licenses]
