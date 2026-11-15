@@ -6,8 +6,8 @@
 # Both bases are pinned by digest (scripts/check-workflows.sh refuses an
 # unpinned one); bump them with scripts/pin-image.sh at the monthly IronRDP
 # pin review (§4.2).
-ARG BUILDER=docker.io/library/rust:1.94.1-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2
-ARG RUNTIME=gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+ARG BUILDER=docker.io/library/rust:1.94.1-slim-trixie@sha256:cf09adf8c3ebaba10779e5c23ff7fe4df4cccdab8a91f199b0c142c53fef3e1a
+ARG RUNTIME=gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2
 
 FROM ${BUILDER} AS build
 # The builder's 1.94.1, named so rustup ignores rust-toolchain.toml's extra
