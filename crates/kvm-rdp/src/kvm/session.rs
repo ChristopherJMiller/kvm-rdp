@@ -568,8 +568,11 @@ impl<'d> Session<'d> {
         if self.login.is_none() && self.login_retry_at.is_some_and(|t| now >= t) {
             self.start_login();
         }
-        let token = self.token.borrow().clone();
-        if let Some(o) = self.video.tick(now, token.as_ref()) {
+        // Borrowed for the synchronous tick only, and released before the
+        // await: never a fresh copy of the secret 10 times a second (PE12
+        // review m6).
+        let o = self.video.tick(now, self.token.borrow().as_ref());
+        if let Some(o) = o {
             self.outcome(o).await;
         }
     }
@@ -1154,8 +1157,46 @@ mod tests {
     /// counted and the new request goes ahead (here it finds no token).
     #[tokio::test]
     async fn a_finished_side_flv_never_makes_the_next_request_busy() {
+        let deps = offline_deps();
+        let metrics = deps.metrics.clone();
+        let mut s = Session::new(1, &deps);
+        s.side = Some(tokio::spawn(async { Err(KvmError::Http(503)) }));
+        while !s.side.as_ref().is_some_and(JoinHandle::is_finished) {
+            tokio::task::yield_now().await;
+        }
+        s.request_idr().await;
+        let f = &metrics.idr_side_failures;
+        assert_eq!(
+            (f.get("busy"), f.get("http"), f.get("no_token")),
+            (0, 1, 1),
+            "busy / the finished side's result / the new request"
+        );
+        s.ws_task.abort();
+    }
+
+    /// PE12 review m6: a tick reads the session's token where it lies — no
+    /// fresh copy of the secret, and no allocation, on each 100 ms tick of
+    /// the session. (A fresh session's video is not wanted yet, so the tick
+    /// reaches the token and nothing else.)
+    #[tokio::test]
+    async fn a_tick_copies_no_token() {
+        use crate::alloc_stats::this_thread;
+        let deps = offline_deps();
+        let mut s = Session::new(1, &deps);
+        let token = kvm_proto::parse_login_token(br#"{"result":0,"token":"0.1"}"#).unwrap();
+        s.token.send_replace(Some((1, token)));
+        let before = this_thread();
+        for _ in 0..10 {
+            s.tick().await;
+        }
+        assert_eq!(this_thread() - before, 0, "allocations in 10 ticks");
+        s.ws_task.abort();
+    }
+
+    /// Deps for a `Session` driven by hand: nothing listens at the KVM.
+    fn offline_deps() -> KvmDeps {
         let metrics = Arc::new(Metrics::default());
-        let deps = KvmDeps {
+        KvmDeps {
             ep: Arc::new(KvmEndpoint::new(
                 Scheme::Https,
                 "127.0.0.1",
@@ -1181,21 +1222,8 @@ mod tests {
             }),
             to_pump: mpsc::channel(8).0,
             hid: Arc::new(HidControl::new(16, metrics.clone())),
-            metrics: metrics.clone(),
-        };
-        let mut s = Session::new(1, &deps);
-        s.side = Some(tokio::spawn(async { Err(KvmError::Http(503)) }));
-        while !s.side.as_ref().is_some_and(JoinHandle::is_finished) {
-            tokio::task::yield_now().await;
+            metrics,
         }
-        s.request_idr().await;
-        let f = &metrics.idr_side_failures;
-        assert_eq!(
-            (f.get("busy"), f.get("http"), f.get("no_token")),
-            (0, 1, 1),
-            "busy / the finished side's result / the new request"
-        );
-        s.ws_task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
