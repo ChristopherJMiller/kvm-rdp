@@ -231,10 +231,13 @@ large() {
 # sliced-threads=0, as every other fixture: -tune zerolatency with -threads 4
 # would cut each AU into four slices, which no ES3 stream does; and
 # -filter_threads 4, or the lavfi graph takes one thread per CPU (§13).
+# Baseline, as the ES3 sends (census.md; PE12 review m7): Main's weighted
+# prediction made admission's slice-header parse allocate per P frame
+# (h264-reader's pred_weight_table), which no ES3 stream does.
 bench_enc() { # OUT SIZE FPS BLOCK_W BLOCK_H SOURCE NOISE — SOURCE ends in = or : (its options follow)
   "${FF[@]}" -filter_threads 4 -f lavfi -i "${6}size=$2:rate=$3" \
     -vf "$7,$(barcode "$4" "$5"),scale=out_color_matrix=bt709:out_range=pc,format=yuv420p" \
-    -t 20 -an -c:v libx264 -preset veryfast -tune zerolatency -profile:v main -level:v 4.2 \
+    -t 20 -an -c:v libx264 -preset veryfast -tune zerolatency -profile:v baseline -level:v 4.2 \
     -bf 0 -threads 4 \
     -x264-params "sliced-threads=0:keyint=$3:min-keyint=$3:scenecut=0:aud=1:repeat-headers=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=pc" \
     -b:v 8M -maxrate 8M -bufsize 8M -f h264 "$1"
