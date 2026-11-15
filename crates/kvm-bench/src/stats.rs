@@ -9,7 +9,8 @@ pub fn percentile(xs: &[f64], p: f64) -> Option<f64> {
     }
     let mut v = xs.to_vec();
     v.sort_by(f64::total_cmp);
-    let rank = (p / 100.0 * v.len() as f64).ceil() as usize;
+    // p·n first: p/100 can round up past an exact rank (PE12 review m3).
+    let rank = (p * v.len() as f64 / 100.0).ceil() as usize;
     v.get(rank.clamp(1, v.len()) - 1).copied()
 }
 
@@ -63,6 +64,22 @@ mod tests {
         assert_eq!(percentile(&xs, 0.0), None);
         let s = summarize(&xs).unwrap();
         assert_eq!((s.n, s.p50, s.p99, s.max), (100, 50.0, 99.0, 100.0));
+    }
+
+    /// PE12 review m3: the rank is p·n/100 rounded up. Dividing p by 100
+    /// first rounds some ranks just past an integer (0.07 · 100 is
+    /// 7.000000000000001), so p7 of 1..=100 read 8.
+    #[test]
+    fn a_rank_is_exact_for_every_p() {
+        let xs: Vec<f64> = (1..=100).map(f64::from).collect();
+        for p in [7, 14, 28, 55, 56] {
+            assert_eq!(percentile(&xs, f64::from(p)), Some(f64::from(p)), "p{p}");
+        }
+        assert_eq!(
+            percentile(&[1.0, 2.0, 3.0], 50.0),
+            Some(2.0),
+            "rank 1.5 → 2"
+        );
     }
 
     #[test]

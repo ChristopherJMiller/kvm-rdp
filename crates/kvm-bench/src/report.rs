@@ -146,4 +146,38 @@ mod tests {
             "{json}"
         );
     }
+
+    /// PE12 review I2: the thresholds decide every verdict, so each bound
+    /// is pinned at its value — a check passes there and fails just past
+    /// it — under both thresholds: strict is §10.1's own numbers, ci's
+    /// timing is 1.5× (DE10 forbids 10×) and its performance 10×.
+    #[test]
+    fn every_bound_passes_at_its_value_and_fails_past_it() {
+        let verdicts = |r: &Report| r.checks.iter().map(|c| c.pass).collect::<Vec<_>>();
+        let mut c = Report::new("t", Thresholds::Ci);
+        c.timing_at_most("x", 23.25, 15.5);
+        c.timing_at_most("x", 23.26, 15.5);
+        c.perf_at_most("x", 50.0, 5.0);
+        c.perf_at_most("x", 50.01, 5.0);
+        assert_eq!(verdicts(&c), [true, false, true, false]);
+        let mut s = Report::new("t", Thresholds::Strict);
+        s.perf_at_most("x", 5.0, 5.0);
+        s.perf_at_most("x", 5.0001, 5.0);
+        s.timing_at_most("x", 15.5, 15.5);
+        s.timing_at_most("x", 15.51, 15.5);
+        s.at_most("x", 0.01, 0.01);
+        s.at_most("x", 0.0101, 0.01);
+        s.at_least("x", 0.99, 0.99);
+        s.at_least("x", 0.9899, 0.99);
+        s.within("x", 7.5, 10.0, 0.25);
+        s.within("x", 12.5, 10.0, 0.25);
+        s.within("x", 7.49, 10.0, 0.25);
+        s.within("x", 12.51, 10.0, 0.25);
+        assert_eq!(
+            verdicts(&s),
+            [
+                true, false, true, false, true, false, true, false, true, true, false, false
+            ]
+        );
+    }
 }

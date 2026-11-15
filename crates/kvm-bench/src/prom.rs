@@ -5,18 +5,11 @@ use std::collections::BTreeMap;
 pub struct Scrape(pub BTreeMap<String, f64>);
 
 impl Scrape {
-    /// Every `series value` line; comments and unparsable lines skipped.
+    /// Every `series value [timestamp]` line; comments, blank lines and
+    /// unparsable lines skipped.
     #[must_use]
     pub fn parse(text: &str) -> Scrape {
-        Scrape(
-            text.lines()
-                .filter(|l| !l.starts_with('#'))
-                .filter_map(|l| {
-                    let (series, value) = l.rsplit_once(' ')?;
-                    Some((series.to_owned(), value.trim().parse().ok()?))
-                })
-                .collect(),
-        )
+        Scrape(text.lines().filter_map(sample).collect())
     }
 
     /// A series' value; 0 when absent — a family renders a label only once
@@ -65,6 +58,31 @@ impl Scrape {
     }
 }
 
+/// One sample line of the text format (PE12 review m4): blanks around it
+/// ignored, `#` first is a comment, then the series, its value and an
+/// optional integer timestamp. A label value may hold blanks and braces;
+/// the value and the timestamp hold neither, so a label set ends at the
+/// line's last `}`.
+fn sample(line: &str) -> Option<(String, f64)> {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return None;
+    }
+    let end = match line.find('{') {
+        Some(_) => line.rfind('}')? + 1,
+        None => line.find(char::is_whitespace)?,
+    };
+    let (series, rest) = line.split_at(end);
+    let mut fields = rest.split_whitespace();
+    let value = fields.next()?.parse().ok()?;
+    match (fields.next(), fields.next()) {
+        (None, _) => {}
+        (Some(ts), None) if ts.parse::<i64>().is_ok() => {}
+        _ => return None,
+    }
+    Some((series.to_owned(), value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +128,49 @@ mod tests {
         let d = b.family_delta(&a, "kvm_rdp_frames_dropped_total", "reason");
         assert_eq!(d.get("soft_gate"), Some(&3.0));
         assert_eq!(d.get("paused"), Some(&1.0));
+    }
+
+    /// PE12 review m4: the text format's other forms — a timestamp after
+    /// the value, blanks around a line, an indented comment, a label value
+    /// holding a blank or a brace — and nothing else: a comment whose last
+    /// word is a number, a line with no value or too many fields.
+    #[test]
+    fn a_scrape_reads_every_form_of_a_sample_line() {
+        let s = Scrape::parse(
+            &[
+                "h 3 1700000000",
+                "trailing 4 ",
+                "\t indented 5",
+                "  # HELP kvm_rdp_x 6",
+                "# HELP kvm_rdp_y 7",
+                "#tight 8",
+                "f{reason=\"a b\"} 2",
+                "g{path=\"}\",le=\"+Inf\"} +Inf 1700000000",
+                "no_value",
+                "too many 1 2",
+                "",
+            ]
+            .join("\n"),
+        );
+        let want: BTreeMap<String, f64> = [
+            ("h", 3.0),
+            ("trailing", 4.0),
+            ("indented", 5.0),
+            ("f{reason=\"a b\"}", 2.0),
+            ("g{path=\"}\",le=\"+Inf\"}", f64::INFINITY),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        assert_eq!(s.0, want);
+    }
+
+    /// PE12 review m4: a family's labels that did not move are left out.
+    #[test]
+    fn a_family_delta_leaves_out_what_did_not_move() {
+        let a = Scrape::parse("f{reason=\"x\"} 1\nf{reason=\"y\"} 4\n");
+        let b = Scrape::parse("f{reason=\"x\"} 1\nf{reason=\"y\"} 6\n");
+        let d = b.family_delta(&a, "f", "reason");
+        assert_eq!(d.into_iter().collect::<Vec<_>>(), [("y".to_owned(), 2.0)]);
     }
 }
