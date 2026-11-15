@@ -3,7 +3,8 @@
 //! profile on coded tags (0 on the sequence header), the profile's NAL
 //! length size, timestamps per `SimConfig::timestamps` — with one-shot
 //! faults applied on the wire. Every write is timed (`max_flv_write_block`)
-//! and each coded tag's is stamped (`FlvAu`'s instant is `sim_tx`).
+//! and each coded tag's is stamped as it starts (`FlvAu`'s instant is
+//! `sim_tx`, which so bounds the send from below: PE12 review I1).
 use crate::encoder::{EncoderHandle, Item, OutFrame};
 use crate::http::{FLV_HEAD, Request, respond};
 use crate::source::nal_type;
@@ -71,13 +72,16 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         u32::try_from(ms).unwrap_or(u32::MAX)
     }
 
+    /// Writes `bytes`, timing the whole write (`max_flv_write_block`), and
+    /// returns when it started: no reader can have a byte before then. The
+    /// instant `write_all` returned can come after the bridge has already
+    /// forwarded the frame (PE12 review I1).
     async fn write(&mut self, bytes: &[u8]) -> std::io::Result<Instant> {
         let start = Instant::now();
         self.out.write_all(bytes).await?;
         self.out.flush().await?;
-        let done = Instant::now();
-        self.shared.write_blocked(done - start);
-        Ok(done)
+        self.shared.write_blocked(start.elapsed());
+        Ok(start)
     }
 
     async fn sequence_header(&mut self, sps: &[u8], pps: &[u8]) -> std::io::Result<()> {
@@ -357,4 +361,52 @@ pub(crate) async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, w.out.shutdown()).await;
     shared.record(SimEvent::FlvClose { conn });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PE12 review I1: `sim_tx` is when a tag's write starts, so it bounds
+    /// the send from below — no reader can have a byte of the tag before
+    /// it. Here a reader that starts draining 50 ms late holds a 4 KiB
+    /// write in a 64-byte pipe: the stamp is from before the reader began,
+    /// and the write-block figure is still the whole write.
+    #[tokio::test]
+    async fn a_write_is_stamped_when_it_starts() {
+        let (out, mut rd) = tokio::io::duplex(64);
+        let shared = Arc::new(Shared::default());
+        let mut w = Writer {
+            out,
+            profile: Profile::es3(),
+            timestamps: Timestamps::default(),
+            opened: Instant::now(),
+            conn: 0,
+            shared: shared.clone(),
+            frames_written: 0,
+            seen_idr: false,
+            skip: None,
+            alter: None,
+            frames_seen: 0,
+            silenced: false,
+            pending: None,
+            held: None,
+            inband_next: None,
+        };
+        let reader = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let began = Instant::now();
+            let mut buf = vec![0u8; 4096];
+            rd.read_exact(&mut buf).await.map(|_| began)
+        });
+        let sim_tx = w.write(&[0x5A; 4096]).await.unwrap();
+        let began = reader.await.unwrap().unwrap();
+        assert!(
+            sim_tx < began,
+            "stamped {:?} after the reader began",
+            sim_tx.saturating_duration_since(began)
+        );
+        let block = shared.stats().max_flv_write_block;
+        assert!(block >= Duration::from_millis(50), "{block:?}");
+    }
 }

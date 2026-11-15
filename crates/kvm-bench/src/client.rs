@@ -91,7 +91,9 @@ pub struct Log {
     pub connected: Option<Instant>,
     pub ended: Option<(Instant, String)>,
     pub rx: Vec<Rx>,
-    /// Each key press, `(scancode, written)` — when its PDU's write returned.
+    /// Each key press, `(scancode, stamped)` — stamped before its PDU is
+    /// encoded and written, so the stamp bounds the press from below (PE12
+    /// review I1); logged once the write returned.
     pub keys: Vec<(u8, Instant)>,
     pub last_read: Option<Instant>,
 }
@@ -124,6 +126,9 @@ enum Ctl {
     Key(u8, bool),
     Readvertise,
     Close,
+    /// A `Shape` change: the loop reads `Shape` at its top only, and with
+    /// reading off and no ack queued it waits on nothing else (PE12 m1).
+    Wake,
 }
 
 pub struct BenchClient {
@@ -150,6 +155,7 @@ impl BenchClient {
 
     pub fn shape(&self, f: impl FnOnce(&mut Shape)) {
         f(&mut lock(&self.shape));
+        let _ = self.ctl.send(Ctl::Wake);
     }
 
     pub fn with_log<R>(&self, f: impl FnOnce(&Log) -> R) -> R {
@@ -412,6 +418,9 @@ fn run(
             tokio::select! {
                 c = ctl.recv() => match c {
                     Some(Ctl::Key(code, pressed)) => {
+                        // Before the PDU exists: the stamp bounds the press
+                        // from below (PE12 review I1).
+                        let stamped = Instant::now();
                         let flags = if pressed { KeyboardFlags::empty() } else { KeyboardFlags::RELEASE };
                         let out = match stage.process_fastpath_input(&mut image, &[FastPathInputEvent::KeyboardEvent(flags, code)]) {
                             Ok(o) => o,
@@ -425,9 +434,10 @@ fn run(
                             }
                         }
                         if pressed {
-                            lock(&log).keys.push((code, Instant::now()));
+                            lock(&log).keys.push((code, stamped));
                         }
                     }
+                    Some(Ctl::Wake) => {}
                     Some(Ctl::Readvertise) => {
                         let Some(cid) = stage.get_dvc::<Capture>().map(|c| c.channel_id()) else { continue };
                         let msg: DvcMessage = Box::new(GfxPdu::CapabilitiesAdvertise(CapabilitiesAdvertisePdu(opts.caps.clone())));
@@ -591,10 +601,17 @@ impl DvcProcessor for Capture {
                             frame_id: end.frame_id,
                             total_frames_decoded: self.decoded,
                         };
-                        if s.ack_delay.is_zero() {
+                        // A FIFO link (PE12 review m2): while acks wait, a
+                        // new one goes behind them, however short its own
+                        // delay — never ahead, as when a delay ends.
+                        let mut q = lock(&self.acks);
+                        if s.ack_delay.is_zero() && q.is_empty() {
                             replies.push(Box::new(GfxPdu::FrameAcknowledge(ack)));
                         } else {
-                            lock(&self.acks).push_back((at + s.ack_delay, ack));
+                            let due = q
+                                .back()
+                                .map_or(at + s.ack_delay, |(t, _)| (*t).max(at + s.ack_delay));
+                            q.push_back((due, ack));
                         }
                     }
                 }

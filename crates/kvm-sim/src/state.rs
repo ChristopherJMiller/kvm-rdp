@@ -37,8 +37,10 @@ pub enum SimEvent {
     FlvClose {
         conn: u64,
     },
-    /// One coded tag written; `at` of the stamped event is `sim_tx` (the
-    /// moment `write_all` of its last byte returned, §10.1).
+    /// One coded tag written; `at` of the stamped event is `sim_tx` (§10.1):
+    /// the moment the tag's write started, so no reader has any of it
+    /// earlier (PE12 review I1; spec rev 6.4 restates §10.1's "when
+    /// `write_all` of the tag's last byte returns").
     FlvAu {
         conn: u64,
         seq: u64,

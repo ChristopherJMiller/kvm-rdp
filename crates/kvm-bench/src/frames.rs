@@ -6,6 +6,10 @@ use std::time::Instant;
 /// End-to-end latencies in ms: each received `(frame_id, arrival)` minus
 /// the latest send of that id at or before the arrival (a looped source
 /// sends each id once per loop); and how many arrivals matched no send.
+/// A send's stamp bounds it from below (kvm-sim stamps a tag's write as it
+/// starts), so an arrival is never its own send's before it; one nearer the
+/// next send of its id than that latest one counts as unmatched — never as
+/// a latency of most of a loop (PE12 review I1).
 #[must_use]
 pub fn latencies(sent: &[(u64, Instant)], received: &[(u64, Instant)]) -> (Vec<f64>, usize) {
     let mut by_id: HashMap<u64, Vec<Instant>> = HashMap::new();
@@ -19,7 +23,11 @@ pub fn latencies(sent: &[(u64, Instant)], received: &[(u64, Instant)]) -> (Vec<f
     for (id, at) in received {
         let tx = by_id.get(id).and_then(|v| {
             let i = v.partition_point(|t| t <= at);
-            i.checked_sub(1).and_then(|j| v.get(j))
+            let tx = v.get(i.checked_sub(1)?)?;
+            match v.get(i) {
+                Some(next) if next.duration_since(*at) < at.duration_since(*tx) => None,
+                _ => Some(tx),
+            }
         });
         match tx {
             Some(tx) => out.push(at.duration_since(*tx).as_secs_f64() * 1000.0),
@@ -43,20 +51,31 @@ pub fn unique_loop(ids: &[u64], fps: u32, min_secs: f64) -> Result<(), String> {
     }
 }
 
-/// Input latencies in ms (§10.1): each press `(usage, written)` against the
-/// first keyboard report (§3.3: `AA AA 08 …`, first key slot at byte 7) at
-/// or after it carrying that usage, each report used once, in order; and
-/// how many presses met none.
+/// Input latencies in ms (§10.1): each press `(usage, stamped)` — stamped
+/// before its write, so the stamp bounds it from below — against the first
+/// keyboard report (§3.3: `AA AA 08 …`, first key slot at byte 7) carrying
+/// that usage, from the press's stamp up to the next press of that usage's
+/// (so one missed press is one miss, never every later press a cycle late:
+/// PE12 review I1), each report used once, in order; and how many presses
+/// met none.
 #[must_use]
 pub fn input_latencies(
     presses: &[(u8, Instant)],
     reports: &[(Instant, Vec<u8>)],
 ) -> (Vec<f64>, usize) {
     let (mut out, mut missed, mut cursor) = (Vec::new(), 0, 0);
-    for (usage, sent) in presses {
-        let hit = reports[cursor..]
+    for (k, (usage, sent)) in presses.iter().enumerate() {
+        let until = presses[k + 1..]
             .iter()
-            .position(|(at, b)| at >= sent && b.len() >= 8 && b[2] == 0x08 && b[7] == *usage);
+            .find(|(u, _)| u == usage)
+            .map(|(_, t)| *t);
+        let hit = reports[cursor..].iter().position(|(at, b)| {
+            at >= sent
+                && until.is_none_or(|u| *at <= u)
+                && b.len() >= 8
+                && b[2] == 0x08
+                && b[7] == *usage
+        });
         match hit {
             Some(i) => {
                 out.push(reports[cursor + i].0.duration_since(*sent).as_secs_f64() * 1000.0);
@@ -112,5 +131,68 @@ mod tests {
         let (lat, missed) = input_latencies(&presses, &reports);
         assert_eq!(lat, [2.0, 3.0]);
         assert_eq!(missed, 1);
+    }
+
+    /// PE12 review I1: a loop-2 arrival 30 µs before its own send's stamp
+    /// — a stamp taken once the write returned allows it — is never
+    /// matched to loop 1's send of that id, 20 s earlier: a 20 s latency in
+    /// the sample, and not "unmatched". With the stamp taken before the
+    /// write (kvm-sim's `sim_tx` since), the same frame meets its own send.
+    #[test]
+    fn a_loop_two_arrival_is_never_matched_to_loop_one() {
+        let t = Instant::now();
+        let us = |n: u64| t + Duration::from_micros(n);
+        let received = [(1, us(20_000_000))];
+        // Stamped when the loop-2 write returned, 30 µs after the arrival.
+        let (lat, unmatched) = latencies(&[(1, us(0)), (1, us(20_000_030))], &received);
+        assert_eq!((lat, unmatched), (vec![], 1));
+        // Stamped when it started, before the frame could arrive.
+        let (lat, unmatched) = latencies(&[(1, us(0)), (1, us(19_999_970))], &received);
+        assert_eq!(unmatched, 0);
+        assert!(lat.len() == 1 && (lat[0] - 0.03).abs() < 1e-9, "{lat:?}");
+    }
+
+    /// PE12 review I1: a press whose report never came is one miss. The
+    /// search stops at the next press of the same key, so the miss never
+    /// takes that press's report and pushes every later press a cycle late.
+    #[test]
+    fn a_missed_press_never_takes_the_next_press_of_its_key() {
+        let t = Instant::now();
+        let ms = |n: u64| t + Duration::from_millis(n);
+        let kbd = |usage: u8| vec![0xAA, 0xAA, 0x08, 0, 0, 0, 0, usage, 0, 0, 0, 0];
+        // Two cycles of a, b; the first a's report is lost.
+        let presses = [
+            (0x04, ms(10)),
+            (0x05, ms(20)),
+            (0x04, ms(30)),
+            (0x05, ms(40)),
+        ];
+        let reports = vec![
+            (ms(22), kbd(0x05)),
+            (ms(32), kbd(0x04)),
+            (ms(42), kbd(0x05)),
+        ];
+        let (lat, missed) = input_latencies(&presses, &reports);
+        assert_eq!((lat, missed), (vec![2.0, 2.0, 2.0], 1));
+    }
+
+    /// PE12 review m5: only a keyboard report (`AA AA 08`) is a press's —
+    /// a pointer report whose byte 7 (`yLo`) happens to equal the usage is
+    /// not — and a report meets one press only: one at the instant of the
+    /// next press of its key is the earlier press's, and the next press
+    /// takes the report after it.
+    #[test]
+    fn a_report_is_a_keyboard_report_and_meets_one_press() {
+        let t = Instant::now();
+        let ms = |n: u64| t + Duration::from_millis(n);
+        let kbd = |usage: u8| vec![0xAA, 0xAA, 0x08, 0, 0, 0, 0, usage, 0, 0, 0, 0];
+        let pointer = vec![0xAA, 0xAA, 0x05, 0x51, 0x00, 0x00, 0x40, 0x04, 0x20];
+        let (lat, missed) =
+            input_latencies(&[(0x04, ms(10))], &[(ms(11), pointer), (ms(12), kbd(0x04))]);
+        assert_eq!((lat, missed), (vec![2.0], 0));
+        let presses = [(0x04, ms(10)), (0x04, ms(20))];
+        let reports = vec![(ms(20), kbd(0x04)), (ms(25), kbd(0x04))];
+        let (lat, missed) = input_latencies(&presses, &reports);
+        assert_eq!((lat, missed), (vec![10.0, 5.0], 0));
     }
 }
