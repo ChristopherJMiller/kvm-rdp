@@ -13,12 +13,15 @@ Milestones 5 and 6 settled, against the code as built. DE*n* are Plan E's
 recorded deviations (`docs/superpowers/plans/2026-10-15-kvm-rdp-plan-e.md`);
 every amended passage below is marked "rev 6.4". The owner's hardware run
 (Plan D Task 1.6) and Windows App acceptance run have not happened yet, so
-every value they would retune keeps its written default. Nothing has run
-in CI yet either — nothing was pushed before the merge that ends Plan E —
-so every CI, nightly and owner-triggered figure below reads "not yet run",
-and the absolute perf verdict (DE11) waits for the nightly's strict run on
-GitHub's runner. The change log supersedes nothing in rev 6.3's; it is
-added to it. One line per change:
+every value they would retune keeps its written default. At rev 6.4
+(2026-11-15) Plans C–E had never been pushed, so none of their CI had
+run: `main` was still Plan B's, running Plan B's `ci.yml` on a push and
+its fuzz nightly every night — red on most nights, on the level-1b oracle
+Task 2.4 fixes. So every figure below from Plan E's CI — its jobs, its
+nightly and the owner's triggers — reads "not yet run", and the absolute
+perf verdict (DE11) waits for the nightly's strict run on GitHub's
+runner. The change log supersedes nothing in rev 6.3's; it is added to
+it. One line per change:
 
 - DE1 (§4.1): the image is a Dockerfile — both bases pinned by digest (Debian 13 since DE17), `cargo build --release --locked -p kvm-rdp -p kvm-probe`, `--remap-path-prefix`, DWARF stripped, `MALLOC_ARENA_MAX=2`, user `65532:65532`, amd64 only, a pinned BuildKit with `SOURCE_DATE_EPOCH` and `rewrite-timestamp=true`; pushed as `ghcr.io/christopherjmiller/kvm-rdp:sha-<short>`, signed keyless with cosign and attested with GitHub build provenance.
 - DE2 (§9.1): "CI checks the published image rejects any other mode" is a check on the wire — the smoke test's X.224 requests for TLS only, standard RDP security and a legacy request with no RDP_NEG_REQ are closed with no reply, and an NLA client's request gets `HYBRID` selected — and the image refuses `[test]` at load, exit 2.
@@ -40,7 +43,7 @@ added to it. One line per change:
 - DE18 (§10.1): the soak runs two warm-up churn cycles before its window (minutes 1 and 3 of the hour), and checks §10.1's strict bounds only on a run of 60 minutes or more.
 - DE19 (§10.1): the whole-process allocation row is a measured regression baseline, 1.1 × (70 + bytes/255) per frame; third-party code, not the bridge, makes the difference from the old guess.
 - DE20 (§10.1, §10.2): every latency stamp is taken before its send — `sim_tx` as kvm-sim starts writing the tag, a key press before its PDU, the null bridge before `send_avc420_frame`.
-- DE21 (§11.4): FreeRDP 3.32.1 refuses AVC420 under `/gfx:frame-ack:off` or a bare `/gfx`; the ack-suspension case runs `/gfx:AVC420,frame-ack:off`, and the ladder is recorded with no `/gfx`, census Leg C's condition.
+- DE21 (§11.4): FreeRDP 3.32.1 advertises AVC420 off under `/gfx:frame-ack:off` or a bare `/gfx`, so the bridge ends that session `no_avc420`; the ack-suspension case runs `/gfx:AVC420,frame-ack:off`, and the ladder is recorded with no `/gfx`, census Leg C's condition.
 - DE22 (§4.2, §12): RUSTSEC-2023-0071 is fixed in rsa 0.10.0, which IronRDP's exact picky/sspi/winscard pins cannot reach; the ignore stays, signed off by the owner (2026-11-15), until the pin review finds the chain on rsa ≥ 0.10.0. Five other advisories of 2026-11-15 were cleared by lockfile bumps.
 - §4.1: `kvm-bench` as built — a pure `kvm_bench` library (statistics and the soak's arithmetic, the `/metrics` parser, the report and its thresholds, the frame and input matchers, the link shaper) and an IO binary with no tests (kvm-sim, the lean client, the bridge as a subprocess, the null bridge, which uses `ironrdp-server`).
 - §4.2: a pin review checklist, monthly and on every IronRDP pin bump, with the upstream caps still missing (SVC/DVC reassembly, the CLIPRDR format count, per-PDU WARNs), the release-candidate crypto and RUSTSEC-2023-0071's trigger, L3's ladder, `kvm-bench`, and beside it the Actions, image and BuildKit pins (distroless's supported list included) and `cargo deny`.
@@ -51,12 +54,12 @@ added to it. One line per change:
 - §7.4: the KVM-runtime stale watch as built (`hid::stale`, `release_all{trigger="rdp_stale"}`) replaces rev 6.3's "carried to Plan E" sentence.
 - §8: the `hid.lua?type=text` comparison is an L5 / Leg D owner item (DE12); a queue resync while the Typist types ends the paste `aborted_resync` and releases all, replacing rev 6.3's m4 residual, with a narrower residual of its own: a resync in or after the paste's last step leaves only a prefix, never a hole.
 - §9.1: DE2's checks in `scripts/image-smoke.sh`, on every PR's image before `publish` pushes those bytes.
-- §10.1: a "Result (rev 6.4)" column — every target met under `strict` on the shared development host, the soak's memory pending the first nightly soak; the bridge-owned split (A, B, C); the whole-process row restated (DE19); the stamps (DE20); the end-to-end figures side by side.
+- §10.1: a "Result (rev 6.4)" column — every target the `strict` run measures, met on the shared development host, and the soak's memory pending the first nightly soak; the bridge-owned split (A, B, C); the whole-process row restated (DE19); the stamps (DE20); the end-to-end figures side by side.
 - §10.2: the harness as built — the scenario names, the `ci` and `all` sets, the bench streams, the link shaper, the null bridge, the reports, the RTT spike's recovery beside its time-to-picture, and the 150 ms / 5 Mbit/s link that cannot carry the 8 Mbit/s stream.
 - §10.4: the registry as built — 47 families (20 counters, 13 labelled families, 9 gauges, 5 histograms), 49 in an `alloc-stats` build; `release_all` gains `rdp_stale` and `paste_resync`, `paste_events` gains `aborted_resync`, and what `websocket_reconnect` counts is spelled out.
 - §11.2, §11.4: L3 as built (DE9, DE21): the four `l3::` cases, the ladder fixture and its re-record rule, the L1 case that replays it.
 - §11.6: the L5 checklist gains DE12's comparison, the deployed bridge's CPU at 1080p30 against §10.1's 5 %, and the memory limit holding over a working day.
-- §12: planning unit E's status; every "Carried to Plan E" bullet names what closed it, and Task 2.4's fix of the fuzz nightly's level-1b oracle joins them; CI as built — the SHA pins, cargo-deny (advisories blocking on `main`, reported on PRs and nightly; RUSTSEC-2023-0071's ignore signed off by the owner, 2026-11-15), the lint job, the nightly, L3, the image and `publish` — none of it run on GitHub yet; what Plan E leaves to the owner; the acceptance checklist runs against the published image (no new item).
+- §12: planning unit E's status; every "Carried to Plan E" bullet names what closed it, and Task 2.4's fix of the fuzz nightly's level-1b oracle joins them; CI as built — the SHA pins, cargo-deny (advisories blocking on `main`, reported on PRs and nightly; RUSTSEC-2023-0071's ignore signed off by the owner, 2026-11-15), the lint job, the nightly, L3, the image and `publish` — none of it run on GitHub yet (`main` still runs Plan B's CI); what Plan E leaves to the owner; the acceptance checklist runs against the published image (no new item).
 - §13: the target budget re-measured with the release artifacts; the soak runs nightly; image builds run in Docker under their own CPU and memory caps, their cache outside the budget; the nightly L2 stressor runs at nice 5.
 - §15: "Watched" gains the image's base and BuildKit digests, the Actions pins, `flake.lock`'s FreeRDP (the L3 ladder fixture follows it) and RUSTSEC-2023-0071's trigger.
 
@@ -551,11 +554,14 @@ sans-IO cores (pump, upstream, HID queue) in `kvm-rdp`.
   - L3 (§11.4): a FreeRDP bump in `flake.lock` re-records the ladder
     fixture, whose first line names the FreeRDP that recorded it
     (`KVM_RDP_L3_RECORD=1`; review the diff);
-  - `kvm-bench --thresholds ci ci` (§10.2), whose allocation check
+  - `kvm-bench --bridge <kvm-rdp> --thresholds ci ci` (§10.2), whose allocation check
     (DE19) moves with IronRDP's encode.
 
-  With it: the Actions pins (`scripts/pin-action.sh`, and its `--verify`
-  on every workflow); the image's base and BuildKit pins
+  With it: the Actions pins — `scripts/pin-action.sh` to bump them, and
+  `scripts/pin-action.sh --verify .github/workflows/*.yml` to check that
+  each SHA is its tag's commit in the action's own repository, a check CI
+  does not make (given no file, `--verify` checks nothing); the image's
+  base and BuildKit pins
   (`scripts/pin-image.sh`), reading distroless's README for the images it
   still supports — a deprecated tag stops updating silently, its digest
   never changing again, as `cc-debian12`'s did, and a superseded Rust
@@ -3109,7 +3115,7 @@ before `census.md` is committed):
 | B | M1 + M2, including the SPS rewriter — required: level patch, VUI re-serialisation and `bitstream_restriction` (§6.8), with the POC-type-0 fixture (§11.5) — and kvm-sim's ES3 profile. No AU assembler and no GOP cache: Leg A needs neither (§6.2, §6.5) |
 | C | M3a: config, logging, admin endpoints, metrics, shutdown, lifecycle, NLA, EGFX pump and state machine, the websocket, the HID writer skeleton and release epoch, L1 and video/lifecycle L2. Requires the three IronRDP patches of `kvm-rdp-egfx-patches-v2` @ `c99eece2`, git-pinned (§4.2; rev 6.2: the patch-1 fallback is not built) |
 | D | M3b + M4: first §11.6's L4 hardware checks (rev 6.2, moved from C); keyboard and mouse mapping, stuck-key timers and the released-by-bridge rule, the Typist, and their L2 cases (rev 6.3: built, with CLIPRDR paste, the re-assert and Plan C's L2 carries; the L4 checks are tooling proven on kvm-sim, and their run on the ES3, Task 1.6, is pending (owner) — DC18's items are built, not yet measured) |
-| E | M5 + M6: L3, CI, image, perf pass (rev 6.2: CI's job timeout, tracked-secrets gate and target-budget step landed with Plan C, DC19; rev 6.3: also the carries below; rev 6.4: built — every carry below closed, L3 with FreeRDP, CI's supply-chain gates and a nightly, the image and its `publish`, and `kvm-bench` with the perf pass (§10.1's targets met under `strict` on the shared host); nothing has run in CI yet, so the strict nightly, the soak and the first publish wait on the first push to `main`) |
+| E | M5 + M6: L3, CI, image, perf pass (rev 6.2: CI's job timeout, tracked-secrets gate and target-budget step landed with Plan C, DC19; rev 6.3: also the carries below; rev 6.4: built — every carry below closed, L3 with FreeRDP, CI's supply-chain gates and a nightly, the image and its `publish`, and `kvm-bench` with the perf pass (every target `strict` measures met on the shared host, the memory soak pending); none of Plan E's CI had run at rev 6.4 — Plans C–E had never been pushed, and `main` ran Plan B's — so the strict nightly, the soak and the first publish wait on Plan E reaching `main`) |
 
 **Carried to Plan E** (rev 6.3: one list, from Plan C's final review and
 Plan D's rulings; rev 6.4: each closed, by the Plan E task named):
@@ -3218,28 +3224,36 @@ reachable (DE22). The advisory pass of 2026-11-15 cleared five new
 advisories by lockfile bumps (`e40c9d5`: RUSTSEC-2026-0382 rustls-webpki,
 -0385 ctutils, -0386 tokio, -0387 crypto-bigint, -0418 libz-sys); stale
 libz-sys build outputs that had captured the development environment were
-removed from the local target dir, and none ever left the host. None of
-this has run on GitHub yet: every CI
-result — the L2-under-load pass rate, the fuzz nightly green since Task
-2.4, the `l3-tools` build time and closure size and the L3 cases' time,
-the `bench` job's cold and warm durations and the caches' sizes, the
-strict nightly and the soak — is not yet run; so is the owner's setting
-"Require actions to be pinned to a full-length commit SHA", for once this
-is on `main`.
+removed from the local target dir, and none ever left the host.
+
+None of Plan E's CI had run on GitHub at rev 6.4. Plans C–E had never
+been pushed, so `main` was still Plan B's: its `ci.yml` had run on two
+pushes to `main` (2026-10-07, both green), and its fuzz nightly runs every
+night — red on most nights (5 green of the 39 runs GitHub listed up to
+2026-11-15), on the level-1b oracle Task 2.4 fixes, so it stays red until
+Plan E reaches `main`. Plan E's new jobs (`lint`, `image`, `bench`,
+`publish`, L3 in `check`) and `nightly.yml` (schedule and
+`workflow_dispatch` only) had never run. So every result of Plan E's CI is
+"not yet run": the L2-under-load pass rate, the fuzz nightly green since
+Task 2.4, the `l3-tools` build time and closure size and the L3 cases'
+time, the `bench` job's cold and warm durations and the caches' sizes, the
+strict nightly and the soak. The owner's setting "Require actions to be
+pinned to a full-length commit SHA" waits for these workflows to be on
+`main`.
 
 Rev 6.4: **what Plan E leaves to the owner.**
 
-- The first push to `main`: the owner asked (2026-11-15) for Plan E to be
-  merged into `main` and pushed once its final review is clean. That push
-  runs `publish` for the first time — its cosign and Rekor entries are
-  public — and making the ghcr package public stays the owner's.
-- The nightly's strict run (`workflow_dispatch`, `thresholds = strict`) and
-  the one-hour soak on GitHub's runner: the absolute perf verdict (DE11)
-  and the memory limit (§10.1).
-- GitHub's "Require actions to be pinned to a full-length commit SHA"
-  setting, once the workflows are on `main`.
-- IronRDP's per-DVC-chunk allocations (§10.1, DE19): upstream or fork work
-  only on the owner's say.
+- Make the ghcr package public, and run the README's `cosign verify`
+  (cosign v3 or later) once on the first published image's digest.
+- Trigger the nightly's strict run (`workflow_dispatch` with
+  `thresholds = strict`) on GitHub's runner — the absolute perf verdict
+  (DE11) — and take the memory limit from the nightly soak's report
+  (`memory limit MiB`) into the deployment in place of its interim 128 Mi
+  (§10.1).
+- Turn on GitHub's "Require actions to be pinned to a full-length commit
+  SHA" setting once the workflows are on `main`.
+- Decide on IronRDP's per-DVC-chunk allocations (§10.1, DE19): upstream or
+  fork work only on the owner's say.
 - Plan D's hardware run (Task 1.6, Leg D) and the Windows App acceptance
   run (L5, below and §11.6), with the L5 items Plan E added — DE12's
   `hid.lua?type=text` comparison among them.
@@ -3412,12 +3426,14 @@ The host is shared and loaded (16 cores, ~12 GiB free RAM, 143 GB free disk at
   artifacts** — the bench's bridge (`--release --features
   alloc-stats,test-hooks`) and `kvm-bench`, whose shared release units
   build once for both binaries (about 50, mostly `ironrdp-*`, still build
-  twice): 5.49 GiB of the 8 GiB at Task 6.1 — `debug/` 3.2 GiB,
-  `release/` 2.3 GiB, the bench streams 88 MiB — so the 8 GiB floor
-  stands. `scripts/target-budget.sh --prune` deletes the stale
+  twice): 5.49 GiB of the 8 GiB at Task 6.1 — `debug/` 3.15 GiB,
+  `release/` 2.25 GiB, the bench streams 0.09 GiB (88 MiB) — so the 8 GiB
+  floor stands. `scripts/target-budget.sh --prune` deletes the stale
   `incremental/` directories first (the disk pass). The one-hour soak runs
-  in the nightly; locally the soak runs at most as `--soak-duration 3m
-  --churn-every 1m`. Image builds run in Docker, not under the cargo
+  in the nightly; a routine local soak runs as `--soak-duration 3m
+  --churn-every 1m`, and the 20- and 30-minute local runs §10.1 records
+  were one-off investigations of the churn's warm-up (Task 5.5 and its
+  review), informative only. Image builds run in Docker, not under the cargo
   wrapper, so `scripts/image-build.sh` makes its own `docker-container`
   builder, capped at CPU shares 205 (about the wrapper's CPUWeight 20) and
   8 GiB, and prunes its cache to 8 GB after each build — outside the
@@ -3514,6 +3530,6 @@ source on :1988 becomes a future option (§3.1, §10.3). Rev 6.4 (Plan E;
 (`rust:1.94.1-slim-trixie`, `distroless/cc-debian13:nonroot`) and
 distroless's list of supported images — a deprecated tag stops updating
 silently (DE17) — and the BuildKit digest, through `scripts/pin-image.sh`;
-the Actions pins (`scripts/pin-action.sh --verify`); `flake.lock`'s
+the Actions pins (`scripts/pin-action.sh --verify .github/workflows/*.yml`); `flake.lock`'s
 FreeRDP, which the L3 ladder fixture follows (§11.4); and RUSTSEC-2023-0071,
 until IronRDP's crypto chain reaches rsa ≥ 0.10.0 (DE22).

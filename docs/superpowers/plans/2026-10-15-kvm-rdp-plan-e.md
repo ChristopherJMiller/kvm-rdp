@@ -7607,7 +7607,9 @@ nix develop --command bash -c 'taskset -c 2,3 "$CARGO_TARGET_DIR/release/kvm-ben
 # The workflow rules, and re-pinning (monthly, with the IronRDP pin review):
 nix develop --command scripts/check-workflows.sh
 nix develop --command scripts/pin-action.sh actions/checkout   # prints the pin to paste
-nix develop --command scripts/pin-image.sh gcr.io/distroless/cc-debian12:nonroot
+nix develop --command bash -c 'scripts/pin-action.sh --verify .github/workflows/*.yml'   # each SHA is its tag's commit
+nix develop --command scripts/pin-image.sh gcr.io/distroless/cc-debian13:nonroot   # Debian 13 since DE17 (cc-debian12 is frozen)
+nix develop --command scripts/pin-image.sh docker.io/library/rust:1.94.1-slim-trixie
 ```
 
 ## Planning notes
