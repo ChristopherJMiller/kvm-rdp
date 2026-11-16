@@ -273,6 +273,50 @@ jobs:
           retention-days: 3
           if-no-files-found: error
 
+  bench:
+    # §10.2: kvm-bench on every PR at loose (10×) thresholds — release builds
+    # of the bridge under test (alloc-stats, test-hooks) and of kvm-bench,
+    # the bench streams from the flake's ffmpeg, and the `ci` set.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust from rust-toolchain.toml
+        run: rustup toolchain install && cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: bench
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - name: Bench tools from the flake (ffmpeg, jq)
+        run: |
+          nix build .#bench-tools --out-link "$RUNNER_TEMP/bench-tools"
+          echo "$RUNNER_TEMP/bench-tools/bin" >> "$GITHUB_PATH"
+      - name: Drop the job token nix.conf now holds
+        # As in `check` and `lint`: install-nix-action writes `access-tokens =
+        # github.com=$GITHUB_TOKEN` into nix.conf; nothing after this step
+        # needs it, and the repository's own code runs next.
+        run: sudo sed -i '/^access-tokens/d' /etc/nix/nix.conf
+      - name: Bench streams (§10.2 — generated, never committed)
+        run: scripts/gen-fixtures.sh bench
+      - name: Release builds — the bridge under test, and kvm-bench
+        run: |
+          cargo build --release --locked -p kvm-rdp --features alloc-stats,test-hooks --bin kvm-rdp
+          cargo build --release --locked -p kvm-bench --bin kvm-bench
+      - name: kvm-bench — the ci set, loose thresholds
+        run: target/release/kvm-bench --bridge target/release/kvm-rdp --thresholds ci --out "$RUNNER_TEMP/kvm-bench" ci
+      - name: Keep the reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kvm-bench-reports
+          path: ${{ runner.temp }}/kvm-bench
+          retention-days: 14
+
   publish:
     # The one job with write permissions (design decision 10): a push to main,
     # after every gate. It runs no repository code — no checkout, no flake
@@ -280,7 +324,7 @@ jobs:
     # the runner image's skopeo, docker and gh, on the archive the `image`
     # job tested.
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [check, fuzz, lint, image]
+    needs: [check, fuzz, lint, image, bench]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

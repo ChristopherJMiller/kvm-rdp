@@ -137,3 +137,55 @@ jobs:
             diff "digests-first/$f" "digests-second/$f" || bad=1
           done
           exit "$bad"
+
+  bench:
+    # §10.2, DE11: every scenario (strict on demand: workflow_dispatch with
+    # thresholds=strict is the perf pass's dedicated runner), then §10.1's
+    # one-hour soak, strict — §13 keeps the hour in CI.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust from rust-toolchain.toml
+        run: rustup toolchain install && cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: bench
+          save-if: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          extra_nix_config: "experimental-features = nix-command flakes"
+      - name: Bench tools from the flake (ffmpeg, jq)
+        run: |
+          nix build .#bench-tools --out-link "$RUNNER_TEMP/bench-tools"
+          echo "$RUNNER_TEMP/bench-tools/bin" >> "$GITHUB_PATH"
+      - name: Drop the job token nix.conf now holds
+        # As in ci.yml: nothing after this step needs it, and the
+        # repository's own code runs next.
+        run: sudo sed -i '/^access-tokens/d' /etc/nix/nix.conf
+      - name: Bench streams
+        run: scripts/gen-fixtures.sh bench
+      - name: Release builds
+        run: |
+          cargo build --release --locked -p kvm-rdp --features alloc-stats,test-hooks --bin kvm-rdp
+          cargo build --release --locked -p kvm-bench --bin kvm-bench
+      # §10.2: absolute targets "pinned with taskset, at nice 0" — CPUs 2,3
+      # of the runner's four (DE11); kvm-bench and the bridge it spawns
+      # share them (results err high, DE10).
+      - name: Every scenario
+        env:
+          THRESHOLDS: ${{ inputs.thresholds || 'ci' }}
+        run: taskset -c 2,3 target/release/kvm-bench --bridge target/release/kvm-rdp --thresholds "$THRESHOLDS" --out "$RUNNER_TEMP/kvm-bench" all
+      - name: The one-hour soak (§10.1)
+        # Not always(): a cancelled nightly must not soak for an hour.
+        if: ${{ !cancelled() }}
+        run: taskset -c 2,3 target/release/kvm-bench --bridge target/release/kvm-rdp --thresholds strict --out "$RUNNER_TEMP/kvm-bench" soak
+      - name: Keep the reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kvm-bench-nightly
+          path: ${{ runner.temp }}/kvm-bench
+          retention-days: 30

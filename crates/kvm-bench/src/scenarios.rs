@@ -56,6 +56,7 @@ pub async fn run(name: &str, cx: &Ctx) -> Result<Report, String> {
         "suspended-reading" => stalled(cx, Stall::SuspendedReading).await,
         "panic-abort" => panic_abort(cx).await,
         "e2e-null" => e2e_null(cx).await,
+        "soak" => crate::soak::soak(cx).await,
         other => Err(format!("no scenario {other:?}")),
     }
 }

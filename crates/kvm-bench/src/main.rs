@@ -2,11 +2,12 @@
 //! process, the bridge under test as a subprocess — a release build with
 //! `--features alloc-stats,test-hooks`:
 //!   kvm-bench --bridge target/release/kvm-rdp [--thresholds ci|strict] [--out DIR] SCENARIO...
-//! `ci` and `all` name scenario sets. Each scenario writes `<name>.json`;
-//! the exit status is 0 only if every check of every report passed.
-// The harness's API: Tasks 5.2–5.5's scenarios use what `unshaped` does not
-// (as tests/l2/client.rs). `allow`, not `expect`: an `expect` would warn as
-// unfulfilled once Task 5.5 uses everything.
+//! `ci` and `all` name scenario sets (`all` is every scenario but `soak`).
+//! Each scenario writes `<name>.json`; the exit status is 0 only if every
+//! check of every report passed.
+// The harness's API, as tests/l2/client.rs: with Task 5.5's soak every
+// scenario is in, and three items are still unread (`Bridge::sigterm`,
+// `Rx::idr`, `Mark::rx`) — kept for the next scenario, not trimmed.
 #[allow(dead_code)]
 mod bridge;
 #[allow(dead_code)]
@@ -14,6 +15,7 @@ mod client;
 mod null_bridge;
 #[allow(dead_code)]
 mod scenarios;
+mod soak;
 mod streams;
 
 use clap::{Parser, ValueEnum};
