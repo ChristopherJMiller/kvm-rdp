@@ -255,6 +255,9 @@ pub fn sps_rewrite(data: &[u8]) {
     // (`level_rank` places 1b between 1 and 1.1). An unranked level was
     // refused above as `UnknownLevel`.
     let rank = |s: &SpsSyntax| level_rank(s.profile_idc, s.level_idc, s.constraint_flags);
+    // Never lower, by rank too: High 1b (`level_idc` 9) to level 1 (10)
+    // is a lowering the number check above cannot see (PE6 review m5).
+    assert!(rank(&out) >= rank(&input));
     let level_raised = rank(&out) > rank(&input);
     if matches!(input.profile_idc, 66 | 77 | 88) && level_raised {
         expect.constraint_flags &= !0x10;
@@ -487,6 +490,44 @@ fn level_1b_needing_1_1() -> Vec<u8> {
     w.write_flag(false); // gaps_in_frame_num_value_allowed_flag
     w.write_ue(9); // pic_width_in_mbs_minus1: 10 MBs
     w.write_ue(8); // pic_height_in_map_units_minus1: 9 MBs
+    w.write_flag(true); // frame_mbs_only_flag
+    w.write_flag(true); // direct_8x8_inference_flag
+    w.write_flag(false); // frame_cropping_flag
+    w.write_flag(false); // vui_parameters_present_flag
+    w.write_trailing_bits();
+    let mut nal = vec![0x67];
+    escape_rbsp_into(&w.into_rbsp(), &mut nal);
+    nal
+}
+
+/// A level-1b SPS at 5×5 macroblocks: 750 MB/s at 30 fps is within 1b's
+/// MaxMBPS (1,485) and MaxFS (99), so the rewriter keeps 1b — no raise —
+/// and never lowers it to level 1 (`level_idc` 10, weaker than 1b;
+/// `rewrite.rs`'s `level_1b_is_ranked_between_level_1_and_level_1_1`,
+/// case 3). The `sps_rewrite` seeds for the oracle's rank comparison:
+/// Baseline (`level_idc` 11, `constraint_set3_flag` kept) pins its equal
+/// case (PE6 review m4); High (`level_idc` 9) its "never lower" by rank
+/// (m5). Otherwise as `level_1b_needing_1_1`.
+fn level_1b_kept(profile_idc: u8, constraint_flags: u8, level_idc: u8) -> Vec<u8> {
+    use crate::bits::{BitWriter, escape_rbsp_into};
+    let mut w = BitWriter::new();
+    w.write_u8(profile_idc);
+    w.write_u8(constraint_flags);
+    w.write_u8(level_idc);
+    w.write_ue(0); // seq_parameter_set_id
+    if profile_idc == 100 {
+        w.write_ue(1); // chroma_format_idc: 4:2:0
+        w.write_ue(0); // bit_depth_luma_minus8
+        w.write_ue(0); // bit_depth_chroma_minus8
+        w.write_flag(false); // qpprime_y_zero_transform_bypass_flag
+        w.write_flag(false); // seq_scaling_matrix_present_flag
+    }
+    w.write_ue(0); // log2_max_frame_num_minus4
+    w.write_ue(2); // pic_order_cnt_type
+    w.write_ue(1); // max_num_ref_frames
+    w.write_flag(false); // gaps_in_frame_num_value_allowed_flag
+    w.write_ue(4); // pic_width_in_mbs_minus1: 5 MBs
+    w.write_ue(4); // pic_height_in_map_units_minus1: 5 MBs
     w.write_flag(true); // frame_mbs_only_flag
     w.write_flag(true); // direct_8x8_inference_flag
     w.write_flag(false); // frame_cropping_flag
@@ -771,6 +812,8 @@ pub fn seeds() -> Vec<(&'static str, String, Vec<u8>)> {
         ("es3like", ES3_LIKE_PARAMS.0.to_vec()),
         ("main", MAIN_360P_PARAMS.0.to_vec()),
         ("level_1b_needs_1_1", level_1b_needing_1_1()),
+        ("level_1b_kept", level_1b_kept(66, 0x10, 11)),
+        ("level_1b_high_kept", level_1b_kept(100, 0, 9)),
     ] {
         out.push(("sps_rewrite", name.to_owned(), sps));
     }
@@ -896,6 +939,33 @@ mod tests {
                 .any(|(t, n, s)| *t == "sps_rewrite" && n == "level_1b_needs_1_1" && *s == sps),
             "the case is an sps_rewrite seed"
         );
+    }
+
+    /// PE6 review m4, m5: the two kept-1b seeds are what their names say —
+    /// the rewriter leaves both at 1b (Baseline's cs3 kept, High's
+    /// `level_idc` 9 not lowered to 10) — and the oracle passes them, so
+    /// they reach its rank comparison's equal case and its "never lower".
+    #[test]
+    fn the_kept_level_1b_seeds_stay_level_1b() {
+        for (name, want) in [
+            ("level_1b_kept", (66, 11, 0x10)),
+            ("level_1b_high_kept", (100, 9, 0)),
+        ] {
+            let sps = seeds()
+                .into_iter()
+                .find(|(t, n, _)| *t == "sps_rewrite" && n == name)
+                .unwrap()
+                .2;
+            let r = rewrite_sps(&sps, &RewriteConfig::ES3).unwrap();
+            let s = &r.syntax;
+            assert_eq!(
+                (s.profile_idc, s.level_idc, s.constraint_flags & 0x10),
+                want,
+                "{name}"
+            );
+            assert!(!r.changed.level, "{name}");
+            sps_rewrite(&sps);
+        }
     }
 
     #[test]

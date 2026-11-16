@@ -113,10 +113,11 @@ impl Measured {
     }
 }
 
-/// The twin: one slice-header parse per VCL NAL, exactly as admission's
-/// `h264::picture::parse_slice` calls h264-reader, against a context
-/// holding the same (rewritten) SPS and the same PPS. Returns what it
-/// allocated.
+/// The twin: one slice-header parse per VCL NAL — the same h264-reader call
+/// on the same bytes as admission's `h264::picture::parse_slice`;
+/// admission's truncation to `SLICE_HEADER_BOUND` and its `Budget` reader
+/// allocate nothing — against a context holding the same (rewritten) SPS
+/// and the same PPS. Returns what it allocated.
 fn twin_parse(ctx: &Context, au: &[Vec<u8>]) -> u64 {
     let before = ALLOCS.load(Ordering::Relaxed);
     for nal in au {

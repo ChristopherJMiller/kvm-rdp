@@ -153,6 +153,7 @@ pub struct SpsLimits {
     /// 2.2.2.2.1; IronRDP's displaycontrol enforces 200..=8192) — a hostile
     /// SPS must not shrink the client to a postage stamp.
     pub min_width: u32,
+    /// Plan E (DE8): the same 200-pixel floor, for the height.
     pub min_height: u32,
     pub max_num_ref_frames: u32,
     pub require_no_scaling_matrix: bool,
@@ -175,7 +176,8 @@ impl Default for SpsLimits {
     }
 }
 
-/// A specific §6.1 SPS limit that was exceeded.
+/// A §6.1 SPS limit an SPS falls outside (above a maximum, below the 200 px
+/// floor, odd, …).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpsLimitViolation {
     Profile(u8),
@@ -550,6 +552,22 @@ mod tests {
         assert_eq!(
             check_sps_limits(&s, &lim),
             Err(SpsLimitViolation::HeightTooSmall(198))
+        );
+
+        // An odd size under the floor reports the floor: the floor is checked
+        // right after the two `…TooLarge` rules, before evenness.
+        let mut s = ok_summary();
+        s.width = 199;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::WidthTooSmall(199))
+        );
+
+        let mut s = ok_summary();
+        s.height = 199;
+        assert_eq!(
+            check_sps_limits(&s, &lim),
+            Err(SpsLimitViolation::HeightTooSmall(199))
         );
 
         let mut s = ok_summary();
