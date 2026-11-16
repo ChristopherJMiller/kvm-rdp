@@ -880,13 +880,18 @@ impl CliprdrBackend for ClientClip {
     fn on_request_format_list(&mut self) {
         // Monitor Ready: announce that the client holds Unicode text (D9b),
         // and with `extra_formats` that many registered formats besides.
-        let mut formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
-        formats.extend((0..self.extra_formats).map(|i| {
-            let id = 0xC000 + u32::try_from(i % 0x3FFF).unwrap();
-            ClipboardFormat::new(ClipboardFormatId::new(id)).with_name(ClipboardFormatName::new(
-                format!("kvm-rdp-l2-format-{i:05}"),
-            ))
-        }));
+        // CF_UNICODETEXT comes last, after them, as Windows-family clients
+        // list "HTML Format" and kin first (PE2 review m3): a bridge that
+        // reads only the head of a long list must not find it.
+        let mut formats: Vec<ClipboardFormat> = (0..self.extra_formats)
+            .map(|i| {
+                let id = 0xC000 + u32::try_from(i % 0x3FFF).unwrap();
+                ClipboardFormat::new(ClipboardFormatId::new(id)).with_name(
+                    ClipboardFormatName::new(format!("kvm-rdp-l2-format-{i:05}")),
+                )
+            })
+            .collect();
+        formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
         self.proxy
             .send_clipboard_message(ClipboardMessage::SendInitiateCopy(formats));
     }

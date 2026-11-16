@@ -151,9 +151,11 @@ struct GfxCallbacks {
 impl GraphicsPipelineHandler for GfxCallbacks {
     fn capabilities_advertise(&mut self, pdu: &CapabilitiesAdvertisePdu) {
         let sets = caps_hex(pdu);
-        // Once per negotiation, bounded by `caps_hex`; L3 reads FreeRDP's
-        // ladder from it (Plan E Task 3.1, DC8). Client-chosen bytes, as
-        // hex: never text the client typed.
+        // Once per client CapabilitiesAdvertise PDU (an authenticated client
+        // may re-advertise); DEBUG, off at the default `info`; at most
+        // ~4.4 KB (`caps_hex`). L3 reads FreeRDP's ladder from it (Plan E
+        // Task 3.1, DC8). Client-chosen bytes, as hex: never text the
+        // client typed.
         tracing::debug!(slot = self.slot, sets = %sets.join(","), "EGFX capabilities advertised");
         let _ = self.tx.send(RdpInput::CapsAdvertised {
             slot: self.slot,

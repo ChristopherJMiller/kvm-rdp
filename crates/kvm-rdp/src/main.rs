@@ -7,7 +7,9 @@
 // keys either way, but an unwinding release build could keep serving NLA
 // with a task it cannot run without gone. Every build without debug
 // assertions — the release profile, the image, kvm-bench's bridge — must
-// use the release profile's `panic = "abort"`. (`cargo test --release`
+// use the release profile's `panic = "abort"`; a release build that turns
+// debug assertions on is outside this guard, and the image sets neither.
+// (`cargo test --release`
 // still builds — test harnesses unwind and the binary L2 spawns aborts —
 // but `a_panicked_pump_shell_ends_the_binary_with_exit_1` then sees
 // SIGABRT; only the debug profile is a supported test invocation.)

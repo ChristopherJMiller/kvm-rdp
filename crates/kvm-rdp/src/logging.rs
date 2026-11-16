@@ -85,10 +85,10 @@ struct PerCallsite {
 
 /// `callsite_enabled` keeps its default, `sometimes`, on purpose: a filter
 /// whose `event_enabled` can refuse needs `enabled` to run before every
-/// event. With `always`, tracing-subscriber 0.3.23 skips `enabled`, so the
-/// per-layer state a refusal leaves behind is never re-armed and the
-/// thread's next event at an `always` callsite would be dropped unseen
-/// (a debug assertion in `FilterState::event_enabled` catches it).
+/// event. With `always`, `enabled` is skipped, so a refusal leaves the
+/// per-layer FilterMap dirty, which tracing-subscriber 0.3.23 asserts
+/// against in every debug build (`FilterState::event_enabled`); in release
+/// the next event still logs. Keep the default.
 impl<S> Filter<S> for PerCallsite {
     /// Every callsite stays eligible; the level filters it is `and`ed
     /// after decide what reaches `event_enabled`.
@@ -323,7 +323,9 @@ mod tests {
     /// most one per interval, and every dropped line is counted. Events the
     /// level filters already drop are never counted (they never reach the
     /// limit), other callsites keep their own allowance, and bridge lines
-    /// are never limited.
+    /// are never limited. Every level is limited, not WARN alone: the
+    /// ERROR lines `ironrdp_cliprdr` still passes, and INFO on a target
+    /// capped at INFO. The bare `kvm_rdp` target is bridge code too.
     #[test]
     fn a_third_party_callsite_logs_once_per_interval_and_counts_the_rest() {
         let buf = Buf::default();
@@ -343,21 +345,41 @@ mod tests {
             for _ in 0..50 {
                 tracing::info!(target: "kvm_rdp::bridge", "bridge-line");
             }
+            // Each flood below is one callsite.
+            for _ in 0..1000 {
+                tracing::error!(target: "ironrdp_cliprdr", "cliprdr-error-flood");
+            }
+            for _ in 0..1000 {
+                tracing::info!(target: "ironrdp_server::x", "capped-info-flood");
+            }
+            for _ in 0..50 {
+                tracing::info!(target: "kvm_rdp", "root-target-line");
+            }
             std::thread::sleep(Duration::from_millis(400));
             unexpected_channel();
         });
         let out = buf.text();
+        let count = |needle: &str| u64::try_from(out.matches(needle).count()).unwrap();
         // Timing-robust (§13's loaded host): a deschedule past the 300 ms
-        // interval inside the first loop lets one more line through, and
-        // every line is either logged or counted.
-        let logged = u64::try_from(out.matches("unexpected-channel").count()).unwrap();
+        // interval inside a flood lets one more line through, and every
+        // line is either logged or counted.
+        let logged = count("unexpected-channel");
+        let cliprdr = count("cliprdr-error-flood");
+        let info = count("capped-info-flood");
         let dropped = dropped.load(std::sync::atomic::Ordering::Relaxed);
         assert!((2..=4).contains(&logged), "{logged} logged: {out}");
-        assert_eq!(logged + dropped, 1001, "{logged} logged, {dropped} dropped");
-        assert_eq!(out.matches("another-callsite").count(), 1, "{out}");
-        assert_eq!(out.matches("same-target-callsite").count(), 1, "{out}");
-        assert_eq!(out.matches("bridge-line").count(), 50, "{out}");
-        assert_eq!(out.matches("capped-debug").count(), 0, "{out}");
+        assert!((1..=2).contains(&cliprdr), "{cliprdr} ERRORs logged: {out}");
+        assert!((1..=2).contains(&info), "{info} INFOs logged: {out}");
+        assert_eq!(
+            logged + cliprdr + info + dropped,
+            1001 + 1000 + 1000,
+            "{logged} + {cliprdr} + {info} logged, {dropped} dropped"
+        );
+        assert_eq!(count("another-callsite"), 1, "{out}");
+        assert_eq!(count("same-target-callsite"), 1, "{out}");
+        assert_eq!(count("bridge-line"), 50, "{out}");
+        assert_eq!(count("root-target-line"), 50, "{out}");
+        assert_eq!(count("capped-debug"), 0, "{out}");
     }
 
     /// The limit has no level opinion: the subscriber's hint stays the

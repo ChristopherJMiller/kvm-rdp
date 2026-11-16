@@ -346,9 +346,20 @@ async fn freerdp_suspending_acks_keeps_the_picture_moving() {
         Some(1.0),
         "acks never suspended"
     );
+    // Nothing is recorded while acks are suspended: a bridge that kept
+    // waiting on them reads the oldest unacked frame's age here (PE9 m1).
+    assert_eq!(
+        sample(&m2, "kvm_rdp_egfx_oldest_unacked_ms"),
+        Some(0.0),
+        "an unacked frame was recorded while acks were suspended"
+    );
+    // Frames keep flowing at rate: at least half of 6 s at 30 fps, where a
+    // bridge throttled to IDR bursts sends a few dozen.
+    let sent = |m: &str| sample(m, "kvm_rdp_egfx_frames_sent_total").unwrap_or(0.0);
     assert!(
-        sample(&m2, "kvm_rdp_egfx_frames_sent_total")
-            > sample(&m1, "kvm_rdp_egfx_frames_sent_total")
+        sent(&m2) - sent(&m1) >= 90.0,
+        "{} frames sent in 6 s",
+        sent(&m2) - sent(&m1)
     );
     assert_ne!(b1, b2, "the picture froze");
     assert!(l3.sim_sent(b2, t2, ms(1500)));

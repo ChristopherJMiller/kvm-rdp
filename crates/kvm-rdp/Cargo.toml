@@ -81,7 +81,10 @@ libc = "0.2"
 # through workspace feature unification (kvm-sim enables test-util).
 tokio = { version = "1", features = ["test-util"] }
 # Turns `test-hooks` on for the lib's unit tests, L2 and the binary L2
-# spawns. Dev-dependency features never reach a non-test build (resolver 3).
+# spawns. Dev-dependency features never reach a build of the lib and bins
+# alone (`cargo build --release -p kvm-rdp`, the image; resolver 3); a build
+# that also compiles tests (`--all-targets`, `cargo test --release`) writes a
+# hooks binary to `target/release/`.
 kvm-rdp = { path = ".", features = ["test-hooks"] }
 
 # The one integration-test binary (§13): every L2 case links here. `libc`
