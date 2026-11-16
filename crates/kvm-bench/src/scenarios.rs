@@ -1,6 +1,6 @@
 //! §10.2's scenarios. Each returns a `Report`; `run` picks one by name.
 use crate::bridge::{Bridge, clk_tck};
-use crate::client::{BenchClient, Opts, Rx};
+use crate::client::{AckMode, BenchClient, Opts, Rx};
 use crate::streams;
 use kvm_bench::frames::{input_latencies, latencies, unique_loop};
 use kvm_bench::prom::Scrape;
@@ -19,9 +19,15 @@ pub struct Ctx {
     pub churn_every: Duration,
 }
 
-/// The per-PR set and every scenario but the soak (§10.2). Tasks 5.3–5.4
-/// add their names.
-pub const CI: &[&str] = &["unshaped", "input-latency"];
+/// The per-PR set and every scenario but the soak (§10.2). Task 5.4 adds
+/// its name.
+pub const CI: &[&str] = &[
+    "unshaped",
+    "input-latency",
+    "withhold",
+    "suspended-reading",
+    "panic-abort",
+];
 pub const ALL: &[&str] = &[
     "unshaped",
     "input-latency",
@@ -29,6 +35,11 @@ pub const ALL: &[&str] = &[
     "shaped-150ms-5mbit",
     "rtt-spike",
     "idle-motion",
+    "withhold",
+    "stop-reading",
+    "suspended-not-reading",
+    "suspended-reading",
+    "panic-abort",
 ];
 
 pub async fn run(name: &str, cx: &Ctx) -> Result<Report, String> {
@@ -39,6 +50,11 @@ pub async fn run(name: &str, cx: &Ctx) -> Result<Report, String> {
         "shaped-150ms-5mbit" => shaped(cx, "shaped-150ms-5mbit", 150, 5).await,
         "rtt-spike" => rtt_spike(cx).await,
         "idle-motion" => idle_motion(cx).await,
+        "withhold" => stalled(cx, Stall::Withhold).await,
+        "stop-reading" => stalled(cx, Stall::StopReading).await,
+        "suspended-not-reading" => stalled(cx, Stall::SuspendedNotReading).await,
+        "suspended-reading" => stalled(cx, Stall::SuspendedReading).await,
+        "panic-abort" => panic_abort(cx).await,
         other => Err(format!("no scenario {other:?}")),
     }
 }
@@ -470,6 +486,249 @@ async fn idle_motion(cx: &Ctx) -> Result<Report, String> {
     r.at_most(
         "NeedIdr entries across idle → motion",
         b.m.delta(&a.m, "kvm_rdp_need_idr_total"),
+        0.0,
+    );
+    Ok(r)
+}
+
+/// The bridge's defaults these bounds are written in (§4.4).
+const SOFT_GATE: f64 = 0.5;
+const STALL_TIMEOUT: f64 = 10.0;
+const WATCHDOG: f64 = 5.0;
+const BACKLOG_LIMIT_MIB: f64 = 4.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stall {
+    Withhold,
+    StopReading,
+    SuspendedNotReading,
+    SuspendedReading,
+}
+
+/// When kvm-sim saw the session's websocket close after `from` — the KVM
+/// side's `Stop`, which comes with the session's end (Closing's
+/// `Disconnect`, or the watchdog's abort for a client that stopped reading).
+fn ended_after(sim: &KvmSim, from: Instant) -> Option<Instant> {
+    sim.stamped_events()
+        .into_iter()
+        .find_map(|(t, e)| (matches!(e, SimEvent::WsClose { .. }) && t >= from).then_some(t))
+}
+
+/// §10.1's stalled-client row, one way of stalling per run.
+async fn stalled(cx: &Ctx, how: Stall) -> Result<Report, String> {
+    let name = match how {
+        Stall::Withhold => "withhold",
+        Stall::StopReading => "stop-reading",
+        Stall::SuspendedNotReading => "suspended-not-reading",
+        Stall::SuspendedReading => "suspended-reading",
+    };
+    let mut r = Report::new(name, cx.thresholds);
+    let s = session(
+        cx,
+        SimConfig::es3(streams::load("bench_1080p30.h264")?),
+        "",
+        Opts::new(2),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let m0 = s.bridge.scrape().await?;
+    let t_m0 = Instant::now();
+    let rss0 = s.bridge.rss_kib().ok_or("no VmRSS")?;
+    let mut peak = rss0;
+    // The reference instant each bound is measured from.
+    let mut from = Instant::now();
+    match how {
+        Stall::Withhold => s.client.shape(|sh| sh.ack = AckMode::Withhold),
+        Stall::StopReading => s.client.shape(|sh| sh.reading = false),
+        Stall::SuspendedNotReading | Stall::SuspendedReading => {
+            s.client.shape(|sh| sh.ack = AckMode::Suspend);
+        }
+    }
+    if how == Stall::SuspendedNotReading {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        s.client.shape(|sh| sh.reading = false);
+        // §10.1: from the backlog first reaching backlog_limit.
+        let limit = BACKLOG_LIMIT_MIB * 1024.0 * 1024.0;
+        let t0 = Instant::now();
+        loop {
+            // The instant before the scrape that shows the limit: taken
+            // after it, the bound would lean toward passing by a scrape.
+            let t = Instant::now();
+            if s.bridge.scrape().await?.get("kvm_rdp_egfx_backlog_bytes") >= limit {
+                from = t;
+                break;
+            }
+            if t0.elapsed() > Duration::from_secs(30) {
+                r.holds("the backlog reached backlog_limit", false);
+                return Ok(r);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let (bound, horizon) = match how {
+        Stall::Withhold | Stall::StopReading => (SOFT_GATE + STALL_TIMEOUT + WATCHDOG + 0.25, 40.0),
+        Stall::SuspendedNotReading => (STALL_TIMEOUT + WATCHDOG + 0.25, 40.0),
+        Stall::SuspendedReading => (f64::INFINITY, 2.0 * (STALL_TIMEOUT + WATCHDOG)),
+    };
+    let t0 = Instant::now();
+    let mut ended = None;
+    while t0.elapsed().as_secs_f64() < horizon {
+        peak = peak.max(s.bridge.rss_kib().unwrap_or(peak));
+        if let Some(t) = ended_after(&s.sim, from) {
+            ended = Some(t);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    r.at_most(
+        "RSS growth, MiB (≤ backlog_limit + 16 MiB)",
+        (peak.saturating_sub(rss0)) as f64 / 1024.0,
+        BACKLOG_LIMIT_MIB + 16.0,
+    );
+    let block = s.sim.stats().max_flv_write_block.as_secs_f64() * 1000.0;
+    r.at_most("max kvm-sim FLV write block, ms", block, 100.0);
+    if how == Stall::SuspendedReading {
+        r.holds(
+            "a client that suspends acks and keeps reading is never ended",
+            ended.is_none(),
+        );
+        // §10.1's delivery row: "suspended runs are matched by FrameId".
+        // Over the closed window [m0 + 0.5 s, m1 − 0.5 s] — a margin for a
+        // frame in flight at either end — the bridge dropped no frame for
+        // any reason, and every frame kvm-sim sent reached the client.
+        let t_m1 = Instant::now();
+        let m1 = s.bridge.scrape().await?;
+        let drops = m1.family_delta(&m0, "kvm_rdp_frames_dropped_total", "reason");
+        for (reason, n) in &drops {
+            r.number(&format!("dropped {reason} while suspended"), *n);
+        }
+        r.holds(
+            "no frame dropped while suspended, for any reason",
+            drops.values().all(|n| *n == 0.0),
+        );
+        // The window stays under one 20 s loop of the bench stream, so a
+        // FrameId names one frame: a lost frame cannot hide behind its copy
+        // in another loop.
+        let lo = t_m0 + Duration::from_millis(500);
+        let hi = (t_m1 - Duration::from_millis(500)).min(lo + Duration::from_secs(15));
+        let got: std::collections::HashSet<u64> = s.client.with_log(|l| {
+            l.rx.iter()
+                .filter(|x| x.at >= lo && x.at <= hi + Duration::from_secs(1))
+                .map(|x| x.frame_id)
+                .collect()
+        });
+        let missing = sim_sent(&s.sim)
+            .iter()
+            .filter(|(id, t)| *t >= lo && *t <= hi && !got.contains(id))
+            .count();
+        r.at_most(
+            "kvm-sim frames in the window never received",
+            missing as f64,
+            0.0,
+        );
+        return Ok(r);
+    }
+    match ended {
+        Some(t) => {
+            r.timing_at_most(
+                "ended after the stall began, s",
+                t.duration_since(from).as_secs_f64(),
+                bound,
+            );
+            let m1 = s.bridge.scrape().await?;
+            r.at_least(
+                "disconnects{client_stalled}",
+                m1.delta(&m0, "kvm_rdp_disconnects_total{cause=\"client_stalled\"}"),
+                1.0,
+            );
+        }
+        None => r.holds(&format!("the session ended within {horizon} s"), false),
+    }
+    Ok(r)
+}
+
+/// `RLIMIT_CORE` of a live process, from `/proc/<pid>/limits` ("Max core
+/// file size", soft and hard; "unlimited" reads as `u64::MAX`).
+fn core_limit(pid: u32) -> Option<(u64, u64)> {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).ok()?;
+    let line = limits
+        .lines()
+        .find_map(|l| l.strip_prefix("Max core file size"))?;
+    let mut f = line.split_whitespace().map(|v| match v {
+        "unlimited" => Some(u64::MAX),
+        n => n.parse().ok(),
+    });
+    Some((f.next()??, f.next()??))
+}
+
+/// §5.2, DE7: a release build aborts on a panic. A test-hooks build's pump
+/// shell panics on `[test] panic_after`, and the process dies by SIGABRT
+/// with no orderly shutdown (in a debug build it would exit 1 — Task 1.1's
+/// L2 case). It writes no core file: kvm-bench's `pre_exec` sets
+/// `RLIMIT_CORE` 0, read back here while the bridge lives (systemd-coredump
+/// still lists the crash, with no core stored). A crash never logs out of
+/// the KVM (§3.2), so the bridge an orchestrator restarts logs in and
+/// serves a picture against the same KVM.
+async fn panic_abort(cx: &Ctx) -> Result<Report, String> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut r = Report::new("panic-abort", cx.thresholds);
+    let src = Source::fixture("360p30_es3like_poc0.h264").map_err(|e| format!("{e:?}"))?;
+    let ids: std::collections::HashSet<u64> = source_ids(&src).into_iter().collect();
+    let sim = KvmSim::start(SimConfig::es3(src))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut b = Bridge::spawn(&cx.bridge, &sim, "[test]\npanic_after = \"1s\"\n")
+        .map_err(|e| format!("{e} — is the bridge a release build with --features test-hooks?"))?;
+    let core = core_limit(b.pid());
+    r.holds(
+        "the bridge runs with RLIMIT_CORE 0 (no core file)",
+        core == Some((0, 0)),
+    );
+    r.number(
+        "bridge pid (coredumpctl info PID: no core stored)",
+        f64::from(b.pid()),
+    );
+    let status = b.wait(Duration::from_secs(10)).await;
+    r.holds(
+        "the release bridge died by SIGABRT (panic = \"abort\")",
+        status.and_then(|s| s.signal()) == Some(libc::SIGABRT),
+    );
+    r.number(
+        "WCOREDUMP (information: a core_pattern pipe sets it with no core stored)",
+        if status.is_some_and(|s| s.core_dumped()) {
+            1.0
+        } else {
+            0.0
+        },
+    );
+    let lines = b.lines();
+    r.holds(
+        "the abort is the injected panic",
+        lines
+            .iter()
+            .any(|l| l.contains("injected: the pump shell panics")),
+    );
+    r.holds(
+        "no orderly shutdown ran",
+        !lines.iter().any(|l| l.contains("\"shutting down\"")),
+    );
+    r.at_most("KVM logouts (§3.2)", sim.stats().logouts as f64, 0.0);
+    // The restart: a bridge without the hook, on the same KVM, serves a
+    // KVM picture to a client.
+    drop(b);
+    let again = Bridge::spawn(&cx.bridge, &sim, "")?;
+    let client = BenchClient::connect(again.rdp, Opts::new(3));
+    r.holds(
+        "the restarted bridge serves a KVM picture within 15 s",
+        client
+            .until(Duration::from_secs(15), |l| {
+                l.rx.iter().any(|x| ids.contains(&x.frame_id))
+            })
+            .await,
+    );
+    r.at_most(
+        "KVM logouts after the restart (§3.2)",
+        sim.stats().logouts as f64,
         0.0,
     );
     Ok(r)
