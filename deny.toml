@@ -13,8 +13,8 @@ yanked = "deny"
 # Each ignore names the advisory, the dependency path that brings it in, and
 # why it is unreachable here — and needs the owner's sign-off (Task 2.2).
 #
-# RUSTSEC-2023-0071 — PENDING OWNER SIGN-OFF (before the first push; Plan E
-# owner items). rsa: the Marvin attack — rsa's private-key operations are
+# RUSTSEC-2023-0071 — signed off by the owner, 2026-11-15 (Plan E Task
+# 2.2's ignore). rsa: the Marvin attack — rsa's private-key operations are
 # not constant-time (PKCS#1 v1.5 decryption padding; no default blinding,
 # which signing shares). The fix is rsa 0.10.0 (the advisory's patched
 # range is >= 0.10.0; rc.18 is unpatched), which IronRDP cannot reach:
@@ -56,7 +56,7 @@ yanked = "deny"
 #   --dry-run --verbose`: once the chain reaches rsa >= 0.10.0, drop this
 #   entry.
 ignore = [
-    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin) via IronRDP's picky/sspi/winscard: the bridge's NTLM-only CredSSP and its rustls/aws-lc TLS key perform no rsa private-key operation — PENDING OWNER SIGN-OFF; fixed in rsa 0.10.0, unreachable through IronRDP's exact picky/sspi/winscard pins" },
+    { id = "RUSTSEC-2023-0071", reason = "rsa (Marvin) via IronRDP's picky/sspi/winscard: the bridge's NTLM-only CredSSP and its rustls/aws-lc TLS key perform no rsa private-key operation — signed off by the owner, 2026-11-15; fixed in rsa 0.10.0, unreachable through IronRDP's exact picky/sspi/winscard pins" },
 ]
 
 [licenses]
