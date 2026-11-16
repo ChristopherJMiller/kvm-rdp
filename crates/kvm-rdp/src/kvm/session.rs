@@ -2009,7 +2009,19 @@ mod tests {
             .wait_for(T, |_| r.last_kbd() == CMD.to_vec())
             .await
             .unwrap();
-        assert!(r.hid.kvm_may_hold());
+        // Waited for, not read once: the writer notes a report (`note_sent`,
+        // which sets `may_hold`) only after its write returns, so kvm-sim
+        // can record Cmd first; and under load `n` above can be read before
+        // the session start's second frame is noted, so the loop can end
+        // on that frame, not Cmd (PE15 review, outside the batch).
+        let held = tokio::time::timeout(T, async {
+            while !r.hid.kvm_may_hold() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(held, "assertion failed: r.hid.kvm_may_hold()");
     }
 
     impl Rig {
