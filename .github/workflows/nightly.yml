@@ -97,13 +97,19 @@ jobs:
           persist-credentials: false
       - name: A clean build
         run: |
+          # The default shell is `bash -e` without pipefail: the build's own
+          # checks must fail the step, not be masked by tee's status.
+          set -euo pipefail
           scripts/image-build.sh "$RUNNER_TEMP/i.oci.tar" --no-cache 2>&1 | tee "$RUNNER_TEMP/build.txt"
           mkdir -p "$RUNNER_TEMP/digests"
           manifest=$(tar -xOf "$RUNNER_TEMP/i.oci.tar" index.json | jq -r '.manifests[0].digest')
+          case $manifest in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "::error::no manifest digest in the archive: $manifest"; exit 1 ;; esac
           echo "$manifest" > "$RUNNER_TEMP/digests/manifest"
           # The config digest from the archive, not the loaded image's .Id
           # (which is the manifest's under the containerd image store).
-          tar -xOf "$RUNNER_TEMP/i.oci.tar" "blobs/sha256/${manifest#sha256:}" | jq -r '.config.digest' > "$RUNNER_TEMP/digests/config"
+          config=$(tar -xOf "$RUNNER_TEMP/i.oci.tar" "blobs/sha256/${manifest#sha256:}" | jq -r '.config.digest')
+          case $config in sha256:????????????????????????????????????????????????????????????????) ;; *) echo "::error::no config digest in the manifest: $config"; exit 1 ;; esac
+          echo "$config" > "$RUNNER_TEMP/digests/config"
           docker image inspect -f '{{json .RootFS.Layers}}' kvm-rdp:ci > "$RUNNER_TEMP/digests/layers"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

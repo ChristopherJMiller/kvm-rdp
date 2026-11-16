@@ -83,6 +83,8 @@ case "${1:-}" in
     ;;
   --verify)
     shift
+    # With no file it would check nothing and exit 0: a silent pass.
+    [ $# -gt 0 ] || { echo "pin-action: --verify needs at least one workflow file" >&2; exit 2; }
     status=0
     for f in "$@"; do verify "$f" || status=1; done
     exit "$status"

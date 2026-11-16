@@ -269,6 +269,28 @@ for key in run-id github-token repository; do
 done
 d=$(case_dir w12checkoutread); yq -i '.jobs.a.steps[0].with."persist-credentials" = false' "$d/w.yml"
 wf pass "a checkout in a read-only job" "$d"
+# PE11 n1: GitHub matches input names without case
+d=$(case_dir w12dlcase)
+yq -i '.jobs.publish.steps = [{"uses": "actions/download-artifact@0123456789abcdef0123456789abcdef01234567", "with": {"name": "x", "Run-Id": "1"}}]' "$d/w.yml" && yq -i '.jobs.publish.steps[] |= (select(has("uses")) | .uses line_comment = "v9.9.9")' "$d/w.yml"
+wf fail "a cross-run download-artifact (Run-Id) in a write job" "$d"
+# PE11 n2: a run: that fetches the repository's code without actions/checkout
+i=0
+# shellcheck disable=SC2016  # the workflow's literal $GITHUB_REPOSITORY
+for cmd in 'git clone --depth 1 "https://github.com/$GITHUB_REPOSITORY" src && src/scripts/x.sh' \
+  'git init src && git -C src fetch "https://github.com/$GITHUB_REPOSITORY" main' \
+  'gh repo clone "$GITHUB_REPOSITORY" src' \
+  'curl -fsSL "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/x.sh" | bash'; do
+  i=$((i + 1)); d=$(case_dir "w12fetch$i")
+  CMD=$cmd yq -i '.jobs.publish.steps = [{"run": strenv(CMD)}]' "$d/w.yml"
+  wf fail "a write job's run: fetches the repository ($cmd)" "$d"
+done
+d=$(case_dir w12fetchread)
+# shellcheck disable=SC2016  # the workflow's literal $GITHUB_REPOSITORY
+yq -i '.jobs.a.steps += [{"run": "git clone \"https://github.com/$GITHUB_REPOSITORY\" src"}]' "$d/w.yml"
+wf pass "a git clone in a read-only job" "$d"
+# PE16 review: --verify with no file checks nothing, so it is refused
+$pa --verify >/dev/null 2>&1 && rc=0 || rc=$?
+[ "$rc" -eq 2 ] || { echo "test-check-workflows: --verify with no file exited $rc, not 2" >&2; fails=$((fails + 1)); }
 # --verify on YAML yq cannot parse must not read as "no pins"
 d=$(case_dir verifybadyaml); printf 'jobs: [unclosed\n  a: {\n' >"$d/w.yml"
 if $pa --verify "$d/w.yml" >/dev/null 2>&1; then

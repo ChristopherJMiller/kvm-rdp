@@ -15,7 +15,9 @@ permissions:
   contents: read
 
 # A newer push to the same PR supersedes the run in flight: IronRDP's graph
-# is too heavy to build twice for nothing (§13). Runs on main always finish.
+# is too heavy to build twice for nothing (§13). A run on main in progress
+# is never cancelled; one still queued is replaced by a newer push (that
+# commit gets no image).
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -360,6 +362,14 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/kvm-rdp.oci.tar"
           tag="$IMAGE:sha-${GITHUB_SHA::7}"
+          # Before the push: the downloaded archive is the one `image`
+          # tested, or the tag never moves (the pushed digest is checked
+          # again below).
+          archived=$(tar -xOf "$archive" index.json | jq -r '.manifests[0].digest')
+          if [ -z "$TESTED" ] || [ "$archived" != "$TESTED" ]; then
+            echo "::error::the archive holds $archived, but the image job tested ${TESTED:-nothing}"
+            exit 1
+          fi
           # One login for skopeo, cosign and attest: attest reads only
           # ~/.docker/config.json, and skopeo falls back to it.
           printf '%s' "$TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin

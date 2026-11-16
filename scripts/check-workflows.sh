@@ -29,10 +29,11 @@
 # (yq's `//` treats `false` as absent, so rules 8 and 10 read the bare value:
 # an absent key prints `null`.)
 # 11. One repository, one SHA, across every workflow.
-# 12. A job with any write permission has no actions/checkout, no `uses: ./`
-#     and no download-artifact with run-id, github-token or repository (a
-#     `run:` of a repo script needs a checkout first, so the checkout ban
-#     covers it).
+# 12. A job with any write permission has no actions/checkout, no `uses: ./`,
+#     no `run:` naming `git clone`/`git fetch`, `gh repo clone` or
+#     raw.githubusercontent.com, and no download-artifact with run-id,
+#     github-token or repository (input names matched without case). Other
+#     ways to fetch code are owner review's (the threat model above).
 # Action names are matched lower-cased: GitHub resolves owner/repo without case.
 set -euo pipefail
 wf=${WORKFLOWS_DIR:-.github/workflows}
@@ -104,10 +105,12 @@ for f in "$wf"/*.yml "$wf"/*.yaml; do
       err "$f: job $job asks for write permissions but its if: is not exactly: $guard"
     fi
     # Rule 12: a job with a write permission runs no repository code and
-    # takes only this run's artifact. A `run:` of a repo script needs a
-    # checkout first, so banning the checkout (and `uses: ./`) covers it
-    # without parsing `run:`; a download from another run, repository or
-    # token could substitute the archive that `image` tested.
+    # takes only this run's artifact. Checked: no checkout, no `uses: ./`,
+    # and no `run:` that clones or fetches the repository by the usual
+    # spellings (git clone/fetch, with or without git's own options; gh
+    # repo clone; raw.githubusercontent.com). A download from another run,
+    # repository or token could substitute the archive that `image` tested;
+    # GitHub matches input names without case, so the keys are downcased.
     if grep -qE '"write(-all)?"' <<<"$perms"; then
       while IFS= read -r u; do
         [ -n "$u" ] || continue
@@ -116,10 +119,14 @@ for f in "$wf"/*.yml "$wf"/*.yaml; do
           ./*) err "$f: job $job has write permissions and uses a local action: $u" ;;
         esac
       done < <(yq -r ".jobs.\"$job\".steps[]? | (.uses // \"\") | downcase" "$f")
+      runs=$(yq -r ".jobs.\"$job\".steps[]? | (.run // \"\")" "$f")
+      if grep -Eiq '(^|[^[:alnum:]_.-])git[[:space:]]([^;&|]*[[:space:]])?(clone|fetch)([[:space:]]|$)|gh[[:space:]]+repo[[:space:]]+clone|raw\.githubusercontent\.com' <<<"$runs"; then
+        err "$f: job $job has write permissions and a run: that clones or fetches the repository (it must run no repository code)"
+      fi
       while IFS= read -r k; do
         [ -n "$k" ] || continue
         err "$f: job $job has write permissions and a download-artifact with $k (only this run's artifact)"
-      done < <(yq -r ".jobs.\"$job\".steps[]? | select((.uses // \"\") | downcase | test(\"^actions/download-artifact@\")) | .with // {} | keys | .[] | select(. == \"run-id\" or . == \"github-token\" or . == \"repository\")" "$f")
+      done < <(yq -r ".jobs.\"$job\".steps[]? | select((.uses // \"\") | downcase | test(\"^actions/download-artifact@\")) | .with // {} | keys | .[] | downcase | select(. == \"run-id\" or . == \"github-token\" or . == \"repository\")" "$f")
     fi
     timeout=$(yq ".jobs.\"$job\".\"timeout-minutes\" // \"\"" "$f")
     [ -n "$timeout" ] || err "$f: job $job has no timeout-minutes"
