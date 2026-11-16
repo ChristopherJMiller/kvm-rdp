@@ -1,6 +1,7 @@
 //! §10.2's matchers: received frames to kvm-sim's sends by FrameId, and
 //! client key presses to the HID reports kvm-sim read.
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// Two sends of one FrameId closer than this are one frame, not two loops:
@@ -50,6 +51,42 @@ pub fn latencies(sent: &[(u64, Instant)], received: &[(u64, Instant)]) -> (Vec<f
         }
     }
     (out, unmatched)
+}
+
+/// A sender's log of `(frame_id, stamp)` — `latencies`' `sent` — for a
+/// sender in kvm-bench's own process (the null bridge, Task 5.4). Each
+/// stamp is taken before its send starts, as kvm-sim's `sim_tx` is (PE12
+/// review I1), so it bounds the send from below: nothing the send sets off
+/// downstream, the frame's arrival included, comes before it. Stamped once
+/// the send returned, an arrival during the send's tail would precede its
+/// own stamp and read as unmatched, or, a loop on, meet the previous
+/// loop's send of its id. A clone shares the log.
+#[derive(Debug, Clone, Default)]
+pub struct SendLog(Arc<Mutex<Vec<(u64, Instant)>>>);
+
+impl SendLog {
+    /// Runs `send` — the whole of frame `id`'s send, from its hand-off on —
+    /// and logs `id` at the instant before `send` began if it returned
+    /// `Ok`; a refused send (`Err`) is not logged. The log's lock is taken
+    /// after `send` returns, never across it.
+    pub fn send<T, E>(&self, id: u64, send: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let stamped = Instant::now();
+        let out = send()?;
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((id, stamped));
+        Ok(out)
+    }
+
+    /// Every logged send so far, in order.
+    #[must_use]
+    pub fn sent(&self) -> Vec<(u64, Instant)> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
 }
 
 /// §10.2's load check: FrameIds unique within one loop, the loop at least
@@ -240,5 +277,54 @@ mod tests {
         let reports = vec![(ms(20), kbd(0x04)), (ms(25), kbd(0x04))];
         let (lat, missed) = input_latencies(&presses, &reports);
         assert_eq!((lat, missed), (vec![10.0, 5.0], 0));
+    }
+
+    /// Task 5.4 (PE12 re-review): a sender's log stamps each send before
+    /// the send starts, as kvm-sim's `sim_tx` (I1). An arrival the send
+    /// itself set off — the client has the frame while the write is still
+    /// under way — then meets its own send. Stamped once the send returned,
+    /// that arrival would come before its stamp and read as unmatched, or,
+    /// a loop on, meet the previous loop's send of its id.
+    #[test]
+    fn a_send_is_stamped_before_it_starts() {
+        let log = SendLog::default();
+        let before = Instant::now();
+        let mut seen = None;
+        let r: Result<(), ()> = log.send(7, || {
+            // The write under way; the client has the frame; the write's tail.
+            std::thread::sleep(Duration::from_millis(2));
+            seen = Some(Instant::now());
+            std::thread::sleep(Duration::from_millis(2));
+            Ok(())
+        });
+        assert_eq!(r, Ok(()));
+        let seen = seen.expect("the send ran");
+        let sent = log.sent();
+        let (lat, unmatched) = latencies(&sent, &[(7, seen)]);
+        assert_eq!(unmatched, 0, "the arrival came before its own send's stamp");
+        assert!(lat.len() == 1 && lat[0] >= 2.0, "{lat:?}");
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, 7);
+        assert!(
+            sent[0].1 >= before && sent[0].1 + Duration::from_millis(2) <= seen,
+            "stamped {:?} after the send began",
+            sent[0].1.saturating_duration_since(before)
+        );
+    }
+
+    /// Only a send that happened is logged — not one IronRDP refused (not
+    /// ready, or at its in-flight cap) — in order; a clone shares the log
+    /// (the null bridge's handle and its shipper).
+    #[test]
+    fn only_a_send_that_happened_is_logged_in_order() {
+        let log = SendLog::default();
+        let shipper = log.clone();
+        assert_eq!(shipper.send(1, || Ok::<_, ()>(())), Ok(()));
+        assert_eq!(shipper.send(2, || Err::<(), _>("refused")), Err("refused"));
+        assert_eq!(shipper.send(3, || Ok::<_, ()>(())), Ok(()));
+        let sent = log.sent();
+        let ids: Vec<u64> = sent.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, [1, 3]);
+        assert!(sent[0].1 <= sent[1].1);
     }
 }

@@ -19,8 +19,7 @@ pub struct Ctx {
     pub churn_every: Duration,
 }
 
-/// The per-PR set and every scenario but the soak (§10.2). Task 5.4 adds
-/// its name.
+/// The per-PR set and every scenario but the soak (§10.2).
 pub const CI: &[&str] = &[
     "unshaped",
     "input-latency",
@@ -40,6 +39,7 @@ pub const ALL: &[&str] = &[
     "suspended-not-reading",
     "suspended-reading",
     "panic-abort",
+    "e2e-null",
 ];
 
 pub async fn run(name: &str, cx: &Ctx) -> Result<Report, String> {
@@ -55,6 +55,7 @@ pub async fn run(name: &str, cx: &Ctx) -> Result<Report, String> {
         "suspended-not-reading" => stalled(cx, Stall::SuspendedNotReading).await,
         "suspended-reading" => stalled(cx, Stall::SuspendedReading).await,
         "panic-abort" => panic_abort(cx).await,
+        "e2e-null" => e2e_null(cx).await,
         other => Err(format!("no scenario {other:?}")),
     }
 }
@@ -731,5 +732,68 @@ async fn panic_abort(cx: &Ctx) -> Result<Report, String> {
         sim.stats().logouts as f64,
         0.0,
     );
+    Ok(r)
+}
+
+/// §10.1's end-to-end latency, for information: the bridge's distribution
+/// and the null bridge's, the same client, source and schedule — p50 and
+/// p99 of each, never subtracted. Both are stamped as a send starts:
+/// kvm-sim's `sim_tx` as a tag's write starts, the null bridge's before
+/// `send_avc420_frame` (`SendLog`).
+async fn e2e_null(cx: &Ctx) -> Result<Report, String> {
+    let mut r = Report::new("e2e-null", cx.thresholds);
+    let window = Duration::from_secs(20);
+    let through_bridge = {
+        let s = session(
+            cx,
+            SimConfig::es3(streams::load("bench_1080p30.h264")?),
+            "",
+            Opts::new(2),
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let from = Instant::now();
+        tokio::time::sleep(window).await;
+        let got: Vec<(u64, Instant)> = s.client.with_log(|l| {
+            l.rx.iter()
+                .filter(|x| x.at >= from)
+                .map(|x| (x.frame_id, x.at))
+                .collect()
+        });
+        latencies(&sim_sent(&s.sim), &got)
+    };
+    let through_null = {
+        let null =
+            crate::null_bridge::NullBridge::start(&streams::load("bench_1080p30.h264")?, 30)?;
+        let c = BenchClient::connect(null.addr, Opts::new(3));
+        if !c.until(Duration::from_secs(15), |l| !l.rx.is_empty()).await {
+            return Err(format!(
+                "no picture from the null bridge: {:?}",
+                c.with_log(|l| l.ended.clone())
+            ));
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let from = Instant::now();
+        tokio::time::sleep(window).await;
+        let got: Vec<(u64, Instant)> = c.with_log(|l| {
+            l.rx.iter()
+                .filter(|x| x.at >= from)
+                .map(|x| (x.frame_id, x.at))
+                .collect()
+        });
+        latencies(&null.sent(), &got)
+    };
+    for (who, (lat, unmatched)) in [("bridge", through_bridge), ("null bridge", through_null)] {
+        // The one check: a distribution to report (a PASS is never empty).
+        let e = summarize(&lat);
+        r.holds(&format!("{who}: latencies measured"), e.is_some());
+        if let Some(x) = e {
+            r.number(&format!("{who} end-to-end p50 ms"), x.p50);
+            r.number(&format!("{who} end-to-end p99 ms"), x.p99);
+            r.number(&format!("{who} frames"), x.n as f64);
+        }
+        r.number(&format!("{who} unmatched frames"), unmatched as f64);
+    }
+    r.note("the two distributions are reported side by side and never subtracted (§10.1)");
     Ok(r)
 }

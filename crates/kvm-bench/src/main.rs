@@ -11,6 +11,7 @@
 mod bridge;
 #[allow(dead_code)]
 mod client;
+mod null_bridge;
 #[allow(dead_code)]
 mod scenarios;
 mod streams;
