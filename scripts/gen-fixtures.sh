@@ -4,6 +4,7 @@
 # scenecut=0. Never fed from the real KVM.
 #   scripts/gen-fixtures.sh            fixtures/*.h264|.flv + *.manifest.json (committed)
 #   scripts/gen-fixtures.sh es3like    only fixtures/360p30_es3like_poc0.h264 (+ manifest)
+#   scripts/gen-fixtures.sh slate      only fixtures/slate_1080p.h264 (+ manifest)
 #   scripts/gen-fixtures.sh large      fixtures/large/*.h264 (gitignored; spikes, benches)
 #   scripts/gen-fixtures.sh bench      ${CARGO_TARGET_DIR:-target}/bench-streams/*.h264 (kvm-bench's
 #                                      §10.2 streams; -threads 4, not deterministic, never committed)
@@ -114,12 +115,6 @@ committed() {
     -bsf:v h264_metadata=video_full_range_flag=1 -f h264 $d/360p30_main_limited_flagfull.h264
   # Demux oracle: the main stream muxed by ffmpeg's own FLV muxer.
   "${FF[@]}" -i $d/360p30_main_full.h264 -c copy -f flv $d/360p30_main_full.flv
-  # "Connecting to KVM…" slate: one 1080p IDR (spec §6.4).
-  "${FF[@]}" -f lavfi -i "color=c=0x202020:size=1920x1080:rate=30" \
-    -vf "drawtext=fontfile=${KVM_RDP_FONT}:text='Connecting to KVM...':fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2,scale=out_color_matrix=bt709:out_range=pc,format=yuv420p" \
-    -frames:v 1 -an -c:v libx264 -preset veryfast -profile:v main -level:v 4.0 -threads 1 \
-    -x264-params "sliced-threads=0:keyint=1:min-keyint=1:scenecut=0:aud=1:repeat-headers=1:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=pc" \
-    -f h264 $d/slate_1080p.h264
 
   manifest $d/360p30_baseline_full.h264 30
   manifest $d/360p30_main_full.h264 30
@@ -130,7 +125,7 @@ committed() {
   manifest $d/360p30_main_limited_flagfull.h264 30
   manifest $d/480p30_main_full.h264 30
   manifest $d/360p30_main_full.flv 30
-  manifest $d/slate_1080p.h264 1
+  slate
   es3like
 }
 
@@ -213,6 +208,80 @@ es3like() {
   rm -rf "$work"
 }
 
+# The "Connecting to KVM…" slate (spec §6.4): one 1080p IDR, sent on the
+# surface the KVM's stream then plays on. Its SPS and PPS are byte for byte
+# what the client gets for the ES3's stream: census.md's SPS through the
+# bridge's own §6.8 rewrite, and census.md's PPS. That is Baseline (66) with
+# the ES3's constraint flags (all 0, so not flagged Constrained Baseline),
+# level 40, CAVLC, POC type 0, log2_max_frame_num 8, one reference frame,
+# 1920×1088 cropped to 1080, limited-range BT.709 (1/1/1), no timing info,
+# bitstream_restriction 0/1.
+#
+# Why (2026-11-16, the first Windows App session, on macOS): the slate
+# stayed on screen for good while Windows App acked the KVM's frames and
+# reported them decoded. The slate was then x264 Main, CABAC, full range,
+# POC type 2, and the KVM's stream is Baseline CAVLC POC type 0 on the same
+# surface. Windows App on macOS most likely keeps the decoder it set up from
+# the surface's first SPS/PPS rather than switching it mid-surface;
+# FreeRDP's software decoder (OpenH264 in L3) follows in-band SPS/PPS
+# changes, which is why no test caught it. The slate must therefore not
+# differ from the KVM's parameter sets: if the ES3's SPS or PPS changes
+# (census.md), update the census constants in es3_fixture and kvm-rdp's
+# slate test, then regenerate.
+#
+# How: x264 encodes Baseline with the census PPS's fields (ref=1;
+# stitchable=1 for pic_init_qp 26; chroma-qp-offset=4) at limited range,
+# then kvm-proto's es3_fixture `slate` swaps in the rewritten census SPS
+# (refusing unless x264's PPS is the census's byte for byte) and retargets
+# the IDR's slice header (frame_num at the census width, a zero
+# pic_order_cnt_lsb). It copies the slice data bit for bit, so the decode
+# stays identical (checked below). x264's SEI stays in the file, where it
+# records the encoder settings; Slate::from_annex_b drops it (§6.3's
+# allowlist).
+slate() {
+  local d=fixtures work md5_src trace kv got sps pps
+  work=$(mktemp -d)
+  "${FF[@]}" -f lavfi -i "color=c=0x202020:size=1920x1080:rate=30" \
+    -vf "drawtext=fontfile=${KVM_RDP_FONT}:text='Connecting to KVM...':fontcolor=white:fontsize=72:x=(w-text_w)/2:y=(h-text_h)/2,scale=out_color_matrix=bt709:out_range=tv,format=yuv420p" \
+    -frames:v 1 -an -c:v libx264 -preset veryfast -profile:v baseline -level:v 4.0 -threads 1 \
+    -x264-params "sliced-threads=0:keyint=1:min-keyint=1:scenecut=0:aud=1:repeat-headers=1:ref=1:stitchable=1:chroma-qp-offset=4:colorprim=bt709:transfer=bt709:colormatrix=bt709:range=tv" \
+    -f h264 "$work/x264.h264"
+  es3_fixture slate "$work/x264.h264" $d/slate_1080p.h264
+  md5_src=$("${DEC[@]}" -i "$work/x264.h264" -fps_mode passthrough -f md5 -)
+  if [ "$("${DEC[@]}" -i $d/slate_1080p.h264 -fps_mode passthrough -f md5 -)" != "$md5_src" ]; then
+    echo "slate: the decoded frame differs from the x264 source" >&2
+    rm -rf "$work"
+    return 1
+  fi
+  # ffmpeg's trace_headers, an independent reader, sees the KVM's shape.
+  trace=$("${DEC[@]}" -loglevel trace -i $d/slate_1080p.h264 -c copy -bsf:v trace_headers -f null - 2>&1 || true)
+  for kv in profile_idc=66 constraint_set0_flag=0 constraint_set1_flag=0 level_idc=40 \
+    log2_max_frame_num_minus4=4 pic_order_cnt_type=0 log2_max_pic_order_cnt_lsb_minus4=4 \
+    max_num_ref_frames=1 frame_mbs_only_flag=1 frame_crop_bottom_offset=4 \
+    video_full_range_flag=0 colour_primaries=1 transfer_characteristics=1 matrix_coefficients=1 \
+    timing_info_present_flag=0 bitstream_restriction_flag=1 max_num_reorder_frames=0 \
+    max_dec_frame_buffering=1 entropy_coding_mode_flag=0 pic_init_qp_minus26=0 \
+    chroma_qp_index_offset=4 frame_num=0 pic_order_cnt_lsb=0; do
+    got=$(tv "$trace" "${kv%%=*}")
+    if [ "$got" != "${kv#*=}" ]; then
+      echo "slate: ${kv%%=*} is $got, want ${kv#*=}" >&2
+      rm -rf "$work"
+      return 1
+    fi
+  done
+  manifest $d/slate_1080p.h264 1
+  # The parameter sets as hex, for review; kvm-rdp's slate tests compare
+  # them with the bridge's rewrite of census.md's.
+  "${FF[@]}" -i $d/slate_1080p.h264 -c copy -bsf:v "filter_units=pass_types=7" -f h264 "$work/sps.h264"
+  "${FF[@]}" -i $d/slate_1080p.h264 -c copy -bsf:v "filter_units=pass_types=8" -f h264 "$work/pps.h264"
+  sps=$(od -An -tx1 -v "$work/sps.h264" | tr -d ' \n' | sed 's/^00000001//')
+  pps=$(od -An -tx1 -v "$work/pps.h264" | tr -d ' \n' | sed 's/^00000001//')
+  jq --arg s "$sps" --arg p "$pps" '. + {sps_hex: $s, pps_hex: $p}' \
+    $d/slate_1080p.h264.manifest.json > "$work/manifest.json"
+  mv "$work/manifest.json" $d/slate_1080p.h264.manifest.json
+  rm -rf "$work"
+}
+
 large() {
   mkdir -p fixtures/large
   local d=fixtures/large
@@ -259,8 +328,9 @@ bench() {
 case "$MODE" in
   committed) committed ;;
   es3like) es3like ;;
+  slate) slate ;;
   large) large ;;
   bench) bench ;;
   clean) rm -rf fixtures/large ;;
-  *) echo "usage: $0 [committed|es3like|large|bench|clean]" >&2; exit 2 ;;
+  *) echo "usage: $0 [committed|es3like|slate|large|bench|clean]" >&2; exit 2 ;;
 esac

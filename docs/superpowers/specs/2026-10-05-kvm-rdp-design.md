@@ -1038,6 +1038,21 @@ embedded slate's dimensions (read from its SPS; the slate is a pre-encoded
 arm suppression, does not count for delivery metrics, and oracles start at the
 first KVM IDR.
 
+(2026-11-16, after the first Windows App session.) **The slate carries the
+KVM's parameter sets**: its SPS and PPS are byte for byte what the client
+gets for the ES3's stream, `census.md`'s SPS through the §6.8 rewrite
+(Baseline 66 with the ES3's constraint flags, all 0; level 40; POC type 0;
+limited-range BT.709) and `census.md`'s PPS (CAVLC). Only its slice header
+and slice data come from x264. On macOS, Windows App kept the slate on screen
+for good while it acked, and reported decoded, every KVM frame after it. The
+slate was then x264 Main, CABAC, full range, and POC type 2. Windows App most
+likely keeps the decoder it set up from the surface's first SPS/PPS rather
+than switching it mid-surface. FreeRDP's software decoder follows in-band
+SPS/PPS changes, so L3 never caught it, and L2's client has no H.264
+decoder. If the ES3's SPS or PPS changes, update `census.md` and the census
+constants in kvm-proto's `es3_fixture` example and the slate test, then
+run `gen-fixtures.sh slate`.
+
 **NeedIdr** means P-frames are dropped until an IDR is handed to IronRDP. Two
 flags drive what it does while waiting (§6.5): `idr_pending` and the
 idr-wait accounting.

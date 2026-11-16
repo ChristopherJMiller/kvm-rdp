@@ -599,7 +599,8 @@ mod tests {
         assert_eq!((s.param_sets_skipped, s.param_sets_unreported), (0, 0));
     }
 
-    /// A 1920x1080 Main SPS (x264's own, from fixtures/slate_1080p.h264),
+    /// A 1920x1080 Main SPS (x264's own, from fixtures/slate_1080p.h264
+    /// before the slate took the ES3's Baseline parameter sets),
     /// standing in for what a KVM sends in-band on a resolution change.
     const SPS_1080P_MAIN: &str = "674d4028dc0780227e5c05b808080a000003000200000300781e3067";
     /// Its PPS.

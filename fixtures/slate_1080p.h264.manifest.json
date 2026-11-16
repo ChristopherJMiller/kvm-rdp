@@ -1,18 +1,20 @@
 {
   "name": "slate_1080p.h264",
-  "sha256": "f2d2e849f0e8980ee1371516f4878daf1ab1a648f41e96d12d4e016865f920b0",
-  "bytes": 5855,
+  "sha256": "4249ddf0c8f719f785f96b59cc601bd83381408ee07c8a50df0e170df497fcb2",
+  "bytes": 11673,
   "width": 1920,
   "height": 1080,
-  "profile_idc": 77,
+  "profile_idc": 66,
   "level_idc": 40,
-  "pic_order_cnt_type": 2,
-  "video_full_range_flag": 1,
+  "pic_order_cnt_type": 0,
+  "video_full_range_flag": 0,
   "bitstream_restriction_flag": 1,
   "colour_primaries": 1,
   "matrix_coefficients": 1,
   "frames": 1,
   "key_frames": 1,
   "keyint": 1,
-  "slices_per_au": 1
+  "slices_per_au": 1,
+  "sps_hex": "67420028965403c0112f2cd40404041b41008540",
+  "pps_hex": "68ce3112"
 }
