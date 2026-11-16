@@ -11,16 +11,42 @@ Windows App: see the status below.
 
 The first target is the Angeet/Yeeso ES3 ("ONE KVM").
 
-**Status:** in development (Milestones 3b and 4). The bridge runs: NLA-only
+**Status:** built through Milestones 5 and 6; not yet run on the real
+device or with Windows App. The bridge runs: NLA-only
 RDP with EGFX AVC420 passthrough of the KVM's H.264, one session at a time
 (a new authenticated client takes over), the client's keyboard and mouse
 mapped to the KVM's HID frames with the stuck-key safety below, clipboard
 paste as typing, admin endpoints and a graceful shutdown — tested against
-`kvm-sim` with an in-process IronRDP client. `kvm-probe` has the hardware
-checks a few settings depend on (the paste pace among them), proven against
-`kvm-sim` but not yet run on the real device, so those settings keep their
-safe defaults. The bridge has not yet driven the real device, and Windows
-App has not yet been run against it (the owner's acceptance checks).
+`kvm-sim` with an in-process IronRDP client, and with FreeRDP 3.32.1 under
+Xvfb (L3 interop: FreeRDP decodes the bridge's stream, also with its frame
+acknowledgements suspended). CI's supply-chain gates are in place: every action
+pinned by commit SHA and checked by a script, `cargo deny` over what the
+image ships, fuzzing on every PR and nightly, and a minimal, non-root,
+reproducible container image, smoke-tested on every PR and published,
+signed, from `main` only. `kvm-bench` measures the spec's performance
+targets (below), all met on a shared development host. `kvm-probe` has the
+hardware checks a few settings depend on (the paste pace among them),
+proven against `kvm-sim` but not yet run on the real device, so those
+settings keep their safe defaults. The bridge has not yet driven the real
+device, and Windows App has not yet been run against it (the owner's
+acceptance checks). Nothing has run in CI yet either: the first push to
+`main` runs every workflow for the first time and publishes the first
+image.
+
+Left to the owner:
+
+- the first push to `main`, asked for once the final review is clean: it
+  publishes the first image, whose cosign and Rekor entries are public;
+  making the ghcr package public stays the owner's;
+- the nightly's strict `kvm-bench` run and the one-hour soak on GitHub's
+  runner — the absolute performance verdict and the image's memory limit;
+- GitHub's "Require actions to be pinned to a full-length commit SHA"
+  setting, once the workflows are on `main`;
+- whether to work on IronRDP's per-chunk allocations upstream or in the
+  fork;
+- the hardware run on the real KVM and the Windows App acceptance run,
+  with the checks Plan E added (among them, the KVM's own `hid.lua` typing
+  compared with ours).
 
 The design, and every decision behind it, is
 [the spec](docs/superpowers/specs/2026-10-05-kvm-rdp-design.md).
@@ -133,8 +159,9 @@ most 64 KiB) and are never logged.
 CI publishes the image from `main` only, as
 `ghcr.io/christopherjmiller/kvm-rdp:sha-<commit>` — pin it with its digest,
 `…:sha-<commit>@sha256:<digest>`. It is distroless (no shell, no package
-manager), amd64, and runs as `65532:65532` on a read-only root filesystem
-with no capabilities; it writes nothing.
+manager; `gcr.io/distroless/cc-debian13:nonroot`, about 51 MiB), amd64, and
+runs as `65532:65532` on a read-only root filesystem with no capabilities;
+it writes nothing.
 
     docker run --read-only --cap-drop ALL -v /etc/kvm-rdp:/etc/kvm-rdp:ro \
       -p 3389:3389 -p 9464:9464 \
@@ -173,6 +200,32 @@ is in the new bundle format):
 
 A commit whose CI run was superseded while queued (GitHub keeps one pending
 run per concurrency group) has no image; pin a published one.
+
+## Benchmarks
+
+`kvm-bench` (spec §10.2) runs kvm-sim and an IronRDP client in one process
+against the bridge as a subprocess, and checks §10.1's targets:
+
+    scripts/gen-fixtures.sh bench   # the bench streams, into target/ (never committed)
+    cargo build --release -p kvm-rdp --features alloc-stats,test-hooks --bin kvm-rdp
+    cargo build --release -p kvm-bench --bin kvm-bench
+    target/release/kvm-bench --bridge target/release/kvm-rdp --thresholds strict all
+
+`--thresholds ci` loosens §10.1's performance bounds 10× and the stalled-client
+timings 1.5×; delivery, bitrate and survival checks are exact (what every PR
+runs, scenario set `ci`). `strict` is meant for a quiet machine (pin it with
+`taskset`, at nice 0). The
+one-hour memory soak (`soak`) runs nightly in CI. Each scenario writes a JSON
+report to `target/kvm-bench/`.
+
+On the shared development host (16 cores, load 4.5–11, pinned to two CPUs
+at nice 0) every `strict` target held. The bridge enqueued every frame
+within 5 ms of reading it from the KVM, and passed input on in 0.71 ms at
+p99. It used 0.75 % of one core at 1080p30 and 8 Mbit/s, delivered every
+frame, and ended each kind of stalled client within its bound. These are
+the counting-allocator build's figures: an upper bound for the image's.
+The spec's §10.1 has the full record. The absolute run on GitHub's runner,
+and the soak that sizes the memory limit, have not run yet.
 
 ## Input and paste
 
@@ -226,8 +279,23 @@ memory-capped, and every long-lived worktree shares one target dir
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`;
   `scripts/target-budget.sh` fails above 8 GiB of target (IronRDP's graph
   is large; `cargo clean` is always safe).
+- `cargo test --workspace --all-features --test l2 -- --ignored l3::
+  --test-threads 1` — L3: FreeRDP (from the flake, with `xvfb-run`) against
+  the bridge. After a FreeRDP bump in `flake.lock`, re-record its
+  capability ladder with `KVM_RDP_L3_RECORD=1` on
+  `l3::freerdps_full_ladder_is_the_committed_fixture` and review the diff.
 - `scripts/gen-fixtures.sh` — regenerate the committed synthetic fixtures.
   Fixtures never come from a real KVM.
+- The monthly pin review (spec §4.2) re-checks the IronRDP pin, its goldens
+  and the upstream caps it still lacks; the Actions pins
+  (`scripts/pin-action.sh --verify`); the image's base and BuildKit digests
+  (`scripts/pin-image.sh`, and distroless's list of still-supported
+  images: a deprecated tag silently stops updating); and `cargo deny`.
+  `deny.toml` ignores one advisory, RUSTSEC-2023-0071 (`rsa`, reached only
+  through IronRDP's crypto crates, which pin a pre-fix release; the bridge
+  performs no RSA private-key operation), signed off by the owner; it goes
+  once `cargo update -p rsa --dry-run --verbose` shows rsa ≥ 0.10.0
+  reachable.
 - Fuzzing runs in CI only (spec §13): every kvm-proto target for 5 s on each
   PR and 300 s nightly, through `scripts/fuzz.sh`, which validates its own
   arguments and caps time, memory, input size and corpus size. To replay a
