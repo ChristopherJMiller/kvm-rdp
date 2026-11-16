@@ -18,7 +18,7 @@ yanked = "deny"
 # not constant-time (PKCS#1 v1.5 decryption padding; no default blinding,
 # which signing shares). The fix is rsa 0.10.0 (the advisory's patched
 # range is >= 0.10.0; rc.18 is unpatched), which IronRDP cannot reach:
-# every Devolutions release pins rsa = "=0.10.0-rc.18" (picky, sspi,
+# every current Devolutions release pins rsa = "=0.10.0-rc.18" (picky, sspi,
 # winscard) and IronRDP pins picky exactly. The owner declined forking
 # three crypto crates, because the bridge performs no rsa private-key
 # operation (below).
@@ -37,8 +37,9 @@ yanked = "deny"
 #   bridge code and no server path of IronRDP at that rev hands an RSA
 #   private key to rsa or picky. Standard RDP security (the server's RSA
 #   key decrypting the client random) is not implemented: the acceptor
-#   selects only HYBRID_EX, HYBRID or SSL and sends
-#   `ServerSecurityData::no_security()` (connection.rs:779–800, 1420). The
+#   selects HYBRID_EX or HYBRID for the bridge (`with_hybrid`,
+#   server.rs:554), and in every mode sends
+#   `ServerSecurityData::no_security()` (connection.rs:1420). The
 #   rsa private-key code in the graph is winscard's emulated smart card
 #   (signing: scard.rs:432–454), which sspi's Kerberos PKINIT client signs
 #   with (sspi smartcard.rs:166–170, kerberos/client/mod.rs:232–237);
@@ -68,10 +69,9 @@ version = 2
 # drafting from `cargo metadata`; Step 2 is the check.
 allow = ["Apache-2.0", "BSD-3-Clause", "ISC", "MIT", "Unicode-3.0"]
 confidence-threshold = 0.93
-
-[licenses.private]
-# The workspace's own crates are MIT OR Apache-2.0 and unpublished.
-ignore = true
+# No [licenses.private] ignore: the workspace's own crates (MIT OR
+# Apache-2.0) pass the allowlist, and an unpublished path or git crate must
+# pass it too.
 
 [bans]
 # Duplicate versions come with IronRDP's graph and are not ours to trim
@@ -90,3 +90,5 @@ unknown-registry = "deny"
 unknown-git = "deny"
 # The IronRDP fork the workspace git-pins (§4.2), and nothing else.
 allow-git = ["https://github.com/ChristopherJMiller/IronRDP"]
+# Every git dependency names its commit: a `branch` or `tag` is refused.
+required-git-spec = "rev"
