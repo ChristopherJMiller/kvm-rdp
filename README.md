@@ -161,11 +161,11 @@ most 64 KiB) and are never logged.
 ## Container image
 
 CI publishes the image from `main` only, as
-`ghcr.io/christopherjmiller/kvm-rdp:sha-<commit>` — pin it with its digest,
-`…:sha-<commit>@sha256:<digest>`. It is distroless (no shell, no package
-manager; `gcr.io/distroless/cc-debian13:nonroot`, about 51 MiB), amd64, and
-runs as `65532:65532` on a read-only root filesystem with no capabilities;
-it writes nothing.
+`ghcr.io/christopherjmiller/kvm-rdp:sha-<7-hex short commit>` — pin it with
+its digest, `…:sha-<commit>@sha256:<digest>`. It is distroless (no shell, no
+package manager; `gcr.io/distroless/cc-debian13:nonroot`, about 51 MiB),
+amd64, and runs as `65532:65532` on a read-only root filesystem with no
+capabilities; it writes nothing.
 
     docker run --read-only --cap-drop ALL -v /etc/kvm-rdp:/etc/kvm-rdp:ro \
       -p 3389:3389 -p 9464:9464 \
@@ -293,10 +293,10 @@ memory-capped, and every long-lived worktree shares one target dir
   Fixtures never come from a real KVM.
 - The monthly pin review (spec §4.2) re-checks the IronRDP pin, its goldens
   and the upstream caps it still lacks; the Actions pins
-  (`scripts/pin-action.sh --verify .github/workflows/*.yml`; with no file
-  it checks nothing); the image's base and BuildKit digests
-  (`scripts/pin-image.sh`, and distroless's list of still-supported
-  images: a deprecated tag silently stops updating); and `cargo deny`.
+  (`scripts/pin-action.sh --verify .github/workflows/*.yml`); the image's
+  base and BuildKit digests (`scripts/pin-image.sh`, and distroless's list
+  of still-supported images: a deprecated tag silently stops updating); and
+  `cargo deny`.
   `deny.toml` ignores one advisory, RUSTSEC-2023-0071 (`rsa`, reached only
   through IronRDP's crypto crates, which pin a pre-fix release; the bridge
   performs no RSA private-key operation), signed off by the owner

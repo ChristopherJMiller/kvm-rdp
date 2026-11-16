@@ -3199,11 +3199,12 @@ action is pinned to a commit SHA, one SHA per action, and
 `push`, `pull_request`, `schedule` and `workflow_dispatch` (so never
 `pull_request_target` or `workflow_run`), a top-level permission other
 than `contents: read`, a job that asks for a write permission anywhere
-but on a push to `main`, or that then checks out or runs repository code,
-a job with no `timeout-minutes`, a rust-cache that saves outside `main`,
-`secrets` outside a job so guarded, a checkout that keeps its token, an
-action pinned to two SHAs, and an image in the `Dockerfile` or a BuildKit
-image without a digest. Tools other than Rust come from the flake (DE13).
+but on a push to `main`, or that then checks out, clones or fetches the
+repository, or uses a local action, a job with no `timeout-minutes`, a
+rust-cache that saves outside `main`, `secrets` outside a job so guarded,
+a checkout that keeps its token, an action pinned to two SHAs, and an
+image in the `Dockerfile` or a BuildKit image without a digest. Tools
+other than Rust come from the flake (DE13).
 `ci.yml` on every PR and push to `main`: `check` (format, the
 tracked-secrets gate, no duplicate `ironrdp-*`, no `ring`, clippy also on
 the image's feature set, the tests, L3 one case at a time, the target
