@@ -1,15 +1,25 @@
 //! §10.2's matchers: received frames to kvm-sim's sends by FrameId, and
 //! client key presses to the HID reports kvm-sim read.
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// Two sends of one FrameId closer than this are one frame, not two loops:
+/// kvm-sim writes each frame to every open FLV (a side FLV during NeedIdr
+/// or the RTT spike's recovery) and a `burst_on_connect` FLV replays the
+/// GOP so far, both within a GOP (1 s in the bench streams), while §10.2's
+/// loops are at least 10 s (`unique_loop`). Half the shortest loop: only
+/// sends a loop apart compete for an arrival (PE12 re-review m-A).
+pub const ONE_FRAME_WITHIN: Duration = Duration::from_secs(5);
 
 /// End-to-end latencies in ms: each received `(frame_id, arrival)` minus
 /// the latest send of that id at or before the arrival (a looped source
 /// sends each id once per loop); and how many arrivals matched no send.
 /// A send's stamp bounds it from below (kvm-sim stamps a tag's write as it
 /// starts), so an arrival is never its own send's before it; one nearer the
-/// next send of its id than that latest one counts as unmatched — never as
-/// a latency of most of a loop (PE12 review I1).
+/// next send of its id than that latest one — when that next send is a loop
+/// on (`ONE_FRAME_WITHIN` or more), not the same frame's copy on another
+/// FLV — counts as unmatched, never as a latency of most of a loop (PE12
+/// review I1, re-review m-A).
 #[must_use]
 pub fn latencies(sent: &[(u64, Instant)], received: &[(u64, Instant)]) -> (Vec<f64>, usize) {
     let mut by_id: HashMap<u64, Vec<Instant>> = HashMap::new();
@@ -25,7 +35,12 @@ pub fn latencies(sent: &[(u64, Instant)], received: &[(u64, Instant)]) -> (Vec<f
             let i = v.partition_point(|t| t <= at);
             let tx = v.get(i.checked_sub(1)?)?;
             match v.get(i) {
-                Some(next) if next.duration_since(*at) < at.duration_since(*tx) => None,
+                Some(next)
+                    if next.duration_since(*tx) >= ONE_FRAME_WITHIN
+                        && next.duration_since(*at) < at.duration_since(*tx) =>
+                {
+                    None
+                }
                 _ => Some(tx),
             }
         });
@@ -150,6 +165,37 @@ mod tests {
         let (lat, unmatched) = latencies(&[(1, us(0)), (1, us(19_999_970))], &received);
         assert_eq!(unmatched, 0);
         assert!(lat.len() == 1 && (lat[0] - 0.03).abs() < 1e-9, "{lat:?}");
+    }
+
+    /// PE12 re-review m-A: kvm-sim writes each frame to every open FLV — a
+    /// side FLV during NeedIdr, the RTT spike's recovery — so one FrameId
+    /// is sent twice within a frame time. Those two sends are one frame:
+    /// an arrival between them meets the first (the bridge forwarded the
+    /// copy whose write had started), never "unmatched" because the second
+    /// copy is nearer; an arrival after both meets the latest. Only sends a
+    /// loop apart compete for an arrival.
+    #[test]
+    fn two_close_sends_of_one_id_are_one_frame() {
+        let t = Instant::now();
+        let us = |n: u64| t + Duration::from_micros(n);
+        // The main FLV's copy at 0, the side FLV's 500 µs later.
+        let sent = [(1, us(0)), (1, us(500)), (2, us(33_000)), (2, us(33_400))];
+        let (lat, unmatched) = latencies(&sent, &[(1, us(400)), (2, us(33_900))]);
+        assert_eq!(unmatched, 0, "{lat:?}");
+        assert!(
+            lat.len() == 2 && (lat[0] - 0.4).abs() < 1e-9 && (lat[1] - 0.5).abs() < 1e-9,
+            "{lat:?}"
+        );
+        // Copies in both loops: an arrival nearer loop 2's copies than loop
+        // 1's is still unmatched, as a lone send's would be.
+        let sent = [
+            (1, us(0)),
+            (1, us(500)),
+            (1, us(20_000_000)),
+            (1, us(20_000_500)),
+        ];
+        let (lat, unmatched) = latencies(&sent, &[(1, us(19_999_000))]);
+        assert_eq!((lat, unmatched), (vec![], 1));
     }
 
     /// PE12 review I1: a press whose report never came is one miss. The

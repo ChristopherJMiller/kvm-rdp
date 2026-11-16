@@ -315,6 +315,10 @@ impl Pump {
         if self.state == new {
             return;
         }
+        // DE4: §10.2's NeedIdr entries per minute — each entry, once.
+        if new == State::NeedIdr {
+            self.metrics.need_idr.inc();
+        }
         if self.state == State::NeedIdr && self.idr.resolve() {
             self.metrics.idr_cancelled.inc();
             out.push(Command::CancelIdrRequest);
@@ -1006,6 +1010,26 @@ mod tests {
 
     fn count(k: &[&str], name: &str) -> usize {
         k.iter().filter(|x| **x == name).count()
+    }
+
+    /// Plan E Task 5.2 (DE4, §10.2's NeedIdr entries per minute): each
+    /// entry into NeedIdr counts once — staying there counts nothing, and a
+    /// transient FLV reconnect from Live is one more.
+    #[test]
+    fn entries_into_need_idr_are_counted_once_each() {
+        let mut r = Rig::new(cfg());
+        r.need_idr();
+        let n0 = r.metrics.need_idr.get();
+        assert!(n0 >= 1, "the session's first wait for an IDR is an entry");
+        r.step(au(false, false)); // a P frame while waiting
+        assert_eq!(r.metrics.need_idr.get(), n0);
+        r.step(au(true, false));
+        assert_eq!(r.pump.state(), State::Live);
+        r.step(Input::FlvOpened {
+            origin: FlvOrigin::Transient,
+        });
+        assert_eq!(r.pump.state(), State::NeedIdr);
+        assert_eq!(r.metrics.need_idr.get(), n0 + 1);
     }
 
     /// §11.2 "Every policy": connecting costs exactly one FLV open, and the

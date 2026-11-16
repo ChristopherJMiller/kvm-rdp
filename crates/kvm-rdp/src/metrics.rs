@@ -264,6 +264,9 @@ pub struct Metrics {
     pub idr_side_failures: Family,
     pub idr_side_fallbacks: Counter,
     pub idr_cancelled: Counter,
+    /// Plan E Task 5.2 (DE4): entries into NeedIdr (§6.4), for §10.2's
+    /// NeedIdr entries per minute.
+    pub need_idr: Counter,
     pub sps_rewrites: Family,
     pub sps_changes: Family,
     pub bursts: Counter,
@@ -357,6 +360,10 @@ impl Default for Metrics {
                 "Side requests that fell back to a reconnect",
             ),
             idr_cancelled: Counter::new("kvm_rdp_idr_cancelled", "Deferred IDR requests cancelled"),
+            need_idr: Counter::new(
+                "kvm_rdp_need_idr",
+                "Entries into NeedIdr (§6.4; §10.2's NeedIdr entries per minute)",
+            ),
             sps_rewrites: Family::new(
                 "kvm_rdp_sps_rewrites",
                 "SPS rewrites by field (§6.8)",
@@ -497,6 +504,7 @@ impl Metrics {
             &self.relogins,
             &self.idr_side_fallbacks,
             &self.idr_cancelled,
+            &self.need_idr,
             &self.bursts,
             &self.frames_sent,
             &self.frames_acked,
@@ -654,9 +662,10 @@ mod tests {
             .collect();
         assert_eq!(
             names.len(),
-            46 + if cfg!(feature = "alloc-stats") { 2 } else { 0 },
-            "19 counters, 13 families, 9 gauges, 5 histograms (+2 counters in alloc-stats builds)"
+            47 + if cfg!(feature = "alloc-stats") { 2 } else { 0 },
+            "20 counters, 13 families, 9 gauges, 5 histograms (+2 counters in alloc-stats builds)"
         );
+        assert!(t.contains("# TYPE kvm_rdp_need_idr_total counter\n"));
         assert!(t.contains("# TYPE kvm_rdp_egfx_client_frames_decoded gauge\n"));
         assert!(t.contains("# TYPE kvm_rdp_log_lines_suppressed_total counter\n"));
         assert!(t.contains("# TYPE kvm_rdp_hid_reasserts_total counter\n"));

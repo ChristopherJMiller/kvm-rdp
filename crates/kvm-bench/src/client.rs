@@ -32,6 +32,7 @@ use ironrdp_pdu::{PduResult, gcc};
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_svc::ChannelFlags;
+use kvm_bench::link::Link;
 use kvm_proto::h264::{frame_id, is_vcl, split_annex_b};
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -401,19 +402,19 @@ fn run(
         // EGFX only: no bitmap update ever lands here.
         let mut image = DecodedImage::new(PixelFormat::RgbA32, 1920, 1080);
         // §10.2's shaped link (pre-flight E62): a link of `read_bps` the
-        // client reads through. Each PDU holds the link for len·8/bps after
-        // it arrives, so an IDR serialises as on a real link, and no credit
-        // accumulates while the source is quiet; a change of rate starts
-        // the link afresh. While the link is busy the read arm is off and a
-        // wake arm waits for it, so acks still fall due and go out.
-        let (mut link_free, mut link_bps) = (Instant::now(), None::<u64>);
+        // client reads through (`kvm_bench::link`). Each PDU holds the link
+        // for len·8/bps, so an IDR serialises as on a real link; an idle
+        // link banks no credit past `WAKE_SLACK`, nor a late wake loses any
+        // (PE13); a change of rate starts the link afresh. While the link is
+        // busy the read arm is off and a wake arm waits for it, so acks
+        // still fall due and go out.
+        let mut link = Link::new(Instant::now());
         let mut clip_open = true;
         loop {
             let s = *lock(&shape);
-            if s.read_bps != link_bps {
-                (link_free, link_bps) = (Instant::now(), s.read_bps);
-            }
-            let link_open = link_bps.is_none() || Instant::now() >= link_free;
+            let now = Instant::now();
+            link.set_rate(now, s.read_bps);
+            let busy = link.busy_until(now);
             let next_ack = lock(&acks).front().map(|(t, _)| *t);
             tokio::select! {
                 c = ctl.recv() => match c {
@@ -494,16 +495,15 @@ fn run(
                         Err(e) => return end(&log, format!("cliprdr: {e}")),
                     }
                 }
-                () = tokio::time::sleep_until(link_free.into()), if s.reading && !link_open => {}
-                pdu = framed.read_pdu(), if s.reading && link_open => {
+                () = sleep_until(busy), if s.reading && busy.is_some() => {}
+                pdu = framed.read_pdu(), if s.reading && busy.is_none() => {
                     let (action, frame) = match pdu {
                         Ok(v) => v,
                         Err(e) => return end(&log, format!("read: {e}")),
                     };
-                    lock(&log).last_read = Some(Instant::now());
-                    if let Some(bps) = link_bps {
-                        link_free = Instant::now() + Duration::from_secs_f64(frame.len() as f64 * 8.0 / bps as f64);
-                    }
+                    let at = Instant::now();
+                    lock(&log).last_read = Some(at);
+                    link.read(at, frame.len());
                     let outputs = match stage.process(&mut image, action, &frame) {
                         Ok(o) => o,
                         Err(e) => return end(&log, format!("process: {e}")),

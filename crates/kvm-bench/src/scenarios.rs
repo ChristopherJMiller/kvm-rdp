@@ -1,13 +1,14 @@
 //! §10.2's scenarios. Each returns a `Report`; `run` picks one by name.
 use crate::bridge::{Bridge, clk_tck};
-use crate::client::{BenchClient, Opts};
+use crate::client::{BenchClient, Opts, Rx};
 use crate::streams;
-use kvm_bench::frames::{latencies, unique_loop};
+use kvm_bench::frames::{input_latencies, latencies, unique_loop};
 use kvm_bench::prom::Scrape;
 use kvm_bench::report::{Report, Thresholds};
 use kvm_bench::stats::summarize;
 use kvm_proto::h264::{frame_id, is_vcl};
-use kvm_sim::{KvmSim, SimConfig, SimEvent, Source};
+use kvm_proto::keymap::usage_for_scancode;
+use kvm_sim::{Fault, KvmSim, SimConfig, SimEvent, Source};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -18,14 +19,26 @@ pub struct Ctx {
     pub churn_every: Duration,
 }
 
-/// The per-PR set and every scenario but the soak (§10.2). Tasks 5.2–5.4
+/// The per-PR set and every scenario but the soak (§10.2). Tasks 5.3–5.4
 /// add their names.
-pub const CI: &[&str] = &["unshaped"];
-pub const ALL: &[&str] = &["unshaped"];
+pub const CI: &[&str] = &["unshaped", "input-latency"];
+pub const ALL: &[&str] = &[
+    "unshaped",
+    "input-latency",
+    "shaped-50ms-20mbit",
+    "shaped-150ms-5mbit",
+    "rtt-spike",
+    "idle-motion",
+];
 
 pub async fn run(name: &str, cx: &Ctx) -> Result<Report, String> {
     match name {
         "unshaped" => unshaped(cx).await,
+        "input-latency" => input_latency(cx).await,
+        "shaped-50ms-20mbit" => shaped(cx, "shaped-50ms-20mbit", 50, 20).await,
+        "shaped-150ms-5mbit" => shaped(cx, "shaped-150ms-5mbit", 150, 5).await,
+        "rtt-spike" => rtt_spike(cx).await,
+        "idle-motion" => idle_motion(cx).await,
         other => Err(format!("no scenario {other:?}")),
     }
 }
@@ -253,5 +266,211 @@ async fn unshaped(cx: &Ctx) -> Result<Report, String> {
         r.number("end-to-end p50 ms", e.p50);
         r.number("end-to-end p99 ms", e.p99);
     }
+    Ok(r)
+}
+
+/// Set-1 make codes for a–z, cycled so consecutive presses differ.
+const LETTERS: [u8; 26] = [
+    0x1E, 0x30, 0x2E, 0x20, 0x12, 0x21, 0x22, 0x23, 0x17, 0x24, 0x25, 0x26, 0x32, 0x31, 0x18, 0x19,
+    0x10, 0x13, 0x1F, 0x14, 0x16, 0x2F, 0x11, 0x2D, 0x15, 0x2C,
+];
+
+/// §10.1: bridge input latency p99 < 5 ms — the client's input PDU written
+/// → kvm-sim's HID frame read, on this process's one clock — while 1080p60
+/// video with an IDR every second flows and a source burst replays every
+/// 5 s (an FLV dropped under `burst_on_connect` replays the GOP so far).
+async fn input_latency(cx: &Ctx) -> Result<Report, String> {
+    let mut r = Report::new("input-latency", cx.thresholds);
+    let mut cfg = SimConfig::es3(streams::load("bench_1080p60.h264")?);
+    cfg.profile.fps = 60;
+    cfg.profile.burst_on_connect = true;
+    // No re-assert within the run (D10a). Re-check after Plan D's residual
+    // fix lands (the re-assert pong-gated, the backoff skipped once until the
+    // session start): 600 s must still mean "none within the run"
+    // (pre-flight X3).
+    let extra = "[video]\nmax_fps = 60\n[input]\nreassert_after = \"600s\"\n";
+    let s = session(cx, cfg, extra, Opts::new(2)).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let a = mark(&s).await?;
+    let t0 = Instant::now();
+    let mut i = 0usize;
+    while t0.elapsed() < Duration::from_secs(20) {
+        let code = LETTERS[i % LETTERS.len()];
+        s.client.key(code, true);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        s.client.key(code, false);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        if i % 100 == 99 {
+            s.sim.inject(Fault::Close);
+        }
+        i += 1;
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let b = mark(&s).await?;
+    window_checks(&mut r, &s, &a, &b);
+    let presses: Vec<(u8, Instant)> = s.client.with_log(|l| {
+        l.keys
+            .iter()
+            .filter_map(|(code, at)| Some((usage_for_scancode(*code, false)?, *at)))
+            .collect()
+    });
+    let reports: Vec<(Instant, Vec<u8>)> = s
+        .sim
+        .stamped_events()
+        .into_iter()
+        .filter_map(|(t, e)| match e {
+            SimEvent::Hid { bytes, .. } => Some((t, bytes)),
+            _ => None,
+        })
+        .collect();
+    let (lat, missed) = input_latencies(&presses, &reports);
+    r.at_most("presses with no HID report", missed as f64, 0.0);
+    match summarize(&lat) {
+        Some(x) => {
+            r.perf_at_most("input latency p99, ms", x.p99, 5.0);
+            r.number("input latency p50 ms", x.p50);
+            r.number("presses", x.n as f64);
+        }
+        None => r.holds("input latencies measured", false),
+    }
+    r.number(
+        "burst frames",
+        b.m.delta(&a.m, "kvm_rdp_burst_frames_total"),
+    );
+    Ok(r)
+}
+
+/// The longest gap between pictures in `[from, to]`, in ms.
+fn longest_gap(rx: &[Rx], from: Instant, to: Instant) -> f64 {
+    let (mut last, mut gap) = (from, 0.0f64);
+    for x in rx.iter().filter(|x| x.at >= from && x.at <= to) {
+        gap = gap.max(x.at.duration_since(last).as_secs_f64() * 1000.0);
+        last = x.at;
+    }
+    gap.max(to.duration_since(last).as_secs_f64() * 1000.0)
+}
+
+/// §10.2's shaped links: acks delayed `delay_ms` and reads throttled to
+/// `mbit` Mbit/s. Reported: NeedIdr entries per minute, drops by reason,
+/// the longest picture gap. Checked: the session survives and kvm-sim never
+/// sees back-pressure. (Task 6.1 records these numbers in rev 6.4; no
+/// default changes from them — controller ruling b.)
+async fn shaped(cx: &Ctx, name: &str, delay_ms: u64, mbit: u64) -> Result<Report, String> {
+    let mut r = Report::new(name, cx.thresholds);
+    let s = session(
+        cx,
+        SimConfig::es3(streams::load("bench_1080p30.h264")?),
+        "",
+        Opts::new(2),
+    )
+    .await?;
+    s.client.shape(|sh| {
+        sh.ack_delay = Duration::from_millis(delay_ms);
+        sh.read_bps = Some(mbit * 1_000_000);
+    });
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let a = mark(&s).await?;
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let b = mark(&s).await?;
+    window_checks(&mut r, &s, &a, &b);
+    let minutes = b.at.duration_since(a.at).as_secs_f64() / 60.0;
+    r.number(
+        "NeedIdr entries per minute",
+        b.m.delta(&a.m, "kvm_rdp_need_idr_total") / minutes,
+    );
+    r.number(
+        "longest picture gap, ms",
+        s.client.with_log(|l| longest_gap(&l.rx, a.at, b.at)),
+    );
+    // What the link carried: under the source's 8 Mbit/s, the link or the
+    // bridge's gates held the stream back.
+    let bits: f64 = s.client.with_log(|l| {
+        l.rx.iter()
+            .filter(|x| x.at >= a.at && x.at <= b.at)
+            .map(|x| x.vcl_bytes as f64 * 8.0)
+            .sum()
+    });
+    r.number(
+        "received VCL Mbit/s",
+        bits / b.at.duration_since(a.at).as_secs_f64() / 1e6,
+    );
+    Ok(r)
+}
+
+/// §10.2's 2 s RTT spike: acks delayed 2 s for 3 s, then prompt again.
+/// Reported: the time from the spike's end to the first picture kvm-sim
+/// sent after it (time-to-picture), the longest picture gap after the
+/// spike, NeedIdr entries and drops. Checked: the session survives.
+async fn rtt_spike(cx: &Ctx) -> Result<Report, String> {
+    let mut r = Report::new("rtt-spike", cx.thresholds);
+    let s = session(
+        cx,
+        SimConfig::es3(streams::load("bench_1080p30.h264")?),
+        "",
+        Opts::new(2),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let a = mark(&s).await?;
+    s.client.shape(|sh| sh.ack_delay = Duration::from_secs(2));
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    s.client.shape(|sh| sh.ack_delay = Duration::ZERO);
+    let spike_end = Instant::now();
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let b = mark(&s).await?;
+    window_checks(&mut r, &s, &a, &b);
+    let sent = sim_sent(&s.sim);
+    let after: Vec<(u64, Instant)> = s.client.with_log(|l| {
+        l.rx.iter()
+            .filter(|x| x.at >= spike_end)
+            .map(|x| (x.frame_id, x.at))
+            .collect()
+    });
+    let ttp = after.iter().find_map(|(id, at)| {
+        let (lat, _) = latencies(&sent, &[(*id, *at)]);
+        let tx = *at - Duration::from_secs_f64(lat.first()? / 1000.0);
+        (tx >= spike_end).then(|| at.duration_since(spike_end).as_secs_f64() * 1000.0)
+    });
+    match ttp {
+        Some(ms) => r.number("time to picture after the spike, ms", ms),
+        None => r.holds("a picture sent after the spike arrived", false),
+    }
+    // The recovery: the first picture after the spike can come while acks
+    // queued in it still fall due (a FIFO link), and the gate close again.
+    r.number(
+        "longest picture gap after the spike, ms",
+        s.client.with_log(|l| longest_gap(&l.rx, spike_end, b.at)),
+    );
+    r.number("NeedIdr entries", b.m.delta(&a.m, "kvm_rdp_need_idr_total"));
+    Ok(r)
+}
+
+/// §10.2's idle → motion: the idle_motion stream's still 10 s, then 10 s of
+/// noise, looped. The soft gate is an age gate (§14: not a frame count), so
+/// the bitrate's jump must close nothing: no soft-gate drop and no NeedIdr
+/// entry over two transitions.
+async fn idle_motion(cx: &Ctx) -> Result<Report, String> {
+    let mut r = Report::new("idle-motion", cx.thresholds);
+    let s = session(
+        cx,
+        SimConfig::es3(streams::load("idle_motion_1080p30.h264")?),
+        "",
+        Opts::new(2),
+    )
+    .await?;
+    let a = mark(&s).await?;
+    tokio::time::sleep(Duration::from_secs(22)).await;
+    let b = mark(&s).await?;
+    window_checks(&mut r, &s, &a, &b);
+    r.at_most(
+        "soft_gate drops across idle → motion",
+        b.m.delta(&a.m, "kvm_rdp_frames_dropped_total{reason=\"soft_gate\"}"),
+        0.0,
+    );
+    r.at_most(
+        "NeedIdr entries across idle → motion",
+        b.m.delta(&a.m, "kvm_rdp_need_idr_total"),
+        0.0,
+    );
     Ok(r)
 }
