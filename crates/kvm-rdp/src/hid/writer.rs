@@ -1243,7 +1243,18 @@ mod tests {
         sim.wait_for(Duration::from_secs(3), |e| hid_events(e) >= 3)
             .await
             .unwrap();
-        assert!(hid.kvm_may_hold(), "a held key was written");
+        // Waited for, not read once: the writer notes a report (`note_sent`,
+        // which sets `may_hold`) only after its write returns, so kvm-sim
+        // can record the held key first — the race 48c15d5 fixed in
+        // `session.rs`'s `hold_cmd` (PE16 review, Plan E Task 6.1).
+        let held = tokio::time::timeout(Duration::from_secs(3), async {
+            while !hid.kvm_may_hold() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(held, "a held key was written");
         hid.release_all(ReleaseTrigger::SessionEnd);
         close(&ctl).await;
         tokio::time::timeout(Duration::from_secs(5), run)
