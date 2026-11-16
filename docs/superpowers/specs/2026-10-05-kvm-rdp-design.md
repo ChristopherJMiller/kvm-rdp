@@ -2,11 +2,63 @@
 
 | | |
 |---|---|
-| Status | Draft rev 6.3 — Plan D's deviations recorded (2026-10-15); rev 6.2: Plan C's (2026-10-08); rev 6.1: Plan B's (2026-10-06); rev 6: census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
+| Status | Draft rev 6.4 — Plan E's deviations recorded (2026-11-15); rev 6.3: Plan D's (2026-10-15); rev 6.2: Plan C's (2026-10-08); rev 6.1: Plan B's (2026-10-06); rev 6: census-filled. Design agreed in conversation 2026-10-05; revised after a source-level research pass (IronRDP `38b074e`, macrdp), a five-lens adversarial review, and three coverage/consistency checks (rev 5); amended with the Milestone 0 Leg A census, 2026-10-06 (rev 5.1); filled from the whole census — Legs A, B and C, with FreeRDP 3.31.1 standing in for Windows App — and the Milestone 0 verdict recorded, 2026-10-06 (rev 6) |
 | Repo | `github.com/ChristopherJMiller/kvm-rdp` (public, MIT OR Apache-2.0) |
 | First target | Angeet/Yeeso ES3 "ONE KVM" wired to a Mac Studio |
 | Client | Microsoft Windows App on macOS, through an rdpgw RD Gateway on 443 |
 | Companion spec | Deployment, gateway, edge gating and KVM isolation live in `luma-homeops` (separate spec, written after Milestone 0). §9.4 lists what this spec requires of it |
+
+**Rev 6.4 — Plan E (2026-10-15 to 2026-11-15).** Records what building
+Milestones 5 and 6 settled, against the code as built. DE*n* are Plan E's
+recorded deviations (`docs/superpowers/plans/2026-10-15-kvm-rdp-plan-e.md`);
+every amended passage below is marked "rev 6.4". The owner's hardware run
+(Plan D Task 1.6) and Windows App acceptance run have not happened yet, so
+every value they would retune keeps its written default. Nothing has run
+in CI yet either — nothing was pushed before the merge that ends Plan E —
+so every CI, nightly and owner-triggered figure below reads "not yet run",
+and the absolute perf verdict (DE11) waits for the nightly's strict run on
+GitHub's runner. The change log supersedes nothing in rev 6.3's; it is
+added to it. One line per change:
+
+- DE1 (§4.1): the image is a Dockerfile — both bases pinned by digest (Debian 13 since DE17), `cargo build --release --locked -p kvm-rdp -p kvm-probe`, `--remap-path-prefix`, DWARF stripped, `MALLOC_ARENA_MAX=2`, user `65532:65532`, amd64 only, a pinned BuildKit with `SOURCE_DATE_EPOCH` and `rewrite-timestamp=true`; pushed as `ghcr.io/christopherjmiller/kvm-rdp:sha-<short>`, signed keyless with cosign and attested with GitHub build provenance.
+- DE2 (§9.1): "CI checks the published image rejects any other mode" is a check on the wire — the smoke test's X.224 requests for TLS only, standard RDP security and a legacy request with no RDP_NEG_REQ are closed with no reply, and an NLA client's request gets `HYBRID` selected — and the image refuses `[test]` at load, exit 2.
+- DE3 (§10.1): bridge-owned allocations are (A) kvm-proto's demux → admission → Annex-B per AU (≤ 1.5), (B) the KVM side's per-chunk wrapper (0) and (C) `Pump::step_into` net of a twin `GraphicsPipelineServer`'s own allocations (≤ 0.5), on the committed ES3-shaped and 480p fixtures.
+- DE4 (§10.4): `kvm_rdp_log_lines_suppressed_total`, `kvm_rdp_egfx_client_frames_decoded`, `kvm_rdp_need_idr_total`, and in `alloc-stats` builds `kvm_rdp_allocations_total` and `kvm_rdp_allocated_bytes_total` join the registry: 47 families, 49 in an `alloc-stats` build.
+- DE5 (§4.5): a third-party line logs only if its callsite has not logged in the last 10 s, and is otherwise counted; bridge lines are never limited.
+- DE6 (§4.4): `test-hooks`, a non-default feature every test build turns on, holds the RDP-runtime stall, the injected panic and the `[test]` table; the image has none of them and refuses `[test]` as an unknown key.
+- DE7 (§5.2): release builds are `panic = "abort"` by construction — a build without debug assertions and without abort does not compile.
+- DE8 (§6.1): the SPS limits gain width and height ≥ 200 after cropping (MS-RDPEDISP 2.2.2.2.1, not MS-RDPBCGR as §12 had it), `stream_incompatible` otherwise.
+- DE9 (§11.2, §11.4): L3 is four `#[ignore]` cases `l3::*` in the L2 test binary, run by CI's `check` job; the 11-set ladder fixture is recorded from the flake's FreeRDP 3.32.1 and names it on its first line (its invocations: DE21).
+- DE10 (§10.2): kvm-bench as built — its own lean client, 20 s bench streams with an IDR every second, 60 fps scenarios at `video.max_fps = 60`, stalled-client timings 1.5× (not 10×) under `ci`, the bridge an `alloc-stats,test-hooks` release build whose CPU and latency are an upper bound for the image's, sharing the pinned CPUs with kvm-bench.
+- DE11 (§10.2): the "dedicated runner" is the nightly's `workflow_dispatch` with `thresholds = strict` on a GitHub-hosted runner, `taskset`-pinned to CPUs 2,3 of its four at nice 0; a pinned run on the shared host is a development check, recorded with its load.
+- DE12 (§8, §11.6): the `hid.lua?type=text` comparison is an L5 / Leg D owner item through the vendor web UI's own text box; nothing guesses a write path into the device's typing endpoint.
+- DE13 (§12): CI's provenance — rustup from the runner image for Rust, `ubuntu-24.04` runners, every other tool from the flake's nixpkgs, except `publish` (skopeo and docker from the runner, cosign from the SHA-pinned installer) and the image jobs' host tools.
+- DE14 (§10.1): the soak's preempting client alternates `127.0.0.2` and `127.0.0.3`, and its resize alternates the 1080p and 720p bench streams.
+- DE15 (§12): cargo-deny's `bans`, `licenses` and `sources` block every PR; `advisories` blocks on main and is reported on PRs and nightly; rustls moves to 0.23.46 (RUSTSEC-2026-0346..0349). RUSTSEC-2023-0071 (`rsa`, Marvin) is ignored in `deny.toml` with its reachability reading: rsa 0.10.0 fixes it, but IronRDP's exact picky/sspi/winscard pins cannot reach that release, and the bridge performs no rsa private-key operation — signed off by the owner (2026-11-15; DE22 supersedes DE15's "no fix upstream" and "pending").
+- DE16 (§7.4): the stale watch releases once the RDP heartbeat is older than 3 s (`hid::stale::RDP_STALE_RELEASE`, three heartbeat periods), not "about 1 s"; `/livez`'s bound is unchanged.
+- DE17 (§4.1, §4.2, §15): the image is on Debian 13 — runtime `gcr.io/distroless/cc-debian13:nonroot`, builder `rust:1.94.1-slim-trixie` (superseding DE1's Debian 12 bases): distroless no longer updates any other tag. 50.9 MiB of a 64 MiB cap; GLIBC_2.39 at most needed, against the runtime's 2.41.
+- DE18 (§10.1): the soak runs two warm-up churn cycles before its window (minutes 1 and 3 of the hour), and checks §10.1's strict bounds only on a run of 60 minutes or more.
+- DE19 (§10.1): the whole-process allocation row is a measured regression baseline, 1.1 × (70 + bytes/255) per frame; third-party code, not the bridge, makes the difference from the old guess.
+- DE20 (§10.1, §10.2): every latency stamp is taken before its send — `sim_tx` as kvm-sim starts writing the tag, a key press before its PDU, the null bridge before `send_avc420_frame`.
+- DE21 (§11.4): FreeRDP 3.32.1 refuses AVC420 under `/gfx:frame-ack:off` or a bare `/gfx`; the ack-suspension case runs `/gfx:AVC420,frame-ack:off`, and the ladder is recorded with no `/gfx`, census Leg C's condition.
+- DE22 (§4.2, §12): RUSTSEC-2023-0071 is fixed in rsa 0.10.0, which IronRDP's exact picky/sspi/winscard pins cannot reach; the ignore stays, signed off by the owner (2026-11-15), until the pin review finds the chain on rsa ≥ 0.10.0. Five other advisories of 2026-11-15 were cleared by lockfile bumps.
+- §4.1: `kvm-bench` as built — a pure `kvm_bench` library (statistics and the soak's arithmetic, the `/metrics` parser, the report and its thresholds, the frame and input matchers, the link shaper) and an IO binary with no tests (kvm-sim, the lean client, the bridge as a subprocess, the null bridge, which uses `ironrdp-server`).
+- §4.2: a pin review checklist, monthly and on every IronRDP pin bump, with the upstream caps still missing (SVC/DVC reassembly, the CLIPRDR format count, per-PDU WARNs), the release-candidate crypto and RUSTSEC-2023-0071's trigger, L3's ladder, `kvm-bench`, and beside it the Actions, image and BuildKit pins (distroless's supported list included) and `cargo deny`.
+- §4.4: `[test] panic_after` and `[test] stall_on_sigusr1` exist only in `test-hooks` builds; the image refuses `[test]` as an unknown key.
+- §4.5: third-party lines limited per callsite (DE5), counted in `kvm_rdp_log_lines_suppressed_total`; IronRDP's per-PDU WARN now costs one line per callsite per 10 s.
+- §5.2: DE7; the release build's abort is shown by `kvm-bench panic-abort`, a debug build's exit 1 by L2.
+- §6.1: DE8's floor beside the other SPS limits.
+- §7.4: the KVM-runtime stale watch as built (`hid::stale`, `release_all{trigger="rdp_stale"}`) replaces rev 6.3's "carried to Plan E" sentence.
+- §8: the `hid.lua?type=text` comparison is an L5 / Leg D owner item (DE12); a queue resync while the Typist types ends the paste `aborted_resync` and releases all, replacing rev 6.3's m4 residual, with a narrower residual of its own: a resync in or after the paste's last step leaves only a prefix, never a hole.
+- §9.1: DE2's checks in `scripts/image-smoke.sh`, on every PR's image before `publish` pushes those bytes.
+- §10.1: a "Result (rev 6.4)" column — every target met under `strict` on the shared development host, the soak's memory pending the first nightly soak; the bridge-owned split (A, B, C); the whole-process row restated (DE19); the stamps (DE20); the end-to-end figures side by side.
+- §10.2: the harness as built — the scenario names, the `ci` and `all` sets, the bench streams, the link shaper, the null bridge, the reports, the RTT spike's recovery beside its time-to-picture, and the 150 ms / 5 Mbit/s link that cannot carry the 8 Mbit/s stream.
+- §10.4: the registry as built — 47 families (20 counters, 13 labelled families, 9 gauges, 5 histograms), 49 in an `alloc-stats` build; `release_all` gains `rdp_stale` and `paste_resync`, `paste_events` gains `aborted_resync`, and what `websocket_reconnect` counts is spelled out.
+- §11.2, §11.4: L3 as built (DE9, DE21): the four `l3::` cases, the ladder fixture and its re-record rule, the L1 case that replays it.
+- §11.6: the L5 checklist gains DE12's comparison, the deployed bridge's CPU at 1080p30 against §10.1's 5 %, and the memory limit holding over a working day.
+- §12: planning unit E's status; every "Carried to Plan E" bullet names what closed it, and Task 2.4's fix of the fuzz nightly's level-1b oracle joins them; CI as built — the SHA pins, cargo-deny (advisories blocking on `main`, reported on PRs and nightly; RUSTSEC-2023-0071's ignore signed off by the owner, 2026-11-15), the lint job, the nightly, L3, the image and `publish` — none of it run on GitHub yet; what Plan E leaves to the owner; the acceptance checklist runs against the published image (no new item).
+- §13: the target budget re-measured with the release artifacts; the soak runs nightly; image builds run in Docker under their own CPU and memory caps, their cache outside the budget; the nightly L2 stressor runs at nice 5.
+- §15: "Watched" gains the image's base and BuildKit digests, the Actions pins, `flake.lock`'s FreeRDP (the L3 ladder fixture follows it) and RUSTSEC-2023-0071's trigger.
 
 **Rev 6.3 — Plan D (2026-10-14 to 2026-10-15).** Records what building
 Milestones 3b and 4 settled, against the code as built. DD*n* are Plan D's
@@ -349,12 +401,45 @@ Windows App ─ rdpgw ─┼─▶ RdpServer (Preempt, Hybrid/NLA)              
 | `kvm-probe` | `kvm-proto`, tokio, hyper, tungstenite, rustls (aws-lc) | Census tool (§12). No IronRDP |
 | `kvm-sim` | `kvm-proto`, tokio, httparse (hyper's parser), tokio-tungstenite, rustls (aws-lc) | Fake ES3 for tests and benches (§11.5), served over TLS; it writes HTTP itself so every FLV byte is observable and corruptible (rev 6.1) |
 | `kvm-rdp` | `kvm-proto`, IronRDP, tokio, rustls (aws-lc) | The bridge binary |
-| `kvm-bench` | `kvm-sim`, IronRDP client crates | Perf harness (§10.2) |
+| `kvm-bench` | `kvm-sim`, IronRDP client crates (rev 6.4: and `ironrdp-server`, for the null bridge) | Perf harness (§10.2) |
 | `fuzz/` | `kvm-proto` only | Separate cargo workspace, nightly, CI-only |
 
 Every hostile-input parser lives in `kvm-proto`, so fuzzing and most tests
 never compile IronRDP or aws-lc. The container image ships `kvm-rdp` and
 `kvm-probe`.
+
+Rev 6.4 (Plan E Task 5.1, DE10): `kvm-bench` is two halves. The pure
+`kvm_bench` library holds what decides pass or fail — the statistics and
+the soak's arithmetic (`stats`), the `/metrics` text parser (`prom`), a
+scenario's report and its thresholds (`report`), the frame and input
+matchers (`frames`) and the shaped link's clock (`link`) — with unit
+tests, and its test binary links no IronRDP (§13). The binary
+(`test = false`) does the IO: kvm-sim, the lean IronRDP client, the bridge
+as a subprocess and the null bridge (§10.1), which uses `ironrdp-server`
+at the same pin (§4.2, `egfx` only). Neither half is in the image, and
+cargo-deny's production graph excludes both `kvm-sim` and `kvm-bench`.
+
+Rev 6.4 (Plan E Tasks 4.1–4.2, DE1, DE17): the image as built. A
+`Dockerfile` builds `cargo build --release --locked -p kvm-rdp -p
+kvm-probe` in `docker.io/library/rust:1.94.1-slim-trixie` and copies both
+binaries onto `gcr.io/distroless/cc-debian13:nonroot`, each base pinned
+by digest (`scripts/pin-image.sh`); Debian 13, because distroless updates
+no other line — `cc-debian12` froze at its last digest — and builder and
+runtime share glibc 2.41 (the binaries need GLIBC_2.39 at most). The
+build remaps `CARGO_HOME` and the source tree (`--remap-path-prefix`), so
+no build-host path reaches an error message; strips DWARF but keeps
+symbols; sets `MALLOC_ARENA_MAX=2` (the soak's condition, §10.1); runs as
+`65532:65532`, amd64 only, with no shell or package manager; and is
+reproducible — a pinned BuildKit, `SOURCE_DATE_EPOCH` = the commit time
+with `rewrite-timestamp=true`, every shipped file's mtime stamped to it,
+and no attestation inside the image index (`scripts/image-build.sh`). It
+measured 50.9 MiB at `07d99c1`, against a 64 MiB cap. Every commit builds
+its own digest. CI builds it and runs `scripts/image-smoke.sh` on every PR
+(§9.1); only a push to `main` publishes, and `publish` pushes the tested
+OCI archive itself, never a rebuild, as
+`ghcr.io/christopherjmiller/kvm-rdp:sha-<short>`, checks that the pushed
+digest is the tested one, signs it keyless with cosign and attests its
+build provenance. A deployment pins `:sha-<short>@sha256:…`.
 
 Rev 6.3 (DD2): of the input path, `kvm-proto` holds the tables (`keymap`:
 set-1 scancode → usage, the US layout, `paste.chord`'s `Chord`),
@@ -444,6 +529,38 @@ sans-IO cores (pump, upstream, HID queue) in `kvm-rdp`.
 - Edition 2024, `rust-version = "1.94"`, `rust-toolchain.toml` 1.94.1; a nix
   flake devshell provides it with `cc`, `cmake`, ffmpeg/x264, FreeRDP 3 (built
   with OpenH264), Xvfb and bubblewrap.
+- **Pin review checklist** (rev 6.4, Plan E), monthly and on every IronRDP
+  pin bump:
+  - the pin goldens (`pin_goldens.rs`, §11.2) and `cargo tree -d` (no
+    duplicate `ironrdp-*` crate);
+  - the fork's three patches (§4.2): still needed, still applied;
+  - the upstream caps still missing: an SVC/DVC reassembly cap (§8); a
+    CLIPRDR format-count cap (PD8 m3: the pinned IronRDP caps no format
+    count — `get_formats` builds a client's whole format list, about 5–10×
+    its wire size, before the backend runs; L2's
+    `a_twenty_thousand_format_list_still_pastes` pins that a 20 000-format
+    list neither panics nor ends the session); and per-PDU WARNs past the
+    INFO cap (`ironrdp_server`'s "Unexpected channel received" — limited
+    per callsite since rev 6.4, §4.5, but still a line per 10 s);
+  - IronRDP's picky/sspi release-candidate crypto (`rsa 0.10.0-rc.18`,
+    `picky 7.0.0-rc.25`, `curve25519-dalek 5.0.0-rc.1`, `ed25519-dalek
+    3.0.0-rc.1`): re-check each one; re-read RUSTSEC-2023-0071's
+    reachability in `deny.toml`, run `cargo update -p rsa --dry-run
+    --verbose`, and drop the ignore once the chain reaches rsa ≥ 0.10.0
+    (DE22);
+  - L3 (§11.4): a FreeRDP bump in `flake.lock` re-records the ladder
+    fixture, whose first line names the FreeRDP that recorded it
+    (`KVM_RDP_L3_RECORD=1`; review the diff);
+  - `kvm-bench --thresholds ci ci` (§10.2), whose allocation check
+    (DE19) moves with IronRDP's encode.
+
+  With it: the Actions pins (`scripts/pin-action.sh`, and its `--verify`
+  on every workflow); the image's base and BuildKit pins
+  (`scripts/pin-image.sh`), reading distroless's README for the images it
+  still supports — a deprecated tag stops updating silently, its digest
+  never changing again, as `cc-debian12`'s did, and a superseded Rust
+  version's builder tag freezes too (harmless while the builder does not
+  ship; DE17); and `cargo deny`'s advisories (DE15).
 
 ### 4.3 Runtime, channels and sans-IO cores
 
@@ -597,6 +714,16 @@ changed — `input.queue`'s bound, `input.reassert_after`, `paste.chord` —
 has its `leak_shapes` shape, and its error never echoes the value (the C1
 rule).
 
+Rev 6.4 (Plan E Task 1.1, DE6): a `[test]` table exists only in builds
+with the non-default `test-hooks` feature, which every test build turns on
+(the lib's dev-dependency on itself) and `cargo build --release` never
+does. It holds `panic_after` (the pump shell panics that long after
+startup — §5.2's panic path, in a debug or a release build) and
+`stall_on_sigusr1` (each SIGUSR1 blocks the RDP thread that long, at most
+30 s — §7.4's stale watch through the real binary). Every other build,
+the image included, refuses `[test]` as an unknown key, exit 2, echoing
+nothing; the image's smoke test checks it (§9.1).
+
 ### 4.5 Admin endpoints and logging
 
 - An admin listener on the KVM runtime serves `/metrics`, `/livez` and
@@ -626,6 +753,15 @@ rule).
   `ironrdp` prefix): its WARNs carry client-chosen data — the file-list
   sanitiser logs the client's file names — and fire once per hostile PDU,
   so a client could otherwise flood the log.
+  Rev 6.4 (Plan E Task 1.3, DE5; PD8 m4): on top of those caps, a line
+  from any target outside `kvm_rdp` that passes them is written only if
+  its callsite has not written one in the last 10 s
+  (`logging::THIRD_PARTY_INTERVAL`); the rest are counted in
+  `kvm_rdp_log_lines_suppressed_total` (§10.4). An authenticated client
+  that makes `ironrdp_server` warn once per PDU ("Unexpected channel
+  received") now costs one line per callsite per 10 s. The per-callsite
+  memory is bounded by the binary's callsites; bridge lines are never
+  limited.
 - Bridge code never logs keystrokes, HID frames, pasted text, the KVM token or
   passwords. HID and paste activity is logged as counts. URLs are logged as
   `scheme://host:port/path`, query removed. No per-frame events above `trace`.
@@ -706,6 +842,16 @@ the input core's driver, §4.3) stops the RDP server in every build, not only un
 after a signal or a certificate change, 1 if startup failed or the RDP
 server stopped on its own, 2 on a config or logging error.
 
+Rev 6.4 (Plan E Tasks 1.1 and 5.3, DE7): release builds are
+`panic = "abort"` by construction — `main.rs` fails to compile any build
+without debug assertions whose panic strategy is not abort
+(`cfg(panic = "abort")`). Both paths are tested through `[test]
+panic_after` (§4.4): a debug build's panicked pump shell exits 1 (L2,
+`a_panicked_pump_shell_ends_the_binary_with_exit_1`), and the release
+build dies by SIGABRT with no orderly shutdown (`kvm-bench panic-abort`,
+§10.2, which also shows the crash never logs out and a restarted bridge
+serves a picture against the same KVM).
+
 ## 6. Video: EGFX AVC420 passthrough
 
 ### 6.1 Admission
@@ -725,7 +871,12 @@ SPS as sent fails them.
   and 100 stay admitted for the committed fixtures (Main) and other sources;
   within a KVM session the first SPS pins the profile (below); chroma 4:2:0,
   8-bit; `frame_mbs_only_flag == 1`; level ≤ 5.1; width ≤ 4096 and height ≤
-  2304, both even; `num_ref_frames` ≤ 1, the census value (`census.md`,
+  2304, both even (rev 6.4, Plan E Task 1.2, DE8: and both ≥ 200 after
+  cropping — RDP's 200-pixel minimum desktop, MS-RDPEDISP 2.2.2.2.1,
+  which IronRDP's displaycontrol enforces as 200..=8192; §12 had cited
+  MS-RDPBCGR — so a hostile SPS cannot resize the client to a 16×16
+  desktop; `video.default_size`'s own 16-pixel floor, set by the operator,
+  is unchanged); `num_ref_frames` ≤ 1, the census value (`census.md`,
   Leg A — stream), and never above 16 (`SpsLimits`' ceiling; tests that
   replay fixtures with more reference frames raise it, never past 16);
   `seq_scaling_matrix_present_flag == 0` and VUI
@@ -1591,9 +1742,25 @@ or a bug — nothing steps the timers, so what the KVM holds stays held: a
 Typist press auto-repeats on the Mac, a held Cmd stays held. Only
 `/livez` notices (the RDP heartbeat older than `admin.liveness_timeout`,
 10 s, §4.5); the supervisor's restart then runs §5.2, whose release-all
-and flush come from the KVM runtime, which the stall does not reach. A
-KVM-runtime watch that releases once the heartbeat is stale while the
-queue's newest state holds something is carried to Plan E (§12).
+and flush come from the KVM runtime, which the stall does not reach.
+Rev 6.4 (Plan E Task 1.5, m3; DE16): **the KVM runtime watches the RDP
+heartbeat.** `hid::stale` runs on the KVM runtime, which an RDP stall does
+not reach, and calls release-all once the heartbeat is older than
+`RDP_STALE_RELEASE`, 3 s, while input is held — what was written to the
+KVM, or the queue's newest state, holds a key, a modifier or a button
+(`HidControl::input_held`; PE4 review I1: reading only the newest state
+missed the instant after a resync zeroes it while the KVM still holds
+the Typist's press) — once per stale episode, counted
+`release_all{trigger="rdp_stale"}` (§10.4), and re-armed when the
+heartbeat is fresh again. 3 s is three periods of the unchanged heartbeat
+(every quarter of `admin.liveness_timeout`, capped at 1 s, §4.5), where
+§12 had said "about 1 s": a single late beat never reads as a stall, and
+a key held through a stalled RDP thread is released at 3 s (L2 measured
+2.9–3.0 s into the stall). The watch sleeps until the heartbeat could
+first be past the bound and polls every 100 ms only beyond it, so an idle
+bridge's KVM runtime wakes about once per two or three heartbeats.
+`/livez`'s bound is unchanged; the restart still heals the stalled
+thread itself.
 
 ## 8. Clipboard: paste as typing
 
@@ -1661,17 +1828,31 @@ While typing:
   presses and typing went on: the Mac received the text less its first
   characters, counted `done` — a lost leading `#` or `cd x &&` changes what
   a terminal runs.
-- Rev 6.3 (Plan D final review m4): a queue overflow while typing drops
-  characters and never holds a key. DD6 keeps the Typist's own reports
-  inside the queue's room, but a writer stalled for less than
-  `hid_write_timeout` while `input.queue` − 8 reports that cannot coalesce
-  arrive (wheel notches pass through typing) overflows it: the resync
-  (§7.3) drops the Typist's queued reports and typing goes on, so
-  characters drop out of the middle of the paste, which counts `done`. No
-  key is left held: the resync re-sends the newest full state, and every
-  character's press is followed by its own release. Far-fetched at the
-  default `input.queue` of 256, easy at its floor of 9 — keep 256 in
-  deployment. Aborting the paste on a resync is carried to Plan E (§12).
+- Rev 6.4 (Plan E Task 1.5, Plan D final review m4; replacing rev 6.3's
+  m4 residual): **a queue resync while the Typist types aborts the
+  paste.** DD6 keeps the Typist's own reports inside the queue's room,
+  but a writer stalled for less than `hid_write_timeout` while
+  `input.queue` − 8 reports that cannot coalesce arrive (wheel notches
+  pass through typing) overflows it, and the resync (§7.3) drops the
+  queued typed reports. While the Typist types, the shell pushes with
+  `HidControl::push_typing_at`, which drops that resync's state under the
+  queue lock, as a websocket reopen's discard does, and makes no later
+  push in the step; the shell steps the core with the resync, and the
+  core ends the paste `aborted_resync` and releases all
+  (`release_all{trigger="paste_resync"}`, §10.4). So the writer finds
+  nothing to write before the release's zeros: nothing after the hole is
+  ever typed, and the KVM keeps a prefix of the text with no key held.
+  `PASTE_ABORTS` has nine labels. The residual: a resync in or after the
+  paste's last step — the last step pushes with `push_at`, since the core
+  is no longer typing after it — can drop the paste's tail, its last ≤ 8
+  reports, and the paste stays counted `done`; the KVM still keeps only a
+  prefix, never a hole, and nothing held. At `paste.pace` 0, after a
+  resync in the last step at most w − 2 ≤ 1 reports follow it (w ≤ 3
+  wheel notches per event: IronRDP decodes the wheel field as 9 bits,
+  −256..=255; the Typist's room is 8 − queued and the queue holds at
+  least 9), and the one that follows is the Typist's final release; at
+  the default pace a step that ends a paste cannot resync at all. Keep
+  `input.queue` at 256 in deployment.
 - If the client's last `Synchronize` reported Caps Lock on, the paste is
   refused (typing would invert case). (Rev 6.3, DD5: that state is toggled
   by each fresh Caps Lock press since, as the Mac's is.)
@@ -1722,7 +1903,14 @@ Limits and hygiene:
 - Milestone 4 compares our typing with the KVM's own `hid.lua?type=text`
   endpoint; ours stays the default unless the device's paces better.
   Rev 6.3: that comparison is deferred to Plan E's perf pass (controller
-  ruling, 2026-10-14); ours stays the default.
+  ruling, 2026-10-14); ours stays the default. Rev 6.4 (Plan E, DE12): it
+  is an L5 / Leg D owner item (§11.6), not a bench — nothing in the repo
+  records the endpoint's request format, and guessing a write path into a
+  hostile device's typing endpoint is not a test. The owner pastes L4's
+  200-character pattern through the vendor web UI's own text box into the
+  committed HID test page, three times, and compares the page's `rate`
+  and text hash with `kvm-probe hid-type` at `paste.pace`. Ours stays the
+  default.
 
 **Clipboard answers** (rev 6.3, as built; PD9 carry 3, review I2,
 re-review m-R1 and m-R2). CLIPRDR answers data requests in order, and
@@ -1802,7 +1990,21 @@ for the oldest request's answer.
      the only mode in any build, L2 included. A client that does not offer
      CredSSP is refused at the X.224 negotiation with a plain disconnect, not
      a "CredSSP required" reply — IronRDP's acceptor sends none — so such a
-     client reports a generic connection failure.)
+     client reports a generic connection failure.) Rev 6.4 (Plan E Tasks
+     4.1–4.2, DE2): since no other mode exists in any build, CI checks the
+     negotiation itself. `scripts/image-smoke.sh`, run on every PR's image
+     before `publish` pushes those same bytes (§4.1), sends X.224
+     Connection Requests to the running image: one asking for TLS only,
+     one for standard RDP security and a legacy one with no RDP_NEG_REQ are
+     each closed with no reply — zero bytes, since IronRDP at the pinned rev
+     sends no RDP_NEG_FAILURE — while an NLA client's request (`TLS |
+     HYBRID`, and `TLS | HYBRID | HYBRID_EX` as Windows App asks) gets
+     `HYBRID` (or `HYBRID_EX`) selected. It also runs the image with either
+     `[test]` key, or a security-mode key, configured and requires exit 2
+     with nothing echoed (`test-hooks` is absent, §4.4). It runs as UID
+     65532 and as 4242, on a read-only root filesystem with no
+     capabilities and `no-new-privileges`, with the deployment's
+     `..data`-linked ConfigMap and Secret mounts.
    - One static username and password via `set_credentials`. The username
      compare is exact and case-sensitive; it must equal what rdpgw pre-fills.
      A client may add its own host name as the NTLM domain: through rdpgw,
@@ -1933,22 +2135,113 @@ keeps it that way.
 
 ### 10.1 Targets
 
-| Metric | Target | Measured |
-|---|---|---|
-| Bridge video latency | p99 < 5 ms | Inside the bridge: last byte of the FLV tag parsed → `ServerEvent::Egfx` enqueued (the enqueue-latency histogram), per frame |
-| Bridge input latency | p99 < 5 ms | Client writes an input PDU → kvm-sim reads the HID frame (same-process epoch), while 1080p60 video with IDRs and a source burst is flowing. kvm-bench only |
-| Delivery | 1.0 | Frames the bridge handed to IronRDP (`Some`) vs frames acked by the client, in unshaped, non-suspended runs. Shaped runs report the drop rate instead; suspended runs are matched by FrameId |
-| CPU | < 5% of one core at 1080p30, 8 Mbit/s | Release build as a subprocess, `/proc/<pid>/stat`; also reported as CPU per Mbit/s |
-| Bridge-owned allocations | ≤ 2 per frame | In-process microbench of `kvm-proto` demux → sanitise → Annex-B, plus the pump with a stub server, under a counting allocator |
-| Whole-process allocations | ≤ 40 + bytes/1590 per frame | Subprocess, exported via `/metrics`; regression metric |
-| Memory (soak) | Over minutes 5–60, RSS least-squares slope < 2 MiB/h and max − min < 16 MiB | `VmRSS` sampled every 10 s, `MALLOC_ARENA_MAX=2`. Every 5 minutes a churn cycle: a preempting reconnect, FLV drop, websocket drop, re-advertise, resize and 1 KiB paste. Nightly, not per PR |
-| Stalled client | RSS growth ≤ `backlog_limit` + 16 MiB. Withheld acks or stopped reading: ended within `soft_gate` + `stall_timeout` + `disconnect_watchdog` (+ one RTT) of the first withheld ack or last read. Suspended and not reading: ended within `stall_timeout` + `disconnect_watchdog` of the backlog first reaching `backlog_limit`. Suspended and reading: never ended | Test client withholds acks; separately suspends them; separately stops reading; separately suspends and keeps reading |
+| Metric | Target | Measured | Result (rev 6.4) |
+|---|---|---|---|
+| Bridge video latency | p99 < 5 ms | Inside the bridge: last byte of the FLV tag parsed → `ServerEvent::Egfx` enqueued (the enqueue-latency histogram), per frame | **Met**: every one of `unshaped`'s 600 frames enqueued within 5 ms (the histogram's ≤ 5 ms fraction 1.000; the check is ≥ 0.99) |
+| Bridge input latency | p99 < 5 ms | Client writes an input PDU → kvm-sim reads the HID frame (same-process epoch), while 1080p60 video with IDRs and a source burst is flowing. kvm-bench only | **Met**: p99 0.71 ms, p50 0.10 ms over 383 presses, none without its HID report (`input-latency`: 1080p60, 51 burst frames in the window) |
+| Delivery | 1.0 | Frames the bridge handed to IronRDP (`Some`) vs frames acked by the client, in unshaped, non-suspended runs. Shaped runs report the drop rate instead; suspended runs are matched by FrameId | **Met**: `unshaped` — 600 frames sent, nothing in flight 3 s after the source stopped, acked / sent 1.0, no frame dropped for any reason, no unmatched frame; `suspended-reading` — every frame kvm-sim sent in the window received, none dropped (shaped runs: §10.2) |
+| CPU | < 5% of one core at 1080p30, 8 Mbit/s | Release build as a subprocess, `/proc/<pid>/stat`; also reported as CPU per Mbit/s | **Met**: 0.75 % of one core at 8.16 Mbit/s forwarded, 0.09 % per Mbit/s — the `alloc-stats,test-hooks` release build: an upper bound for the image's |
+| Bridge-owned allocations | ≤ 2 per frame | In-process microbench of `kvm-proto` demux → sanitise → Annex-B, plus the pump with a stub server, under a counting allocator | **Met**: (A) 1.011 per AU on the ES3-shaped fixture and 1.017 on the 480p Main one, + (B) 0, + (C) 0.000 per frame (DE3, below); in the bench, heaptrack puts bridge code at 1.34 per frame |
+| Whole-process allocations | ≤ 40 + bytes/1590 per frame; rev 6.4 (DE19): ≤ 1.1 × (70 + bytes/255), the measured regression baseline | Subprocess, exported via `/metrics`; regression metric | **Met** against the baseline: 199.45 per frame at `unshaped`'s 34 001-byte mean frame (bound 223.67; the old formula gives 61.4 — below) |
+| Memory (soak) | Over minutes 5–60, RSS least-squares slope < 2 MiB/h and max − min < 16 MiB | `VmRSS` sampled every 10 s, `MALLOC_ARENA_MAX=2`. Every 5 minutes a churn cycle: a preempting reconnect, FLV drop, websocket drop, re-advertise, resize and 1 KiB paste. Nightly, not per PR. Rev 6.4 (DE18): two warm-up cycles first; the bounds checked on runs of 60 minutes or more | **Pending the first nightly soak**; the deployment's interim memory limit of 128 Mi stands. Local runs, informative only, below |
+| Stalled client | RSS growth ≤ `backlog_limit` + 16 MiB. Withheld acks or stopped reading: ended within `soft_gate` + `stall_timeout` + `disconnect_watchdog` (+ one RTT) of the first withheld ack or last read. Suspended and not reading: ended within `stall_timeout` + `disconnect_watchdog` of the backlog first reaching `backlog_limit`. Suspended and reading: never ended | Test client withholds acks; separately suspends them; separately stops reading; separately suspends and keeps reading | **Met**: `withhold` ended 10.53 s and `stop-reading` 10.56 s after the stall began (bound 15.75 s, the RTT taken as 0.25 s); `suspended-not-reading` 15.07 s after the backlog reached 4 MiB (bound 15.25 s); `suspended-reading` never ended; RSS grew at most 4.67 MiB (bound 20); each ended session counted `client_stalled` |
+
+Rev 6.4 (Plan E Task 6.1): **how the results were taken.** The Result
+column is one serial run of `kvm-bench --thresholds strict all` (§10.2) on
+the shared development host (16 cores), 2026-11-15 19:53–19:58 PST,
+`taskset`-pinned to CPUs 2,3 at nice 0, with a 1-minute load average of
+4.53 at the start and 11.07 at the end; all twelve scenarios passed. That
+is a development check (DE11): the absolute verdict is the nightly's
+`workflow_dispatch` with `thresholds = strict` on GitHub's runner, which
+has not yet run (an owner trigger). Every CPU and latency figure is the
+`alloc-stats,test-hooks` release build's — an upper bound for the image's
+build — and kvm-bench shares the two pinned CPUs with the bridge it
+spawns, so the results err high (DE10).
+
+Rev 6.4 (DE3): **bridge-owned allocations, as built.** (A) kvm-proto's
+demux → admission → Annex-B, per access unit, at most 1.5: 1.011 on the
+ES3-shaped fixture and 1.017 on the 480p Main one, net of a twin
+h264-reader parse of the same slices (third-party parser allocations —
+the Main fixture's weighted-prediction tables — are not the bridge's;
+kvm-proto's `alloc` test binary). (A) is the steady state, each AU
+released before the next read; under a burst the demuxer may reallocate
+per read, which the whole-process metric covers. (B) The KVM side's
+per-chunk wrapper, 0: `drain` demuxes into one reused tag buffer (§12's
+per-chunk `Vec<FlvTag>` is gone; `kvm::video`'s
+`drain_reuses_the_tag_buffer`). (C) `Pump::step_into`
+for the shell's three inputs and the frame's ack, appending into the
+shell's reused `Vec` (PC14 n4's extra copy is gone), minus what a twin
+`GraphicsPipelineServer`'s `send_avc420_frame` + `drain_output` allocate
+for the same Annex-B, at most 0.5: 0.000. tokio's channel blocks and
+IronRDP's encode in the shell are outside it, and are the whole-process
+metric's.
+
+Rev 6.4 (DE19): **whole-process allocations are a regression baseline.**
+The row's first bound, 40 + bytes/1590, was a guess of about one
+allocation per 1590-byte DVC chunk. Measured, the process makes about
+199 per frame (202.2 before the bench streams became Constrained
+Baseline, as the ES3 sends), and heaptrack over the steady window
+attributes 1.34 of them to bridge code (DE3's ≤ 2 holds) and about 198
+to third-party code: IronRDP about 6.2 per 1590-byte DVC chunk (the
+EGFX/DVC encode's `to_vec` and a `Box` per `SvcMessage`, the SVC
+chunkify, and the MCS/X.224 framing's `WriteBuf`s), rustls about 10 and
+hyper about 9.5. No bridge-side change reaches 61, so `unshaped` checks
+the measurement, 1.1 × (70 + bytes/255) — about 223 at the bench stream's
+mean frame — where the 10 % is for the read side (hyper, rustls) on
+another machine, and `ci` loosens it 10×. IronRDP's per-chunk DVC
+allocations are an owner item (upstream or fork work only on the owner's
+say).
+
+Rev 6.4 (DE14, DE18): **the soak as built.** The memory line is the
+`alloc-stats,test-hooks` release build's, run as kvm-bench's subprocess
+with only `MALLOC_ARENA_MAX=2` in its environment and `VmRSS` sampled on
+kvm-bench's own thread through every churn cycle, so the churn's peaks are
+in the samples. Each cycle is the row's six steps, each checked: the
+preempting client alternates `127.0.0.2` and `127.0.0.3`, so a reconnect
+never meets Preempt's evicted-address bar (§5.1), and the resize
+alternates the 1080p and 720p bench streams. Two warm-up cycles run
+before the window, at minutes 1 and 3 of the hour (from/5 and 3·from/5,
+where the window starts at from = min(5, minutes/12)): the churn raises
+glibc's high-water mark by about 2.3 MiB over its first two cycles, one
+of each resize order, and then RSS holds. The window's cycles keep the
+row's schedule (5, 10, …, 55). Both bounds are strict and are checked
+only on a run of 60 minutes or more; a shorter run reports them. The
+report gives the steady RSS (the window's median), the peak, and the
+memory limit the companion deployment design (§4.2 there) takes in place
+of its interim 128 Mi: (steady RSS + `backlog_limit` 4 MiB + 16 MiB, the
+stalled-client bound) × 1.5. `soak.json` keeps the RSS series by minute
+and every cycle's start, so a red nightly is read against its cycles;
+`churn cycles` counts the warm-ups, with `warm-up churn cycles` beside it.
+The nightly soak has not yet run. Local runs, informative only and never
+the limit — the same build, on the shared host at load 8–15, shorter
+than the hour: 30 minutes with churn every 5 (before the warm-ups
+existed), steady 16.41 MiB, limit 54.6 MiB, slope after the warm-up
+0.088 MiB/h; 20 minutes with churn every minute (19 cycles), steady
+16.77 MiB, limit 55.2 MiB; 20 minutes with churn every 2 minutes and the
+warm-ups, RSS about 17.2 MiB and flat after minute 1.2, window slope
+0.036 MiB/h. No per-cycle leak: every step, repeated over 19 cycles, adds
+at most 28 KiB, and the thread count stays at 3.
 
 End-to-end latency (`sim_tx` = when `write_all` of the tag's last byte
 returns, → client `EndFrame` parsed, TLS on both legs) is reported for
 information **alongside** a null bridge's distribution — the same client
 against a minimal IronRDP server sending kvm-sim's pre-converted AUs from
 memory on the same schedule — p50 and p99 of each, never subtracted.
+Rev 6.4 (DE20): every stamp is taken before its send, so a send bounds
+its arrival from below — `sim_tx` is when kvm-sim *starts* writing the
+tag (it includes kvm-sim's own TLS encryption and write); the null
+bridge stamps before `send_avc420_frame`; and for input latency the
+client stamps a key press before its PDU exists. Measured
+(`e2e-null`, the same strict run; 600 frames each, none unmatched): the
+bridge p50 0.56 ms, p99 3.28 ms; the null bridge p50 0.38 ms, p99
+3.22 ms. The bridge side is the `alloc-stats` build (its counting
+allocator included); the two are reported side by side and never
+subtracted.
+
+Rev 6.4 (PC17 m2): **the KVM → pump channel never filled** —
+`channel_full` drops per minute 0 in `unshaped` and in `input-latency`
+(source bursts included), and 0 in every other scenario with a live
+window, each of which reports it.
 
 ### 10.2 Harness (`kvm-bench`)
 
@@ -1983,6 +2276,88 @@ memory on the same schedule — p50 and p99 of each, never subtracted.
 - Hot-path rules: `TCP_NODELAY` everywhere; one reusable Annex-B buffer; no
   per-frame logging above trace.
 
+Rev 6.4 (Plan E Tasks 5.1–5.5, DE10, DE11): **the harness as built.**
+`kvm-bench --bridge <kvm-rdp> --thresholds strict|ci [--out DIR]
+<scenario>…` (§4.1). The bridge under test is the release build with
+`--features alloc-stats,test-hooks` (its CPU and latency an upper bound
+for the image's; `test-hooks` is inert unless `[test]` is configured, and
+only `panic-abort` configures it), spawned with a cleared environment but
+`MALLOC_ARENA_MAX=2`, `RLIMIT_CORE` 0 and a parent-death signal. Each
+scenario writes `<scenario>.json` (default `target/kvm-bench/`): its
+checks with value, bound and verdict, its numbers, notes and, for the
+soak, its series.
+
+- **Scenarios**: `unshaped` (§10.1's video latency, CPU, allocations,
+  delivery, bitrate, FrameId uniqueness, end-to-end), `input-latency`,
+  `shaped-50ms-20mbit`, `shaped-150ms-5mbit`, `rtt-spike`,
+  `idle-motion`, the four stalled clients `withhold`, `stop-reading`,
+  `suspended-not-reading` and `suspended-reading`, `panic-abort` (§5.2),
+  `e2e-null` (the null bridge), and `soak` (§10.1, nightly). `ci` is
+  every PR's set — `unshaped`, `input-latency`, `withhold`,
+  `suspended-reading`, `panic-abort` — and `all` is every scenario but
+  the soak. Every live window also reports `channel_full` drops per
+  minute (PC17 m2), drops by reason, and kvm-sim's longest FLV write
+  block (≤ 100 ms, checked in every live-window and stalled-client
+  scenario: at most 5.1 ms in the strict run).
+- **Thresholds**: `strict` is §10.1's own numbers; `ci` loosens the
+  performance bounds 10× and the stalled-client timings 1.5× (a 10× bound
+  would be a 155 s case); delivery, bitrate, uniqueness and survival are
+  exact under both.
+- **Bench streams** (`scripts/gen-fixtures.sh bench`, into
+  `target/bench-streams/`, never committed): testsrc2 under full-frame
+  noise with the barcode drawn over it, 8 Mbit/s capped with no filler,
+  Baseline profile (CAVLC), as the ES3 sends, an IDR every second, 20 s
+  each (loops of ≥ 10 s, under the 60 s above), 1080p and 720p at 30 and
+  60 fps, plus `idle_motion_1080p30` (10 s of a still screen, then 10 s
+  of noise); `-threads 4`, so not deterministic — kvm-bench checks what it
+  needs. 60 fps scenarios configure `video.max_fps = 60`.
+- **The client** is kvm-bench's own lean one, not L2's (L2's records
+  every PDU for its oracles; at 1080p60 that would be the measurement).
+  Its read throttle is a link (`kvm_bench::link`): each PDU holds it for
+  its length at the link's rate, so an IDR serialises as on a real link,
+  with at most 5 ms of credit after idling; acks are delayed in order.
+- **The null bridge**: a minimal `ironrdp-server` (NLA, EGFX AVC420)
+  sending the bench stream's AUs from memory, one per 1/fps from the
+  first IDR, missed ticks skipped, with the bridge's region QP, to the
+  same client — §10.1's end-to-end baseline.
+- **Where it runs** (DE11): every PR's `bench` job runs `ci` at
+  `--thresholds ci`; the nightly runs `all` at its dispatch's thresholds
+  (`ci` when scheduled) and then the one-hour soak at `strict`, both
+  `taskset`-pinned to CPUs 2,3 of the runner's four at nice 0; the
+  absolute targets are the nightly's `workflow_dispatch` with
+  `thresholds = strict` (not yet run). kvm-bench and the bridge it spawns
+  share the pinned CPUs, so results err high. A pinned run on the shared
+  development host is a development check, recorded with its load
+  (§10.1's Result column).
+
+Rev 6.4: **the shaped runs and the spike** (§10.1's strict run, each
+window after a 5 s warm-up). The gates' defaults are unchanged: neither
+`unshaped` nor `shaped-50ms-20mbit` dropped a frame at `soft_gate`,
+`backlog_gate` or `standing_delay` — nor for any other reason — so
+nothing here asks for a new default, and Leg D and the owner's
+Windows App run may still retune them.
+
+- `shaped-50ms-20mbit`: 0 NeedIdr entries per minute, no drops, 8.09
+  Mbit/s received, longest picture gap 174 ms.
+- `shaped-150ms-5mbit` **cannot carry the bench stream**, which is §10.2's
+  8 Mbit/s worst case: 3.57 Mbit/s received, 44 NeedIdr entries per
+  minute, 516 `awaiting_idr` and 19 `soft_gate` drops in 30 s, longest
+  gap 1.26 s. A passthrough bridge cannot lower the source's bitrate; at
+  150 ms and 5 Mbit/s any single frame over about 219 KB closes the soft
+  gate on its own (500 ms − 150 ms of serialisation), and the census saw
+  static-screen IDRs up to 264 KB. Recorded; no default changed.
+- `rtt-spike` (acks delayed 2 s for 3 s): time to picture after the spike
+  25 ms (7–31 ms over the task's runs); then the picture stops — longest
+  gap after the spike 2.53 s, 2 NeedIdr entries, 143 `awaiting_idr` and
+  6 `soft_gate` drops. That freeze is the design (§6.6's soft gate, §6.5's
+  IDR wait): an IDR sent just before the spike ends gets a 2 s ack, the
+  gate closes again, the periodic IDR due as that ack returns is dropped,
+  and the picture comes back with the next IDR. So beside time-to-picture
+  the run reports the recovery: a steady picture returns within the
+  spike's RTT plus one GOP — about 4 s on the ES3's 2 s GOP.
+- `idle-motion`: no `soft_gate` drop and no NeedIdr entry across the
+  idle → motion transitions (the soft gate is an age gate, §14).
+
 ### 10.3 End to end (hardware, Milestone 6 and L5)
 
 - Glass-to-glass: a millisecond clock on the Mac filmed with a slow-motion
@@ -2012,7 +2387,8 @@ in-flight, backlog bytes, ack suspension, ack RTT, auto-detect RTT and
 standing delay, QoE decode time; negotiated capability version; bursts; HID
 reports sent, coalesced, resyncs and epoch discards; release-all by trigger;
 paste events and skipped characters; disconnects by cause; allocations per
-frame (`alloc-stats` builds).
+frame (`alloc-stats` builds; rev 6.4: built — the two allocation counters
+below, read per frame by kvm-bench, §10.1).
 
 **The registry as built** (rev 6.2, Plan C's `kvm_rdp::metrics`). Counters
 and labelled families are exposed with `_total`; label values are fixed
@@ -2021,7 +2397,12 @@ skipped characters are Plan D's, allocations per frame Plan E's. Rev 6.3
 (Plan D's `kvm_rdp::metrics`, as built): 44 families — 18 counters, 13
 labelled families, 8 gauges and 5 histograms, a count `metrics`'s own test
 pins (the final review's I2 added `release_websockets`); Plan D's rows are
-marked.
+marked. Rev 6.4 (Plan E, DE4; `kvm_rdp::metrics` as built): **47
+families — 20 counters, 13 labelled families, 9 gauges and 5
+histograms — and 49 in an `alloc-stats` build**, the count `metrics`'s
+own test pins (`every_metric_name_is_unique_and_well_formed`); Plan E's
+rows and labels are marked "rev 6.4". Task 1.5's release triggers and
+paste abort are labels on existing families, not families.
 
 | Metric | Kind | Labels (values) |
 |---|---|---|
@@ -2056,6 +2437,20 @@ marked.
 | `kvm_rdp_paste_skipped_chars_total` (rev 6.3) | counter | — (scalars §8's text handling skipped, counted when a paste is done) |
 | `kvm_rdp_clipboard_discarded_total` (rev 6.3) | counter | `reason`: `late`, `unasked` (answers no paste took), `in_flight` (dropped by the backend while another was in flight), `unanswered` (requests retired with no answer) — §8's clipboard answers |
 | `kvm_rdp_release_websockets_total` (rev 6.3, final review I2) | counter | `outcome`: `confirmed` (the KVM's pong after the release), `unconfirmed` (written, never proved), `failed` (no open carried it), `superseded` (a new session, or the exit, ended it first — a takeover's too, even before it ran, r-m1) — the release websocket after a session end the KVM did not prove released (§7.4) |
+| `kvm_rdp_log_lines_suppressed_total` (rev 6.4, DE5) | counter | — (third-party log lines not written because their callsite wrote one in the last 10 s, §4.5) |
+| `kvm_rdp_egfx_client_frames_decoded` (rev 6.4) | gauge | — (the client's last `totalFramesDecoded`, from its FrameAcknowledge: §11.4's decode count) |
+| `kvm_rdp_need_idr_total` (rev 6.4) | counter | — (entries into NeedIdr, §6.4: §10.2's NeedIdr entries per minute) |
+| `kvm_rdp_allocations_total`, `kvm_rdp_allocated_bytes_total` (rev 6.4, `alloc-stats` builds only) | counter | — (heap allocations, and bytes requested, since start: the process-wide count of the counting allocator `kvm_rdp::alloc_stats`; §10.1's whole-process allocations per frame are their delta over `egfx_frames_sent`'s) |
+
+Rev 6.4 (PE15 review): **what `release_all{trigger="websocket_reconnect"}`
+counts.** One release per websocket loss, plus one per websocket open
+whose discard drops a queued report (rev 6.3, §7.3). A session's first
+open always discards one — the input core's own all-up report for the
+session start's epoch move — so those discards equal
+`kvm_rdp_hid_epoch_discards_total` one for one. For N websocket drops the
+counter reads N plus the discards: never a double release, and no key
+is left held. The soak's report shows both numbers side by side
+(measured locally: 20 = 11 drops + 9 discards).
 
 `frames_dropped` counts frames, not gate events (rev 6.2): a frame a gate
 drops counts that gate's reason — in Live, `burst_truncated` for a burst AU
@@ -2103,6 +2498,16 @@ core's, so they are `kvm-rdp` unit tests with an injected clock (beside
 table (against Microsoft's, §11.1), the US layout, `scale_abs` and §8's
 text handling and Typist.
 
+Rev 6.4 (Plan E Tasks 3.1–3.2, DE9): the L3 row as built — four
+`#[ignore]` cases, `l3::*`, in the L2 test binary (no third
+IronRDP-linked test executable, §13), run one at a time by CI's `check`
+job with the flake's FreeRDP 3.32.1 and `xvfb-run` on `PATH` (`nix build
+.#l3-tools`); §11.4 has them. The FreeRDP 11-set ladder L1 was waiting
+for (DC8) is committed as `fixtures/freerdp-gfx-ladder.txt`, recorded by
+L3 from the flake's FreeRDP, and L1's
+`capability_replays_confirm_what_the_census_recorded` replays it: `V10_7`,
+with AVC420, the confirm `census.md` records (Leg C).
+
 L1 cases:
 
 - **Every cell of the §6.4 state × input table**, one case each.
@@ -2111,7 +2516,7 @@ L1 cases:
   ever sent. FreeRDP's are recorded (Leg B): with `/gfx:AVC420`, `V8`
   `02000000` and `V8_1` `12000000` → `V8_1`; without it, an 11-set ladder
   `V8`…`V10_7` → `V10_7` (`census.md` names these sets but not their bytes,
-  so they are captured from the flake's FreeRDP — by Plan E's L3 since rev 6.2); byte-identical through
+  so they are captured from the flake's FreeRDP — by Plan E's L3 since rev 6.2; rev 6.4: `fixtures/freerdp-gfx-ladder.txt`, recorded from FreeRDP 3.32.1 with no `/gfx`, §11.4); byte-identical through
   rdpgw (Leg C), and FreeRDP never re-advertised. Windows App's (direct,
   through rdpgw, any re-advertise) are added from the owner's acceptance run
   (§12). A re-advertise whose confirmed set lacks AVC420 →
@@ -2365,6 +2770,47 @@ A second run uses `/gfx:frame-ack:off` to exercise ack suspension. FreeRDP
 models a conformant, non-buffering client; colour and presentation-hold
 questions belong to L5.
 
+Rev 6.4 (Plan E Tasks 3.1–3.2, DE9, DE21): **L3 as built.** Four
+`#[ignore]` cases in the L2 binary (§11.2), each FreeRDP run as `xvfb-run
+-d -e <log> -w 0 -s "-screen 0 1280x720x24 -fbdir <dir>" xfreerdp /v:…
+/u:… /p:… /cert:ignore /log-level:WARN -clipboard` plus the case's own
+flags, with a private `HOME` and `TMPDIR`:
+
+1. `freerdp_decodes_the_es3_stream_through_the_bridge` (`/sec:nla
+   /gfx:AVC420`): the three oracles above — FreeRDP's log clean; Xvfb's
+   framebuffer, read from `-fbdir` (XWD) by the binary's own parser, shows
+   the barcode changing over 1.1 s, each reading a frame kvm-sim sent in
+   the 1.5 s before; `kvm_rdp_egfx_capability_version` `V8_1`, and
+   `kvm_rdp_egfx_frames_acked_total` and
+   `kvm_rdp_egfx_client_frames_decoded` (§10.4) advancing — and the
+   advertise equal to `census.md`'s `/gfx:AVC420` pair.
+2. `freerdp_suspending_acks_keeps_the_picture_moving`: the second run,
+   as `/gfx:AVC420,frame-ack:off`. The spelling above, `/gfx:frame-ack:off`,
+   does not work with FreeRDP 3.32.1: it advertises AVC420 off in every
+   set unless `/gfx` names `AVC420` (or `AVC444`) or `/gfx` is left out, so
+   that run — like a bare `/gfx` — is ended `no_avc420`, correctly (§6.7).
+   With `stall_timeout` scaled to 2 s, frames keep flowing and the picture
+   keeps moving for 6 s once acks are suspended (FreeRDP sends one SUSPEND
+   ack, then none), and the session is never ended `client_stalled`.
+3. `freerdps_full_ladder_is_the_committed_fixture`: FreeRDP with **no
+   `/gfx` option** — census Leg C's own condition ("the bare `.rdp` (no
+   `/gfx`)") — advertises 11 sets, `V8`…`V10_7`, byte for byte
+   `fixtures/freerdp-gfx-ladder.txt`, which the bridge confirms at `V10_7`
+   with AVC420. The fixture's first line is the recording FreeRDP's
+   `xfreerdp /version` (`# This is FreeRDP version 3.32.1 (n/a)`; the
+   census ran 3.31.1), checked against the running one; a FreeRDP bump in
+   `flake.lock` fails the case until the ladder is re-recorded
+   (`KVM_RDP_L3_RECORD=1`), the diff reviewed and committed.
+4. `freerdp_without_nla_is_refused_before_any_kvm_traffic` (`/sec:tls`):
+   refused at the X.224 negotiation (§9.1) — FreeRDP exits failed, the
+   bridge logs the protocol mismatch, kvm-sim sees no connection on any
+   of its ports, and the bridge still answers `/readyz`.
+
+Every L3 wait is bounded, and dropping a case kills FreeRDP's whole
+process group (xvfb-run and Xvfb included), waiting for the group before
+`SIGKILL` (`xwd`'s `a_dropped_group_leaves_no_process_behind`), so a
+failed case leaves no X server or client behind. The four take about 8 s.
+
 ### 11.5 kvm-sim and fixtures
 
 - kvm-sim serves login, logout, FLV (muxed live by `kvm-proto`'s muxer,
@@ -2507,6 +2953,20 @@ questions belong to L5.
   glass-to-glass bounds (§10.3). The owner acceptance checklist (§12) asks
   the Milestone 0 questions only Windows App can answer; L5 repeats its items
   against the finished bridge.
+- Rev 6.4 (Plan E): the L5 checklist gains three items, each pass/fail
+  and recorded:
+  - **`hid.lua?type=text` against our typing** (§8, DE12; with Leg D):
+    the owner pastes L4's 200-character pattern through the vendor web
+    UI's own text box into the committed HID test page, three times, and
+    compares the page's `rate` and text hash with `kvm-probe hid-type` at
+    `paste.pace`. Ours stays the default unless the device's paces better.
+  - **The deployed bridge's CPU at 1080p30 on the real ES3** against
+    §10.1's 5 % of one core — the pod's CPU usage while the owner works;
+    kvm-bench cannot reach the real KVM, and its figure is the
+    `alloc-stats` build's on kvm-sim (§10.1).
+  - **The memory limit holds over a working day** — no OOM kill — once
+    the nightly soak has sized it (§10.1; until then the deployment's
+    interim 128 Mi).
 
 ## 12. Milestones and planning units
 
@@ -2555,7 +3015,8 @@ the lists below:
   `/gfx:AVC420` two-set capability pair's bytes are recorded in
   `census.md`; the 11-set ladder (no `/gfx`, Leg C) is named but not
   committed with its bytes as a separate fixture file (captured, since rev 6.2 by Plan E's L3,
-  from the flake's FreeRDP, §11.2). Windows App's capability and key-matrix
+  from the flake's FreeRDP, §11.2; rev 6.4: committed as
+  `fixtures/freerdp-gfx-ladder.txt`, from FreeRDP 3.32.1). Windows App's capability and key-matrix
   fixtures wait for the acceptance run.
 - Leg C: everything ran on loopback, so the stand-in proxy's source address
   (127.0.0.2) played the trusted proxy and 127.0.0.1 "another LAN host";
@@ -2648,51 +3109,140 @@ before `census.md` is committed):
 | B | M1 + M2, including the SPS rewriter — required: level patch, VUI re-serialisation and `bitstream_restriction` (§6.8), with the POC-type-0 fixture (§11.5) — and kvm-sim's ES3 profile. No AU assembler and no GOP cache: Leg A needs neither (§6.2, §6.5) |
 | C | M3a: config, logging, admin endpoints, metrics, shutdown, lifecycle, NLA, EGFX pump and state machine, the websocket, the HID writer skeleton and release epoch, L1 and video/lifecycle L2. Requires the three IronRDP patches of `kvm-rdp-egfx-patches-v2` @ `c99eece2`, git-pinned (§4.2; rev 6.2: the patch-1 fallback is not built) |
 | D | M3b + M4: first §11.6's L4 hardware checks (rev 6.2, moved from C); keyboard and mouse mapping, stuck-key timers and the released-by-bridge rule, the Typist, and their L2 cases (rev 6.3: built, with CLIPRDR paste, the re-assert and Plan C's L2 carries; the L4 checks are tooling proven on kvm-sim, and their run on the ES3, Task 1.6, is pending (owner) — DC18's items are built, not yet measured) |
-| E | M5 + M6: L3, CI, image, perf pass (rev 6.2: CI's job timeout, tracked-secrets gate and target-budget step landed with Plan C, DC19; rev 6.3: also the carries below) |
+| E | M5 + M6: L3, CI, image, perf pass (rev 6.2: CI's job timeout, tracked-secrets gate and target-budget step landed with Plan C, DC19; rev 6.3: also the carries below; rev 6.4: built — every carry below closed, L3 with FreeRDP, CI's supply-chain gates and a nightly, the image and its `publish`, and `kvm-bench` with the perf pass (§10.1's targets met under `strict` on the shared host); nothing has run in CI yet, so the strict nightly, the soak and the first publish wait on the first push to `main`) |
 
 **Carried to Plan E** (rev 6.3: one list, from Plan C's final review and
-Plan D's rulings):
+Plan D's rulings; rev 6.4: each closed, by the Plan E task named):
 
 - `--remap-path-prefix` (or `trim-paths` once stable) in the image build,
-  so no build-host source path reaches an error message (PC15).
+  so no build-host source path reaches an error message (PC15). Rev 6.4:
+  Task 4.1 — the Dockerfile's `RUSTFLAGS` remap `CARGO_HOME` and the
+  source tree, and the smoke test greps both binaries for a build path
+  (§4.1).
 - Actions pinned by SHA, and `cargo deny` (licences and advisories) over
-  the production graph.
+  the production graph. Rev 6.4: Task 2.1 (`scripts/pin-action.sh`,
+  enforced by `scripts/check-workflows.sh`) and Task 2.2 (`deny.toml`,
+  DE15, DE22).
 - §10.1's allocation budget, including PC14 n4 (one extra `Vec` copy per
-  AU in the pump's `step`) and the per-chunk `Vec<FlvTag>`.
+  AU in the pump's `step`) and the per-chunk `Vec<FlvTag>`. Rev 6.4: Task
+  1.4 (`Pump::step_into` into the shell's reused `Vec`, the KVM side's
+  reused tag buffer, the counting allocator and `alloc-stats`; DE3) and
+  Task 5.1 (the whole-process figure, DE19) — §10.1.
 - A minimum frame size in admission: a hostile SPS can resize the client
   to a tiny desktop (16×16) — e.g. refused below MS-RDPBCGR's 200 px as
-  `stream_incompatible`.
+  `stream_incompatible`. Rev 6.4: Task 1.2 (DE8, §6.1 — the 200-pixel
+  minimum is MS-RDPEDISP's).
 - Gating the `RdpInput::Stall` test hook (a `std::thread::sleep` on the RDP
   runtime, reachable only through a hidden test handle) behind a
-  non-default feature.
+  non-default feature. Rev 6.4: Task 1.1 (`test-hooks`, DE6, §4.4).
 - IronRDP's format-list amplification (PD8 m3): `get_formats` builds the
   client's whole format list, about 5–10× its wire size, before the
   backend runs, and `paste.max_bytes` caps only responses — the
   reassembly class §8 accepts; a format-count cap joins the pin review's
-  upstream-cap note.
+  upstream-cap note. Rev 6.4: Task 1.3 (L2's
+  `a_twenty_thousand_format_list_still_pastes`); the cap is on §4.2's pin
+  review checklist.
 - Milestone 4's comparison of our typing with the KVM's
-  `hid.lua?type=text` (§8), in the perf pass.
+  `hid.lua?type=text` (§8), in the perf pass. Rev 6.4: an L5 / Leg D owner
+  item (DE12, §8, §11.6).
 - A nightly L2 run under a CPU stressor at the wrapper's nice 19, so
-  load-sensitive cases surface in CI rather than on the shared host.
+  load-sensitive cases surface in CI rather than on the shared host. Rev
+  6.4: Task 2.3 (`nightly.yml`'s `l2-under-load`,
+  `scripts/l2-under-load.sh`: L2 at nice 19 under one nice-5 busy loop per
+  CPU, three runs).
 - The disk pass: pruning the stale incremental cache
-  (`target/debug/incremental`).
+  (`target/debug/incremental`). Rev 6.4: Task 2.1
+  (`scripts/target-budget.sh --prune`).
 - kvm-bench measuring how often the KVM → pump channel fills (PC17 m2): an
   AU dropped there mid-replay freezes the picture until the next IDR
-  (≤ 2 s), accepted as designed (DC12).
+  (≤ 2 s), accepted as designed (DC12). Rev 6.4: Tasks 5.1 and 5.2
+  (`channel_full` drops per minute in every live window, `input-latency`
+  with source bursts): 0 per minute (§10.1).
 - Rate limiting IronRDP's per-PDU WARNs past the INFO cap (PD8 m4):
   `ironrdp_server`'s "Unexpected channel received" lets an authenticated
   client cause one WARN per PDU (pre-existing; `ironrdp_cliprdr`'s are
-  held at ERROR since rev 6.3, §4.5).
+  held at ERROR since rev 6.3, §4.5). Rev 6.4: Task 1.3 (DE5, §4.5).
 - A KVM-runtime watch that calls release-all once the RDP heartbeat is
   about 1 s old while the queue's newest state holds something (Plan D
   final review m3): a stalled RDP thread is otherwise healed only by
-  `/livez`'s restart (§7.4).
+  `/livez`'s restart (§7.4). Rev 6.4: Task 1.5 (`hid::stale`, at 3 s,
+  DE16, while anything written or queued holds input; §7.4).
 - Ending a paste as aborted when the queue resyncs while it types (Plan D
   final review m4, §8), so an overflow never drops characters from the
-  middle of a paste.
+  middle of a paste. Rev 6.4: Task 1.5 (`paste_events{aborted_resync}`,
+  `release_all{paste_resync}`; §8).
 
 Not carried: bounding the admin response write and shutdown — Plan C did
 it (§4.5, rev 6.2).
+
+Rev 6.4: Plan E also closed Plan B's recorded limitation, the fuzz
+nightly red on `sps_rewrite`'s level-1b oracle (Task 2.4: the oracle reads
+a level raise by rank, so level 1b → 1.1 is a raise, and the case is a
+seed), and built the companion deployment design's asks of kvm-rdp: the
+certificate poll follows symlinks, so a Kubernetes Secret's `..data` swap
+is a renewal (`bridge`'s `a_kubernetes_secret_swap_is_a_renewal`); the
+image is `sha-<commit>` with a digest, non-root by number, on a read-only
+root with no writable path; `/livez` and `/readyz` stay unauthenticated;
+kvm-rdp's CI builds and signs the image; and the memory limit comes from
+the soak (§10.1, pending its first nightly).
+
+Rev 6.4: **CI as built** (DC19's job timeout, tracked-secrets gate and
+target budget, then Plan E Part 2 and Tasks 3.2, 4.2 and 5.5). Every
+action is pinned to a commit SHA, one SHA per action, and
+`scripts/check-workflows.sh` (with its own tests) refuses any trigger but
+`push`, `pull_request`, `schedule` and `workflow_dispatch` (so never
+`pull_request_target` or `workflow_run`), a top-level permission other
+than `contents: read`, a job that asks for a write permission anywhere
+but on a push to `main`, or that then checks out or runs repository code,
+a job with no `timeout-minutes`, a rust-cache that saves outside `main`,
+`secrets` outside a job so guarded, a checkout that keeps its token, an
+action pinned to two SHAs, and an image in the `Dockerfile` or a BuildKit
+image without a digest. Tools other than Rust come from the flake (DE13).
+`ci.yml` on every PR and push to `main`: `check` (format, the
+tracked-secrets gate, no duplicate `ironrdp-*`, no `ring`, clippy also on
+the image's feature set, the tests, L3 one case at a time, the target
+budget), `fuzz`, `lint` (the workflow and image-pin rules, actionlint,
+shellcheck, and `cargo deny` — `bans`, `licenses` and `sources` blocking;
+`advisories` blocking on `main`, reported on PRs, DE15), `image` (build,
+the tested archive's digest, the smoke test, §9.1), `bench` (`kvm-bench`'s
+`ci` set, §10.2) and, on a push to `main` only, `publish` — the one job
+with `packages`, `id-token` and `attestations` write — which pushes the
+tested archive, checks its digest, signs it with cosign, attests it and
+verifies both as the README tells a consumer to. `nightly.yml`:
+`l2-under-load`, `deny-advisories` (reported), `image-build` and
+`reproducible` (two clean builds are one image), and `bench` (`all`, then
+the one-hour soak). `fuzz-nightly.yml`: every target 300 s. RUSTSEC-2023-0071
+is ignored in `deny.toml` with its reachability reading, signed off by the
+owner (2026-11-15); it goes once the pin review finds rsa ≥ 0.10.0
+reachable (DE22). The advisory pass of 2026-11-15 cleared five new
+advisories by lockfile bumps (`e40c9d5`: RUSTSEC-2026-0382 rustls-webpki,
+-0385 ctutils, -0386 tokio, -0387 crypto-bigint, -0418 libz-sys); stale
+libz-sys build outputs that had captured the development environment were
+removed from the local target dir, and none ever left the host. None of
+this has run on GitHub yet: every CI
+result — the L2-under-load pass rate, the fuzz nightly green since Task
+2.4, the `l3-tools` build time and closure size and the L3 cases' time,
+the `bench` job's cold and warm durations and the caches' sizes, the
+strict nightly and the soak — is not yet run; so is the owner's setting
+"Require actions to be pinned to a full-length commit SHA", for once this
+is on `main`.
+
+Rev 6.4: **what Plan E leaves to the owner.**
+
+- The first push to `main`: the owner asked (2026-11-15) for Plan E to be
+  merged into `main` and pushed once its final review is clean. That push
+  runs `publish` for the first time — its cosign and Rekor entries are
+  public — and making the ghcr package public stays the owner's.
+- The nightly's strict run (`workflow_dispatch`, `thresholds = strict`) and
+  the one-hour soak on GitHub's runner: the absolute perf verdict (DE11)
+  and the memory limit (§10.1).
+- GitHub's "Require actions to be pinned to a full-length commit SHA"
+  setting, once the workflows are on `main`.
+- IronRDP's per-DVC-chunk allocations (§10.1, DE19): upstream or fork work
+  only on the owner's say.
+- Plan D's hardware run (Task 1.6, Leg D) and the Windows App acceptance
+  run (L5, below and §11.6), with the L5 items Plan E added — DE12's
+  `hid.lua?type=text` comparison among them.
 
 The companion `luma-homeops` spec is written once Milestone 0 passes. It has
 passed (verdict below), so the companion spec can be written now; it takes
@@ -2731,7 +3281,11 @@ with Windows App on macOS, direct and through rdpgw — against the
 run. The Leg B/C spikes (`spikes/legb-winapp`, `spikes/legc-rdpgw`) are
 throwaway and are not re-run for this; they stay only as historical
 evidence (§12, Status). Each result goes into `census.md`, and the values
-marked *acceptance* in §4.4 are retuned from it. In priority order:
+marked *acceptance* in §4.4 are retuned from it. Rev 6.4: the finished
+bridge is the published image —
+`ghcr.io/christopherjmiller/kvm-rdp:sha-<short>@sha256:…`, verified with
+the README's `cosign verify` — so acceptance runs against what a
+deployment pins; no new item. In priority order:
 
 1. **VUI and colour.** Does Windows App honour the VUI? Replay
    `fixtures/large/1080p30_main_limited.h264` and its `…_flagfull` twin
@@ -2854,6 +3408,21 @@ The host is shared and loaded (16 cores, ~12 GiB free RAM, 143 GB free disk at
 - Budget (**rev 6.2**): IronRDP's graph puts debug + tests far past the ~1.5 GB once estimated; `scripts/target-budget.sh` fails the gate above `KVM_RDP_TARGET_BUDGET_GIB` — default: 8 GiB, Task 2.1's floor, which stands: 3.31 GiB measured once Plan C's binary and L2 executable existed (2.4 GiB after Task 2.1) × 1.3 is 4.3 GiB, under it; 3.42 GiB at Plan C's end — and names the one safe cleanup, `cargo clean`; `[build] incremental = false` is committed. CI runs the same script after its tests (DC19).
 - Fuzzing and the 1-hour soak run in CI only; bench streams live in `target/`;
   census captures (15–60 MB each) are wiped after each session.
+- Rev 6.4 (Plan E): **the budget, re-measured with the release
+  artifacts** — the bench's bridge (`--release --features
+  alloc-stats,test-hooks`) and `kvm-bench`, whose shared release units
+  build once for both binaries (about 50, mostly `ironrdp-*`, still build
+  twice): 5.49 GiB of the 8 GiB at Task 6.1 — `debug/` 3.2 GiB,
+  `release/` 2.3 GiB, the bench streams 88 MiB — so the 8 GiB floor
+  stands. `scripts/target-budget.sh --prune` deletes the stale
+  `incremental/` directories first (the disk pass). The one-hour soak runs
+  in the nightly; locally the soak runs at most as `--soak-duration 3m
+  --churn-every 1m`. Image builds run in Docker, not under the cargo
+  wrapper, so `scripts/image-build.sh` makes its own `docker-container`
+  builder, capped at CPU shares 205 (about the wrapper's CPUWeight 20) and
+  8 GiB, and prunes its cache to 8 GB after each build — outside the
+  target budget, beside it: 2.9 GB at Task 6.1. The nightly's L2 stressor
+  runs one busy loop per CPU at nice 5, L2 itself at nice 19.
 
 ## 14. Rejected alternatives
 
@@ -2940,4 +3509,11 @@ opens it, its upstream PR (§4.2); IronRDP API churn and an upstream SVC/DVC
 reassembly cap (monthly pin review); rdpgw's legacy-transport refusal in
 token mode (#185) and any pin past `16cdaaf` (§9.4); FLV source latency —
 *open*, not measured by the census: if SRS buffers ~350 ms, the WebRTC
-source on :1988 becomes a future option (§3.1, §10.3).
+source on :1988 becomes a future option (§3.1, §10.3). Rev 6.4 (Plan E;
+§4.2's pin review checklist): the image's base digests
+(`rust:1.94.1-slim-trixie`, `distroless/cc-debian13:nonroot`) and
+distroless's list of supported images — a deprecated tag stops updating
+silently (DE17) — and the BuildKit digest, through `scripts/pin-image.sh`;
+the Actions pins (`scripts/pin-action.sh --verify`); `flake.lock`'s
+FreeRDP, which the L3 ladder fixture follows (§11.4); and RUSTSEC-2023-0071,
+until IronRDP's crypto chain reaches rsa ≥ 0.10.0 (DE22).
