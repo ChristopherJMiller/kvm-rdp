@@ -219,17 +219,25 @@ running_checks() { # $1 = uid:gid
   exchange 0300000b06e00000000000
   refused "a Connection Request with no RDP_NEG_REQ as $1"
   ok "as $1: /readyz and /livez 200; HYBRID selected; TLS-only, standard and legacy security closed with no reply"
-  local t0 t1 code logs
+  local t0 t1 finished fin code logs bridge_ms docker_ms
   t0=$(date +%s%N)
   docker stop -t 10 "$name" >/dev/null
   t1=$(date +%s%N)
   code=$(docker inspect -f '{{.State.ExitCode}}' "$name")
   [ "$code" = 0 ] || fail "exit $code after SIGTERM as $1"
-  [ $(((t1 - t0) / 1000000)) -le 6000 ] || fail "SIGTERM took $(((t1 - t0) / 1000000)) ms as $1"
+  # The bound is on the bridge's exit, by containerd's timestamp: `docker
+  # stop`'s own time is mostly dockerd's work before the signal and after
+  # the exit (ADV3 review: up to 13 s on a loaded host, against the
+  # bridge's ≤ 50 ms), so it is printed, not bounded.
+  finished=$(docker inspect -f '{{.State.FinishedAt}}' "$name")
+  fin=$(date -d "$finished" +%s%N) || fail "cannot read FinishedAt '$finished' as $1"
+  bridge_ms=$(((fin - t0) / 1000000))
+  docker_ms=$(((t1 - t0) / 1000000))
+  [ "$bridge_ms" -le 5000 ] || fail "SIGTERM took $bridge_ms ms as $1 (docker stop: $docker_ms ms)"
   logs=$(docker logs "$name" 2>&1)
   grep -qF '"shutting down"' <<<"$logs" || fail "no shutdown line as $1"
   docker rm "$name" >/dev/null
-  ok "as $1: SIGTERM → exit 0 in $(((t1 - t0) / 1000000)) ms"
+  ok "as $1: SIGTERM → exit 0 in $bridge_ms ms (docker stop: $docker_ms ms)"
 }
 
 for uid in 65532:65532 4242:4242; do
