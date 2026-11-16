@@ -313,10 +313,13 @@ async fn freerdp_decodes_the_es3_stream_through_the_bridge() {
     assert_eq!(l3.sim.stats().logouts, 0);
 }
 
-/// §11.4's second run: `/gfx:frame-ack:off` suspends acks (§6.6). Frames
-/// keep flowing and the picture keeps moving, with the stall timer scaled
-/// to 2 s, for three times that once acks are suspended — a bridge that
-/// waited for acks would close the session as client_stalled inside it.
+/// §11.4's second run: `/gfx:AVC420,frame-ack:off` suspends acks (§6.6) —
+/// not §11.4's original `/gfx:frame-ack:off`, which FreeRDP 3.32.1 sends
+/// with AVC420 off in every set, so the bridge ends it `no_avc420` (DE21,
+/// spec rev 6.4). Frames keep flowing and the picture keeps moving, with
+/// the stall timer scaled to 2 s, for three times that once acks are
+/// suspended — a bridge that waited for acks would close the session as
+/// client_stalled inside it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "L3: needs xfreerdp and xvfb-run on PATH (nix build .#l3-tools)"]
 async fn freerdp_suspending_acks_keeps_the_picture_moving() {
