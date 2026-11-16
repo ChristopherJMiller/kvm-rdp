@@ -669,8 +669,11 @@ fn core_limit(pid: u32) -> Option<(u64, u64)> {
 /// L2 case). It writes no core file: kvm-bench's `pre_exec` sets
 /// `RLIMIT_CORE` 0, read back here while the bridge lives (systemd-coredump
 /// still lists the crash, with no core stored). A crash never logs out of
-/// the KVM (§3.2), so the bridge an orchestrator restarts logs in and
-/// serves a picture against the same KVM.
+/// the KVM (§3.2): an abort runs no code, so no logout path exists (DE7).
+/// No client connects before the panic, so no KVM session exists yet and
+/// the logouts check before the restart is a record, not a test of that.
+/// The bridge an orchestrator restarts logs in and serves a picture
+/// against the same KVM.
 async fn panic_abort(cx: &Ctx) -> Result<Report, String> {
     use std::os::unix::process::ExitStatusExt as _;
     let mut r = Report::new("panic-abort", cx.thresholds);
@@ -714,7 +717,11 @@ async fn panic_abort(cx: &Ctx) -> Result<Report, String> {
         "no orderly shutdown ran",
         !lines.iter().any(|l| l.contains("\"shutting down\"")),
     );
-    r.at_most("KVM logouts (§3.2)", sim.stats().logouts as f64, 0.0);
+    r.at_most(
+        "KVM logouts before the restart (no KVM session yet)",
+        sim.stats().logouts as f64,
+        0.0,
+    );
     // The restart: a bridge without the hook, on the same KVM, serves a
     // KVM picture to a client.
     drop(b);
