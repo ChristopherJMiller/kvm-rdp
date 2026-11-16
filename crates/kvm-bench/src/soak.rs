@@ -2,16 +2,18 @@
 //! 10 s under MALLOC_ARENA_MAX=2, on its own thread; every `churn_every` a
 //! churn cycle — a preempting reconnect (from the other loopback address,
 //! DE14), an FLV drop, a websocket drop, a re-advertise, a resize (1080p ↔
-//! 720p) and a 1 KiB paste; over minutes 5 to the end, the RSS slope
-//! < 2 MiB/h and max − min < 16 MiB. The steady RSS sizes the deployment's
-//! memory limit.
+//! 720p) and a 1 KiB paste — after two warm-up cycles before the window
+//! (minutes 1 and 3 of the hour); over minutes 5 to the end, the RSS slope
+//! < 2 MiB/h and max − min < 16 MiB, checked over an hour or more. The
+//! steady RSS sizes the deployment's memory limit; the report keeps the
+//! RSS series and each cycle's start, so a failure can be read from it.
 use crate::bridge::{Bridge, rss_kib_of};
 use crate::client::{BenchClient, Opts};
 use crate::scenarios::{Ctx, source_ids};
 use crate::streams;
 use kvm_bench::prom::Scrape;
 use kvm_bench::report::Report;
-use kvm_bench::stats::soak_memory;
+use kvm_bench::stats::{churn_starts, soak_memory};
 use kvm_sim::{Fault, KvmSim, ResizeSignal, SimConfig, SimEvent};
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -65,6 +67,18 @@ fn footprint(r: &mut Report, before: &Scrape, after: &Scrape) {
             r.number(&format!("{family}{{{label}=\"{value}\"}}"), n);
         }
     }
+    // Beside `release_all{websocket_reconnect}`: its counts past the
+    // websocket losses are opens that discarded queued reports (PE15
+    // review m3).
+    r.number(
+        "kvm_rdp_hid_epoch_discards_total",
+        after.delta(before, "kvm_rdp_hid_epoch_discards_total"),
+    );
+    r.note(
+        "release_all{websocket_reconnect} counts each websocket loss once, and each open that \
+         discards a queued report — a session's first open discarding the input core's queued \
+         all-up report, counted in kvm_rdp_hid_epoch_discards_total: not a double release",
+    );
 }
 
 async fn connect(bridge: &Bridge, source: u8, text: &str) -> Result<BenchClient, String> {
@@ -219,13 +233,28 @@ pub async fn soak(cx: &Ctx) -> Result<Report, String> {
     let s0 = bridge.scrape().await?;
     let (t0, mut big, mut failed_steps, mut cycles) = (Instant::now(), true, 0u32, 0u32);
     let sampler = Sampler::start(bridge.pid(), t0);
-    let mut next_churn = t0 + cx.churn_every;
+    let minutes = cx.soak_duration.as_secs_f64() / 60.0;
+    // Two warm-up cycles before §10.1's window (minutes 1 and 3 of the
+    // hour), then its own: from `churn_every` on, every `churn_every`
+    // (PE15 review m1). A cycle starts once due; one that overruns the
+    // next's start delays it, never skips it.
+    let mut schedule = churn_starts(minutes, cx.churn_every.as_secs_f64() / 60.0)
+        .into_iter()
+        .peekable();
+    // Each cycle's start, (minute, cycle number), on the RSS series' axis.
+    let (mut warm_up_starts, mut window_starts) = (Vec::new(), Vec::new());
     let mut paste_reports: Vec<f64> = Vec::new();
     let mut slowest: BTreeMap<&'static str, f64> = BTreeMap::new();
     while t0.elapsed() < cx.soak_duration {
-        if Instant::now() >= next_churn {
+        let due = |(m, _): &(f64, bool)| Instant::now() >= t0 + Duration::from_secs_f64(m * 60.0);
+        if let Some((_, warm_up)) = schedule.next_if(due) {
             cycles += 1;
-            next_churn += cx.churn_every;
+            let start = (t0.elapsed().as_secs_f64() / 60.0, f64::from(cycles));
+            if warm_up {
+                warm_up_starts.push(start);
+            } else {
+                window_starts.push(start);
+            }
             // 1. A preempting reconnect from the other address (DE14).
             source = if source == 2 { 3 } else { 2 };
             let at = Instant::now();
@@ -333,28 +362,19 @@ pub async fn soak(cx: &Ctx) -> Result<Report, String> {
         Err(e) => r.note(format!("/metrics at the end: {e}")),
     }
     r.number("RSS samples", samples.len() as f64);
-    // §10.1: minutes 5 to the end (a short local run: its last 11/12).
-    match soak_memory(&samples, cx.soak_duration.as_secs_f64() / 60.0) {
-        Some(m) => {
-            r.number("steady window from minute", m.from);
-            if cx.soak_duration < Duration::from_secs(30 * 60) {
-                // Over a few minutes a 0.1 MiB drift is already 2 MiB/h, and
-                // one churn cycle moves RSS by more: the bounds are the hour's.
-                r.number("RSS slope, MiB/h (minutes 5 on)", m.per_hour);
-                r.number("RSS max − min, MiB (minutes 5 on)", m.range);
-                r.note(
-                    "short soak: slope and range are reported, not checked (§10.1's hour is the nightly's)",
-                );
-            } else {
-                r.at_most("RSS slope, MiB/h (minutes 5 on)", m.per_hour, 2.0);
-                r.at_most("RSS max − min, MiB (minutes 5 on)", m.range, 16.0);
-            }
-            r.number("steady RSS MiB", m.steady);
-            r.number("peak RSS MiB", m.peak);
-            r.number("memory limit MiB (RSS + 4 + 16, + 50 %)", m.limit);
-        }
+    // §10.1: minutes 5 to the end (a short local run: its last 11/12);
+    // strict bounds, checked over the hour only (PE15 review m2, m4).
+    match soak_memory(&samples, minutes) {
+        Some(m) => m.report(&mut r, minutes),
         None => r.holds("two or more RSS samples in the steady window", false),
     }
+    // The samples themselves, and each cycle's start on their axis: a red
+    // nightly is read from its own report — a step at a cycle's start, or
+    // a drift (PE15 review I1).
+    r.series("VmRSS MiB by minute", samples);
+    r.number("warm-up churn cycles", warm_up_starts.len() as f64);
+    r.series("warm-up churn cycle starts (minute, cycle)", warm_up_starts);
+    r.series("churn cycle starts (minute, cycle)", window_starts);
     if let Some(n) = paste_reports.iter().copied().reduce(f64::max) {
         r.number("HID reports per 1 KiB paste, most", n);
     }

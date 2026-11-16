@@ -46,6 +46,11 @@ pub struct Report {
     pub checks: Vec<Check>,
     pub numbers: BTreeMap<String, f64>,
     pub notes: Vec<String>,
+    /// Named `(x, y)` series a failure is read from (the soak's RSS by
+    /// minute, PE15 review I1). Absent from the JSON while empty, so a
+    /// report without one is byte for byte what it always was.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub series: BTreeMap<String, Vec<(f64, f64)>>,
 }
 
 impl Report {
@@ -57,6 +62,7 @@ impl Report {
             checks: Vec::new(),
             numbers: BTreeMap::new(),
             notes: Vec::new(),
+            series: BTreeMap::new(),
         }
     }
 
@@ -86,6 +92,11 @@ impl Report {
         self.push(name, value, format!("<= {bound}"), value <= bound);
     }
 
+    /// A strict bound no threshold loosens: §10.1's soak, "slope < 2 MiB/h".
+    pub fn under(&mut self, name: &str, value: f64, bound: f64) {
+        self.push(name, value, format!("< {bound}"), value < bound);
+    }
+
     pub fn at_least(&mut self, name: &str, value: f64, bound: f64) {
         self.push(name, value, format!(">= {bound}"), value >= bound);
     }
@@ -102,6 +113,10 @@ impl Report {
 
     pub fn holds(&mut self, name: &str, ok: bool) {
         self.push(name, if ok { 1.0 } else { 0.0 }, "true".to_owned(), ok);
+    }
+
+    pub fn series(&mut self, name: &str, points: Vec<(f64, f64)>) {
+        self.series.insert(name.to_owned(), points);
     }
 
     pub fn number(&mut self, name: &str, value: f64) {
@@ -145,6 +160,59 @@ mod tests {
             json.contains("\"thresholds\":\"strict\"") && json.contains("\"p50 ms\":1.5"),
             "{json}"
         );
+    }
+
+    /// A report's JSON, as every scenario wrote it before series existed:
+    /// a report with none must stay byte for byte what it was (PE15 fix
+    /// round 1).
+    #[test]
+    fn a_report_without_series_is_the_json_it_always_was() {
+        let mut r = Report::new("t", Thresholds::Ci);
+        r.at_most("x", 1.0, 2.0);
+        r.number("n", 1.5);
+        r.note("a");
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"scenario":"t","thresholds":"ci","checks":[{"name":"x","value":1.0,"bound":"<= 2","pass":true}],"numbers":{"n":1.5},"notes":["a"]}"#
+        );
+    }
+
+    /// A series (the soak's RSS by minute, PE15 review I1) is in the JSON,
+    /// as `[x, y]` pairs under `series`, once there is one — and the key is
+    /// absent while there is none.
+    #[test]
+    fn a_series_is_in_the_json_only_when_there_is_one() {
+        let mut r = Report::new("t", Thresholds::Strict);
+        let empty = serde_json::to_string(&r).unwrap();
+        assert!(!empty.contains("series"), "{empty}");
+        r.series("VmRSS MiB by minute", vec![(0.0, 14.0), (0.25, 14.5)]);
+        r.series("churn cycle starts (minute, cycle)", Vec::new());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.ends_with(
+                r#""notes":[],"series":{"VmRSS MiB by minute":[[0.0,14.0],[0.25,14.5]],"churn cycle starts (minute, cycle)":[]}}"#
+            ),
+            "{json}"
+        );
+    }
+
+    /// §10.1's soak bounds are strict ("slope < 2 MiB/h"): `under` fails at
+    /// its bound, where `at_most` passes.
+    #[test]
+    fn a_strict_bound_fails_at_its_value() {
+        let mut r = Report::new("t", Thresholds::Strict);
+        r.under("slope", 1.9999, 2.0);
+        r.under("slope", 2.0, 2.0);
+        r.under("slope", 2.0001, 2.0);
+        assert_eq!(
+            r.checks.iter().map(|c| c.pass).collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        assert_eq!(r.checks[0].bound, "< 2");
+        // Thresholds never loosen it.
+        let mut c = Report::new("t", Thresholds::Ci);
+        c.under("slope", 2.5, 2.0);
+        assert!(!c.passed());
     }
 
     /// PE12 review I2: the thresholds decide every verdict, so each bound
